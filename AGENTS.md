@@ -98,13 +98,17 @@
 
 ## 当前进度与后续顺序
 
-截至整理日,已完成最小 Python/uv 环境、硬件检查、资源下载/软链接、静态 XML 检查及归档/资产校验。主项目 `dependencies` 仍为空,尚未安装训练依赖,也未完成 PyTorch 数据数值加载、MuJoCo 编译、FK 对拍、重定向或训练。
+截至 2026-09-11(第二轮),M0 主体已完成:最小 Python/uv 环境、硬件检查、资源接入之外,另完成:
+
+- 依赖锁定与验证:torch 2.14.0+cu126(RTX 3090 前向/反向验证)、mujoco 3.13.0、numpy/scipy/trimesh/pillow/pytest;wheel 来源与验证记录见 `docs/m0_verification.md` §1。
+- 派生锁定资产:`derived/robots/g1_29dof_locked{.xml,_w_largebox.xml,.urdf}`,含 31 个命名 sites(15 解剖 kpt + 10 脚底 + 6 手部);URDF `<collsion>` 拼写已修正并验证;哈希与站点表见 `derived/robots/lock_record.json`;约定固化在 `src/ireset/embodied/g1_spec.py`,5 项约定测试通过。
+- 数据审计(71 样本):教师 NPZ qpos 布局为 `[qw,qx,qy,qz,x,y,z]|29j|箱体[wxyz|xyz]`(与内部约定相反,须显式转换);PT↔NPZ 配对经精确相似变换验证恢复;312 独立演示/6 受试者;教师回放限位 0 违规但有毫米级穿透。详见 `docs/m0_verification.md` §3。
+- 派生目录 `derived/` 不入版本管理,可由 `scripts/build_locked_assets.py` 与 `scripts/audit_data.py` 重新生成。
 
 后续按方案推进:
 
-1. 按需引入并锁定成熟依赖,验证 Python 3.12、GPU 与 MuJoCo 实际功能。
-2. 审计 OMOMO/教师数据配对、人体尺度、时间轴、物体位姿与关节顺序。
-3. 在派生资产中处理模型差异,完成加载、FK/雅可比与接触几何对拍,锁定正式 G1 版本。
-4. 建立独立验收器和纯优化基线,再实现修复器、确定性/扩散模型及闭环比较。
+1. M1:适配 `pytorch_kinematics` 与 MuJoCo FK 对拍、35 维根增量雅可比验证;接触区间/锚点与逐帧交互网格;独立验收器与纯优化基线;标定接触推断阈值与分组划分清单。
+2. M2:顺序 QP 修复器(OSQP、SCP、状态机、后缀回退)。
+3. M3-M4:确定性/扩散生成、闭环比较与最终评测。
 
 资源变化同步更新 `resources/README.md` 和 manifest;设计变化同步更新实现方案。本文件保留关键约定与阶段摘要,不要把未执行的计划写成已验证结果。

@@ -1,0 +1,30 @@
+# Locked G1 29-DoF robot configuration (M0).
+# Values must stay consistent with src/ireset/embodied/g1_spec.py and
+# derived/robots/lock_record.json; tests/test_conventions.py guards this.
+
+robot: g1_29dof_locked
+n_joints: 29
+nq_robot: 36
+nq_scene: 43
+
+assets:
+  plain_xml: derived/robots/g1_29dof_locked.xml
+  scene_xml: derived/robots/g1_29dof_locked_w_largebox.xml
+  urdf: derived/robots/g1_29dof_locked.urdf
+  rebuild_script: scripts/build_locked_assets.py
+
+# Internal pose storage: [x, y, z, qw, qx, qy, qz] (MuJoCo freejoint order).
+# Teacher NPZ stores [qw, qx, qy, qz, x, y, z] and must be converted.
+pose_convention: xyz_quat_wxyz
+
+keypoints:
+  anatomical: kpt_*          # 15 sites, SMPLH correspondence in G1Spec.KPT_TO_SMPLH
+  sole_spheres: sole_{l,r}_{1..5}
+  sole_sphere_radius_m: 0.005
+  hand:
+    palm: hand_{l,r}_palm
+    thumb: hand_{l,r}_thumb
+    pinky: hand_{l,r}_pinky
+    tip_sphere_radius_m: 0.001
+
+robot_height_m: 1.32         # upstream holosoma g1 default, used for human scaling

@@ -6,3 +6,6 @@ __pycache__/
 resources/data/OMOMO_new
 resources/data/omniretarget/
 third_party/holosoma/
+derived/
+wandb/
+*.egg-info/
