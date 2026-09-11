@@ -25,11 +25,12 @@ contact_inference:
   foot_exit_m: 0.03
   foot_entry_speed_mps: 0.3
   min_duration: 3
-  # reference-side (human) thresholds
-  ref_hand_enter_m: 0.06
-  ref_hand_exit_m: 0.12
-  ref_foot_enter_m: 0.08
-  ref_foot_exit_m: 0.14
+  # reference-side (human) thresholds: calibrated vs robot-side inference
+  # (macro-F1 0.876, 18 original clips, scripts/calibrate_contact_thresholds.py)
+  ref_hand_enter_m: 0.04
+  ref_hand_exit_m: 0.072
+  ref_foot_enter_m: 0.05
+  ref_foot_exit_m: 0.08
   ref_foot_speed_mps: 0.35
 
 teacher_quality_m1_baseline:          # measured 2026-09-11, 24 original clips

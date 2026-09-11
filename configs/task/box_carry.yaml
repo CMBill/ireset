@@ -1,0 +1,38 @@
+# MVP task definition: single largebox carry on flat ground (locked 2026-09-11).
+# Statistics measured over all 312 original teacher demos (not augmentations);
+# see derived/data/split/manifest.json and docs/m0_verification.md.
+
+task: box_carry
+fps: 30
+ground_plane: {a: 0.0, b: 0.0, c: 1.0, d: 0.0}   # z = 0, normal +z
+gravity: [0.0, 0.0, -9.81]
+
+object:
+  asset: resources/robots/largebox/largebox.obj
+  mujoco_geom: largebox            # locked scene, mesh (convex hull) collision
+  aabb_center_geom_frame: [0.00281, 0.00003, 0.00703]   # training proxy only
+  half_extents_geom_frame: [0.22132, 0.21167, 0.20298]  # hull differs ~7cm mean
+  resting_height_m: 0.185          # median box z over all originals
+  note: >-
+    MuJoCo recentered the mesh: geom frame != OBJ frame (see
+    src/ireset/geometry/distance_adapter.py). Acceptance queries always use
+    the MuJoCo hull, never the analytic AABB.
+
+# Observed scene envelope over originals; used for reachability pre-screening
+# (plan 8.1) and anomaly checks. Not acceptance gates by themselves.
+scene_envelope:
+  root_height_m: [0.305, 0.814]
+  box_height_m: [0.179, 1.561]
+  root_box_horizontal_dist_m: [0.144, 1.340]
+  human_keypoint_z_m: [-0.031, 1.482]   # feet may sit ~3cm into ground in source data
+  observed_peak_speeds:                  # data range, NOT acceptance limits
+    box_mps: 2.26
+    root_mps: 5.29
+
+data_split:
+  manifest: derived/data/split/manifest.json
+  seed: 20260911
+  train_demos: 250
+  val_demos: 31
+  test_demos: 31        # all 6 subjects in every split; 31 < 100 target reported per plan 1.3
+  unsupervised_reserve: 17   # largebox PT without teacher NPZ

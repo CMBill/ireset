@@ -98,10 +98,10 @@ def infer_reference_schedule(
     human_kpts_world: np.ndarray,      # [T, 52, 3]
     source_obj_pose: np.ndarray,       # [T, 7] project convention [xyz, qwxyz]
     hand_distance_fn=None,             # optional override(world_pts, pose) -> [T] distance
-    hand_enter_m: float = 0.06,
-    hand_exit_m: float = 0.12,
-    foot_enter_m: float = 0.08,
-    foot_exit_m: float = 0.14,
+    hand_enter_m: float = 0.04,   # calibrated 2026-09-11 vs robot-side inference,
+    hand_exit_m: float = 0.072,    # macro-F1 0.876 over 18 original clips
+    foot_enter_m: float = 0.05,    # (scripts/calibrate_contact_thresholds.py)
+    foot_exit_m: float = 0.08,
     foot_speed_mps: float = 0.35,
     min_duration: int = 3,
     fps: float = 30.0,
