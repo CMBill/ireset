@@ -98,17 +98,16 @@
 
 ## 当前进度与后续顺序
 
-截至 2026-09-11(第二轮),M0 主体已完成:最小 Python/uv 环境、硬件检查、资源接入之外,另完成:
+截至 2026-09-11(第三轮),M0、M1 均已完成:
 
-- 依赖锁定与验证:torch 2.14.0+cu126(RTX 3090 前向/反向验证)、mujoco 3.13.0、numpy/scipy/trimesh/pillow/pytest;wheel 来源与验证记录见 `docs/m0_verification.md` §1。
-- 派生锁定资产:`derived/robots/g1_29dof_locked{.xml,_w_largebox.xml,.urdf}`,含 31 个命名 sites(15 解剖 kpt + 10 脚底 + 6 手部);URDF `<collsion>` 拼写已修正并验证;哈希与站点表见 `derived/robots/lock_record.json`;约定固化在 `src/ireset/embodied/g1_spec.py`,5 项约定测试通过。
-- 数据审计(71 样本):教师 NPZ qpos 布局为 `[qw,qx,qy,qz,x,y,z]|29j|箱体[wxyz|xyz]`(与内部约定相反,须显式转换);PT↔NPZ 配对经精确相似变换验证恢复;312 独立演示/6 受试者;教师回放限位 0 违规但有毫米级穿透。详见 `docs/m0_verification.md` §3。
-- 派生目录 `derived/` 不入版本管理,可由 `scripts/build_locked_assets.py` 与 `scripts/audit_data.py` 重新生成。
+- M0:依赖锁定(torch 2.14.0+cu126 GPU 验证、mujoco 3.13.0)、派生锁定资产(`derived/robots/g1_29dof_locked*`,31 sites)、71 样本配对审计。详见 `docs/m0_verification.md`。
+- M1(本轮):运动学层(`kinematics/` 35 维 retract/雅可比,1000 状态 FD 验证 max 3.9e-9;torch FK 对拍 max 7.1e-7 m)、交互网格(`imesh/` 逐帧 Delaunay+均匀 Laplacian,刚体不变性测试)、几何层(`geometry/` 碰撞对+允许列表、可微 AABB 距离;**MuJoCo mesh 重定心旋转已实证**,box geom 系≠OBJ 系)、接触推断(`embodied/contact_sites.py` 双阈值+去抖)与 F1 指标、独立验收器(`repair/validation.py`,含自碰撞与插值检查,6 类注入违规全部检出)、教师质量量化(24 段:穿透 ≤16.5mm、脚滑 ~0.3m/s、接触 F1 0.872——教师非可行真值证据)、未约束 GN 纯优化基线(MPJPE 4.2cm、10.6ms/帧)。容差锁定于 `configs/eval/protocol.yaml`。详见 `docs/m1_verification.md`。
+- 测试 31 项全过(`uv run --locked pytest tests/ -q`)。关键工程事实:教师 NPZ qpos 为四元数在前布局需显式转换;扫描箱凸包与 AABB 差 mean~7cm(AABB 仅训练代理);MuJoCo freejoint 角速度 qvel 为体系。
 
 后续按方案推进:
 
-1. M1:适配 `pytorch_kinematics` 与 MuJoCo FK 对拍、35 维根增量雅可比验证;接触区间/锚点与逐帧交互网格;独立验收器与纯优化基线;标定接触推断阈值与分组划分清单。
-2. M2:顺序 QP 修复器(OSQP、SCP、状态机、后缀回退)。
-3. M3-M4:确定性/扩散生成、闭环比较与最终评测。
+1. M2(关键路径):顺序 QP 修复器——OSQP 线性化子问题、SCP 接受规则、接触状态机、顺序 check-then-repair 与后缀回退;速度限值正式标定;约束版纯优化基线。
+2. M3:确定性/扩散生成(60 帧窗口、拼接)。
+3. M4:闭环比较与最终评测。
 
 资源变化同步更新 `resources/README.md` 和 manifest;设计变化同步更新实现方案。本文件保留关键约定与阶段摘要,不要把未执行的计划写成已验证结果。

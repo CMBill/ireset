@@ -94,6 +94,33 @@ KPT_TO_SMPLH: dict[str, str] = {
     "kpt_r_wrist": "R_Wrist",
 }
 
+#: Anatomical keypoint site -> hosting body (authoritative table; the asset
+#: build script and kinematics adapters both consume this).
+KPT_BODIES: dict[str, str] = {
+    "kpt_pelvis": "pelvis_contour_link",
+    "kpt_l_hip": "left_hip_pitch_link",
+    "kpt_r_hip": "right_hip_pitch_link",
+    "kpt_l_knee": "left_knee_link",
+    "kpt_r_knee": "right_knee_link",
+    "kpt_l_shoulder": "left_shoulder_roll_link",
+    "kpt_r_shoulder": "right_shoulder_roll_link",
+    "kpt_l_elbow": "left_elbow_link",
+    "kpt_r_elbow": "right_elbow_link",
+    "kpt_l_ankle": "left_ankle_intermediate_1_link",
+    "kpt_r_ankle": "right_ankle_intermediate_1_link",
+    "kpt_l_toe": "left_ankle_roll_sphere_5_link",
+    "kpt_r_toe": "right_ankle_roll_sphere_5_link",
+    "kpt_l_wrist": "left_rubber_hand_link",
+    "kpt_r_wrist": "right_rubber_hand_link",
+}
+
+#: Sole proxy site -> collision-sphere body (sphere centers, radius 5 mm).
+SOLE_BODIES: dict[str, str] = {
+    f"sole_{side}_{i}": f"{full}_ankle_roll_sphere_{i}_link"
+    for side, full in (("l", "left"), ("r", "right"))
+    for i in range(1, 6)
+}
+
 #: Foot sole proxy sites (sphere centers) per foot, ordered heel-outside,
 #: heel-inside, front-outside, front-inside, toe. Spheres 1-4 are the upstream
 #: "foot sticking" set; sphere 5 is the toe.

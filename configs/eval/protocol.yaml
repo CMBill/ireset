@@ -1,0 +1,42 @@
+# M1 evaluation protocol: locked tolerances (plan sections 10.1, 14.3).
+# Mirrors src/ireset/repair/validation.py::ValidationConfig defaults; the yaml
+# is the experimental record, the dataclass is the runtime source.
+
+validation:
+  penetration_tolerance_m: 0.002      # accepted-trajectory max penetration
+  joint_limit_tolerance_rad: 0.00001
+  joint_velocity_limit_radps: 6.0     # provisional: model defines none; recalibrate M2
+  base_lin_velocity_limit_mps: 1.5    # provisional
+  base_ang_velocity_limit_radps: 3.0  # provisional
+  hand_gap_m: 0.01
+  hand_anchor_error_m: 0.01
+  hand_relative_speed_mps: 0.02
+  foot_speed_mps: 0.02
+  foot_anchor_drift_m: 0.01
+  foot_ground_gap_m: 0.005
+  check_interpolated_states: true
+  max_subdivisions: 2
+
+contact_inference:
+  # robot-side (generated geometry) thresholds
+  hand_enter_m: 0.02
+  hand_exit_m: 0.06                   # pilot-review: long hover near box inflates intervals
+  foot_enter_m: 0.012
+  foot_exit_m: 0.03
+  foot_entry_speed_mps: 0.3
+  min_duration: 3
+  # reference-side (human) thresholds
+  ref_hand_enter_m: 0.06
+  ref_hand_exit_m: 0.12
+  ref_foot_enter_m: 0.08
+  ref_foot_exit_m: 0.14
+  ref_foot_speed_mps: 0.35
+
+teacher_quality_m1_baseline:          # measured 2026-09-11, 24 original clips
+  full_pass_rate: 0.0                 # teacher is NOT unconditionally feasible truth
+  joint_limits_pass: 1.0
+  velocities_pass: 0.5
+  penetration_worst_max_m: 0.0165
+  foot_support_speed_worst: "~0.30 m/s during inferred stance"
+  hand_anchor_drift_worst: "up to ~1.35 m on hover-inclusive intervals"
+  contact_f1_macro_mean: 0.872        # robot-inferred vs reference-inferred

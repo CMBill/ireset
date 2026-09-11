@@ -38,32 +38,8 @@ import numpy as np
 
 from ireset.paths import DERIVED_ROBOTS_DIR, G1_HOLOSOMA_DIR
 
-# Body -> anatomical keypoint site (name prefix kpt_). Target bodies follow the
-# upstream ("smplh", "g1") JOINTS_MAPPING selection; sites sit at body origins.
-KPT_BODIES: dict[str, str] = {
-    "kpt_pelvis": "pelvis_contour_link",
-    "kpt_l_hip": "left_hip_pitch_link",
-    "kpt_r_hip": "right_hip_pitch_link",
-    "kpt_l_knee": "left_knee_link",
-    "kpt_r_knee": "right_knee_link",
-    "kpt_l_shoulder": "left_shoulder_roll_link",
-    "kpt_r_shoulder": "right_shoulder_roll_link",
-    "kpt_l_elbow": "left_elbow_link",
-    "kpt_r_elbow": "right_elbow_link",
-    "kpt_l_ankle": "left_ankle_intermediate_1_link",
-    "kpt_r_ankle": "right_ankle_intermediate_1_link",
-    "kpt_l_toe": "left_ankle_roll_sphere_5_link",
-    "kpt_r_toe": "right_ankle_roll_sphere_5_link",
-    "kpt_l_wrist": "left_rubber_hand_link",
-    "kpt_r_wrist": "right_rubber_hand_link",
-}
-
-# Foot sole collision spheres; numbering follows the source model bodies.
-SOLE_BODIES: dict[str, str] = {
-    f"sole_{side}_{i}": f"{full}_ankle_roll_sphere_{i}_link"
-    for side, full in (("l", "left"), ("r", "right"))
-    for i in range(1, 6)
-}
+# Site tables live in the library as the single source of truth.
+from ireset.embodied.g1_spec import KPT_BODIES, SOLE_BODIES  # noqa: E402
 
 # Hand contact proxies. Palm sites at the rubber-hand mesh bbox center in the
 # rubber_hand body frame (computed from the compiled source model, vertices
