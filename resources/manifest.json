@@ -1,0 +1,354 @@
+{
+  "date": "2026-09-11",
+  "holosoma": {
+    "url": "https://github.com/amazon-far/holosoma",
+    "commit": "bccd4d7451640a2800ddc77e469d911a84f91994",
+    "path": "third_party/holosoma",
+    "sparse_paths": [
+      "src/holosoma_retargeting"
+    ],
+    "user_g1_top_level_files_match_commit": true
+  },
+  "omniretarget": {
+    "revision": "135259130158f1cb1799e4ab9b6566c938285fc9",
+    "url": "https://huggingface.co/datasets/omniretarget/OmniRetarget_Dataset",
+    "archive": "resources/data/omniretarget/robot-object.zip",
+    "archive_sha256": "93001f298aec587cd2b0a79aa5553d264cf2148e5397d4aa4bb767a9d58041b3",
+    "trajectory_count": 1826,
+    "frames": 323812,
+    "fps": 30,
+    "source_names_matched": 312,
+    "pairing_status": "filename only; geometry and temporal alignment pending",
+    "verified_model_files": 74
+  },
+  "files": {
+    "resources/data/omniretarget/models/g1/assets/half_sphere.obj": {
+      "bytes": 3876860,
+      "sha256": "73e153c4164100b8a6c82c9897e489fdf8d6794cab0d1ad809b639a7662add20"
+    },
+    "resources/data/omniretarget/models/g1/assets/head_link.obj": {
+      "bytes": 1518851,
+      "sha256": "61c950b17c36245ba2a719ae0f8b425f8b8eeed4763d050da1840b90a5a70930"
+    },
+    "resources/data/omniretarget/models/g1/assets/left_G1_EE_pad.obj": {
+      "bytes": 688089,
+      "sha256": "08ea0ea7e1803a70c53806a01bb04f2f02c1ff3a71eba957b08378703a1676b3"
+    },
+    "resources/data/omniretarget/models/g1/assets/left_ankle_pitch_link.obj": {
+      "bytes": 95753,
+      "sha256": "863c8833a07e09a2aa4fda9693c14c424f99d0804ae1991ca35213cfff9b6e82"
+    },
+    "resources/data/omniretarget/models/g1/assets/left_ankle_roll_link.obj": {
+      "bytes": 1040588,
+      "sha256": "1996adeb213deaad6ed660c95192cc08d704411f69ed90ef3d61e625037188bb"
+    },
+    "resources/data/omniretarget/models/g1/assets/left_elbow_link.obj": {
+      "bytes": 129040,
+      "sha256": "f39eb615e0adb6409fb0784bef8f8ef3d9bac84a27702da993fe694f406ab2b3"
+    },
+    "resources/data/omniretarget/models/g1/assets/left_elbow_link_merge.obj": {
+      "bytes": 5303130,
+      "sha256": "91396ef8c697b338c0ef0c8c186bfdaec27690da7f1c953419dab6b8a40d7fea"
+    },
+    "resources/data/omniretarget/models/g1/assets/left_hand_index_0_link.obj": {
+      "bytes": 660164,
+      "sha256": "b7778bdd45e6bd6dfff48b5a4d721ab2fca7a3827f54099306e98dc467b80d15"
+    },
+    "resources/data/omniretarget/models/g1/assets/left_hand_index_1_link.obj": {
+      "bytes": 2533143,
+      "sha256": "5ad9107bac460988b5ebd0bb3e2557536823590fa39880466ab0bdc7454ce497"
+    },
+    "resources/data/omniretarget/models/g1/assets/left_hand_middle_0_link.obj": {
+      "bytes": 660164,
+      "sha256": "b7778bdd45e6bd6dfff48b5a4d721ab2fca7a3827f54099306e98dc467b80d15"
+    },
+    "resources/data/omniretarget/models/g1/assets/left_hand_middle_1_link.obj": {
+      "bytes": 2533143,
+      "sha256": "5ad9107bac460988b5ebd0bb3e2557536823590fa39880466ab0bdc7454ce497"
+    },
+    "resources/data/omniretarget/models/g1/assets/left_hand_palm_link.obj": {
+      "bytes": 3582324,
+      "sha256": "9ec926bbb75931b8a345aa3653f26ec7610093741684f194d6b71cb0ec89a1af"
+    },
+    "resources/data/omniretarget/models/g1/assets/left_hand_thumb_0_link.obj": {
+      "bytes": 7896,
+      "sha256": "d5ec45c92de98acc651f7b5ae2d7f9aa0e44122f017e8246fab0995645796803"
+    },
+    "resources/data/omniretarget/models/g1/assets/left_hand_thumb_1_link.obj": {
+      "bytes": 655001,
+      "sha256": "87ba42742afeeff6f7a8f3b8b76d9d332e1f9775583acb48ed3d68bdb203535c"
+    },
+    "resources/data/omniretarget/models/g1/assets/left_hand_thumb_2_link.obj": {
+      "bytes": 2543762,
+      "sha256": "02e2b6bc6049dccacc08cf2cf949d4d8e5f063b9bf49ef91ca0ecd294ecb67bd"
+    },
+    "resources/data/omniretarget/models/g1/assets/left_hip_pitch_link.obj": {
+      "bytes": 274334,
+      "sha256": "4ed685646bdee41ddd1e74a715dcaabc59a11bcf97f2c450f0de1c4d33f8ca9e"
+    },
+    "resources/data/omniretarget/models/g1/assets/left_hip_roll_link.obj": {
+      "bytes": 290324,
+      "sha256": "87699e76fee17d30dac37163a441ffe341837b938927af19f2b3cac7f046c781"
+    },
+    "resources/data/omniretarget/models/g1/assets/left_hip_yaw_link.obj": {
+      "bytes": 468677,
+      "sha256": "0c2de1d276eb3179344417c1b1f65308ff7e10451dd89719a11a033ff0f3a142"
+    },
+    "resources/data/omniretarget/models/g1/assets/left_knee_link.obj": {
+      "bytes": 1386316,
+      "sha256": "490a3228be00b1886b116a5b99c83fdc480b9f73ba0f1b7e240956f7ece9b4b7"
+    },
+    "resources/data/omniretarget/models/g1/assets/left_rubber_hand.obj": {
+      "bytes": 3869484,
+      "sha256": "2955af3ebc299bb01913c821842817e2d1da8ea883e4b6092df2f308b1a645ab"
+    },
+    "resources/data/omniretarget/models/g1/assets/left_shoulder_pitch_link.obj": {
+      "bytes": 265294,
+      "sha256": "47e59be304a59f8b7267f09aa214a0b664a51f172648951a91c5c491158d969e"
+    },
+    "resources/data/omniretarget/models/g1/assets/left_shoulder_roll_link.obj": {
+      "bytes": 618153,
+      "sha256": "906b966a1eac99d962f3b3c068f99aa425f4eed0c1a49432b18272ebe6fe4fc6"
+    },
+    "resources/data/omniretarget/models/g1/assets/left_shoulder_yaw_link.obj": {
+      "bytes": 378509,
+      "sha256": "43094daafb1b84744d5adea3802ed4e85591103d50e2f249d7cc19e1798b6fd9"
+    },
+    "resources/data/omniretarget/models/g1/assets/left_sphere_hand.obj": {
+      "bytes": 63111,
+      "sha256": "86b1968dd22b994aa5843ba399f2aef67180d7f8c00b17dfe0ca68de1f177af6"
+    },
+    "resources/data/omniretarget/models/g1/assets/left_wrist_pitch_link.obj": {
+      "bytes": 122829,
+      "sha256": "78c95a4a38918d364cdb2521c61ddd9378fe5387d66d6dc7a81cab7c5d9506a6"
+    },
+    "resources/data/omniretarget/models/g1/assets/left_wrist_roll_link.obj": {
+      "bytes": 547879,
+      "sha256": "fa16cac0ba54068d6e6e2c6bad6d8eb406cd69e84211ab4ff45f8643e11e36ff"
+    },
+    "resources/data/omniretarget/models/g1/assets/left_wrist_roll_rubber_hand.obj": {
+      "bytes": 5948800,
+      "sha256": "c6ada824c78999a26717936e8d1ee4195481fd50934fe52e999c072c8140776b"
+    },
+    "resources/data/omniretarget/models/g1/assets/left_wrist_yaw_link.obj": {
+      "bytes": 488670,
+      "sha256": "fecf8ddca63429a8ebbf958b1603362cf07fc944e9ca9af3e211886da0959287"
+    },
+    "resources/data/omniretarget/models/g1/assets/logo_link.mtl": {
+      "bytes": 398,
+      "sha256": "cd787ead96363aa676d9a79626803f9053ecc7a3cef6d4f1640176a8cf2785d3"
+    },
+    "resources/data/omniretarget/models/g1/assets/logo_link.obj": {
+      "bytes": 385478,
+      "sha256": "451f64e733980255a370618a23ab6b4c9c37ea035b3bca04ae965ee55574ae08"
+    },
+    "resources/data/omniretarget/models/g1/assets/pelvis.obj": {
+      "bytes": 1675329,
+      "sha256": "450ec17e11c33d6a92b6e97525db0ad7fef39ce4191bcdcf7f02d7e2b71d4bd8"
+    },
+    "resources/data/omniretarget/models/g1/assets/pelvis_contour_link.obj": {
+      "bytes": 3042238,
+      "sha256": "64453d101c1e8fcde8d93b910f54d8be905c88ffc5f4f5e1ffa55e9ed532584f"
+    },
+    "resources/data/omniretarget/models/g1/assets/right_G1_EE_pad.obj": {
+      "bytes": 692176,
+      "sha256": "4c8a5dc82b28fd1bd4179ad24772d873ea9a0a4964c4b3ec4db99f1413ea4020"
+    },
+    "resources/data/omniretarget/models/g1/assets/right_ankle_pitch_link.obj": {
+      "bytes": 95766,
+      "sha256": "c387584a3e7749f5cfbfd525c13a63fb05258f0cc92f1af195df1ca348bffaf9"
+    },
+    "resources/data/omniretarget/models/g1/assets/right_ankle_roll_link.obj": {
+      "bytes": 1041809,
+      "sha256": "dd8b9445531854d4c72bf1cdb71d59df6b3f5bf060d2811ea0e1401998ccd4b1"
+    },
+    "resources/data/omniretarget/models/g1/assets/right_elbow_link.obj": {
+      "bytes": 129190,
+      "sha256": "a4f981be317bb82bc53b6407c64cbfa4d4f226008fd2f3fb266f34af6a4f86cc"
+    },
+    "resources/data/omniretarget/models/g1/assets/right_elbow_link_merge.obj": {
+      "bytes": 5157715,
+      "sha256": "80115f722ead3626a6eaf5119bc52097b64a096a6af949cbee4f6042db4186e1"
+    },
+    "resources/data/omniretarget/models/g1/assets/right_hand_index_0_link.obj": {
+      "bytes": 650417,
+      "sha256": "d885f7160cade7044d862a2548e7992273f99df9b2daf4cb1fe1764e836469f7"
+    },
+    "resources/data/omniretarget/models/g1/assets/right_hand_index_1_link.obj": {
+      "bytes": 2520443,
+      "sha256": "617f6b3bdf7fc5f71de55a10421031e52160979d63c468127205a6ef21ffa806"
+    },
+    "resources/data/omniretarget/models/g1/assets/right_hand_middle_0_link.obj": {
+      "bytes": 650417,
+      "sha256": "d885f7160cade7044d862a2548e7992273f99df9b2daf4cb1fe1764e836469f7"
+    },
+    "resources/data/omniretarget/models/g1/assets/right_hand_middle_1_link.obj": {
+      "bytes": 2520443,
+      "sha256": "617f6b3bdf7fc5f71de55a10421031e52160979d63c468127205a6ef21ffa806"
+    },
+    "resources/data/omniretarget/models/g1/assets/right_hand_palm_link.obj": {
+      "bytes": 3564093,
+      "sha256": "17c12b40713d7f4c112ae7194ad24b1652461606cbeb9f77297f9df73ea7dc66"
+    },
+    "resources/data/omniretarget/models/g1/assets/right_hand_thumb_0_link.obj": {
+      "bytes": 7785,
+      "sha256": "7afaed0bf51366a5c431b221d3b69efd4b348f291d89ac93c62dd49bf8c45722"
+    },
+    "resources/data/omniretarget/models/g1/assets/right_hand_thumb_1_link.obj": {
+      "bytes": 650265,
+      "sha256": "e276c040a4d6e2129b9c9b317a99cd697fcb47740daccbb322d01194cfeda4fc"
+    },
+    "resources/data/omniretarget/models/g1/assets/right_hand_thumb_2_link.obj": {
+      "bytes": 2520382,
+      "sha256": "068b9581d17418d7111aa247273300d0776115436e27df6a9468db5f1d23d731"
+    },
+    "resources/data/omniretarget/models/g1/assets/right_hip_pitch_link.obj": {
+      "bytes": 276636,
+      "sha256": "d6e2ddf3990b662ab5582dd348b396bb3eb1b064827f7f386206b049ca3526ba"
+    },
+    "resources/data/omniretarget/models/g1/assets/right_hip_roll_link.obj": {
+      "bytes": 291327,
+      "sha256": "f63e568476977acbc993de97407f69fdaaaaa8ff6194a1ed9004a2fdad18c596"
+    },
+    "resources/data/omniretarget/models/g1/assets/right_hip_yaw_link.obj": {
+      "bytes": 470717,
+      "sha256": "5c8f27b1598c3fc7792bbb5ece6646504ffb8b4db3f9c752fa5b572593746318"
+    },
+    "resources/data/omniretarget/models/g1/assets/right_knee_link.obj": {
+      "bytes": 1383642,
+      "sha256": "958e400cebc40c3e481ad3cd2ea9fd1a88c17728b91de7a33df24c0432969a7c"
+    },
+    "resources/data/omniretarget/models/g1/assets/right_rubber_hand.obj": {
+      "bytes": 3690515,
+      "sha256": "0804b574f7bf34be20dd8a101bf22f4bf01fec319071ffb5f113b261ba8d47c8"
+    },
+    "resources/data/omniretarget/models/g1/assets/right_shoulder_pitch_link.obj": {
+      "bytes": 266659,
+      "sha256": "f24f9da5d61fe103a34d75a72af0e29da91f87e489e2dc27a5900c159a5457d6"
+    },
+    "resources/data/omniretarget/models/g1/assets/right_shoulder_roll_link.obj": {
+      "bytes": 621953,
+      "sha256": "11dd3bfbf6eec175608aa7d1d6f56617146b52c43defb912687ad781ea297019"
+    },
+    "resources/data/omniretarget/models/g1/assets/right_shoulder_yaw_link.obj": {
+      "bytes": 377846,
+      "sha256": "11fcb7b5777c168fd27990081cf815499df251fd0b351901cb5029e5b97c55c2"
+    },
+    "resources/data/omniretarget/models/g1/assets/right_sphere_hand.obj": {
+      "bytes": 63111,
+      "sha256": "86b1968dd22b994aa5843ba399f2aef67180d7f8c00b17dfe0ca68de1f177af6"
+    },
+    "resources/data/omniretarget/models/g1/assets/right_wrist_pitch_link.obj": {
+      "bytes": 114317,
+      "sha256": "823d57238b59884a88ceff1aba48d584bcef975e5eb92acad00da9c4e6f76be3"
+    },
+    "resources/data/omniretarget/models/g1/assets/right_wrist_roll_link.obj": {
+      "bytes": 549333,
+      "sha256": "6142a7c6803a6b5906734ed029076ead6dfea6990363aa122ed6f088088fed48"
+    },
+    "resources/data/omniretarget/models/g1/assets/right_wrist_roll_rubber_hand.obj": {
+      "bytes": 5932848,
+      "sha256": "94d0856fb64a7e8200c5fadf4ccc19067b13508374d7c20eafba940942d565f4"
+    },
+    "resources/data/omniretarget/models/g1/assets/right_wrist_yaw_link.obj": {
+      "bytes": 525416,
+      "sha256": "8685565af5f4fc8aa119ffadaf66ad988b9715e49e4498cef80c739448376279"
+    },
+    "resources/data/omniretarget/models/g1/assets/torso_constraint_L_link.obj": {
+      "bytes": 251106,
+      "sha256": "93264201f3c13b30b35c5fb4cd72736f69d52577a8388819718772725d6fea7e"
+    },
+    "resources/data/omniretarget/models/g1/assets/torso_constraint_L_rod_link.obj": {
+      "bytes": 103365,
+      "sha256": "7fd9d81ccc9af1dc2c9a3e37179160b40d28611f49f1718214605dfd8fe2b73d"
+    },
+    "resources/data/omniretarget/models/g1/assets/torso_constraint_R_link.obj": {
+      "bytes": 258717,
+      "sha256": "71ff33c8bbc19eef45ae3345265c9f8b9539a966a581fde82d947e8c37ef3575"
+    },
+    "resources/data/omniretarget/models/g1/assets/torso_constraint_R_rod_link.obj": {
+      "bytes": 103607,
+      "sha256": "f18970d27ec38cdd9412362579964fd81173c3190b1df3beb902e3a46a890960"
+    },
+    "resources/data/omniretarget/models/g1/assets/torso_link.obj": {
+      "bytes": 3489189,
+      "sha256": "28cd5329f3ebec5efe5b0d09afca87b750bd2d5c63e3d893fe15cdf13abac863"
+    },
+    "resources/data/omniretarget/models/g1/assets/tote_no_bar.obj": {
+      "bytes": 1042787,
+      "sha256": "80d55c09af067694bde55907b8f71db6bd282a4819f4f41a3e136086ad19e449"
+    },
+    "resources/data/omniretarget/models/g1/assets/waist_constraint_L.obj": {
+      "bytes": 154696,
+      "sha256": "b76cd61fdddedcfcbb7ab79d3c020423541c36bb1988bcf4ccba18b0239f1035"
+    },
+    "resources/data/omniretarget/models/g1/assets/waist_constraint_R.obj": {
+      "bytes": 156138,
+      "sha256": "906aac4a261bf72688efd59e5fbbc070ed5884accf53b955989458266b1a3797"
+    },
+    "resources/data/omniretarget/models/g1/assets/waist_roll_link.obj": {
+      "bytes": 22777,
+      "sha256": "be355b255fec17a743531916869713f4ef5ea6fc4d7c81f2b275af4298e0966d"
+    },
+    "resources/data/omniretarget/models/g1/assets/waist_support_link.obj": {
+      "bytes": 233308,
+      "sha256": "8c7603f23737d1ac0b52d9e50ba1e5582c9fae08381b65ad450dde86fd42134e"
+    },
+    "resources/data/omniretarget/models/g1/assets/waist_yaw_link.obj": {
+      "bytes": 420691,
+      "sha256": "747b8dc46c5fae891db4ca54f0c2a898ad32ff7e160fe785bf193dcd5505a69e"
+    },
+    "resources/data/omniretarget/models/g1/g1_29dof.urdf": {
+      "bytes": 47796,
+      "sha256": "5e9110166a845896f9977c35f7301f130db2aaa34d3d470d118db148d291b593"
+    },
+    "resources/data/omniretarget/models/g1/g1_29dof_spherehand.urdf": {
+      "bytes": 48901,
+      "sha256": "6d79140d335157ad026d24b79be6fbb161c997c01c3ffc37bcca282dc2240696"
+    },
+    "resources/data/omniretarget/models/ground_box.sdf": {
+      "bytes": 658,
+      "sha256": "80f72e717ac9364039dfbd2566d58f936e5cd84d0bf38a802df45d1a6e01aff7"
+    },
+    "resources/data/omniretarget/models/largebox/largebox.obj": {
+      "bytes": 1998275,
+      "sha256": "dbcc11281f62e9226f49165252375080d2e490e5a3f0ab6ba917acbd8f7abc1c"
+    },
+    "resources/data/omniretarget/models/largebox/largebox.urdf": {
+      "bytes": 902,
+      "sha256": "627b7cf5b46500c89ca69afdd3ebdcaf64db6c6810dae43b94120eacafbab37e"
+    },
+    "resources/robots/largebox/largebox.obj": {
+      "bytes": 1998275,
+      "sha256": "dbcc11281f62e9226f49165252375080d2e490e5a3f0ab6ba917acbd8f7abc1c"
+    },
+    "resources/robots/largebox/largebox.urdf": {
+      "bytes": 902,
+      "sha256": "627b7cf5b46500c89ca69afdd3ebdcaf64db6c6810dae43b94120eacafbab37e"
+    },
+    "resources/robots/largebox/largebox.xml": {
+      "bytes": 706,
+      "sha256": "0d6d41a192e4d8702935400c8b2698f66141770054bd8ff288f091c5f7e2b25e"
+    },
+    "resources/robots/g1_holosoma/g1_29dof.urdf": {
+      "bytes": 49620,
+      "sha256": "1c5a19d8440d246fd6a21645de0b9bc8b92c99ee5cd895607a402db9eb02a32b"
+    },
+    "resources/robots/g1_holosoma/g1_29dof.xml": {
+      "bytes": 32958,
+      "sha256": "8c586e4747da85804180fe44d8692e0fd8231356728b6327e256dca498087a78"
+    },
+    "resources/robots/g1_holosoma/g1_29dof_spherehand.urdf": {
+      "bytes": 47315,
+      "sha256": "58798588cb27ff59f80c9d6c39d374e6127d740d505e72daa9ae58b8274a61ea"
+    },
+    "resources/robots/g1_holosoma/g1_29dof_spherehand.xml": {
+      "bytes": 39275,
+      "sha256": "17549f99cc230aa8e8d29a5bcc30cc3075ad34cbc1f9860dacbbe840ac092313"
+    },
+    "resources/robots/g1_holosoma/g1_29dof_w_largebox.xml": {
+      "bytes": 33690,
+      "sha256": "13b0404edf67a87e09054ea878023a737e5bd6a943844d5387f209a44f24fc5c"
+    }
+  }
+}
