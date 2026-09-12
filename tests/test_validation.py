@@ -91,11 +91,57 @@ def test_detects_foot_slide_during_support(teacher_qpos, validator) -> None:
 
 
 def test_detects_nonfinite(teacher_qpos, validator) -> None:
+    """NaN joints: clean rejection with an explicit status, never a crash."""
     q = teacher_qpos.copy().astype(float)
     q[10, 20] = np.nan
-    # NaN must never produce a passing report (comparisons with NaN are False)
-    try:
-        rep = validator.validate(q)
-    except (ValueError, FloatingPointError):
-        pytest.skip("MuJoCo rejected NaN qpos directly, equally valid")
+    rep = validator.validate(q)
+    assert rep.status == "rejected_nonfinite"
     assert not rep.passed
+    assert rep.checks["finite"].location.startswith("t=")
+
+
+def test_detects_nonfinite_box_quaternion(teacher_qpos, validator) -> None:
+    """NaN box quat used to crash scipy Slerp; must be a clean rejection."""
+    q = teacher_qpos.copy().astype(float)
+    q[5, 40] = np.nan
+    rep = validator.validate(q)
+    assert rep.status == "rejected_nonfinite"
+    assert not rep.passed
+
+
+def test_detects_zero_norm_quaternion(teacher_qpos, validator) -> None:
+    q = teacher_qpos.copy().astype(float)
+    q[3, 3:7] = 0.0
+    rep = validator.validate(q)
+    assert rep.status == "rejected_degenerate_quaternion"
+    assert not rep.passed
+
+
+def test_adaptive_subdivision_reports_post_interval(teacher_qpos, validator) -> None:
+    """Fast frame pairs subdivide; max_check_interval_m is post-subdivision."""
+    q = teacher_qpos[:6].copy()
+    rep = validator.validate(q)
+    cfg = validator.cfg
+    motion = validator._frame_motion_m(q[2], q[3])
+    if motion > cfg.max_substep_motion_m:
+        assert rep.max_check_interval_m < motion
+    else:
+        assert rep.max_check_interval_m <= cfg.max_substep_motion_m + 1e-9
+
+
+def test_mid_frame_penetration_caught_by_subdivision(teacher_qpos, validator) -> None:
+    """Penetration only between two clean keyframes must still be detected."""
+    q = teacher_qpos[:3].copy()
+    root = q[1, 0:3]
+    far = root + np.array([2.0, 0.0, 0.0])
+    hit = root.copy()
+    s_star = 0.35
+    a = (hit - s_star * far) / (1 - s_star)
+    q[0, 36:39] = a
+    q[1, 36:39] = far
+    q[0, 39:43] = [1, 0, 0, 0]
+    q[1, 39:43] = [1, 0, 0, 0]
+    rep = validator.validate(q)
+    assert not rep.checks["penetration"].passed, (
+        f"interior penetration missed (worst={rep.checks['penetration'].worst})"
+    )

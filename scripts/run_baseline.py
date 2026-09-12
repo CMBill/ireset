@@ -25,6 +25,7 @@ from audit_data import convert_scene_qpos
 from ireset.embodied.g1_spec import KPT_TO_SMPLH
 from ireset.embodied.contact_sites import SMPLH_INDEX
 from ireset.eval.baselines import InteractionTracker, TrackerConfig
+from ireset.kinematics.mujoco_adapter import RobotState
 from ireset.paths import TEACHER_TRAJ_DIR
 from ireset.repair.validation import IndependentValidator, ValidationConfig
 
@@ -53,9 +54,16 @@ def main() -> None:
         result = tracker.track(human, scene[:, 36:43])
         dt_ms = (time.perf_counter() - t0) / scene.shape[0] * 1e3
 
-        # keypoint MPJPE against the reference (what the tracker sees)
-        from ireset.kinematics.mujoco_adapter import RobotState
+        # first-frame MPJPE after solving frame 0 from the reference-estimated
+        # init (review Fix 4): the seeding quality M2's fallback inherits
+        init = tracker.initial_state(human[0])
+        solved0 = tracker.solve_frame(init, human[0])
+        first_err = float(np.linalg.norm(
+            tracker.kin.keypoints(solved0)[0] - human[0][KPT_IDX], axis=-1).mean())
+        init_err = float(np.linalg.norm(
+            tracker.kin.keypoints(init)[0] - human[0][KPT_IDX], axis=-1).mean())
 
+        # keypoint MPJPE against the reference (what the tracker sees)
         st = RobotState(result[:, 0:3], result[:, 3:7], result[:, 7:36])
         achieved = tracker.kin.keypoints(st)
         target = human[:, KPT_IDX]
@@ -66,17 +74,21 @@ def main() -> None:
             "clip": demo,
             "frames": int(scene.shape[0]),
             "mpjpe_m": round(mpjpe, 4),
+            "frame0_solved_mpjpe_m": round(first_err, 4),
+            "init_raw_mpjpe_m": round(init_err, 4),
             "ms_per_frame": round(dt_ms, 1),
             "passed": bool(rep.passed),
             "summary": rep.summary(),
             "worst": {k: round(v.worst, 5) for k, v in rep.checks.items()},
         })
-        print(f"{demo}: mpjpe={mpjpe:.4f}m {dt_ms:.0f}ms/frame {rep.summary()} "
+        print(f"{demo}: mpjpe={mpjpe:.4f}m first={first_err:.4f}m {dt_ms:.0f}ms/frame {rep.summary()} "
               f"pen={rep.checks['penetration'].worst:.4f}")
 
     agg = {
         "n_clips": len(rows),
         "mpjpe_mean": float(np.mean([r["mpjpe_m"] for r in rows])),
+        "frame0_solved_mpjpe_mean": float(np.mean([r["frame0_solved_mpjpe_m"] for r in rows])),
+        "init_raw_mpjpe_mean": float(np.mean([r["init_raw_mpjpe_m"] for r in rows])),
         "ms_per_frame_mean": float(np.mean([r["ms_per_frame"] for r in rows])),
         "pass_rate": float(np.mean([r["passed"] for r in rows])),
     }

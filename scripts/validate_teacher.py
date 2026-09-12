@@ -82,6 +82,7 @@ def main() -> None:
         T = scene.shape[0]
         f1 = contact_f1_all(rep.schedule, ref_sched, T) if rep.schedule else {}
         rows.append({
+            "status": rep.status,
             "clip": f"{demo}_{variant}",
             "passed": rep.passed,
             "summary": rep.summary(),
@@ -89,6 +90,7 @@ def main() -> None:
             "limits": {k: v.limit for k, v in rep.checks.items()},
             "check_passed": {k: v.passed for k, v in rep.checks.items()},
             "max_check_interval_m": round(rep.max_check_interval_m, 4),
+            "subdivision_capped": bool(rep.subdivision_capped),
             "robot_intervals": [
                 {"eff": iv.effector, "support": iv.support, "start": iv.start, "end": iv.end}
                 for iv in (rep.schedule.intervals if rep.schedule else [])
@@ -97,7 +99,12 @@ def main() -> None:
                 {"eff": iv.effector, "support": iv.support, "start": iv.start, "end": iv.end}
                 for iv in ref_sched.intervals
             ],
-            "contact_f1": {k: round(v, 4) for k, v in f1.items()},
+            "contact_f1": {
+                k: (None if v is None else (round(v, 4) if isinstance(v, float) else
+                    (v if isinstance(v, int) else
+                     {kk: round(vv, 4) for kk, vv in v.items()})))
+                for k, v in f1.items()
+            },
         })
         print(rows[-1]["clip"], rows[-1]["summary"],
               {k: round(v, 4) for k, v in rows[-1]["worst"].items() if k in ("penetration", "foot_support", "hand_grasp")})
@@ -111,7 +118,12 @@ def main() -> None:
         "per_check_worst_max": {
             k: max(r["worst"].get(k, 0.0) for r in rows) for k in rows[0]["worst"]
         },
-        "contact_f1_macro_mean": float(np.mean([r["contact_f1"].get("macro_f1", 0.0) for r in rows])),
+        "contact_f1_macro_mean_defined": float(np.mean(
+            [r["contact_f1"]["macro_f1"] for r in rows if r["contact_f1"].get("macro_f1") is not None]
+        )),
+        "n_clips_with_defined_macro": sum(
+            1 for r in rows if r["contact_f1"].get("macro_f1") is not None
+        ),
     }
     OUT.mkdir(parents=True, exist_ok=True)
     def _to_py(o):

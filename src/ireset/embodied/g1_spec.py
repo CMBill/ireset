@@ -13,9 +13,10 @@ Conventions (project-wide, see docs/interaction_retarget_impl_plan.md section 4.
   directly. Published datasets storing ``[qw, qx, qy, qz, x, y, z]`` must be
   converted explicitly.
 - The scene qpos adds the box freejoint at indices [36:43].
-- Site positions for sole/hand proxies sit at collision-sphere *centers*; the
-  recorded radii must be subtracted along the contact normal when locking
-  surface anchors (a sphere center is not the contact surface).
+- Site positions for sole/hand proxies sit at collision-sphere *centers*; a
+  sphere center is not the contact surface. Acceptance-grade surface gaps
+  come from MuJoCo ``mj_geomDistance`` (exact for tilted feet too); the
+  recorded radii are asset metadata, not inputs to a subtraction shortcut.
 """
 
 from __future__ import annotations
@@ -128,7 +129,8 @@ SOLE_SITES: dict[str, tuple[str, ...]] = {
     side: tuple(f"sole_{side}_{i}" for i in range(1, 6)) for side in ("l", "r")
 }
 
-#: Collision radii of the sole proxy spheres (meters).
+#: Collision radii of the sole proxy spheres (meters). Asset metadata only;
+#: gap queries use MuJoCo geomDistance (see module docstring).
 SOLE_SPHERE_RADIUS_M = 0.005
 
 #: Hand contact proxy sites. Tips are 1 mm collision spheres; palm is the

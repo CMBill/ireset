@@ -77,6 +77,44 @@ def box_geom_to_world(points_geom: np.ndarray, box_pose: np.ndarray) -> np.ndarr
     return np.einsum("tij,tnj->tni", R_b, p_body) + t_b[:, None, :]
 
 
+# --- acceptance-grade hull geometry ------------------------------------------
+
+_HULL: "trimesh.Trimesh | None" = None
+
+
+def largebox_hull():
+    """Convex hull of the compiled largebox mesh (the collision geometry).
+
+    This is the acceptance-grade geometry; the analytic AABB in this module
+    is a differentiable *training* proxy only (mean ~1.8cm error at a true
+    2cm gap — exactly the regime contact inference decides in).
+    """
+    global _HULL
+    if _HULL is None:
+        import mujoco
+        import trimesh
+
+        from ireset.embodied.g1_spec import G1Spec
+
+        m = G1Spec().load_scene()
+        mid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_MESH, "largebox_mesh")
+        verts = m.mesh_vert[m.mesh_vertadr[mid] : m.mesh_vertadr[mid] + m.mesh_vertnum[mid]]
+        _HULL = trimesh.Trimesh(vertices=verts.astype(np.float64), process=False).convex_hull
+    return _HULL
+
+
+def largebox_hull_surface_distance(points_world: np.ndarray, box_pose: np.ndarray) -> np.ndarray:
+    """Unsigned hull surface distance (0 inside), [T]; batched over frames.
+
+    ``points_world`` [T, 3], ``box_pose`` [T, 7] project convention. This is
+    the reference-side metric for contact scheduling and F1 scoring.
+    """
+    import trimesh
+
+    geom = world_to_box_geom(points_world, box_pose).reshape(-1, 3)
+    return np.clip(-trimesh.proximity.signed_distance(largebox_hull(), geom), 0.0, None)
+
+
 # --- analytic AABB distances (geom frame) ------------------------------------
 
 

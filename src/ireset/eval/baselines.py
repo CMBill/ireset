@@ -46,18 +46,30 @@ class InteractionTracker:
         self.cfg = cfg or TrackerConfig()
         self.spec = self.kin.spec
         self._smplh_ids = [SMPLH_INDEX[KPT_TO_SMPLH[k]] for k in KPT_NAMES]
+        self._pelvis_site_offset: np.ndarray | None = None
 
     def initial_state(self, ref_kpts_world: np.ndarray) -> RobotState:
-        """Reference-estimated root pose (pelvis position, shoulder yaw) + nominal q."""
+        """Reference-estimated root pose (pelvis position, shoulder yaw) + nominal q.
+
+        The G1 left shoulder sits at +y in the body frame, so the human
+        shoulder line maps to the robot +y axis (not +x): with d = l - r,
+        yaw = atan2(-d_x, d_y). The pelvis keypoint is a site on
+        ``pelvis_contour_link`` offset from the root origin; the nominal-pose
+        offset is precomputed once and removed.
+        """
         from ireset.kinematics.rotation_adapter import mat_to_quat_wxyz, so3_exp_np
 
         kpts = ref_kpts_world[self._smplh_ids]  # [15, 3] in G1 correspondence order
-        pos = kpts[0].copy()                    # pelvis site ~ root height offset applied below
         sh_l = kpts[KPT_NAMES.index("kpt_l_shoulder")]
         sh_r = kpts[KPT_NAMES.index("kpt_r_shoulder")]
-        yaw = np.arctan2(-(sh_l[1] - sh_r[1]), sh_l[0] - sh_r[0])  # +x along shoulder line
+        d = sh_l - sh_r
+        yaw = np.arctan2(-d[0], d[1])
         R = so3_exp_np(np.array([0.0, 0.0, yaw]))
-        # pelvis site sits slightly below the root (MJCF pelvis origin); ignore offset
+        if self._pelvis_site_offset is None:
+            nominal = RobotState(np.zeros((1, 3)), np.array([[1.0, 0, 0, 0]]), np.zeros((1, 29)))
+            site = self.kin.site_positions(nominal, ["kpt_pelvis"])[0, 0]
+            self._pelvis_site_offset = -site  # root -> site in body frame
+        pos = kpts[0] + R @ self._pelvis_site_offset
         q = np.zeros((1, 29))
         return RobotState(pos[None].copy(), mat_to_quat_wxyz(R)[None], q)
 

@@ -101,8 +101,9 @@
 截至 2026-09-11(第三轮),M0、M1 均已完成(M0 最后一项"分组清单/阈值/场景边界"于 M1 工具就绪后补齐):
 
 - M0:依赖锁定(torch 2.14.0+cu126 GPU 验证、mujoco 3.13.0)、派生锁定资产(`derived/robots/g1_29dof_locked*`,31 sites)、71 样本配对审计。**M0 收尾(本轮)**:250/31/31 按演示分组划分(种子 20260911,受试者哈希 zlib.crc32,清单锁定 `derived/data/split/`;总量 3.0h/312 演示/1,826 NPZ;17 个无教师 PT 为 reserve)、场景边界(root [0.305,0.814]m、箱 [0.179,1.561]m,`configs/task/box_carry.yaml`)、参考侧接触阈值标定(hand 0.04/0.072、foot 0.05/0.08,宏 F1 0.876,`configs/eval/protocol.yaml`)。详见 `docs/m0_verification.md`。
-- M1:运动学层(`kinematics/` 35 维 retract/雅可比,1000 状态 FD 验证 max 3.9e-9;torch FK 对拍 max 7.1e-7 m)、交互网格(`imesh/` 逐帧 Delaunay+均匀 Laplacian,刚体不变性测试)、几何层(`geometry/` 碰撞对+允许列表、可微 AABB 距离;**MuJoCo mesh 重定心旋转已实证**,box geom 系≠OBJ 系)、接触推断(`embodied/contact_sites.py` 双阈值+去抖)与 F1 指标、独立验收器(`repair/validation.py`,含自碰撞与插值检查,6 类注入违规全部检出)、教师质量量化(24 段:穿透 ≤16.5mm、脚滑 ~0.3m/s、接触 F1 0.872——教师非可行真值证据)、未约束 GN 纯优化基线(MPJPE 4.2cm、10.6ms/帧)。容差锁定于 `configs/eval/protocol.yaml`。详见 `docs/m1_verification.md`。
-- 测试 31 项全过(`uv run --locked pytest tests/ -q`)。关键工程事实:教师 NPZ qpos 为四元数在前布局需显式转换;扫描箱凸包与 AABB 差 mean~7cm(AABB 仅训练代理);MuJoCo freejoint 角速度 qvel 为体系;Python 内建 `hash()` 跨进程随机,划分种子必须用稳定哈希。
+- M1:运动学层(`kinematics/` 35 维 retract/雅可比,1000 状态 FD 验证 max 3.9e-9;torch FK 对拍 max 7.1e-7 m)、交互网格(`imesh/` 逐帧 Delaunay+均匀 Laplacian,刚体不变性测试)、几何层(`geometry/` 碰撞对+允许列表、可微 AABB 距离;**MuJoCo mesh 重定心旋转已实证**,box geom 系≠OBJ 系)、接触推断(`embodied/contact_sites.py` 双阈值+去抖、hull 参考度量)与 F1 指标(双空未定义策略)、独立验收器(`repair/validation.py`,含自碰撞、表面距离间隙、逐 site 检查、显式有限性门与 status 状态码、含箱体运动的真自适应细分)。教师质量量化(修复后 71 段:穿透最差 23.2mm、脚滑 ~0.3m/s、接触 F1 0.657 defined-only——教师非可行真值证据)、未约束 GN 纯优化基线(整段 MPJPE 4.9cm、10.6ms/帧、求解首帧 2.6cm)。容差与阈值锁定于 `configs/eval/protocol.yaml`(推断 enter ≤ 验收门槛由代码强制)。详见 `docs/m1_verification.md` 与 `docs/m1_fix_plan.md`。
+- M1 审阅修复(2026-09-11 第二轮):F1 双空虚高、脚部球心当表面、AABB 代理进标定、基线首帧 yaw、有限性检查、死配置六项已修并重标定重锁(旧值与失效原因保留在 protocol.yaml 与 m1_verification.md §8)。
+- 测试 51 项全过(`uv run --locked pytest tests/ -q`)。关键工程事实:教师 NPZ qpos 为四元数在前布局需显式转换;扫描箱凸包与 AABB 差 mean~7cm(AABB 仅训练代理);MuJoCo freejoint 角速度 qvel 为体系;Python 内建 `hash()` 跨进程随机,划分种子必须用稳定哈希;参考脚部高度 82% 帧低于 0.02m,脚部阈值不可由 F1 标定。
 
 后续按方案推进:
 

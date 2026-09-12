@@ -1,6 +1,9 @@
 # M1 evaluation protocol: locked tolerances (plan sections 10.1, 14.3).
 # Mirrors src/ireset/repair/validation.py::ValidationConfig defaults; the yaml
 # is the experimental record, the dataclass is the runtime source.
+# 2026-09-11 review round: contact thresholds and baselines re-locked after the
+# m1_fix_plan fixes (surface gaps, per-site checks, hull metric, F1 undefined
+# policy, adaptive subdivision). Superseded values preserved with reasons.
 
 validation:
   penetration_tolerance_m: 0.002      # accepted-trajectory max penetration
@@ -14,30 +17,41 @@ validation:
   foot_speed_mps: 0.02
   foot_anchor_drift_m: 0.01
   foot_ground_gap_m: 0.005
-  check_interpolated_states: true
-  max_subdivisions: 2
+  check_interpolated_states: true     # adaptive by Cartesian motion incl. box
+  max_substep_motion_m: 0.05          # now enforced (was dead config)
+  max_subdivisions: 2                 # now enforced (was dead config)
 
 contact_inference:
-  # robot-side (generated geometry) thresholds
-  hand_enter_m: 0.02
-  hand_exit_m: 0.06                   # pilot-review: long hover near box inflates intervals
-  foot_enter_m: 0.012
-  foot_exit_m: 0.03
+  # robot-side (generated geometry) thresholds; enter <= gate enforced in code
+  hand_enter_m: 0.01                  # supersedes 0.02 (exceeded hand_gap_m)
+  hand_exit_m: 0.03                   # supersedes 0.06
+  foot_enter_m: 0.005                 # supersedes 0.012 (exceeded gap; center-z bug)
+  foot_exit_m: 0.02                   # supersedes 0.03
   foot_entry_speed_mps: 0.3
   min_duration: 3
-  # reference-side (human) thresholds: calibrated vs robot-side inference
-  # (macro-F1 0.876, 18 original clips, scripts/calibrate_contact_thresholds.py)
+  # reference-side (human) thresholds: skip-F1 0.668 on hull metric (18 clips,
+  # grid flat within +/-0.003 -> weakly identified, pilot review queued);
+  # foot pinned by the acceptance invariant, NOT F1-calibratable (82% of
+  # reference foot heights sit below 0.02 m -> F1 saturates)
   ref_hand_enter_m: 0.04
-  ref_hand_exit_m: 0.072
-  ref_foot_enter_m: 0.05
-  ref_foot_exit_m: 0.08
+  ref_hand_exit_m: 0.072              # ratio 1.8: recorded assumption, uncalibrated
+  ref_foot_enter_m: 0.005
+  ref_foot_exit_m: 0.02
   ref_foot_speed_mps: 0.35
+  # Superseded first lock (AABB metric + double-empty F1 bias): ref_foot
+  # 0.05/0.08; claimed macro-F1 0.876. The ref_hand numbers coincide by
+  # chance of a flat optimum; the F1 itself was inflated.
 
-teacher_quality_m1_baseline:          # measured 2026-09-11, 24 original clips
+teacher_quality_m1_baseline:          # 2026-09-11 after fixes, 71 clips (24 original + 47 augmented)
   full_pass_rate: 0.0                 # teacher is NOT unconditionally feasible truth
   joint_limits_pass: 1.0
-  velocities_pass: 0.5
-  penetration_worst_max_m: 0.0165
-  foot_support_speed_worst: "~0.30 m/s during inferred stance"
-  hand_anchor_drift_worst: "up to ~1.35 m on hover-inclusive intervals"
-  contact_f1_macro_mean: 0.872        # robot-inferred vs reference-inferred
+  velocities_pass: 0.310              # max 3.06x the provisional limit
+  penetration_pass: 0.042             # worst 23.2mm (adaptive subdivision finds deeper moments)
+  foot_support_pass: 0.0              # worst speed ~0.30 m/s during inferred stance: genuine slide
+  hand_grasp_pass: 0.085              # anchor drift up to ~2.4m on hover-inclusive intervals (pilot review)
+  contact_f1_macro_mean_defined: 0.657  # skip policy; all 71 clips have a defined macro
+  # Superseded first-lock values (pre-fix): penetration worst 16.5mm (single
+  # midpoint level), velocities 0.5 pass (originals only), contact F1 0.872
+  # (double-empty scored 1.0; AABB reference metric); foot_support 0% pass was
+  # then partly a threshold artifact (center-z radius bug pinned the ratio at
+  # exactly 1.0).

@@ -36,11 +36,14 @@ class ValidationConfig:
     joint_velocity_limit_radps: float = 6.0
     base_lin_velocity_limit_mps: float = 1.5
     base_ang_velocity_limit_radps: float = 3.0
-    # contact inference thresholds
-    hand_enter_m: float = 0.02
-    hand_exit_m: float = 0.06
-    foot_enter_m: float = 0.012
-    foot_exit_m: float = 0.03
+    # contact inference thresholds. Enter thresholds must not exceed the gate
+    # the resulting interval must satisfy (enforced in __post_init__): an
+    # interval created at a distance the gate already rejects fails for a
+    # configuration reason, not a motion reason.
+    hand_enter_m: float = 0.01
+    hand_exit_m: float = 0.03
+    foot_enter_m: float = 0.005
+    foot_exit_m: float = 0.02
     foot_entry_speed_mps: float = 0.3
     min_duration: int = 3
     # contact quality gates (plan 10.1)
@@ -55,6 +58,14 @@ class ValidationConfig:
     max_substep_motion_m: float = 0.05
     max_subdivisions: int = 2
     fps: float = 30.0
+
+    def __post_init__(self) -> None:
+        if self.hand_enter_m > self.hand_gap_m:
+            raise ValueError(f"hand_enter_m {self.hand_enter_m} > hand_gap_m {self.hand_gap_m}")
+        if self.foot_enter_m > self.foot_ground_gap_m:
+            raise ValueError(f"foot_enter_m {self.foot_enter_m} > foot_ground_gap_m {self.foot_ground_gap_m}")
+        if self.hand_exit_m < self.hand_enter_m or self.foot_exit_m < self.foot_enter_m:
+            raise ValueError("exit threshold must not be tighter than enter (hysteresis)")
 
 
 @dataclass
@@ -71,9 +82,19 @@ class ValidationReport:
     passed: bool
     checks: dict[str, CheckResult] = field(default_factory=dict)
     schedule: ContactSchedule | None = None
+    #: max Cartesian site displacement between consecutive *checked* states
+    #: (post-subdivision), per plan 6.3 "report the max check interval"
     max_check_interval_m: float = 0.0
+    #: True when max_subdivisions capped the subdivision below what
+    #: max_substep_motion_m would require (reported, never silently passed)
+    subdivision_capped: bool = False
+    #: passed / rejected_nonfinite / rejected_degenerate_quaternion /
+    #: rejected_tolerance
+    status: str = "passed"
 
     def summary(self) -> str:
+        if self.status != "passed" and self.status != "rejected_tolerance":
+            return self.status
         if self.passed:
             return "passed"
         failed = [k for k, v in self.checks.items() if not v.passed]
@@ -94,6 +115,22 @@ class IndependentValidator:
         self.hand_sites = {s: ids(list(v.values())) for s, v in HAND_SITES.items()}
         self.sole_sites = {s: ids(list(v)) for s, v in SOLE_SITES.items()}
         self.box_geom = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "largebox")
+        self.ground_geom = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "ground")
+        # sole collision-sphere geoms: the *surface* gap to the ground must
+        # come from mj_geomDistance (exact, works for tilted feet); site
+        # centers are 5 mm spheres and are not the contact surface.
+        self.sole_geoms = {
+            s: [
+                mujoco.mj_name2id(
+                    self.model, mujoco.mjtObj.mjOBJ_GEOM,
+                    f"{'left' if s == 'l' else 'right'}_ankle_roll_sphere_{i}_link",
+                )
+                for i in range(1, 6)
+            ]
+            for s in ("l", "r")
+        }
+        self._motion_data = mujoco.MjData(self.model)
+        self._hand_geoms = self._hand_geoms_for()
 
     # -- core ----------------------------------------------------------------
 
@@ -101,16 +138,40 @@ class IndependentValidator:
         q = np.asarray(scene_qpos, dtype=float)
         T = q.shape[0]
         cfg = self.cfg
-        checks: dict[str, CheckResult] = {}
 
+        # Explicit pre-gates: non-finite input and degenerate quaternions are
+        # rejected before any geometric/scipy call (plan 1.3: non-finite
+        # results must be rejected with an explicit status, never a crash or
+        # a NaN worst value).
+        if not np.isfinite(q).all():
+            bad = np.argwhere(~np.isfinite(q))
+            return ValidationReport(
+                passed=False, status="rejected_nonfinite",
+                checks={"finite": CheckResult(False, float("inf"), 0.0,
+                        location=f"t={bad[0, 0]} qpos_idx={bad[0, 1]}",
+                        detail=f"{len(bad)} non-finite entries")},
+            )
+        for name, sl in (("root_quat", slice(3, 7)), ("box_quat", slice(39, 43))):
+            n = np.linalg.norm(q[:, sl], axis=1)
+            if (n < 1e-8).any():
+                return ValidationReport(
+                    passed=False, status="rejected_degenerate_quaternion",
+                    checks={"quaternion": CheckResult(False, float(n.min()), 1e-8,
+                            location=f"{name} t={int(np.argmin(n))}")},
+                )
+
+        checks: dict[str, CheckResult] = {}
         checks["joint_limits"] = self._check_joint_limits(q)
         checks["velocities"] = self._check_velocities(q)
-        pen_worst, pen_where, max_interval = self._check_penetration(q)
+        pen_worst, pen_where, max_interval, capped = self._check_penetration(q)
         checks["penetration"] = CheckResult(
             pen_worst <= cfg.penetration_tolerance_m, pen_worst,
             cfg.penetration_tolerance_m, pen_where,
         )
-        report = ValidationReport(passed=False, checks=checks, max_check_interval_m=max_interval)
+        report = ValidationReport(
+            passed=False, checks=checks, max_check_interval_m=max_interval,
+            subdivision_capped=capped, status="rejected_tolerance",
+        )
 
         schedule = self._infer_robot_schedule(q)
         report.schedule = schedule
@@ -118,6 +179,8 @@ class IndependentValidator:
         checks["hand_grasp"] = self._check_hands(q, schedule)
 
         report.passed = all(c.passed for c in checks.values())
+        if report.passed:
+            report.status = "passed"
         return report
 
     # -- components ------------------------------------------------------------
@@ -151,14 +214,50 @@ class IndependentValidator:
                     w / cfg.base_ang_velocity_limit_radps)
         return CheckResult(worst <= 1.0, worst, 1.0, f"joint={dq:.2f}rad/s pos={dpos:.2f}m/s ang={w:.2f}rad/s")
 
-    def _check_penetration(self, q: np.ndarray) -> tuple[float, str, float]:
-        """Max penetration over all pairs at keyframes + adaptive midpoints."""
+    def _all_site_xpos(self, qp: np.ndarray, d: mujoco.MjData) -> np.ndarray:
+        d.qpos = qp
+        mujoco.mj_forward(self.model, d)
+        return d.site_xpos.copy()
+
+    def _frame_motion_m(self, qa: np.ndarray, qb: np.ndarray) -> float:
+        """Max collision-relevant displacement between two states, in meters.
+
+        Replaces the dimensionally inconsistent ``|dpos| + max|dq|`` metric
+        (joint radians and base meters are not addable). Robot-side motion is
+        the max site displacement; the box contributes its geom-center
+        displacement so that box-only motion still triggers subdivision.
+        """
+        d = self._motion_data
+        xa = self._all_site_xpos(qa, d)
+        xb = self._all_site_xpos(qb, d)
+        motion = float(np.linalg.norm(xb - xa, axis=-1).max())
+        ba = self._box_geom_xpos(qa, d)
+        bb = self._box_geom_xpos(qb, d)
+        motion = max(motion, float(np.linalg.norm(bb - ba)))
+        return motion
+
+    def _box_geom_xpos(self, qp: np.ndarray, d: mujoco.MjData) -> np.ndarray:
+        d.qpos = qp
+        mujoco.mj_forward(self.model, d)
+        return d.geom_xpos[self.box_geom].copy()
+
+    def _check_penetration(self, q: np.ndarray) -> tuple[float, str, float, bool]:
+        """Max penetration over all pairs at keyframes + adaptive subdivisions.
+
+        Each frame pair is subdivided so that the max site motion between
+        checked states stays under ``max_substep_motion_m`` (up to
+        ``max_subdivisions`` extra levels); ``max_check_interval_m`` reports
+        the *post-subdivision* interval, and ``capped`` flags pairs where the
+        budget could not be met.
+        """
         cfg = self.cfg
         d = mujoco.MjData(self.model)
+        self._motion_data = mujoco.MjData(self.model)
         pairs = self.pairs.all_pairs
         worst = 0.0
         where = ""
         max_interval = 0.0
+        capped = False
 
         def probe(qp: np.ndarray, tag: str) -> float:
             nonlocal worst, where
@@ -177,12 +276,15 @@ class IndependentValidator:
             probe(q[t], f"t={t}")
         if cfg.check_interpolated_states:
             for t in range(q.shape[0] - 1):
-                lo, hi = q[t], q[t + 1]
-                motion = np.linalg.norm(hi[0:3] - lo[0:3]) + np.abs(hi[7:36] - lo[7:36]).max()
-                mid = self._interpolate(lo, hi, 0.5)
-                probe(mid, f"t={t}.5")
-                max_interval = max(max_interval, motion)
-        return worst, where, max_interval
+                motion = self._frame_motion_m(q[t], q[t + 1])
+                n_sub = int(np.clip(np.ceil(motion / cfg.max_substep_motion_m), 1, cfg.max_subdivisions + 1))
+                for i in range(1, n_sub):
+                    probe(self._interpolate(q[t], q[t + 1], i / n_sub), f"t={t}+{i}/{n_sub}")
+                interval = motion / n_sub
+                max_interval = max(max_interval, interval)
+                if interval > cfg.max_substep_motion_m:
+                    capped = True
+        return worst, where, max_interval, capped
 
     def _interpolate(self, qa: np.ndarray, qb: np.ndarray, s: float) -> np.ndarray:
         from scipy.spatial.transform import Rotation as Rot, Slerp
@@ -200,56 +302,77 @@ class IndependentValidator:
         return out
 
     def _infer_robot_schedule(self, q: np.ndarray) -> ContactSchedule:
+        """Infer contacts from generated geometry, per-site anchors.
+
+        Caches per-site world positions (hands [T,3,3], soles [T,5,3]) and
+        per-site box-frame hand positions; sole *gap* uses true MuJoCo
+        sphere-surface distance to the ground, not site-center height.
+        """
         cfg = self.cfg
         d = mujoco.MjData(self.model)
         T = q.shape[0]
         schedule = ContactSchedule()
 
         hand_dist = {s: np.full(T, np.inf) for s in self.hand_sites}
-        sole_z = {s: np.full(T, np.inf) for s in self.sole_sites}
-        hand_world = {s: np.zeros((T, 3)) for s in self.hand_sites}
-        sole_world = {s: np.zeros((T, 3)) for s in self.sole_sites}
-        box_R = np.zeros((T, 3, 3)); box_t = np.zeros((T, 3))
+        sole_gap = {s: np.full(T, np.inf) for s in self.sole_sites}
+        hand_pts = {s: np.zeros((T, 3, 3)) for s in self.hand_sites}
+        sole_pts = {s: np.zeros((T, 5, 3)) for s in self.sole_sites}
+        hand_local = {s: np.zeros((T, 3, 3)) for s in self.hand_sites}
         for t in range(T):
             d.qpos = q[t]
             mujoco.mj_forward(self.model, d)
             R_g = d.geom_xmat[self.box_geom].reshape(3, 3)
             x_g = d.geom_xpos[self.box_geom]
-            box_R[t], box_t[t] = R_g, x_g
             for s, ids in self.hand_sites.items():
-                pts = d.site_xpos[ids]
-                hand_world[s][t] = pts.mean(0)
-                dists = [
-                    mujoco.mj_geomDistance(self.model, d, self._hand_geom(s, k), self.box_geom, 1.0, self._fromto)
-                    for k in range(3)
-                ]
-                hand_dist[s][t] = min(dists)
+                pts = d.site_xpos[ids]                                  # [3,3]
+                hand_pts[s][t] = pts
+                hand_local[s][t] = (R_g.T @ (pts - x_g).T).T
+                hand_dist[s][t] = min(
+                    mujoco.mj_geomDistance(self.model, d, g, self.box_geom, 1.0, self._fromto)
+                    for g in self._hand_geoms[s]
+                )
             for s, ids in self.sole_sites.items():
-                sole_world[s][t] = d.site_xpos[ids].mean(0)
-                sole_z[s][t] = d.site_xpos[ids][:, 2].min()
+                sole_pts[s][t] = d.site_xpos[ids]                       # [5,3]
+                sole_gap[s][t] = min(
+                    mujoco.mj_geomDistance(self.model, d, g, self.ground_geom, 1.0, self._fromto)
+                    for g in self.sole_geoms[s]
+                )
 
+        dt = 1.0 / cfg.fps
         for s, name in (("l", "left_hand"), ("r", "right_hand")):
             for a, b in hysteresis_intervals(hand_dist[s], cfg.hand_enter_m, cfg.hand_exit_m, cfg.min_duration):
-                anchor_local = box_R[a].T @ (hand_world[s][a] - box_t[a])
-                schedule.intervals.append(ContactInterval(name, a, b, "object", anchor=anchor_local))
-        dt = 1.0 / cfg.fps
+                anchor = hand_local[s][a].copy()                        # [3,3] sites
+                schedule.intervals.append(ContactInterval(name, a, b, "object", anchor=anchor))
         for s, name in (("l", "left_foot"), ("r", "right_foot")):
-            pts = sole_world[s]
-            speed = np.concatenate([[np.inf], np.linalg.norm(np.diff(pts, axis=0), axis=1) / dt])
-            gated = np.where(speed < cfg.foot_entry_speed_mps, sole_z[s], np.inf)
+            pts = sole_pts[s]
+            per_site_speed = np.concatenate(
+                [[np.inf], np.linalg.norm(np.diff(pts, axis=0), axis=2).max(1) / dt]
+            )
+            gated = np.where(per_site_speed < cfg.foot_entry_speed_mps, sole_gap[s], np.inf)
             for a, b in hysteresis_intervals(gated, cfg.foot_enter_m, cfg.foot_exit_m, cfg.min_duration):
                 schedule.intervals.append(ContactInterval(name, a, b, "ground", anchor=pts[a].copy()))
 
-        self._cache = dict(hand_dist=hand_dist, hand_world=hand_world, sole_world=sole_world,
-                           sole_z=sole_z, box_R=box_R, box_t=box_t)
+        self._cache = dict(hand_dist=hand_dist, sole_gap=sole_gap, hand_pts=hand_pts,
+                           sole_pts=sole_pts, hand_local=hand_local)
         return schedule
 
-    def _hand_geom(self, side: str, k: int) -> int:
-        names = {"l": ("left_rubber_hand_link", "left_thumb_link", "left_pinky_link"),
-                 "r": ("right_rubber_hand_link", "right_thumb_link", "right_pinky_link")}
-        return mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, names[side][k])
+    def _hand_geoms_for(self) -> dict[str, list[int]]:
+        names = {
+            s: [f"{'left' if s == 'l' else 'right'}_{part}_link"
+                for part in ("rubber_hand", "thumb", "pinky")]
+            for s in ("l", "r")
+        }
+        return {
+            s: [mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, n) for n in lst]
+            for s, lst in names.items()
+        }
 
     def _check_feet(self, q: np.ndarray, schedule: ContactSchedule) -> CheckResult:
+        """Per-site support checks (plan 10.1: *all* constrained sites).
+
+        A foot pivoting in place keeps its centroid fixed while individual
+        sole sites sweep — centroid metrics would miss it.
+        """
         cfg = self.cfg
         cache = self._cache
         dt = 1.0 / cfg.fps
@@ -260,19 +383,19 @@ class IndependentValidator:
             if iv.support != "ground" or iv.effector not in side_of:
                 continue
             s = side_of[iv.effector]
-            pts = cache["sole_world"][s][iv.start : iv.end]
-            z = cache["sole_z"][s][iv.start : iv.end]
+            pts = cache["sole_pts"][s][iv.start : iv.end]        # [n, 5, 3]
+            gap = cache["sole_gap"][s][iv.start : iv.end]
             if len(pts) > 1:
-                speed = np.linalg.norm(np.diff(pts, axis=0), axis=1).max() / dt
+                speed = np.linalg.norm(np.diff(pts, axis=0), axis=-1).max() / dt
                 worst = max(worst, speed / cfg.foot_speed_mps)
                 detail.append(f"{iv.effector} speed={speed:.3f}")
-            drift = np.linalg.norm(pts - pts[0], axis=1).max()
+            drift = np.linalg.norm(pts - pts[0], axis=-1).max()
             worst = max(worst, drift / cfg.foot_anchor_drift_m)
-            gap = z.max()
-            worst = max(worst, gap / cfg.foot_ground_gap_m)
+            worst = max(worst, gap.max() / cfg.foot_ground_gap_m)
         return CheckResult(worst <= 1.0, worst, 1.0, "; ".join(detail[-3:]))
 
     def _check_hands(self, q: np.ndarray, schedule: ContactSchedule) -> CheckResult:
+        """Per-site grasp checks: gap, per-site anchor drift, relative speed."""
         cfg = self.cfg
         cache = self._cache
         dt = 1.0 / cfg.fps
@@ -284,17 +407,13 @@ class IndependentValidator:
                 continue
             s = side_of[iv.effector]
             seg = slice(iv.start, iv.end)
-            # gap: inferred distance already bounded by enter threshold at start;
-            # check it stays within hand_gap_m of the box
             gap = cache["hand_dist"][s][seg].max()
             worst = max(worst, gap / cfg.hand_gap_m)
-            # anchor drift in box frame
-            local = np.einsum("tij,tj->ti", cache["box_R"][seg], cache["hand_world"][s][seg] - cache["box_t"][seg])
-            anchor_err = np.linalg.norm(local - iv.anchor, axis=1).max()
+            local = cache["hand_local"][s][seg]                    # [n, 3 sites, 3]
+            anchor_err = np.linalg.norm(local - iv.anchor, axis=-1).max()
             worst = max(worst, anchor_err / cfg.hand_anchor_error_m)
-            # box-frame relative speed of the hand centroid
             if local.shape[0] > 1:
-                rel_speed = np.linalg.norm(np.diff(local, axis=0), axis=1).max() / dt
+                rel_speed = np.linalg.norm(np.diff(local, axis=0), axis=-1).max() / dt
                 worst = max(worst, rel_speed / cfg.hand_relative_speed_mps)
             detail.append(f"{iv.effector} gap={gap:.3f} anchor={anchor_err:.3f}")
         return CheckResult(worst <= 1.0, worst, 1.0, "; ".join(detail[-3:]))

@@ -11,7 +11,7 @@ Rules (plan section 4.4):
   setting; a by-subject split would be a separate experiment).
 - The 17 largebox PT files without teacher data are excluded from the
   supervised splits and recorded separately as unsupervised reserve.
-- Test set: 32 independent demos (< the 100-demo target; per plan 1.3 the
+- Test set: 31 independent demos (< the 100-demo target; per plan 1.3 the
   available reserved demos are used and the count reported).
 
 Outputs (locked lists, not just the procedure):

@@ -8,9 +8,9 @@ threshold crossings are not contacts.
 
 Anchors follow plan section 8.1:
 
-- hand anchors are fixed in the **object (box geom) frame**: the box-surface
-  point closest to the hand centroid at contact establishment;
-- foot anchors are fixed in the **world frame**: the sole position at
+- hand anchors are fixed in the **object (box geom) frame**: per-site
+  positions of the hand contact proxies at contact establishment;
+- foot anchors are fixed in the **world frame**: per-site sole positions at
   touchdown, valid after height/velocity gating.
 
 Both are *candidates*: downstream repair/validation commits them only after
@@ -54,7 +54,7 @@ class ContactInterval:
     start: int               # inclusive frame
     end: int                 # exclusive frame
     support: str             # object / ground
-    anchor: np.ndarray | None = None   # hand: [3] box-geom frame; foot: [3] world
+    anchor: np.ndarray | None = None   # hand: [3 sites, 3] box-geom frame; foot: [5, 3] world
     confidence: float = 1.0
 
 
@@ -71,12 +71,13 @@ class ContactSchedule:
 
 
 def hysteresis_intervals(
-    metric: np.ndarray, enter: float, exit: float, min_duration: int
+    metric: np.ndarray, enter: float, exit_th: float, min_duration: int
 ) -> list[tuple[int, int]]:
     """Extract [start, end) intervals where metric crosses enter/exit.
 
-    ``metric`` smaller than ``enter`` starts a contact; larger than ``exit``
-    ends it. Intervals shorter than ``min_duration`` frames are dropped.
+    ``metric`` smaller than ``enter`` starts a contact; larger than
+    ``exit_th`` ends it. Intervals shorter than ``min_duration`` frames are
+    dropped.
     """
     metric = np.asarray(metric)
     T = metric.shape[0]
@@ -86,7 +87,7 @@ def hysteresis_intervals(
     for t in range(T):
         if not active and metric[t] < enter:
             active, start = True, t
-        elif active and metric[t] > exit:
+        elif active and metric[t] > exit_th:
             intervals.append((start, t))
             active = False
     if active:
@@ -98,10 +99,10 @@ def infer_reference_schedule(
     human_kpts_world: np.ndarray,      # [T, 52, 3]
     source_obj_pose: np.ndarray,       # [T, 7] project convention [xyz, qwxyz]
     hand_distance_fn=None,             # optional override(world_pts, pose) -> [T] distance
-    hand_enter_m: float = 0.04,   # calibrated 2026-09-11 vs robot-side inference,
-    hand_exit_m: float = 0.072,    # macro-F1 0.876 over 18 original clips
-    foot_enter_m: float = 0.05,    # (scripts/calibrate_contact_thresholds.py)
-    foot_exit_m: float = 0.08,
+    hand_enter_m: float = 0.04,   # recalibrated 2026-09-11 (review fix Phase C):
+    hand_exit_m: float = 0.072,    # skip-F1 0.668, hull metric, grid flat within
+    foot_enter_m: float = 0.005,   # +/-0.003 (weakly identified, pilot review);
+    foot_exit_m: float = 0.02,     # foot pinned by the acceptance invariant
     foot_speed_mps: float = 0.35,
     min_duration: int = 3,
     fps: float = 30.0,
@@ -112,10 +113,7 @@ def infer_reference_schedule(
     box surface in the source object frame. Foot metric: minimum world height
     of ankle/toe, gated by horizontal speed.
     """
-    from ireset.geometry.distance_adapter import (
-        point_box_surface_distance_numpy,
-        world_to_box_geom,
-    )
+    from ireset.geometry.distance_adapter import largebox_hull_surface_distance
 
     T = human_kpts_world.shape[0]
     schedule = ContactSchedule()
@@ -125,8 +123,10 @@ def infer_reference_schedule(
         if hand_distance_fn is not None:
             dist = hand_distance_fn(centroid, source_obj_pose)
         else:
-            in_box = world_to_box_geom(centroid, source_obj_pose)     # [T,3] geom frame (AABB proxy)
-            dist = point_box_surface_distance_numpy(in_box)
+            # acceptance-grade hull metric; the analytic AABB is a training
+            # proxy whose error (~1.8cm at a true 2cm gap) is the same order
+            # as these thresholds and must not decide contacts
+            dist = largebox_hull_surface_distance(centroid, source_obj_pose)
         for s, e in hysteresis_intervals(dist, hand_enter_m, hand_exit_m, min_duration):
             schedule.intervals.append(ContactInterval(hand, s, e, "object"))
 
