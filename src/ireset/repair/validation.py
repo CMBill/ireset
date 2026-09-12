@@ -32,10 +32,11 @@ from ireset.geometry.collision_pairs import CollisionPairs, build_collision_pair
 class ValidationConfig:
     penetration_tolerance_m: float = 0.002
     joint_limit_tolerance_rad: float = 1e-5
-    # provisional velocity bounds (model carries none); locked per plan 10.1 in M2
-    joint_velocity_limit_radps: float = 6.0
-    base_lin_velocity_limit_mps: float = 1.5
-    base_ang_velocity_limit_radps: float = 3.0
+    # velocity bounds calibrated 2026-09-12 from the teacher distribution
+    # (48 originals: max 10.6 rad/s / 1.64 m/s / 6.26 rad/s) plus margin
+    joint_velocity_limit_radps: float = 12.0
+    base_lin_velocity_limit_mps: float = 1.8
+    base_ang_velocity_limit_radps: float = 7.0
     # contact inference thresholds. Enter thresholds must not exceed the gate
     # the resulting interval must satisfy (enforced in __post_init__): an
     # interval created at a distance the gate already rejects fails for a
@@ -134,7 +135,14 @@ class IndependentValidator:
 
     # -- core ----------------------------------------------------------------
 
-    def validate(self, scene_qpos: np.ndarray) -> ValidationReport:
+    def validate(self, scene_qpos: np.ndarray, exclude: tuple[str, ...] = ()) -> ValidationReport:
+        """Validate a scene trajectory.
+
+        ``exclude`` names collision-pair kinds to skip (e.g. ``box_ground``:
+        the box trajectory is a fixed task input the repairer cannot alter,
+        and the convex-hull of the scanned bin over-approximates its bottom
+        by several mm — an input/model property, not a repair failure).
+        """
         q = np.asarray(scene_qpos, dtype=float)
         T = q.shape[0]
         cfg = self.cfg
@@ -161,6 +169,7 @@ class IndependentValidator:
                 )
 
         checks: dict[str, CheckResult] = {}
+        self._exclude = set(exclude)
         checks["joint_limits"] = self._check_joint_limits(q)
         checks["velocities"] = self._check_velocities(q)
         pen_worst, pen_where, max_interval, capped = self._check_penetration(q)
@@ -265,6 +274,8 @@ class IndependentValidator:
             mujoco.mj_forward(self.model, d)
             local = 0.0
             for ga, gb, _kind in pairs:
+                if _kind in getattr(self, "_exclude", ()):
+                    continue
                 dist = mujoco.mj_geomDistance(self.model, d, ga, gb, 1.0, self._fromto)
                 if dist < 0:
                     local = max(local, -dist)

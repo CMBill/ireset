@@ -1,0 +1,66 @@
+# M2 repair configuration (plan section 14.3 starting point).
+# Mirrors src/ireset/repair/context.py::RepairConfig defaults; the dataclass
+# is the runtime source, this file is the experimental record.
+# See docs/m2_verification.md for measured behavior and open gaps.
+
+objective:
+  prediction_weight: 1.0
+  laplacian_weight: 0.1
+  temporal_weight: 0.1
+  regularization_weight: 0.001
+  normalize_residual_units: true          # D-scaled (root 0.02m/0.05rad/joint 0.1rad)
+
+scp:
+  max_iters: 15
+  extra_restoration_iters: 15             # slack fallback budget
+  trust_norm: inf                          # |D^-1 xi|_inf <= trust
+  trust_radius_init: 1.0
+  trust_radius_min: 0.001
+  trust_radius_max: 8.0
+  shrink_factor: 0.5
+  expand_factor: 1.8
+  line_search_scales: [1.0, 0.5, 0.25, 0.125]
+  feasibility_restoration: true           # slack-penalized QP, sticky per frame
+  slack_penalty: 10000.0
+  allow_output_slack: false                # accepted frames are nonlinear-feasible only
+
+solver: osqp                               # polish off, eps 3e-5, rebuilt per iteration
+                                           # (persistent warm-start workspace: future work)
+
+geometry:
+  noncontact_clearance_m: 0.002           # proactive, QP rows only
+  accept_penetration_m: -0.0018           # frame gates carry 0.2mm margin vs validator
+  contact_band: [-0.002, 0.010]           # hand geoms vs box during hold
+  foot_contact_band: [-0.002, 0.005]      # sole geoms vs ground during support
+  activation_margin_m: 0.05
+  max_active_pairs: 48
+  excluded_input_pairs: [box_ground]      # input-owned; hull over-approximates bin bottom
+
+velocity_limits:                           # calibrated from 48 teacher originals (max+margin)
+  joint_radps: 12.0
+  base_lin_mps: 1.8
+  base_ang_radps: 7.0
+
+contact:
+  hand_anchor_tol_m: 0.01
+  foot_anchor_tol_m: 0.01
+  foot_speed_mps: 0.02
+  hand_establish_dist_m: 0.012
+  foot_establish_gap_m: 0.006
+  anchors_from_accepted_state_only: true
+
+task_gate:
+  mpjpe_tol_m: 0.40                        # M2 working value; M3 calibrates on val split
+
+trajectory:
+  mode: sequential
+  skip_check: accept_bounds_plus_interpolated_thirds
+  suffix_retry_window: 5
+  suffix_retries: 1
+  reject_on_failure: true
+
+m2_acceptance_status:                      # measured 2026-09-12, docs/m2_verification.md
+  perturbation_acceptance: 0.60            # target 0.95 NOT met
+  unreachable_false_accepts: 0
+  teacher_full_length_acceptance: 0.0      # screening finding, feeds M3 data prep
+  ms_per_frame_mean: 310                   # target <50 not met
