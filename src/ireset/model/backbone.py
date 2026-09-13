@@ -31,11 +31,13 @@ ROOT_FEATURES, JOINT_FEATURES = 9, 1
 class Attn(nn.Module):
     """Scaled dot-product attention in explicit math form.
 
-    Deliberately not ``F.scaled_dot_product_attention``: its fast CUDA
-    backends pull in Triton, whose driver fails to compile on this host
-    (no system Python.h; plan 3.4 forbids touching system Python). The
-    math path is plain deterministic torch ops; ``mask`` is a boolean
-    keep-mask broadcastable to [*, L, S].
+    Originally written as explicit ``softmax(QK^T/sqrt(d)) + mask``
+    because ``F.scaled_dot_product_attention`` pulled in Triton, which
+    could not compile on the pre-migration system interpreter (no
+    Python.h). The venv now runs uv-managed CPython 3.12.13 where Triton
+    and SDPA work, but this path is kept so pilot runs stay numerically
+    reproducible; switching to SDPA is a deferred speed optimization.
+    ``mask`` is a boolean keep-mask broadcastable to [*, L, S].
     """
 
     def __init__(self, d_model: int, n_heads: int) -> None:

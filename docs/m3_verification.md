@@ -26,6 +26,8 @@
 
 ## 4. 训练 pilot(§9.1)
 
+> 注:本节数字为首轮(接触损失带 §8 所述坐标变换 bug)。修复后重训数字见 §8;`derived/models/*/summary.json` 已被修复后运行覆盖,首轮产物归档于 `derived/models/*_v1_contactbug/`。
+
 - 单卡 RTX 3090,micro-batch=4、梯度累积=4(有效 16)、FP32、AdamW(lr 1e-4,wd 1e-5)、梯度裁剪 1.0,seed 20260913;train 6,431 窗 / val 233 窗(60 个 val 文件上限),4000 优化步(≈10 epoch)。
 - 实测(2026-09-13,`derived/models/*/summary.json`):
 
@@ -37,6 +39,8 @@
 - 完整训练成本估计:pilot 未饱和(4k 步损失仍在缓降)。同配置下 ~15 epoch ≈ 1.6 h/模型;后续按验证曲线决定是否延长,不预承诺 GPU 天数。训练曲线见 `derived/models/*/loss_history.json`。
 
 ## 5. 验收实验(§10.2/§10.4)
+
+> 注:同 §4,本节为首轮(带 §8 变换 bug)数字;修复后刷新见 §8。
 
 设置:val 分组 8 个 original(120 帧),扩散 DDIM-25 与确定性各生成一条(拼接 60/30),教师 σ∈{0.02,0.05} 扰动作"真实预测误差"对照,同修复器同计时。产物 `derived/data/validation/generation_eval.json`。
 
@@ -68,4 +72,39 @@
 
 ## 7. 测试
 
-`uv run --locked pytest tests/ -q`:76 项全过(新增 `tests/test_generation.py` 17 项:token 往返/限位映射/退化检测、划分不相交、clip 系不变性、条件器与主干形状、窗口 mask 语义、DDIM 完美模型复原、种子复现、add_noise 闭式、调度器配置断言、拼接恒等/slerp 中点/边界诊断、损失有限且可微、生成器烟测)。
+`uv run --locked pytest tests/ -q`:76 项全过(新增 `tests/test_generation.py` 17 项:token 往返/限位映射/退化检测、划分不相交、clip 系不变性、条件器与主干形状、窗口 mask 语义、DDIM 完美模型复原、种子复现、add_noise 闭式、调度器配置断言、拼接恒等/slerp 中点/边界诊断、损失有限且可微、生成器烟测)。第三轮修复后全套 **78 项**(+2,见 §8)。
+
+## 8. 审阅修复轮(2026-09-13 第三轮)
+
+独立代码审阅提出接触损失坐标变换疑点,判定属实,并连带发现一个几何层方向反转:
+
+**判定证据**(脚本对拍,教师 val 24 窗口,教师状态 + MuJoCo FK + M1 已验证的 `world_to_box_geom` 为地面真值):
+
+- losses.py 手接触项的 clip→box 变换 `p_body = R_box_clip @ p_rel` **缺转置**(`R_box_clip` 为 box→clip,应取其转置):修复后与地面真值最大偏差 **5.9e-8 m**,修复前最大偏差 **0.104 m**(逐点、随箱体旋转系统性变化);
+- 修复后,AABB 表面点(geom 系构造)经完整链的 |SDF| 残差 ~1e-16 m;修复前 2–6 cm;
+- bug 难以从训练曲线察觉的原因:教师接触帧上 |SDF| 均值在两链下几乎相同(0.087 vs 0.088 m;AABB 代理误差 + 教师未真接触本身 ~0.09 m,hull 参考距离 0.147 m),故 `contact_m2` 平台量级不变(记录值 ~0.012–0.016 ≈ 教师 SDF² 水平 0.0077 同量级)——但逐帧梯度方向错误,模型学到了"在错误旋转下的箱面上放手",与 FK/重建损失冲突产生系统性噪声梯度。
+
+**修复**(共三处):
+
+1. `train/losses.py`:变换提为 `LossAssembler.hand_points_box_geom`(einsum `"btji"` 转置形式,注释锚定 `world_to_box_geom`/MuJoCo `geom_xmat` 约定);接触项调用该方法。
+2. `geometry/distance_adapter.py` `box_geom_to_world`:第一处 einsum `"ji"`→`"ij"`(geom→body 应为 `R_g @ p + x_g`;原方向翻转导致与 `world_to_box_geom` 不互逆,箱面点往返差 0.26 m)。**该函数此前无任何调用点、无测试覆盖,未污染 M1–M3 已有实验结论**;本次修复并补往返回归测试,防后用(M4 锚点/评测)。
+3. `model/backbone.py` `Attn` 类注释过时("Triton 驱动编译失败"):迁移 uv 托管 CPython 3.12.13 后 Triton/SDPA 已可用,保留显式实现的理由更新为 pilot 数值可复现,SDPA 切换列为后续优化。
+
+**回归测试**(新增 2 项,全套 **78 项全过**):`test_contact_chain_matches_mujoco_box_frame`(真实 G1 模型 + 随机箱位姿,损失链 vs MuJoCo FK + `world_to_box_geom`,阈值 1e-4 m)、`test_box_geom_world_roundtrip`(随机箱位姿下 geom↔world 往返 <1e-10,并 guard `R_g` 非对称防测试退化)。
+
+**重训与验收刷新**(同配置 seed 20260913、4000 步;首轮产物归档为 `derived/models/*_v1_contactbug` 留对比):
+
+| 模型 | 步/墙钟 | ms/步 | 峰值显存 | best val(v1 bug 对照) |
+|---|---|---|---|---|
+| 扩散 | 4000 / 62.7 min | 812.5 | 5.47 GiB | **0.0949**(0.0958) |
+| 确定性 | 4000 / 60.6 min | 805.9 | 5.47 GiB | **0.2491**(0.2459) |
+
+验收刷新(同 §5 协议:val 8 个 original、120 帧、DDIM-25、seed 7):
+
+| 模型 | 根 RMSE | 根测地角 | 关节 MAE | MPJPE | 接触 F1(macro) | 修复接受 | 修复 ms/帧 |
+|---|---|---|---|---|---|---|---|
+| 扩散 | 5.6 cm | 11.3° | 0.151 rad | 9.0 cm | 0.594 | 0/8 | ~491(max 1017) |
+| 确定性 | 5.2 cm | 9.9° | 0.403 rad | 10.9 cm | 0.387 | 0/8 | ~259(max 467) |
+
+**与首轮的差异解读**:保真度指标在 8 段小样本噪声范围内持平(val 0.0949 vs 0.0958、0.2491 vs 0.2459;MPJPE 9.0 vs 8.9、10.9 vs 11.3 cm)——符合预期:接触项为五项损失之一(权重 0.5),pilot 阶段主导信号是重建+FK。修复的意义在**梯度方向正确**(对拍 5.9e-8 m)而非损失量级变化:val contact_m2 新旧同为 ~0.010–0.012,即正误两链下教师水平接近,这正是 bug 隐蔽、训练曲线无法暴露它的原因。其余结论不变:教师噪声基线与两模型修复接受率仍全 0/8、同因 `rejected_frame`(M2 教师可行性阻塞);接缝关节速度全部低于内部 p95;生成计时扩散 8.8 ms/帧、确定性 0.5 ms/帧。修复耗时均值较首轮下降(扩散 ~491 vs 93–1034、确定性 ~259 vs 88–497 ms/帧),与接触项不再把模型推向不可行姿态的方向一致,但 8 段样本不作强归因。接触 F1 macro 波动(扩散 0.485→0.594、确定性 0.485→0.387)视为小样本波动,不下方向性结论。
+

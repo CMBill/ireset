@@ -126,6 +126,27 @@ def test_world_to_box_geom_matches_mujoco_hull(spec: G1Spec) -> None:
     assert np.abs(mapped - direct).max() < 1e-10
 
 
+def test_box_geom_world_roundtrip() -> None:
+    """box_geom_to_world must invert world_to_box_geom (review round 3 fix).
+
+    The mesh-recentering rotation R_g is non-symmetric, so a flipped
+    geom->body direction does not cancel in the round trip (the previous
+    ``"ji"`` einsum left a 0.26 m residual on box-surface points).
+    """
+    from ireset.geometry.distance_adapter import box_geom_to_world
+
+    rng = np.random.default_rng(7)
+    R_g, _ = largebox_static_frame()
+    assert not np.allclose(R_g, R_g.T), "guard: recentering rotation must stay non-symmetric"
+    for _ in range(4):
+        box_q = np.concatenate([rng.uniform(-1, 1, 3), rng.standard_normal(4)])
+        box_q[3:7] /= np.linalg.norm(box_q[3:7])
+        pose = box_q[None].repeat(9, 0)
+        pts = rng.uniform(-0.5, 0.5, (9, 3))
+        back = world_to_box_geom(box_geom_to_world(pts, pose), pose)
+        assert np.abs(back.reshape(9, 3) - pts).max() < 1e-10
+
+
 def test_aabb_is_documented_proxy_not_oracle(spec: G1Spec) -> None:
     """Quantify the AABB-vs-hull approximation gap (rounded scanned bin)."""
     _, verts, hull, _ = stored_box_data(spec)

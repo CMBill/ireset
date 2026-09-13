@@ -73,7 +73,7 @@ def box_geom_to_world(points_geom: np.ndarray, box_pose: np.ndarray) -> np.ndarr
     R_b = quat_to_mat_wxyz(np.atleast_2d(box_pose)[:, 3:7])
     t_b = np.atleast_2d(box_pose)[:, 0:3]
     pts = np.atleast_2d(points_geom).reshape(box_pose.shape[0], -1, 3)
-    p_body = np.einsum("ji,tnj->tni", R_g, pts) + x_g[None, None, :]
+    p_body = np.einsum("ij,tnj->tni", R_g, pts) + x_g[None, None, :]   # R_g p + x_g (geom->body)
     return np.einsum("tij,tnj->tni", R_b, p_body) + t_b[:, None, :]
 
 

@@ -293,6 +293,56 @@ def test_loss_assembler_finite_and_differentiable():
     assert x0_pred.grad is not None and torch.isfinite(x0_pred.grad).all()
 
 
+def test_contact_chain_matches_mujoco_box_frame():
+    """Contact-loss clip->box transform vs MuJoCo FK + world_to_box_geom.
+
+    Review round 3 (2026-09-13): the chain previously applied R_box_clip
+    without the transpose — up to 0.10 m per-point deviation from the
+    M1-verified geom frame on val data; the transposed form matched to
+    5.9e-8 m. Guards the exact convention with a real G1 model.
+    """
+    from ireset.embodied.g1_spec import G1Spec
+    from ireset.geometry.distance_adapter import world_to_box_geom
+    from ireset.kinematics.mujoco_adapter import G1Kinematics, RobotState
+    from ireset.train.losses import HAND_SITE_NAMES
+
+    rng = np.random.default_rng(3)
+    tk = StateTokenizer(G1Spec().joint_range, RootStats(mean=np.zeros(3), std=np.ones(3)))
+    T = 7
+    root = np.concatenate(
+        [rng.normal([0, 0, 0.8], [0.3, 0.3, 0.1], (T, 3)),
+         np.tile([1.0, 0, 0, 0], (T, 1)) + rng.normal(0, 0.08, (T, 4))], axis=1)
+    root[:, 3:7] /= np.linalg.norm(root[:, 3:7], axis=1, keepdims=True)
+    q = tk.lo + (tk.hi - tk.lo) * rng.random((T, 29))
+    wfc = np.eye(4)
+    wfc[:3, :3] = so3_exp_np(rng.normal(size=3) * 0.5)
+    wfc[:3, 3] = rng.uniform(-0.5, 0.5, 3)
+    box_pose = np.concatenate([rng.uniform(-0.7, 0.7, (T, 3)), rng.normal(size=(T, 4))], axis=1)
+    box_pose[:, 3:7] /= np.linalg.norm(box_pose[:, 3:7], axis=1, keepdims=True)
+
+    x0 = tk.encode(root, q, wfc)
+    batch = {
+        "x0": torch.as_tensor(x0, dtype=torch.float32)[None],
+        "box_t_clip": torch.as_tensor(world_to_clip(box_pose[:, 0:3], wfc), dtype=torch.float32)[None],
+        "box_quat": torch.as_tensor(box_pose[:, 3:7], dtype=torch.float32)[None],
+        "wfc": torch.as_tensor(wfc, dtype=torch.float32)[None],
+    }
+    asm = LossAssembler(tk, LossWeights(), "cpu")
+    pos_p, quat_p, q_p = asm.decode_clip(batch["x0"])
+    flat = lambda a: a.reshape(-1, a.shape[-1])
+    hand_p = asm.fk.site_world_positions(
+        flat(pos_p), flat(quat_p), flat(q_p), HAND_SITE_NAMES).view(1, T, -1, 3)
+    p_geom = asm.hand_points_box_geom(hand_p, batch)[0].detach().numpy()
+
+    root_w, q_w, ok = tk.decode(x0, wfc)
+    hand_w = G1Kinematics().site_positions(
+        RobotState(root_w[:, 0:3], root_w[:, 3:7], q_w), HAND_SITE_NAMES)
+    p_geom_gt = world_to_box_geom(hand_w, box_pose)
+    assert ok.all()
+    err = float(np.abs(p_geom - p_geom_gt).max())
+    assert err < 1e-4, f"contact chain deviates from MuJoCo geom frame: {err} m"
+
+
 # --- generator smoke ----------------------------------------------------------------
 
 def test_generator_deterministic_smoke():

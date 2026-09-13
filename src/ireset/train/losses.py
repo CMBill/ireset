@@ -67,6 +67,19 @@ class LossAssembler:
         q = self.lo + (x0[..., 9:38].clamp(-1.0, 1.0) + 1.0) * (self.hi - self.lo) / 2.0
         return pos, quat, q
 
+    def hand_points_box_geom(self, hand_p: torch.Tensor, batch: dict) -> torch.Tensor:
+        """Clip-frame hand points [B,F,S,3] -> largebox **geom** frame.
+
+        Same chain as :func:`ireset.geometry.distance_adapter.world_to_box_geom`
+        (MuJoCo ``geom_xmat`` convention): clip->box body uses the *inverse*
+        box rotation ``R_box_clip^T``, body->geom uses ``R_g^T (p - x_g)``.
+        """
+        Rz_T = batch["wfc"][:, :3, :3].transpose(1, 2)                  # [B,3,3] world->clip
+        R_box_clip = torch.einsum("bij,btjk->btik", Rz_T, quat_to_mat_torch(batch["box_quat"]))
+        p_rel = hand_p - batch["box_t_clip"][:, :, None, :]              # [B,F,S,3]
+        p_body = torch.einsum("btji,btsj->btsi", R_box_clip, p_rel)      # R_box_clip^T: clip->box
+        return (p_body - self.x_g) @ self.R_g                            # R_g^T (p_body - x_g)
+
     def __call__(self, x0_pred: torch.Tensor, batch: dict) -> tuple[torch.Tensor, dict]:
         x0 = batch["x0"]
         parts: dict[str, torch.Tensor] = {}
@@ -108,11 +121,7 @@ class LossAssembler:
             hand_p = self.fk.site_world_positions(
                 flat(pos_p), flat(quat_p), flat(q_p), HAND_SITE_NAMES
             ).view(B, F, -1, 3)                                                     # [B,F,6,3]
-            Rz_T = batch["wfc"][:, :3, :3].transpose(1, 2)                              # [B,3,3]
-            R_box_clip = torch.einsum("bij,btjk->btik", Rz_T, quat_to_mat_torch(batch["box_quat"]))
-            p_rel = hand_p - batch["box_t_clip"][:, :, None, :]                          # [B,F,6,3]
-            p_body = torch.einsum("btij,btsj->btsi", R_box_clip, p_rel)
-            p_geom = (p_body - self.x_g) @ self.R_g                                      # R_g^T (p - x_g)
+            p_geom = self.hand_points_box_geom(hand_p, batch)                           # [B,F,6,3]
             sdf = point_box_sdf_torch(p_geom)                                            # [B,F,6]
             contact = batch["contact"][..., 0:2]                                         # [B,F,2]
             left = sdf[..., 0:3] * contact[..., 0:1]
