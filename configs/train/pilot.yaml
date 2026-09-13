@@ -1,0 +1,23 @@
+# Single-GPU pilot training (plan 9.1: RTX 3090 24 GiB, micro-batch 4,
+# gradient accumulation 4, FP32). Loss weights in explicit units:
+# pos/rot6d/joint are normalized-space MSE; geodesic rad^2; fk m^2;
+# contact m^2 (AABB training proxy); vel normalized-space frame diff.
+model_type: diffusion
+steps: 4000
+micro_batch: 4
+grad_accum: 4
+lr: 1.0e-4
+weight_decay: 1.0e-5
+grad_clip: 1.0
+seed: 20260913
+num_workers: 4
+val_every: 250
+device: cuda
+loss:
+  w_pos: 1.0
+  w_rot6d: 1.0
+  w_joint: 1.0
+  w_geodesic: 0.5
+  w_fk: 2.0
+  w_contact: 0.5
+  w_vel: 0.5

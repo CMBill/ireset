@@ -13,7 +13,7 @@
 ## Python 与环境管理
 
 - 固定 **Python 3.12.x**,使用 **uv** 管理环境和依赖。`.python-version` 为 `3.12`,`pyproject.toml` 要求 `>=3.12,<3.13`。
-- 使用项目 `.venv`;当前已验证解释器为 Python 3.12.3,uv 为 0.12.3。不要修改系统 Python 或混入其他项目环境。
+- 使用项目 `.venv`;当前已验证解释器为 uv 托管 CPython 3.12.13(2026-09-13 起;原系统 3.12.3 无 dev 头文件,torch/triton 快速后端无法编译,经用户授权迁移)。不要修改系统 Python 或混入其他项目环境。
 - 依赖通过 `uv add` / `uv remove` 维护,保留并版本管理 `uv.lock`。同步使用 `uv sync --locked`,项目命令使用 `uv run --locked`。
 - 按当前实现步骤添加依赖,不要预先安装整个技术栈。记录 PyTorch CUDA wheel 来源、依赖版本及运行验证结果。
 - `.venv`、缓存和大型下载不纳入代码版本管理。上游工具需要独立依赖时单独用 uv 管理,不得破坏主项目的 Python 3.12 约束。
@@ -98,18 +98,19 @@
 
 ## 当前进度与后续顺序
 
-截至 2026-09-12(第四轮),M0、M1 完成,M2 机制完成、验收部分未达标(扰动接受率 60%<95%、310ms/帧>50ms;accepted 结果 100% 过独立终检、不可达 0 误受;教师整段修复 0% → M3 须重备数据)(M0 最后一项"分组清单/阈值/场景边界"于 M1 工具就绪后补齐):
+截至 2026-09-13(第五轮),M0、M1 完成,M2 机制完成、验收部分未达标(扰动接受率 60%<95%、310ms/帧>50ms;accepted 结果 100% 过独立终检、不可达 0 误受),M3 机制完成并通过验收(详见下)(M0 最后一项"分组清单/阈值/场景边界"于 M1 工具就绪后补齐):
 
 - M0:依赖锁定(torch 2.14.0+cu126 GPU 验证、mujoco 3.13.0)、派生锁定资产(`derived/robots/g1_29dof_locked*`,31 sites)、71 样本配对审计。**M0 收尾(本轮)**:250/31/31 按演示分组划分(种子 20260911,受试者哈希 zlib.crc32,清单锁定 `derived/data/split/`;总量 3.0h/312 演示/1,826 NPZ;17 个无教师 PT 为 reserve)、场景边界(root [0.305,0.814]m、箱 [0.179,1.561]m,`configs/task/box_carry.yaml`)、参考侧接触阈值标定(hand 0.04/0.072、foot 0.05/0.08,宏 F1 0.876,`configs/eval/protocol.yaml`)。详见 `docs/m0_verification.md`。
 - M1:运动学层(`kinematics/` 35 维 retract/雅可比,1000 状态 FD 验证 max 3.9e-9;torch FK 对拍 max 7.1e-7 m)、交互网格(`imesh/` 逐帧 Delaunay+均匀 Laplacian,刚体不变性测试)、几何层(`geometry/` 碰撞对+允许列表、可微 AABB 距离;**MuJoCo mesh 重定心旋转已实证**,box geom 系≠OBJ 系)、接触推断(`embodied/contact_sites.py` 双阈值+去抖、hull 参考度量)与 F1 指标(双空未定义策略)、独立验收器(`repair/validation.py`,含自碰撞、表面距离间隙、逐 site 检查、显式有限性门与 status 状态码、含箱体运动的真自适应细分)。教师质量量化(修复后 71 段:穿透最差 23.2mm、脚滑 ~0.3m/s、接触 F1 0.657 defined-only——教师非可行真值证据)、未约束 GN 纯优化基线(整段 MPJPE 4.9cm、10.6ms/帧、求解首帧 2.6cm)。容差与阈值锁定于 `configs/eval/protocol.yaml`(推断 enter ≤ 验收门槛由代码强制)。详见 `docs/m1_verification.md` 与 `docs/m1_fix_plan.md`。
 - M1 审阅修复(2026-09-11 第二轮):F1 双空虚高、脚部球心当表面、AABB 代理进标定、基线首帧 yaw、有限性检查、死配置六项已修并重标定重锁(旧值与失效原因保留在 protocol.yaml 与 m1_verification.md §8)。
 - M2(2026-09-12):顺序 QP 修复器四模块(`repair/{context,constraints,scp,pipeline}.py`,OSQP 3 依赖新增);速度限值标定(关节 12/根线 1.8/根角 7,教师分布 max+裕量);**8 项数值 bug 修复**(穿透梯度符号、mesh 旋转项、信赖域行错位、违反度归一、箱-地伪影等,FD 对拍验证);59 项测试全过;M2 验收实验如实记录 60%/95%。详见 `docs/m2_verification.md` 与 `configs/repair/qp_default.yaml`。
-- 测试 59 项全过(`uv run --locked pytest tests/ -q`)。关键工程事实:教师 NPZ qpos 为四元数在前布局需显式转换;扫描箱凸包与 AABB 差 mean~7cm(AABB 仅训练代理);MuJoCo freejoint 角速度 qvel 为体系;Python 内建 `hash()` 跨进程随机,划分种子必须用稳定哈希;参考脚部高度 82% 帧低于 0.02m,脚部阈值不可由 F1 标定。
+- M3(2026-09-13):数据层(`data/{schema,teacher,windows}.py`,完整 §4.3 schema + 修复层适配;clip 坐标系取自参考人初始位置/yaw;划分卫生有测试)、token 层(`model/tokens.py` 38 维 x0:clip 系根位置训练分组标准化 + rot6d + 关节限位映射,退化显式标记)、模型层(`model/{conditioner,backbone,deterministic,generator}.py` + `diffusion/generator.py`:30 token/帧、d240/4层/6头、时间注意力窗口 31、条件交叉注意力;Diffusers x0-prediction `prediction_type="sample"`、`clip_sample=False`)、五项损失(重建/测地/FK/接触/速度)、60/30 窗口拼接(SLERP 融合,接缝速度低于内部 p95)、训练器与脚本(`scripts/{precompute_m3_cache,train_generation,eval_generation}.py`)。**教师 1,826 文件关节零越界**(无剔除/裁剪);根统计 258,462 帧。pilot:两模型各 4000 步 ≈64 分钟、峰值 5.47GiB、val 0.096/0.246。验收(8 段 val):MPJPE 8.9cm[扩散]/11.3cm[确定性]、根 RMSE 5.1/5.9cm、DDIM-25 ≈8-10ms/帧(5/10/25 步消融质量不敏感);**所有输入含教师噪声基线整段修复接受率 0%**(同因 `rejected_frame`)——§10.1 的 ≥90% 整段接受率被 M2 收尾+教师重生成阻塞,如实记录。详见 `docs/m3_verification.md`。
+- 测试 76 项全过(`uv run --locked pytest tests/ -q`,新增 `tests/test_generation.py` 17 项)。关键工程事实:教师 NPZ qpos 为四元数在前布局需显式转换;扫描箱凸包与 AABB 差 mean~7cm(AABB 仅训练代理);MuJoCo freejoint 角速度 qvel 为体系;Python 内建 `hash()` 跨进程随机,划分种子必须用稳定哈希;参考脚部高度 82% 帧低于 0.02m,脚部阈值不可由 F1 标定;pytorch_kinematics FK 不支持 3 维批量(损失内拉平 B·F);系统 Python 3.12 无 dev 头文件导致 Triton 驱动编译失败,`.venv` 已重建于 uv 托管 CPython 3.12.13(注意力层保留显式数学实现)。
 
 后续按方案推进:
 
-1. M2 收尾(优先):扰动接受率 60%→95%(多起点重启、锚定带两段收紧、持久 QP 工作区)、单帧 310ms→<50ms;约束版纯优化基线。
-2. M3:确定性/扩散生成(60 帧窗口、拼接);教师数据重生成/清洗(M2 筛选结论);task gate 验证集标定。
+1. M2 收尾(优先,阻塞 §10.1 整段接受率):扰动接受率 60%→95%(多起点重启、锚定带两段收紧、持久 QP 工作区)、单帧 310ms→<50ms;约束版纯优化基线。
+2. M3 剩余:教师数据重生成/清洗(M2/M3 双重证实:教师与生成输出同因 rejected_frame 全拒);task gate 验证集标定;生成训练未饱和(4k 步),按验证曲线延长。
 3. M4:闭环比较与最终评测。
 
 资源变化同步更新 `resources/README.md` 和 manifest;设计变化同步更新实现方案。本文件保留关键约定与阶段摘要,不要把未执行的计划写成已验证结果。

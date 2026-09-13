@@ -78,6 +78,27 @@ def so3_exp_torch(w: torch.Tensor) -> torch.Tensor:
     return eye + torch.sin(theta.unsqueeze(-1)) * K + (1 - torch.cos(theta.unsqueeze(-1))) * (K @ K)
 
 
+def so3_log_torch(R: torch.Tensor) -> torch.Tensor:
+    """Differentiable log map [..., 3, 3] -> [..., 3] (axis-angle).
+
+    Smooth away from theta = pi (the principal-branch singularity, shared
+    with every closed-form log map); near theta = 0 a first-order Taylor
+    branch keeps gradients finite. Losses using this should not rely on
+    values at rotations near pi from their targets.
+    """
+    tr = R[..., 0, 0] + R[..., 1, 1] + R[..., 2, 2]
+    cos = ((tr - 1.0) / 2.0).clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+    theta = torch.acos(cos)
+    w = 0.5 * torch.stack(
+        [R[..., 2, 1] - R[..., 1, 2], R[..., 0, 2] - R[..., 2, 0], R[..., 1, 0] - R[..., 0, 1]],
+        dim=-1,
+    )
+    sin = torch.sin(theta)
+    # theta / sin(theta) -> 1 as theta -> 0; both branches stay finite
+    factor = torch.where(theta < 1e-4, torch.ones_like(theta), theta / sin.clamp_min(1e-12))
+    return w * factor[..., None]
+
+
 def skew_torch(v: torch.Tensor) -> torch.Tensor:
     zero = torch.zeros_like(v[..., 0])
     return torch.stack(

@@ -1,0 +1,9 @@
+# Locked pilot starting points (plan 7.1 / 14.3); values are documentation
+# for scripts/train_generation.py defaults and are not yet tuned.
+window: 60            # frames per generation window (30 Hz)
+stride: 30            # window stride; overlap = window - stride
+time_window: 31       # temporal attention window (frames)
+d_model: 240
+n_layers: 4
+n_heads: 6
+ffn_mult: 4

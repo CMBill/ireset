@@ -1,0 +1,11 @@
+# x0-prediction diffusion settings (plan 7.2). Schedulers come from
+# diffusers with prediction_type="sample", clip_sample=False (and DDIM
+# thresholding off): joint limits are enforced by the clean-angle sigmoid
+# map only, never by sampler-level global clipping.
+num_train_timesteps: 1000
+beta_schedule: scaled_linear
+beta_start: 0.0001
+beta_end: 0.02
+ddim_steps: 25        # plan ablations: 5 / 10 / 25
+eta: 0.0
+guidance: none        # no CFG / inference-time energy guidance by default
