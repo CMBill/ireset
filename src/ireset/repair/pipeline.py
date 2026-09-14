@@ -29,7 +29,8 @@ from ireset.geometry.collision_pairs import build_collision_pairs
 from ireset.geometry.distance_adapter import largebox_hull
 from ireset.imesh.delaunay import build_frame_mesh, laplacian_coordinates
 from ireset.geometry.distance_adapter import world_to_box_geom
-from ireset.repair.constraints import FrameEvaluator
+from ireset.kinematics.mujoco_adapter import retract_batch
+from ireset.repair.constraints import FrameEvaluator, tangent_error
 from ireset.repair.context import ContactStateMachine, ReferenceCondition, RepairConfig
 from ireset.repair.scp import FrameContext, FrameSolver
 from ireset.repair.validation import IndependentValidator
@@ -62,10 +63,13 @@ class RepairPipeline:
     # -- interaction mesh precompute -------------------------------------------
 
     def _mesh_assets(self, condition: ReferenceCondition) -> None:
-        if self._surf_pts is not None:
-            return
-        pts, _ = trimesh.sample.sample_surface(largebox_hull(), N_SURF, seed=0)
-        self._surf_pts = np.asarray(pts, dtype=float)
+        # surface samples are demo-independent (seeded once); the ground
+        # points belong to THIS condition's box trajectory and must be
+        # recomputed per clip -- caching them across segments leaked demo-1
+        # geometry into every later segment of a shared-pipeline run
+        if self._surf_pts is None:
+            pts, _ = trimesh.sample.sample_surface(largebox_hull(), N_SURF, seed=0)
+            self._surf_pts = np.asarray(pts, dtype=float)
         gp = []
         for c in (condition.box_pose[0, 0:3], condition.box_pose[-1, 0:3]):
             for dx, dy in ((-0.5, -0.5), (0.5, 0.5)):
@@ -85,12 +89,18 @@ class RepairPipeline:
 
     # -- frame context -----------------------------------------------------------
 
-    def _establishment_candidates(self, z: np.ndarray, box: np.ndarray, contacts, t: int) -> dict:
+    def _establishment_candidates(self, z: np.ndarray, box: np.ndarray, contacts, t: int,
+                                  prev_sole: dict | None = None) -> dict:
         """Anchor candidates from an ACCEPTED state, gated by geometry (plan 8.1).
 
         Hands must be within the establishment distance of the box *without
         deep penetration*; feet must be near the ground. Called after a frame
         is accepted (skipped or repaired).
+
+        P0.1 L1: feet additionally pass a quasi-static gate -- a foot sliding
+        faster than ``foot_anchor_establish_speed_mps`` (measured against the
+        previous *accepted* sole positions) may touch (band rows apply via the
+        reference schedule) but must not lock a world anchor it cannot honor.
         """
         out = {"hand": {}, "foot": {}}
         self.ev.forward(z, box)
@@ -103,9 +113,14 @@ class RepairPipeline:
         for side, name in (("l", "left_foot"), ("r", "right_foot")):
             if contacts.holding[name] or not contacts.reference_wants_hold(name, t):
                 continue
+            pts = self.ev.site_positions(self.ev.sole_sites[side])
+            if prev_sole and prev_sole.get(side) is not None:
+                speed = float(np.linalg.norm(pts - prev_sole[side], axis=-1).max()) * self.cfg.fps
+                if speed >= self.cfg.foot_anchor_establish_speed_mps:
+                    continue
             gap = min(self.ev.geom_distance(g, self.ev.ground_geom)[0] for g in self.ev.sole_geoms[side])
             if -self.cfg.contact_band_pen_m <= gap <= self.cfg.foot_establish_gap_m:
-                out["foot"][name] = self.ev.site_positions(self.ev.sole_sites[side])
+                out["foot"][name] = pts
         return out
 
     def _frame_ctx(self, t, prediction, condition, contacts, prev_local, prev_sole, z_prev):
@@ -140,7 +155,11 @@ class RepairPipeline:
             return False, "state_constraints"
         # interpolated midpoint against the previous accepted state: the
         # final validator checks interpolated states, so the sequential loop
-        # must not accept corner-cutting transitions (plan 6.3)
+        # must not accept corner-cutting transitions (plan 6.3). The probe
+        # points mirror the validator's ADAPTIVE subdivision exactly (motion
+        # under max_substep_motion_m gets no interpolated probes) -- the
+        # previous unconditional thirds were strictly stronger than the
+        # independent final check and rejected states it would accept
         if ctx.z_prev is not None:
             scene_a = np.zeros(43)
             scene_a[0:36] = ctx.z_prev
@@ -148,8 +167,12 @@ class RepairPipeline:
             scene_b = np.zeros(43)
             scene_b[0:36] = z
             scene_b[36:43] = ctx.box_pose
-            for s_frac in (1 / 3, 0.5, 2 / 3):  # match the validator's subdivision
-                mid = self.validator._interpolate(scene_a, scene_b, s_frac)
+            vcfg = self.validator.cfg
+            motion = self.validator._frame_motion_m(scene_a, scene_b)
+            n_sub = int(np.clip(np.ceil(motion / vcfg.max_substep_motion_m),
+                                1, vcfg.max_subdivisions + 1))
+            for i in range(1, n_sub):
+                mid = self.validator._interpolate(scene_a, scene_b, i / n_sub)
                 val_m, lo_m, hi_m, scl_m = self.solver.constraint_rows(
                     mid[0:36], ctx, trust=self.cfg.trust_radius_max, mode="accept"
                 )
@@ -179,6 +202,10 @@ class RepairPipeline:
         final = self.validator.validate(result.trajectory, exclude=("box_ground",))
         if final.passed:
             result.diagnostics["final_validation"] = "passed"
+            result.diagnostics["final_checks"] = {
+                k: {"worst": round(float(v.worst), 4), "limit": float(v.limit)}
+                for k, v in final.checks.items()
+            }
             return result
 
         # suffix rollback: keep the validated prefix (states + anchors) by
@@ -199,6 +226,10 @@ class RepairPipeline:
         final2 = self.validator.validate(retry.trajectory, exclude=("box_ground",))
         if final2.passed:
             retry.diagnostics["final_validation"] = "passed_after_suffix_retry"
+            retry.diagnostics["final_checks"] = {
+                k: {"worst": round(float(v.worst), 4), "limit": float(v.limit)}
+                for k, v in final2.checks.items()
+            }
             return retry
         return TrajectoryResult(False, "rejected_final", diagnostics={
             **retry.diagnostics, "final_retry": final2.summary(),
@@ -222,6 +253,30 @@ class RepairPipeline:
             z_pred = prediction[t, 0:36].copy()
             box = prediction[t, 36:43]
             z_prev = accepted[-1].copy() if accepted else None
+            # P0.1 L1: anchors live only while the foot stays quasi-static.
+            # The teacher slides in bursts, so an anchor locked on a slow
+            # frame must degrade to touching-without-anchor once the
+            # *prediction* foot slides again (reference-driven decision,
+            # never the solver's -- the repaired foot is pinned and would
+            # never trigger its own release).
+            if prev_sole:
+                self.ev.forward(z_pred, box)
+                for side, name in (("l", "left_foot"), ("r", "right_foot")):
+                    if contacts.holding[name] and prev_sole.get(side) is not None:
+                        pts = self.ev.site_positions(self.ev.sole_sites[side])
+                        speed = float(np.linalg.norm(pts - prev_sole[side], axis=-1).max()) * self.cfg.fps
+                        if speed >= self.cfg.foot_anchor_establish_speed_mps:
+                            contacts.release(name)
+                # symmetric L1 completion for hands: an anchor the *prediction*
+                # no longer honors (hand drifted beyond the anchor tolerance
+                # in box frame) degrades to unanchored -- band classification
+                # itself stays anchor-driven
+                for side, name in (("l", "left_hand"), ("r", "right_hand")):
+                    anchor = contacts.anchors[name]
+                    if contacts.holding[name] and anchor is not None:
+                        hl = self.ev.hand_local(side)
+                        if float(np.linalg.norm(hl - anchor, axis=-1).max()) > self.cfg.hand_anchor_tol_m:
+                            contacts.release(name)
             ctx = self._frame_ctx(t, prediction, condition, contacts, prev_local, prev_sole, z_prev)
 
             ok, why = self.frame_valid(z_pred, ctx)
@@ -231,13 +286,25 @@ class RepairPipeline:
                 iterations.append(0)
             else:
                 res = self.solver.solve_frame(z_pred, ctx)
+                path = "repaired" if not res.slack_used else "repaired_slack"
+                res, bt = self._transition_backtrack(res, ctx, z_prev)
+                if bt:
+                    path = bt
                 if not self._frame_result_ok(res, ctx):
-                    if self.cfg.enable_slack_fallback:
+                    # multi-start restart from the previous accepted state
+                    # (P0.1 L0): deep-violation frames linearize badly from
+                    # z_pred but solve from the accepted predecessor
+                    res_alt = self.solver.solve_frame(z_prev, ctx) if z_prev is not None else None
+                    if res_alt is not None:
+                        res_alt, bt2 = self._transition_backtrack(res_alt, ctx, z_prev)
+                        if self._frame_result_ok(res_alt, ctx):
+                            res, path = res_alt, bt2 or "repaired_prev"
+                    if not self._frame_result_ok(res, ctx) and self.cfg.enable_slack_fallback:
                         res2 = self.solver.solve_frame(
                             z_prev if z_prev is not None else z_pred, ctx, force_slack=True
                         )
                         if self._frame_result_ok(res2, ctx):
-                            res = res2
+                            res, path = res2, "repaired_slack"
                             fallbacks += 1
                 if not self._frame_result_ok(res, ctx):
                     timings.append(time.perf_counter() - t0)
@@ -249,12 +316,12 @@ class RepairPipeline:
                         "skipped": sum(1 for st in frame_status if st == "skipped"),
                     })
                 z = res.z
-                frame_status.append("repaired" if not res.slack_used else "repaired_slack")
+                frame_status.append(path)
                 iterations.append(res.iterations)
 
             # commit contact transitions from the accepted state only:
             # anchors lock from the geometry that just passed all checks
-            cands = self._establishment_candidates(z, box, contacts, t)
+            cands = self._establishment_candidates(z, box, contacts, t, prev_sole)
             contacts.commit("left_hand", t, hand_local=cands["hand"].get("left_hand"))
             contacts.commit("right_hand", t, hand_local=cands["hand"].get("right_hand"))
             contacts.commit("left_foot", t, sole_world=cands["foot"].get("left_foot"))
@@ -280,6 +347,28 @@ class RepairPipeline:
             return False
         ok, _why = self.frame_valid(res.z, ctx)
         return ok
+
+    def _transition_backtrack(self, res, ctx, z_prev) -> tuple:
+        """Transition-aware step backtracking (P0.1 L0).
+
+        The QP never sees the interpolated-third corner-cut check that
+        ``frame_valid`` applies between z_prev and the candidate; when the
+        solver's output fails *only* that check, shrink the step along the
+        same tangent direction from z_prev and re-check. Pure solver
+        improvement: no gate or tolerance changes.
+        """
+        if not res.accepted or z_prev is None:
+            return res, None
+        ok, why = self.frame_valid(res.z, ctx)
+        if ok or why != "transition_interpolated":
+            return res, None
+        xi = tangent_error(res.z, z_prev)
+        for alpha in (0.75, 0.5, 0.25):
+            cand = retract_batch(self.ev.model, z_prev[None], (alpha * xi)[None])[0]
+            if self.frame_valid(cand, ctx)[0]:
+                res.z = cand
+                return res, "repaired_bt"
+        return res, None
 
     def _first_failure_frame(self, report) -> int | None:
         for chk in report.checks.values():

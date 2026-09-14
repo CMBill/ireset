@@ -168,9 +168,14 @@ def test_pivot_in_place_detected(validator) -> None:
     # (radius 0.131 m vs 0.19 m here); the per-site check is the strictly
     # more sensitive formulation required by plan 10.1 ("all constrained
     # sites") and must flag the pivot.
+    #
+    # P0.1 L1: support := quasi-static and the entry speed gate equals the
+    # check gate (0.02), so the pivot must stay below 0.02 m/s toe sweep to
+    # remain inferred support; a slow-enough pivot is then flagged by the
+    # per-site DRIFT gate (faster pivots are transition, uncertified).
     h = _root_height_for_tangent(validator)
-    T = 8
-    angs = np.linspace(0, 0.3, T)  # ~17 deg: toe 0.25 m/s passes the entry gate
+    T = 24
+    angs = np.linspace(0, 0.069, T)  # toe sweeps ~0.017 m/s; drift ~13mm
     q = np.zeros((T, 43))
     for t, a in enumerate(angs):
         q[t, 0:3] = [0.1, 0.0, h]
@@ -183,7 +188,7 @@ def test_pivot_in_place_detected(validator) -> None:
     centroid_drift = np.linalg.norm(pts.mean(1) - pts[0].mean(0), axis=1).max()
     per_site_drift = np.linalg.norm(pts - pts[0], axis=-1).max()
     assert per_site_drift > centroid_drift       # sites sweep strictly more
-    assert per_site_drift > 0.05                 # outer sites clearly violate the gate
+    assert per_site_drift > 0.01                 # outer sites violate the drift gate
     assert not rep.checks["foot_support"].passed  # per-site check must flag it
 
 

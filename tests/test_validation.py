@@ -72,21 +72,25 @@ def test_detects_excessive_velocity(teacher_qpos, validator) -> None:
     assert not rep.checks["velocities"].passed
 
 
-def test_detects_foot_slide_during_support(teacher_qpos, validator) -> None:
-    """Horizontal root drift during inferred sole contact must trip foot checks.
-
-    We translate the whole robot horizontally over a support segment (box
-    fixed), which slides the feet while keeping them on the ground.
+def test_detects_foot_slide_during_support(validator) -> None:
+    """A SLOW horizontal slide during inferred sole contact must trip the
+    drift check. P0.1 L1 semantics: support := quasi-static (entry speed gate
+    0.02 == check gate), so fast slides are excluded from support intervals
+    (transition, uncertified) and only sub-gate-speed slides stay inside --
+    those are caught by the 1cm anchor-drift gate.
     """
-    q = teacher_qpos.copy()
-    rep0 = validator.validate(q)
-    supports = [iv for iv in rep0.schedule.intervals if iv.support == "ground"]
-    assert supports, "expected at least one inferred support interval"
-    iv = supports[0]
-    T = iv.end - iv.start
-    drift = np.linspace(0.0, 0.2, T)[:, None] * np.array([[1.0, 0.0, 0.0]])
-    q[iv.start : iv.end, 0:3] += drift
+    from test_contacts import _root_height_for_tangent
+
+    T = 45
+    h = _root_height_for_tangent(validator)
+    q = np.zeros((T, 43))
+    q[:, 0:3] = [0.1, 0.0, h]
+    q[:, 3] = 1.0
+    q[:, 36:43] = [1.5, 0.0, 0.19, 1.0, 0, 0, 0]
+    q[:, 0] += np.linspace(0.0, 0.013, T)   # 0.0087 m/s < 0.02, drift 13mm > 10mm
     rep = validator.validate(q)
+    supports = [iv for iv in rep.schedule.intervals if iv.support == "ground"]
+    assert supports, "slow slide stays inside inferred support"
     assert not rep.checks["foot_support"].passed
 
 

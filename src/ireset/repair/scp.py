@@ -149,18 +149,23 @@ class FrameSolver:
             lim = self.dt * cfg.joint_velocity_limit_radps
             l[29:58], u[29:58] = -lim, lim
             scale[29:58] = lim
-            val[58:61] = z[0:3] - ctx.z_prev[0:3]
+            # root linear/angular velocity as NORM rows, matching the final
+            # validator: per-component box rows admitted diagonal steps up to
+            # sqrt(3)x the limit (fixed 2026-09-13, P0); slots 59,60,62,63
+            # stay inactive to preserve the row layout
+            val[58] = float(np.linalg.norm(z[0:3] - ctx.z_prev[0:3]))
             lim_t = self.dt * cfg.base_lin_velocity_limit_mps
-            l[58:61], u[58:61] = -lim_t, lim_t
-            scale[58:61] = lim_t
+            l[58], u[58] = -INF, lim_t
+            scale[58] = lim_t
             from ireset.kinematics.rotation_adapter import quat_to_mat_wxyz, so3_log_np
 
             R = quat_to_mat_wxyz(z[3:7][None])[0]
             Rp = quat_to_mat_wxyz(ctx.z_prev[3:7][None])[0]
-            val[61:64] = so3_log_np((R @ Rp.T)[None])[0]
+            r_rot = so3_log_np((R @ Rp.T)[None])[0]
+            val[61] = float(np.linalg.norm(r_rot))
             lim_r = self.dt * cfg.base_ang_velocity_limit_radps
-            l[61:64], u[61:64] = -lim_r, lim_r
-            scale[61:64] = lim_r
+            l[61], u[61] = -INF, lim_r
+            scale[61] = lim_r
 
         val[64:99] = np.zeros(35)
         l[64:99] = -trust
@@ -247,29 +252,21 @@ class FrameSolver:
         scored.sort(key=lambda c: c[0])
         for dist, ga, gb, kind, ft in scored[: cfg.max_active_pairs]:
             J = ev.distance_jacobian(ga, gb, ft, dist)
-            if kind == "robot_box" and self._hand_hold_overlap(ga, ctx):
+            # P0.1 L1: contact bands classify PER PAIR by geometry alone -- a
+            # pair closer than the band upper is a contact pair (touching
+            # allowed; [2mm, band_hi] satisfies both classifications, so
+            # boundary flips are harmless), farther pairs keep the noncontact
+            # clearance. Freeze demands come ONLY from locked anchors: this is
+            # the "touching-but-not-anchored" state, covering hovering
+            # reference grasps and pitched support feet without raising any
+            # threshold, and matching the validator's closest-point semantics.
+            if kind == "robot_box" and dist <= cfg.contact_band_gap_m:
                 rows.append((dist, J, -cfg.contact_band_pen_m, cfg.contact_band_gap_m))
-            elif kind == "robot_ground" and self._foot_hold_overlap(ga, ctx):
+            elif kind == "robot_ground" and dist <= cfg.foot_contact_gap_m:
                 rows.append((dist, J, -cfg.contact_band_pen_m, cfg.foot_contact_gap_m))
             else:
                 rows.append((dist, J, cfg.noncontact_clearance_m, INF))
         return rows
-
-    def _foot_hold_overlap(self, ga: int, ctx: FrameContext) -> bool:
-        """Sole collision geoms count as contact pairs while the foot supports."""
-        ev = self.ev
-        for side in ("l", "r"):
-            if ctx.foot_anchor.get(side) is not None and ga in ev.sole_geoms[side]:
-                return True
-        return False
-
-    def _hand_hold_overlap(self, ga: int, ctx: FrameContext) -> bool:
-        """Hand collision geoms count as contact pairs while their hand holds."""
-        ev = self.ev
-        for side in ("l", "r"):
-            if ctx.hand_anchor.get(side) is not None and ga in ev._hand_geoms[side]:
-                return True
-        return False
 
     def violation(self, val: np.ndarray, l: np.ndarray, u: np.ndarray,
                   scale: np.ndarray | None = None) -> float:
@@ -334,21 +331,39 @@ class FrameSolver:
             lim = self.dt * cfg.joint_velocity_limit_radps
             l_rows.append(-lim - dv); u_rows.append(lim - dv)
 
+            # root velocity as a linearized NORM row (slot 0 of the 3-slot
+            # block; slots 1,2 stay inactive): d . (dp + xi_p) <= lim at the
+            # current direction d = dp/|dp|; relinearized every SCP iteration.
+            # Below half the limit the row is dropped (satisfied, and the
+            # direction is meaningless near zero).
             Sel_p = I35[0:3]
             dp_prev = z[0:3] - ctx.z_prev[0:3]
-            A_rows.append(Sel_p)
             lim_t = self.dt * cfg.base_lin_velocity_limit_mps
-            l_rows.append(-lim_t - dp_prev); u_rows.append(lim_t - dp_prev)
+            lin_A = np.zeros((3, N_TANGENT))
+            lin_lo = np.full(3, -INF)
+            lin_hi = np.full(3, INF)
+            n_dp = float(np.linalg.norm(dp_prev))
+            if n_dp > 0.5 * lim_t and n_dp > 1e-9:
+                lin_A[0] = (dp_prev / n_dp) @ Sel_p
+                lin_hi[0] = lim_t - n_dp
+            A_rows.append(lin_A)
+            l_rows.append(lin_lo); u_rows.append(lin_hi)
 
             from ireset.kinematics.rotation_adapter import quat_to_mat_wxyz, so3_log_np
 
             R = quat_to_mat_wxyz(z[3:7][None])[0]
             Rp = quat_to_mat_wxyz(ctx.z_prev[3:7][None])[0]
             r_rot = so3_log_np((R @ Rp.T)[None])[0]
-            Sel_r = I35[3:6]
             lim_r = self.dt * cfg.base_ang_velocity_limit_radps
-            A_rows.append(Sel_r)
-            l_rows.append(-lim_r - r_rot); u_rows.append(lim_r - r_rot)
+            rot_A = np.zeros((3, N_TANGENT))
+            rot_lo = np.full(3, -INF)
+            rot_hi = np.full(3, INF)
+            n_rot = float(np.linalg.norm(r_rot))
+            if n_rot > 0.5 * lim_r and n_rot > 1e-9:
+                rot_A[0] = (r_rot / n_rot) @ I35[3:6]
+                rot_hi[0] = lim_r - n_rot
+            A_rows.append(rot_A)
+            l_rows.append(rot_lo); u_rows.append(rot_hi)
 
         # trust region (rows tracked for the slack assembly)
         Dm = np.diag(1.0 / self.D)

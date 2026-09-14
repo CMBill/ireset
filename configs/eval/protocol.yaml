@@ -27,7 +27,11 @@ contact_inference:
   hand_exit_m: 0.03                   # supersedes 0.06
   foot_enter_m: 0.005                 # supersedes 0.012 (exceeded gap; center-z bug)
   foot_exit_m: 0.02                   # supersedes 0.03
-  foot_entry_speed_mps: 0.3
+  hand_entry_speed_mps: 0.02          # P0.1 L1: speed-gated interval entry,
+                                      # entry gate <= the check gate it feeds
+  foot_entry_speed_mps: 0.02          # P0.1 L1: 0.3 -> 0.02 (== foot_speed_mps);
+                                      # sliding grounded stretches are transition,
+                                      # not certified support
   min_duration: 3
   # reference-side (human) thresholds: skip-F1 0.668 on hull metric (18 clips,
   # grid flat within +/-0.003 -> weakly identified, pilot review queued);
@@ -42,8 +46,24 @@ contact_inference:
   # 0.05/0.08; claimed macro-F1 0.876. The ref_hand numbers coincide by
   # chance of a flat optimum; the F1 itself was inflated.
 
-teacher_quality_m1_baseline:          # 2026-09-11 after fixes, 71 clips (24 original + 47 augmented)
-  full_pass_rate: 0.0                 # teacher is NOT unconditionally feasible truth
+relaxed_validation:                    # P0.1 L2 2026-09-13: teacher baseline
+                                       # building ONLY (p0_relaxed_validation_plan
+                                       # section 4), never for plan 10.1 claims.
+                                       # Paired with qp_default.yaml
+                                       # relaxed_repair; cross-config invariants
+                                       # enforced in ireset.repair.config_io.
+  foot_ground_gap_m: 0.017             # pairs foot_contact_gap_m (support-hover
+                                       # census p90 0.0148 + 2mm)
+  hand_gap_m: 0.035                    # pairs contact_band_gap_m (grasp-gap
+                                       # census p95 0.0331 + margin)
+  hand_anchor_error_m: 0.20            # pairs hand_anchor_tol_m 0.19 (grasp
+                                       # anchor-drift census p90 0.1819):
+                                       # NON-BINDING, teacher hands do not anchor
+  hand_relative_speed_mps: 0.15        # grasp drift-rate cover; NON-BINDING
+# foot_speed_mps / foot_anchor_drift_m / penetration / joint+base limits stay
+# strict: quasi-static support (P0.1 L1 semantics) keeps the 10.1 foot gates
+
+teacher_quality_m1_baseline:          # 2026-09-11 after fixes, 71 clips (24 original + 47 augmented)  full_pass_rate: 0.0                 # teacher is NOT unconditionally feasible truth
   joint_limits_pass: 1.0
   velocities_pass: 0.310              # max 3.06x the provisional limit
   penetration_pass: 0.042             # worst 23.2mm (adaptive subdivision finds deeper moments)

@@ -46,6 +46,7 @@ from ireset.model.tokens import RootStats, StateTokenizer
 from ireset.data.windows import make_tokenizer
 from ireset.kinematics.mujoco_adapter import G1Kinematics
 from ireset.kinematics.rotation_adapter import quat_to_mat_wxyz
+from ireset.repair.config_io import MODES, load_mode_configs
 from ireset.repair.pipeline import RepairPipeline
 from ireset.repair.validation import IndependentValidator
 
@@ -123,7 +124,9 @@ def repair_run(pipe, scene, cond, tag: str) -> dict:
     wall = time.perf_counter() - t0
     d = res.diagnostics
     row = {"tag": tag, "accepted": bool(res.accepted), "status": res.status,
-           "wall_s": round(wall, 2)}
+           "wall_s": round(wall, 2),
+           "t_fail": d.get("t_fail"), "skip_reason": d.get("skip_reason"),
+           "reason": d.get("reason")}
     if res.accepted and res.trajectory is not None:
         rep = res.trajectory
         row["repair_root_m"] = float(np.linalg.norm(rep[:, 0:3] - scene[:, 0:3], axis=1).mean())
@@ -132,7 +135,6 @@ def repair_run(pipe, scene, cond, tag: str) -> dict:
         tm = np.array(d["timings_s"])
         row["ms_per_frame_mean"] = round(float(tm.mean() * 1e3), 1)
     else:
-        row["reason"] = d.get("reason")
         row["first_failure_frame"] = d.get("first_failure_frame")
     return row
 
@@ -146,15 +148,28 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--models-dir", type=str, default=str(ROOT / "derived" / "models"))
     ap.add_argument("--skip-baselines", action="store_true")
+    ap.add_argument("--validation-mode", choices=MODES, default="strict",
+                    help="strict = locked gates; relaxed = P0 teacher-baseline "
+                         "pairs (never valid for plan 10.1 claims)")
+    ap.add_argument("--output", type=str, default=None)
+    ap.add_argument("--task-gate-yaml", type=str, default=None,
+                    help="override task_mpjpe_tol_m from a task_quality_gates.yaml")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     models_dir = Path(args.models_dir)
     generators = {m: load_generator(m, device, args.ddim_steps, models_dir) for m in args.models}
 
-    pipe = RepairPipeline()
+    rcfg, vcfg = load_mode_configs(args.validation_mode)
+    if args.task_gate_yaml:
+        import yaml as _yaml
+        rcfg.task_mpjpe_tol_m = float(
+            _yaml.safe_load(Path(args.task_gate_yaml).read_text())
+            ["task_quality_gates"]["mpjpe_tol_m"])
+    pipe = RepairPipeline(cfg=rcfg)
+    pipe.validator.cfg = vcfg
     kin = G1Kinematics()
-    validator = IndependentValidator()
+    validator = IndependentValidator(cfg=vcfg)
     lo, hi = pipe.spec.joint_range[:, 0], pipe.spec.joint_range[:, 1]
 
     val_originals = [f for f in load_split_files("val") if f.endswith("_original.npz")][: args.demos]
@@ -217,9 +232,10 @@ def main() -> None:
             if any(r.get("model") == m for r in rows)
         },
     }
+    agg["mode"] = args.validation_mode
     OUT.mkdir(parents=True, exist_ok=True)
-    (OUT / "generation_eval.json").write_text(
-        json.dumps({"aggregate": agg, "rows": rows}, indent=2, default=float))
+    out = Path(args.output) if args.output else OUT / "generation_eval.json"
+    out.write_text(json.dumps({"aggregate": agg, "rows": rows}, indent=2, default=float))
     print(json.dumps(agg, indent=2, default=float))
 
 

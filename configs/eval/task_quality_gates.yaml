@@ -1,0 +1,12 @@
+task_quality_gates:
+  mpjpe_tol_m: 0.101
+  calibration:
+    date: '2026-09-13'
+    n_segments: 17
+    n_frames: 1999
+    repair_mpjpe_p50: 0.0656
+    repair_mpjpe_p90: 0.0766
+    repair_mpjpe_p95: 0.0807
+    margin_m: 0.02
+    bias: calibrated on relaxed-mode ACCEPTED teacher segments -- selection bias toward
+      repairable clips; values underestimate the full-distribution tail

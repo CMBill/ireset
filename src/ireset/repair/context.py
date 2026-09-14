@@ -53,8 +53,10 @@ class RepairConfig:
     trust_radius_max: float = 8.0
     shrink_factor: float = 0.5
     expand_factor: float = 1.8
-    scp_max_iters: int = 15
-    scp_extra_restoration_iters: int = 15  # fallback solves get a longer budget
+    # P0.1 L0 (2026-09-13): 15+15 -> 40+40. Teacher failures were mostly
+    # `infeasible` within the 15-iteration budget; compute-only change.
+    scp_max_iters: int = 40
+    scp_extra_restoration_iters: int = 40  # fallback solves get a longer budget
     # velocity bounds (shared with the validator; calibrated M2)
     joint_velocity_limit_radps: float = 12.0
     base_lin_velocity_limit_mps: float = 1.8
@@ -73,6 +75,10 @@ class RepairConfig:
     # contact establishment gates (geometric, at commit time)
     hand_establish_dist_m: float = 0.012
     foot_establish_gap_m: float = 0.006
+    # P0.1 L1 (2026-09-13): quasi-static gate -- sliding feet touch (band
+    # rows) but never lock world anchors; aligned with the validator's
+    # foot_entry_speed_mps ("support := quasi-static")
+    foot_anchor_establish_speed_mps: float = 0.05
     # task quality gate: M2 working value. The teacher violates the support
     # model (slides ~1.4cm/frame), so repaired feet stay pinned while the
     # reference slides -> keypoint error grows to ~16cm; deep-tail frames with
@@ -143,6 +149,14 @@ class ContactStateMachine:
             elif not wants and self.holding[effector]:
                 self.holding[effector] = False
                 self.anchors[effector] = None
+
+    def release(self, effector: str) -> None:
+        """Drop an anchor mid-interval (P0.1 L1): a sliding prediction foot
+        degrades the contact to touching-without-anchor. The reference
+        interval itself is unchanged -- only the freeze demand disappears."""
+        if self.holding[effector]:
+            self.holding[effector] = False
+            self.anchors[effector] = None
 
     def rollback_to(self, t: int) -> None:
         """Release anchors established at or after frame t (suffix rollback)."""

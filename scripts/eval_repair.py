@@ -32,6 +32,7 @@ import numpy as np
 from audit_data import convert_scene_qpos
 from ireset.embodied.contact_sites import infer_reference_schedule
 from ireset.paths import TEACHER_TRAJ_DIR
+from ireset.repair.config_io import MODES, load_mode_configs
 from ireset.repair.context import ReferenceCondition
 from ireset.repair.pipeline import RepairPipeline
 
@@ -71,7 +72,7 @@ def perturb_spike(scene: np.ndarray, t: int, joint: int, amp: float, lo, hi) -> 
     return out
 
 
-def run(pipeline, scene, cond) -> dict:
+def run(pipeline, scene, cond, save_npz: Path | None = None) -> dict:
     t0 = time.perf_counter()
     res = pipeline.repair_trajectory(scene, cond)
     wall = time.perf_counter() - t0
@@ -80,6 +81,12 @@ def run(pipeline, scene, cond) -> dict:
         "accepted": bool(res.accepted), "status": res.status, "wall_s": round(wall, 2),
         "_diag": d,
     }
+    if "final_checks" in d:
+        row["final_checks"] = d["final_checks"]
+    if save_npz is not None and res.accepted:
+        save_npz.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(save_npz, trajectory=res.trajectory, prediction=scene,
+                 human_kpts=cond.human_kpts_world, box_pose=cond.box_pose)
     if "timings_s" in d:
         tm = np.array(d["timings_s"])
         row.update({
@@ -136,6 +143,16 @@ def main() -> None:
     ap.add_argument("--frames", type=int, default=120)
     ap.add_argument("--bases-only", action="store_true",
                     help="skip the teacher screening phase (already reported)")
+    ap.add_argument("--teacher-only", action="store_true",
+                    help="P1/P1b only (P0.1 acceptance run)")
+    ap.add_argument("--validation-mode", choices=MODES, default="strict",
+                    help="strict = locked gates; relaxed = P0 teacher-baseline "
+                         "pairs (never valid for plan 10.1 claims)")
+    ap.add_argument("--output", type=str, default=None)
+    ap.add_argument("--save-dir", type=str, default=None,
+                    help="save accepted teacher trajectories as NPZ (P0.2 input)")
+    ap.add_argument("--task-gate-yaml", type=str, default=None,
+                    help="override task_mpjpe_tol_m from a task_quality_gates.yaml")
     args = ap.parse_args()
 
     by_subj: dict[str, list[str]] = defaultdict(list)
@@ -145,7 +162,15 @@ def main() -> None:
         d for _, ds in sorted(by_subj.items()) for d in ds[: args.per_subject]
     ]
 
-    pipe = RepairPipeline()
+    rcfg, vcfg = load_mode_configs(args.validation_mode)
+    if args.task_gate_yaml:
+        import yaml as _yaml
+        rcfg.task_mpjpe_tol_m = float(
+            _yaml.safe_load(Path(args.task_gate_yaml).read_text())
+            ["task_quality_gates"]["mpjpe_tol_m"])
+    pipe = RepairPipeline(cfg=rcfg)
+    pipe.validator.cfg = vcfg
+    save_dir = Path(args.save_dir) if args.save_dir else None
     lo, hi = pipe.spec.joint_range[:, 0], pipe.spec.joint_range[:, 1]
 
     # ---- Phase 1: teacher repair (base generation + screening) -------------
@@ -158,7 +183,8 @@ def main() -> None:
     bases = []
     for demo in demos:
         scene, cond = load(demo, args.frames)
-        row = run(pipe, scene, cond)
+        row = run(pipe, scene, cond,
+                  save_npz=save_dir / f"{demo}.npz" if save_dir else None)
         row["demo"] = demo
         teacher_rows.append(row)
         print(f"[P1] {demo}: accepted={row['accepted']} {row.get('reason', '')} "
@@ -182,87 +208,90 @@ def main() -> None:
                 cond.human_kpts_world[:n_cut], cond.box_pose[:n_cut],
                 cond.ref_schedule, cond.fps,
             )
-            prow = run(pipe, prefix_scene, prefix_cond)
+            prow = run(pipe, prefix_scene, prefix_cond,
+                       save_npz=save_dir / f"{demo}_prefix.npz" if save_dir else None)
             prow["demo"] = demo + ":prefix"
             teacher_rows.append(prow)
             print(f"[P1b] {demo}:prefix({n_cut}f): accepted={prow['accepted']} "
                   f"(teacher prefixes remain infeasible under the interaction model)")
     base_rate = float(np.mean([r["accepted"] for r in teacher_rows if ":prefix" not in r["demo"]])) if teacher_rows else 0.0
 
-    # ---- Phase 1c: synthetic support bases (the recoverable-perturbation set)
-    # Teachers violate the support/grasp model too deeply for pure QP repair
-    # (screening result above); the M2 acceptance experiment therefore uses
-    # deterministic synthetic bases with ACTIVE foot-support anchoring.
-    import mujoco
+    pert_rows, unreach_rows, bases = [], [], []
+    if not args.teacher_only:
+        # ---- Phase 1c: synthetic support bases (the recoverable-perturbation set)
+        # Teachers violate the support/grasp model too deeply for pure QP repair
+        # (screening result above); the M2 acceptance experiment therefore uses
+        # deterministic synthetic bases with ACTIVE foot-support anchoring.
+        import mujoco
 
-    from ireset.embodied.contact_sites import ContactInterval, ContactSchedule
-    from ireset.embodied.g1_spec import KPT_TO_SMPLH
-    from ireset.embodied.contact_sites import SMPLH_INDEX
+        from ireset.embodied.contact_sites import ContactInterval, ContactSchedule
+        from ireset.embodied.g1_spec import KPT_TO_SMPLH
+        from ireset.embodied.contact_sites import SMPLH_INDEX
 
-    def make_base(seed: int, T: int = 60):
-        rng = np.random.default_rng(seed)
-        v = RepairPipeline()
-        h_probe = RepairPipeline()
-        h = _tangent_root_height(h_probe)
-        scene = np.zeros((T, 43))
-        scene[:, 0:3] = [0.0, 0.0, h]
-        scene[:, 3] = 1.0
-        scene[:, 36:43] = [2.0, 0.0, 0.25, 1.0, 0, 0, 0]
-        lo_j, hi_j = v.spec.joint_range[:, 0], v.spec.joint_range[:, 1]
-        scene[:, 7:36] = np.clip(rng.normal(0, 0.02, (1, 29)), lo_j, hi_j)
-        ids = [mujoco.mj_name2id(v.ev.model, mujoco.mjtObj.mjOBJ_SITE, n) for n in KPT_TO_SMPLH]
-        human = np.zeros((T, 52, 3))
-        for t in range(T):
-            v.ev.forward(scene[t, 0:36], scene[t, 36:43])
-            for k, name in enumerate(KPT_TO_SMPLH):
-                human[t, SMPLH_INDEX[KPT_TO_SMPLH[name]]] = v.ev.site_positions(ids)[k]
-        sched = ContactSchedule(intervals=[
-            ContactInterval("left_foot", 0, T, "ground"),
-            ContactInterval("right_foot", 0, T, "ground"),
-        ])
-        return scene, ReferenceCondition(human, scene[:, 36:43].copy(), sched)
+        def make_base(seed: int, T: int = 60):
+            rng = np.random.default_rng(seed)
+            v = RepairPipeline()
+            h_probe = RepairPipeline()
+            h = _tangent_root_height(h_probe)
+            scene = np.zeros((T, 43))
+            scene[:, 0:3] = [0.0, 0.0, h]
+            scene[:, 3] = 1.0
+            scene[:, 36:43] = [2.0, 0.0, 0.25, 1.0, 0, 0, 0]
+            lo_j, hi_j = v.spec.joint_range[:, 0], v.spec.joint_range[:, 1]
+            scene[:, 7:36] = np.clip(rng.normal(0, 0.02, (1, 29)), lo_j, hi_j)
+            ids = [mujoco.mj_name2id(v.ev.model, mujoco.mjtObj.mjOBJ_SITE, n) for n in KPT_TO_SMPLH]
+            human = np.zeros((T, 52, 3))
+            for t in range(T):
+                v.ev.forward(scene[t, 0:36], scene[t, 36:43])
+                for k, name in enumerate(KPT_TO_SMPLH):
+                    human[t, SMPLH_INDEX[KPT_TO_SMPLH[name]]] = v.ev.site_positions(ids)[k]
+            sched = ContactSchedule(intervals=[
+                ContactInterval("left_foot", 0, T, "ground"),
+                ContactInterval("right_foot", 0, T, "ground"),
+            ])
+            return scene, ReferenceCondition(human, scene[:, 36:43].copy(), sched)
 
-    for seed in range(6):
-        scene, cond = make_base(seed)
-        row = run(pipe, scene, cond)
-        row["demo"] = f"synthetic_base_{seed}"
-        teacher_rows.append(row)
-        print(f"[P1c] synthetic_base_{seed}: accepted={row['accepted']} "
-              f"skip={row.get('skip_rate', '-')}")
-        if row["accepted"]:
-            bases.append((f"synthetic_{seed}", pipe.repair_trajectory(scene, cond).trajectory,
-                          cond, scene))
+        for seed in range(6):
+            scene, cond = make_base(seed)
+            row = run(pipe, scene, cond)
+            row["demo"] = f"synthetic_base_{seed}"
+            teacher_rows.append(row)
+            print(f"[P1c] synthetic_base_{seed}: accepted={row['accepted']} "
+                  f"skip={row.get('skip_rate', '-')}")
+            if row["accepted"]:
+                bases.append((f"synthetic_{seed}", pipe.repair_trajectory(scene, cond).trajectory,
+                              cond, scene))
 
-    # ---- Phase 2: recoverable perturbations --------------------------------
-    pert_rows = []
-    for demo, base_traj, cond, orig in bases:
-        variants = {
-            "joint_noise_0.02": perturb_joint_noise(orig, 0.02, seed=1, lo=lo, hi=hi),
-            "joint_noise_0.05": perturb_joint_noise(orig, 0.05, seed=2, lo=lo, hi=hi),
-            "joint_noise_0.10": perturb_joint_noise(orig, 0.10, seed=3, lo=lo, hi=hi),
-            "root_offset_3cm_6deg": perturb_root_offset(orig, [0.03, -0.02, 0.0], np.deg2rad(6)),
-            "single_spike_0.3rad": perturb_spike(orig, min(30, orig.shape[0] // 2), 16, 0.3, lo, hi),
-        }
-        for name, pert in variants.items():
-            row = run(pipe, pert, cond)
-            row.update({"demo": demo, "variant": name})
-            pert_rows.append(row)
-            print(f"[P2] {demo} {name}: accepted={row['accepted']} {row.get('reason','')}")
+        # ---- Phase 2: recoverable perturbations --------------------------------
+        for demo, base_traj, cond, orig in bases:
+            variants = {
+                "joint_noise_0.02": perturb_joint_noise(orig, 0.02, seed=1, lo=lo, hi=hi),
+                "joint_noise_0.05": perturb_joint_noise(orig, 0.05, seed=2, lo=lo, hi=hi),
+                "joint_noise_0.10": perturb_joint_noise(orig, 0.10, seed=3, lo=lo, hi=hi),
+                "root_offset_3cm_6deg": perturb_root_offset(orig, [0.03, -0.02, 0.0], np.deg2rad(6)),
+                "single_spike_0.3rad": perturb_spike(orig, min(30, orig.shape[0] // 2), 16, 0.3, lo, hi),
+            }
+            for name, pert in variants.items():
+                row = run(pipe, pert, cond)
+                row.update({"demo": demo, "variant": name})
+                pert_rows.append(row)
+                print(f"[P2] {demo} {name}: accepted={row['accepted']} {row.get('reason','')}")
+
+        # ---- Phase 3: unreachable input must reject -----------------------------
+        for demo, base_traj, cond, orig in bases[:2]:
+            bad = orig.copy()
+            bad[:, 36:39] = bad[:, 0:3]  # box centered inside the robot root
+            bad[:, 39:43] = [1, 0, 0, 0]
+            row = run(pipe, bad, cond)
+            row.update({"demo": demo, "variant": "unreachable_box"})
+            unreach_rows.append(row)
+            print(f"[P3] {demo} unreachable: accepted={row['accepted']} (must be False)")
+
     pert_rate = float(np.mean([r["accepted"] for r in pert_rows])) if pert_rows else None
-
-    # ---- Phase 3: unreachable input must reject -----------------------------
-    unreach_rows = []
-    for demo, base_traj, cond, orig in bases[:2]:
-        bad = orig.copy()
-        bad[:, 36:39] = bad[:, 0:3]  # box centered inside the robot root
-        bad[:, 39:43] = [1, 0, 0, 0]
-        row = run(pipe, bad, cond)
-        row.update({"demo": demo, "variant": "unreachable_box"})
-        unreach_rows.append(row)
-        print(f"[P3] {demo} unreachable: accepted={row['accepted']} (must be False)")
     false_accepts = sum(1 for r in unreach_rows if r["accepted"])
 
     agg = {
+        "mode": args.validation_mode,
         "n_teacher_clips": len([r for r in teacher_rows if ":prefix" not in r["demo"]
                                 and "synthetic" not in r["demo"]]),
         "teacher_acceptance": base_rate,
@@ -285,7 +314,8 @@ def main() -> None:
     for rows in (teacher_rows, pert_rows, unreach_rows):
         for r in rows:
             r.pop("_diag", None)
-    (OUT / "repair_eval.json").write_text(json.dumps(
+    out = Path(args.output) if args.output else OUT / "repair_eval.json"
+    out.write_text(json.dumps(
         {"aggregate": agg, "teacher": teacher_rows, "perturbations": pert_rows,
          "unreachable": unreach_rows}, indent=2, default=float))
     print(json.dumps(agg, indent=2))

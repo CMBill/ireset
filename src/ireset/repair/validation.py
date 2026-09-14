@@ -45,7 +45,15 @@ class ValidationConfig:
     hand_exit_m: float = 0.03
     foot_enter_m: float = 0.005
     foot_exit_m: float = 0.02
-    foot_entry_speed_mps: float = 0.3
+    # P0.1 L1 (2026-09-13): interval entry is speed-gated and the entry gate
+    # must not exceed the check gate it feeds (same principle as the distance
+    # enter<=gate invariant: an interval created at a speed its own check
+    # rejects fails for a configuration reason, not a motion reason).
+    # Support := quasi-static; fast approach/release stretches near the box
+    # or ground are transition, not certified contact. Supersedes the single
+    # foot_entry_speed_mps=0.3.
+    hand_entry_speed_mps: float = 0.02   # <= hand_relative_speed_mps
+    foot_entry_speed_mps: float = 0.02   # <= foot_speed_mps
     min_duration: int = 3
     # contact quality gates (plan 10.1)
     hand_gap_m: float = 0.01
@@ -67,6 +75,10 @@ class ValidationConfig:
             raise ValueError(f"foot_enter_m {self.foot_enter_m} > foot_ground_gap_m {self.foot_ground_gap_m}")
         if self.hand_exit_m < self.hand_enter_m or self.foot_exit_m < self.foot_enter_m:
             raise ValueError("exit threshold must not be tighter than enter (hysteresis)")
+        if self.hand_entry_speed_mps > self.hand_relative_speed_mps:
+            raise ValueError("hand_entry_speed_mps must not exceed hand_relative_speed_mps")
+        if self.foot_entry_speed_mps > self.foot_speed_mps:
+            raise ValueError("foot_entry_speed_mps must not exceed foot_speed_mps")
 
 
 @dataclass
@@ -351,7 +363,15 @@ class IndependentValidator:
 
         dt = 1.0 / cfg.fps
         for s, name in (("l", "left_hand"), ("r", "right_hand")):
-            for a, b in hysteresis_intervals(hand_dist[s], cfg.hand_enter_m, cfg.hand_exit_m, cfg.min_duration):
+            # speed-gated entry (P0.1 L1): fast approach/release stretches are
+            # transition, not certified grasp; the entry gate never exceeds
+            # the rel_speed check it feeds
+            hpts = hand_pts[s]
+            h_speed = np.concatenate(
+                [[np.inf], np.linalg.norm(np.diff(hpts, axis=0), axis=2).max(1) / dt]
+            )
+            gated = np.where(h_speed < cfg.hand_entry_speed_mps, hand_dist[s], np.inf)
+            for a, b in hysteresis_intervals(gated, cfg.hand_enter_m, cfg.hand_exit_m, cfg.min_duration):
                 anchor = hand_local[s][a].copy()                        # [3,3] sites
                 schedule.intervals.append(ContactInterval(name, a, b, "object", anchor=anchor))
         for s, name in (("l", "left_foot"), ("r", "right_foot")):
@@ -388,6 +408,7 @@ class IndependentValidator:
         cache = self._cache
         dt = 1.0 / cfg.fps
         worst = 0.0
+        where = ""
         detail = []
         side_of = {"left_foot": "l", "right_foot": "r"}
         for iv in schedule.intervals:
@@ -397,13 +418,20 @@ class IndependentValidator:
             pts = cache["sole_pts"][s][iv.start : iv.end]        # [n, 5, 3]
             gap = cache["sole_gap"][s][iv.start : iv.end]
             if len(pts) > 1:
-                speed = np.linalg.norm(np.diff(pts, axis=0), axis=-1).max() / dt
-                worst = max(worst, speed / cfg.foot_speed_mps)
-                detail.append(f"{iv.effector} speed={speed:.3f}")
+                sp = np.linalg.norm(np.diff(pts, axis=0), axis=-1).max(1) / dt
+                t_w = int(np.argmax(sp))
+                ratio = float(sp.max() / cfg.foot_speed_mps)
+                if ratio > worst:
+                    worst, where = ratio, f"{iv.effector} speed t={iv.start + 1 + t_w}"
+                detail.append(f"{iv.effector} speed={sp.max():.3f}")
             drift = np.linalg.norm(pts - pts[0], axis=-1).max()
-            worst = max(worst, drift / cfg.foot_anchor_drift_m)
-            worst = max(worst, gap.max() / cfg.foot_ground_gap_m)
-        return CheckResult(worst <= 1.0, worst, 1.0, "; ".join(detail[-3:]))
+            dr_ratio = float(drift / cfg.foot_anchor_drift_m)
+            if dr_ratio > worst:
+                worst, where = dr_ratio, f"{iv.effector} drift"
+            gap_ratio = float(gap.max() / cfg.foot_ground_gap_m)
+            if gap_ratio > worst:
+                worst, where = gap_ratio, f"{iv.effector} gap t={iv.start + int(np.argmax(gap))}"
+        return CheckResult(worst <= 1.0, worst, 1.0, where, "; ".join(detail[-3:]))
 
     def _check_hands(self, q: np.ndarray, schedule: ContactSchedule) -> CheckResult:
         """Per-site grasp checks: gap, per-site anchor drift, relative speed."""
@@ -411,6 +439,7 @@ class IndependentValidator:
         cache = self._cache
         dt = 1.0 / cfg.fps
         worst = 0.0
+        where = ""
         detail = []
         side_of = {"left_hand": "l", "right_hand": "r"}
         for iv in schedule.intervals:
@@ -418,13 +447,19 @@ class IndependentValidator:
                 continue
             s = side_of[iv.effector]
             seg = slice(iv.start, iv.end)
-            gap = cache["hand_dist"][s][seg].max()
-            worst = max(worst, gap / cfg.hand_gap_m)
+            gap = float(cache["hand_dist"][s][seg].max())
+            gap_ratio = gap / cfg.hand_gap_m
+            if gap_ratio > worst:
+                worst, where = gap_ratio, f"{iv.effector} gap t={seg.start + int(np.argmax(cache['hand_dist'][s][seg]))}"
             local = cache["hand_local"][s][seg]                    # [n, 3 sites, 3]
             anchor_err = np.linalg.norm(local - iv.anchor, axis=-1).max()
-            worst = max(worst, anchor_err / cfg.hand_anchor_error_m)
+            ae_ratio = float(anchor_err / cfg.hand_anchor_error_m)
+            if ae_ratio > worst:
+                worst, where = ae_ratio, f"{iv.effector} anchor t={seg.start}"
             if local.shape[0] > 1:
-                rel_speed = np.linalg.norm(np.diff(local, axis=0), axis=-1).max() / dt
-                worst = max(worst, rel_speed / cfg.hand_relative_speed_mps)
+                rs = np.linalg.norm(np.diff(local, axis=0), axis=-1).max(1) / dt
+                rs_ratio = float(rs.max() / cfg.hand_relative_speed_mps)
+                if rs_ratio > worst:
+                    worst, where = rs_ratio, f"{iv.effector} rel_speed t={seg.start + 1 + int(np.argmax(rs))}"
             detail.append(f"{iv.effector} gap={gap:.3f} anchor={anchor_err:.3f}")
-        return CheckResult(worst <= 1.0, worst, 1.0, "; ".join(detail[-3:]))
+        return CheckResult(worst <= 1.0, worst, 1.0, where, "; ".join(detail[-3:]))
