@@ -123,6 +123,38 @@ def task_mpjpe_stats(ev, traj: np.ndarray, cond: ReferenceCondition) -> dict:
             "max": round(float(v.max()), 4)}
 
 
+def print_frame_log(pipe: RepairPipeline) -> None:
+    """--verbose: one compact line per frame (last check call = the decided
+    state) plus every failing endpoint/probe record with violating rows."""
+    last_check: dict[int, dict] = {}
+    failing: list[dict] = []
+    for rec in pipe.frame_log:
+        if rec["kind"] == "check":
+            last_check[rec["t"]] = rec
+            if rec.get("rows"):
+                failing.append(rec)
+        elif rec.get("viol", 0.0) > 1e-6:
+            failing.append(rec)
+    for t in sorted(last_check):
+        r = last_check[t]
+        corr = r.get("corridor", {})
+        cl = corr.get("l")
+        cr = corr.get("r")
+        print(f"  [t={t:3d}] viol={r['viol']:.5f} "
+              f"handL {r['hand_l_prev_m']*1e3:8.2f}->{r['hand_l_cand_m']*1e3:8.2f}mm "
+              f"handR {r['hand_r_prev_m']*1e3:8.2f}->{r['hand_r_cand_m']*1e3:8.2f}mm "
+              f"corridor L={('%.2f/%.2f' % (cl['dist_m']*1e3, cl['upper_m']*1e3)) if cl else '-'} "
+              f"R={('%.2f/%.2f' % (cr['dist_m']*1e3, cr['upper_m']*1e3)) if cr else '-'} "
+              f"margin={r['band_margin_m']*1e3:.2f}mm")
+    for r in failing:
+        tag = "probe" if r["kind"] == "probe" else "ENDPOINT"
+        loc = (f" i={r['i']}/{r['n_sub']}" if r["kind"] == "probe" else "")
+        print(f"  !! [t={r['t']:3d}]{tag}{loc} viol={r['viol']:.5f}")
+        for row in r.get("rows", []):
+            print(f"       {row['pair']}: {row['val_m']*1e3:.3f}mm "
+                  f"in [{row['lo_m']*1e3:.3f}, {row['hi_m']*1e3:.3f}]mm")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--set", choices=["diagnosis6", "calibration24", "train", "val", "test"],
@@ -138,6 +170,9 @@ def main() -> None:
     ap.add_argument("--output-dir", type=str,
                     default=str(DERIVED_DATA_DIR / "teachers_regenerated"))
     ap.add_argument("--report", type=str, default=None)
+    ap.add_argument("--verbose", action="store_true",
+                    help="per-frame hand_dist / corridor_upper / probe details "
+                         "(printed summary + full frame_log in the report rows)")
     args = ap.parse_args()
 
     demos = args.demos if args.demos else registered_set(args.set)
@@ -155,6 +190,7 @@ def main() -> None:
     regen_cfg = replace(rcfg, regen_mode=True)
     pipe = RepairPipeline(cfg=regen_cfg)
     pipe.validator.cfg = vcfg
+    pipe.verbose = args.verbose
     validator = IndependentValidator(cfg=vcfg)
 
     out_dir = Path(args.output_dir)
@@ -177,6 +213,12 @@ def main() -> None:
                "ms_per_frame": round(wall * 1e3 / scene.shape[0], 1),
                "t_fail": res.diagnostics.get("t_fail"),
                "skip_reason": res.diagnostics.get("skip_reason")}
+        if args.verbose:
+            print(f"[{demo}] frame log ({len(pipe.frame_log)} records):")
+            print_frame_log(pipe)
+            log_path = out_dir / f"frame_log_{demo}.json"
+            log_path.write_text(json.dumps(pipe.frame_log, indent=1, default=float))
+            row["frame_log"] = str(log_path)
         keep = False
         if res.accepted and res.trajectory is not None:
             traj = res.trajectory

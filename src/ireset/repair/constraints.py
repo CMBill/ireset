@@ -181,6 +181,9 @@ class FrameEvaluator:
         d = mujoco.mj_geomDistance(self.model, self.data, ga, gb, distmax, self._fromto)
         return float(d), self._fromto.copy()
 
+    def geom_name(self, gid: int) -> str:
+        return mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, gid)
+
     def distance_jacobian(self, ga: int, gb: int, fromto: np.ndarray, dist: float) -> np.ndarray:
         """Jacobian of the signed distance wrt xi (rigid closest-point form).
 

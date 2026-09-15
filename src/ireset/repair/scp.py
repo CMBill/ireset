@@ -121,6 +121,13 @@ class FrameSolver:
         self.dt = 1.0 / cfg.fps
         self._osqp = osqp.OSQP()
         self._frame_pairs: list | None = None
+        #: diagnostics for the regeneration approach corridor (per side:
+        #: bound geom distance + active upper at the LAST linearization);
+        #: read by the pipeline's verbose frame log, not by the solver
+        self.last_corridor: dict[str, dict] = {}
+        #: geom-pair names parallel to the rows returned by the last
+        #: ``_collision_rows`` call (diagnostics)
+        self.last_row_pairs: list[str] = []
 
     # -- nonlinear evaluation ------------------------------------------------
 
@@ -314,6 +321,8 @@ class FrameSolver:
                     cands.append((ga, gb, kind))
             self._frame_pairs = cands
         rows = []
+        row_names = []
+        self.last_corridor = {}
         scored = []
         for ga, gb, kind in self._frame_pairs:
             dist, ft = ev.geom_distance(ga, gb, distmax=cfg.activation_margin_m + 0.01)
@@ -357,7 +366,8 @@ class FrameSolver:
                 upper = cfg.regen_hand_contact_gap_m if prev is None else max(
                     cfg.regen_hand_contact_gap_m,
                     prev - cfg.regen_closing_rate_mps * self.dt - margin)
-                regen_active[(best[1], best[2])] = (best[0], best[3], upper)        # regen mode keeps an interior margin above the -2 mm validator
+                regen_active[(best[1], best[2])] = (best[0], best[3], upper)
+                self.last_corridor[side] = {"dist_m": best[0], "upper_m": upper}        # regen mode keeps an interior margin above the -2 mm validator
         # floor on every band row: solutions sit on constraint boundaries
         # by construction, and boundary-sitting states would graze past
         # the gate at the transition probes' interpolated states. Probes
@@ -369,6 +379,7 @@ class FrameSolver:
         for (ga, gb), (dist, ft, upper) in regen_active.items():
             J = ev.distance_jacobian(ga, gb, ft, dist)
             rows.append((dist, J, band_lo, upper))
+            row_names.append(f"{ev.geom_name(ga)}~{ev.geom_name(gb)}:regen")
             added_regens.add((ga, gb))
         # regen rows count against the same fixed budget (99 + MAX_PAIRS):
         # the capped loop gives up that many slots so the total never
@@ -391,6 +402,8 @@ class FrameSolver:
                 rows.append((dist, J, band_lo, cfg.foot_contact_gap_m))
             else:
                 rows.append((dist, J, cfg.noncontact_clearance_m, INF))
+            row_names.append(f"{ev.geom_name(ga)}~{ev.geom_name(gb)}")
+        self.last_row_pairs = row_names
         return rows
 
     def violation(self, val: np.ndarray, l: np.ndarray, u: np.ndarray,

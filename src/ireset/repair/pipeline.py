@@ -31,7 +31,7 @@ from ireset.geometry.distance_adapter import world_to_box_geom
 from ireset.kinematics.mujoco_adapter import retract_batch
 from ireset.repair.constraints import FrameEvaluator, tangent_error
 from ireset.repair.context import EFFECTORS, ContactStateMachine, ReferenceCondition, RepairConfig
-from ireset.repair.scp import FrameContext, FrameSolver
+from ireset.repair.scp import FrameContext, FrameSolver, solver_band_margin
 from ireset.repair.validation import IndependentValidator
 
 KPT_IDX = [SMPLH_INDEX[v] for v in KPT_TO_SMPLH.values()]
@@ -90,6 +90,11 @@ class RepairPipeline:
         self.validator = IndependentValidator(spec=self.spec)
         self._surf_pts: np.ndarray | None = None
         self._ground_pts: np.ndarray | None = None
+        #: per-frame check/probe diagnostics (regeneration debugging); only
+        #: populated when ``verbose`` is set -- strictly additive, the solve
+        #: path never reads it
+        self.verbose: bool = False
+        self.frame_log: list[dict] = []
 
     # -- interaction mesh precompute -------------------------------------------
 
@@ -202,6 +207,21 @@ class RepairPipeline:
 
     # -- frame-level checks (skip logic, plan 8.4) ---------------------------------
 
+    def _hand_dists_verbose(self, z: np.ndarray, box: np.ndarray) -> dict:
+        self.ev.forward(z, box)
+        return {s: min(self.ev.geom_distance(g, self.ev.box_geom)[0]
+                       for g in self.ev._hand_geoms[s]) for s in ("l", "r")}
+
+    def _violating_rows_verbose(self, val, lo, hi, n_rows: int) -> list[dict]:
+        names = getattr(self.solver, "last_row_pairs", [])
+        out = []
+        for k in range(n_rows):
+            v, l_, h_ = val[99 + k], lo[99 + k], hi[99 + k]
+            if v < l_ - 1e-9 or v > h_ + 1e-9:
+                out.append({"pair": names[k] if k < len(names) else "?",
+                            "val_m": float(v), "lo_m": float(l_), "hi_m": float(h_)})
+        return out
+
     def frame_valid(self, z: np.ndarray, ctx: FrameContext) -> tuple[bool, str]:
         # fresh pair scan for acceptance decisions: the solver's per-frame
         # cache reflects the linearization state, not this candidate
@@ -209,7 +229,25 @@ class RepairPipeline:
         val, lo, hi, scl = self.solver.constraint_rows(
             z, ctx, trust=self.cfg.trust_radius_max, mode="accept"
         )
-        if self.solver.violation(val, lo, hi, scl) > 1e-6:
+        ep_viol = self.solver.violation(val, lo, hi, scl)
+        if self.verbose:
+            # corridor snapshot is from THIS endpoint linearization
+            # (constraint_rows -> _collision_rows refreshed it)
+            cand_d = self._hand_dists_verbose(z, ctx.box_pose)
+            prev_d = (self._hand_dists_verbose(
+                ctx.z_prev,
+                ctx.box_pose_prev if ctx.box_pose_prev is not None else ctx.box_pose)
+                if ctx.z_prev is not None else {"l": float("nan"), "r": float("nan")})
+            check = {"t": ctx.t, "kind": "check", "viol": float(ep_viol),
+                     "hand_l_prev_m": float(prev_d["l"]), "hand_l_cand_m": float(cand_d["l"]),
+                     "hand_r_prev_m": float(prev_d["r"]), "hand_r_cand_m": float(cand_d["r"]),
+                     "corridor": {s: self.solver.last_corridor.get(s)
+                                  for s in ("l", "r") if self.solver.last_corridor.get(s)},
+                     "band_margin_m": solver_band_margin(ctx, self.cfg)}
+            if ep_viol > 1e-6:
+                check["rows"] = self._violating_rows_verbose(val, lo, hi, len(self.solver._last_rows))
+            self.frame_log.append(check)
+        if ep_viol > 1e-6:
             return False, "state_constraints"
         # interpolated probes between the previous accepted scene and the
         # candidate: the final validator interpolates FULL scenes (robot +
@@ -248,8 +286,19 @@ class RepairPipeline:
                         mode="accept", band_margin_m=0.0
                     )
                     n_coll = 99 + len(self.solver._last_rows)
-                    if self.solver.violation(val_m[99:n_coll], lo_m[99:n_coll],
-                                             hi_m[99:n_coll], scl_m[99:n_coll]) > 1e-6:
+                    viol_m = self.solver.violation(val_m[99:n_coll], lo_m[99:n_coll],
+                                                   hi_m[99:n_coll], scl_m[99:n_coll])
+                    if self.verbose:
+                        mid_d = self._hand_dists_verbose(mid[0:36], mid[36:43])
+                        rec = {"t": ctx.t, "kind": "probe", "i": i, "n_sub": int(n_sub),
+                               "viol": float(viol_m),
+                               "hand_l_mid_m": float(mid_d["l"]),
+                               "hand_r_mid_m": float(mid_d["r"]),
+                               "motion_m": float(motion)}
+                        if viol_m > 1e-6:
+                            rec["rows"] = self._violating_rows_verbose(val_m, lo_m, hi_m, n_coll - 99)
+                        self.frame_log.append(rec)
+                    if viol_m > 1e-6:
                         return False, "transition_interpolated"
             finally:
                 self.solver._frame_pairs = saved_pairs
@@ -264,6 +313,8 @@ class RepairPipeline:
         """End-to-end repair; ``diagnostics["total_s"]`` covers both attempts
         plus all final validations (the timing callers must report)."""
         t0 = time.perf_counter()
+        if self.verbose:
+            self.frame_log = []
         result = self._repair_trajectory(prediction, condition)
         result.diagnostics.setdefault("total_s", round(time.perf_counter() - t0, 3))
         return result
