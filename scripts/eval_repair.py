@@ -92,10 +92,15 @@ def run(pipeline, scene, cond, save_npz: Path | None = None) -> dict:
         row.update({
             "frames": int(len(tm)),
             "ms_per_frame_mean": round(float(tm.mean() * 1e3), 1),
+            "ms_per_frame_p50": round(float(np.percentile(tm, 50) * 1e3), 1),
             "ms_per_frame_p95": round(float(np.percentile(tm, 95) * 1e3), 1),
+            "ms_per_frame_max": round(float(tm.max() * 1e3), 1),
             "skipped": int(d.get("skipped", 0)),
             "fallbacks": int(d.get("fallbacks", 0)),
+            "slack_frames": int(d.get("slack_frames", 0)),
+            "slack_fraction": round(float(d.get("slack_frames", 0)) / max(1, len(tm)), 3),
             "skip_rate": round(float(d.get("skipped", 0)) / max(1, len(tm)), 3),
+            "end_to_end_s": d.get("total_s"),
         })
     else:
         row["t_fail"] = d.get("t_fail")
@@ -314,11 +319,18 @@ def main() -> None:
     for rows in (teacher_rows, pert_rows, unreach_rows):
         for r in rows:
             r.pop("_diag", None)
-    out = Path(args.output) if args.output else OUT / "repair_eval.json"
+    from closed_loop_metrics import metadata_block
+    out = Path(args.output) if args.output else OUT / (
+        f"repair_eval_{args.validation_mode}_tol{rcfg.task_mpjpe_tol_m:.3f}.json")
     out.write_text(json.dumps(
         {"aggregate": agg, "teacher": teacher_rows, "perturbations": pert_rows,
-         "unreachable": unreach_rows}, indent=2, default=float))
+         "unreachable": unreach_rows,
+         "metadata": metadata_block(
+             args.validation_mode, rcfg.task_mpjpe_tol_m, demos or [],
+             seed=0, extra={"per_subject": args.per_subject, "frames": args.frames})},
+        indent=2, default=float))
     print(json.dumps(agg, indent=2))
+    print(f"-> {out}")
 
 
 if __name__ == "__main__":

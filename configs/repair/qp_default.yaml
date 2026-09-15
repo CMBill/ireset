@@ -76,9 +76,15 @@ relaxed_repair:                           # P0.1 L2 2026-09-13: teacher baseline
   contact_band_gap_m: 0.035               # grasp-gap census p95 0.0331 + margin
                                           # (863 grasp frames)
   hand_anchor_tol_m: 0.19                 # grasp anchor-drift census p90 0.1819.
-                                          # NON-BINDING by construction: teacher
-                                          # hands do not anchor; recorded as a
-                                          # distribution fact, not a real gate
+                                          # P0-fix F1 (2026-09-14): the entry
+                                          # speed gate is BOX-frame, so anchors
+                                          # CAN engage when a hand holds within
+                                          # enter distance quasi-statically;
+                                          # on the teacher hover distribution
+                                          # (grasp-gap p95 33mm > enter 10mm)
+                                          # intervals still rarely form -- a
+                                          # data-inherent hover fact (Path B),
+                                          # not a permanently non-binding gate
   task_mpjpe_tol_m: 0.40                  # working value; P0.2 recalibrates
 # foot_speed_mps / foot_anchor_tol_m / contact_band_pen_m / velocity limits /
 # iteration budgets unchanged: quasi-static support (L1) keeps strict gates

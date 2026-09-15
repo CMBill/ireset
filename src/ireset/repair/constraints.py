@@ -37,12 +37,14 @@ MAX_PAIRS = 48
 N_HAND_ROWS = 18   # 2 hands x 3 sites x 3 axes
 N_FOOT_ROWS = 30   # 2 feet x 5 sites x 3 axes
 N_FOOT_SPEED = 30
+N_HAND_SPEED = 18  # 2 hands x 3 sites x 3 axes (regen box-frame speed rows)
 N_FIXED = 29 + 29 + 3 + 3 + 35
 COLLISION_OFF = N_FIXED                       # 99
 HAND_OFF = COLLISION_OFF + MAX_PAIRS          # 147
 FOOT_OFF = HAND_OFF + N_HAND_ROWS             # 165
 FOOT_SPEED_OFF = FOOT_OFF + N_FOOT_ROWS       # 195
-N_ROWS = FOOT_SPEED_OFF + N_FOOT_SPEED        # 225
+HAND_SPEED_OFF = FOOT_SPEED_OFF + N_FOOT_SPEED  # 225
+N_ROWS = HAND_SPEED_OFF + N_HAND_SPEED        # 243
 
 KPT_NAMES = list(KPT_TO_SMPLH)
 

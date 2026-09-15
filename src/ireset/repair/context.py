@@ -93,6 +93,49 @@ class RepairConfig:
     suffix_retry_window: int = 5
     suffix_retries: int = 1
     fps: float = 30.0
+    # teacher regeneration mode (Path B, p0 plan section 7): during
+    # reference grasp intervals the hand-box pair carries an ACTIVE upper
+    # bound regardless of current distance -- the hovering teacher warm
+    # start gets pulled onto the box surface (per-pair geometric bands
+    # alone never engage at 15-33mm). Hand anchors are then governed by
+    # the reference schedule alone: the prediction-driven release would
+    # fire every frame (the warm start itself hovers). Feet keep the
+    # standard semantics (P0-fix strict 6/6 shows they already hold).
+    regen_mode: bool = False
+    regen_hand_contact_gap_m: float = 0.008   # < hand_enter 0.01 so the validator certifies
+    # approach corridor: the active bound closes by at least this rate per
+    # frame from the previous ACCEPTED distance -- a hard gap from interval
+    # start is single-frame infeasible (4-5 cm of Cartesian hand motion),
+    # and an unbounded reach trips the transition check
+    regen_closing_rate_mps: float = 0.15
+    # offline regeneration runs quality-critical solves: the default merit
+    # penalty (mu ~12) lets the tracking objective outrank sub-mm violation
+    # reductions and the convergence tail stalls above the 1e-6 feasibility
+    # threshold; regeneration multiplies mu (standard mode unchanged)
+    regen_merit_multiplier: float = 30.0
+    # dedicated hand-keypoint tracking objective (regen only): the robot
+    # hand-site centroid chases the REFERENCE HUMAN hand centroid, which
+    # is quasi-static in the box frame during grasp. The mesh term cannot
+    # take this role -- raising its weight to hold the hands breaks the
+    # quasi-static foot model (it also tracks the human's foot slides)
+    # interpolation-dip margin coefficient for solver band rows
+    # (margin = min(6mm, max(0.5mm, coef * frame_motion^2)))
+    dip_margin_coef: float = 0.3
+    regen_hand_track_weight: float = 25.0
+    regen_hand_track_scale_m: float = 0.02
+    # hard box-frame speed rows for in-band hands: DISABLED (0.0) after
+    # a negative result -- any bound tight enough to kill the per-frame
+    # QP chatter (~1 mm/frame) also forbids following the reference's own
+    # grip adjustments (p90 15 mm/frame), and distance-gated activation
+    # flaps at its threshold; certification stays the validator's job
+    regen_hand_speed_mps: float = 0.0
+    # regeneration does NOT lock hand point anchors: a +-10mm box-frame
+    # anchor under box rotation is repeatedly tipped out by the
+    # hover-tracking objective (marginal 0.1-1mm infeasibilities). Contact
+    # is maintained by the hard gap row every frame; box-frame pose
+    # stability comes from keypoint tracking (the reference hand is
+    # quasi-static on the box during grasp) and is JUDGED by the strict
+    # validator's anchor-drift gate at screening time.
 
 
 #: effectors tracked by the state machine

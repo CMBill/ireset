@@ -16,14 +16,13 @@ rejected ones carry diagnostics only (never an exportable trajectory).
 
 from __future__ import annotations
 
-import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 import trimesh
 
-from ireset.embodied.contact_sites import SMPLH_INDEX, infer_reference_schedule
+from ireset.embodied.contact_sites import HAND_TIP_JOINTS, SMPLH_INDEX, infer_reference_schedule
 from ireset.embodied.g1_spec import G1Spec, KPT_TO_SMPLH
 from ireset.geometry.collision_pairs import build_collision_pairs
 from ireset.geometry.distance_adapter import largebox_hull
@@ -31,13 +30,45 @@ from ireset.imesh.delaunay import build_frame_mesh, laplacian_coordinates
 from ireset.geometry.distance_adapter import world_to_box_geom
 from ireset.kinematics.mujoco_adapter import retract_batch
 from ireset.repair.constraints import FrameEvaluator, tangent_error
-from ireset.repair.context import ContactStateMachine, ReferenceCondition, RepairConfig
+from ireset.repair.context import EFFECTORS, ContactStateMachine, ReferenceCondition, RepairConfig
 from ireset.repair.scp import FrameContext, FrameSolver
 from ireset.repair.validation import IndependentValidator
 
 KPT_IDX = [SMPLH_INDEX[v] for v in KPT_TO_SMPLH.values()]
 N_SURF = 12   # object surface samples for the interaction mesh
 N_GROUND = 8  # world-fixed ground points
+
+
+def _surface_target(p: np.ndarray, box_pose: np.ndarray,
+                    clearance: float = 0.008, max_scale: float = 3.0) -> np.ndarray:
+    """Hand-tracking target projected to just OUTSIDE the box hull.
+
+    The wrist+fingertip centroid of a grasping hand sits a couple of cm
+    INSIDE the surface; tracking it directly presses the robot hand geoms
+    against the -2 mm penetration floor. Bisection along (box_pos -> p)
+    finds the first point with the requested hull clearance (8 mm: site
+    centroid at 8 mm leaves the collision spheres a few mm of margin --
+    5 mm grazed the floor through the sphere radii).
+    """
+    from ireset.geometry.distance_adapter import largebox_hull_surface_distance
+
+    sdf = float(largebox_hull_surface_distance(p[None], box_pose[None])[0])
+    if sdf >= clearance:
+        return p
+    d = p - box_pose[0:3]
+    n = float(np.linalg.norm(d))
+    if n < 1e-6:
+        return p
+    d = d / n
+    lo, hi = 0.0, max_scale
+    for _ in range(24):
+        mid = 0.5 * (lo + hi)
+        q = box_pose[0:3] + mid * d * n
+        if float(largebox_hull_surface_distance(q[None], box_pose[None])[0]) >= clearance:
+            hi = mid
+        else:
+            lo = mid
+    return box_pose[0:3] + hi * d * n
 
 
 @dataclass
@@ -105,6 +136,10 @@ class RepairPipeline:
         out = {"hand": {}, "foot": {}}
         self.ev.forward(z, box)
         for side, name in (("l", "left_hand"), ("r", "right_hand")):
+            # regen mode: no hand anchors at all (contact via the hard gap
+            # row; drift judged by the validator at screening)
+            if self.cfg.regen_mode:
+                continue
             if contacts.holding[name] or not contacts.reference_wants_hold(name, t):
                 continue
             dist = min(self.ev.geom_distance(g, self.ev.box_geom)[0] for g in self.ev._hand_geoms[side])
@@ -133,6 +168,20 @@ class RepairPipeline:
         for side, name in (("l", "left_foot"), ("r", "right_foot")):
             foot_anchor[side] = contacts.anchors[name] if contacts.holding[name] else None
         L, delta, fixed = self._frame_mesh(condition, t)
+        # Path B approach corridor input + hand-tracking target
+        prev_hand_dist = {}
+        ref_hand_kpts = {}
+        if self.cfg.regen_mode:
+            z_ref = z_prev if z_prev is not None else prediction[t, 0:36]
+            self.ev.forward(z_ref, prediction[t, 36:43])
+            pose = prediction[t, 36:43]
+            for side in ("l", "r"):
+                prev_hand_dist[side] = min(
+                    self.ev.geom_distance(g, self.ev.box_geom)[0]
+                    for g in self.ev._hand_geoms[side])
+                ids = [SMPLH_INDEX[n] for n in HAND_TIP_JOINTS["left" if side == "l" else "right"]]
+                p = condition.human_kpts_world[t][ids].mean(0)
+                ref_hand_kpts[side] = _surface_target(p, pose)
         return FrameContext(
             t=t, box_pose=prediction[t, 36:43].copy(),
             z_pred=prediction[t, 0:36].copy(), z_prev=z_prev,
@@ -140,6 +189,15 @@ class RepairPipeline:
             mesh_L=L, delta_ref=delta, mesh_fixed=fixed,
             hand_anchor=hand_anchor, foot_anchor=foot_anchor,
             prev_hand_local=prev_local, prev_sole_world=prev_sole,
+            box_pose_prev=prediction[t - 1, 36:43].copy() if t > 0 else None,
+            ref_hold={name: contacts.reference_wants_hold(name, t) for name in EFFECTORS},
+            prev_hand_dist=prev_hand_dist,
+            ref_hand_kpts=ref_hand_kpts,
+            frame_motion_m=(
+                self.validator._frame_motion_m(
+                    np.r_[z_prev, prediction[t - 1, 36:43]],
+                    np.r_[prediction[t, 0:36], prediction[t, 36:43]])
+                if z_prev is not None else 0.0),
         )
 
     # -- frame-level checks (skip logic, plan 8.4) ---------------------------------
@@ -153,17 +211,21 @@ class RepairPipeline:
         )
         if self.solver.violation(val, lo, hi, scl) > 1e-6:
             return False, "state_constraints"
-        # interpolated midpoint against the previous accepted state: the
-        # final validator checks interpolated states, so the sequential loop
-        # must not accept corner-cutting transitions (plan 6.3). The probe
-        # points mirror the validator's ADAPTIVE subdivision exactly (motion
-        # under max_substep_motion_m gets no interpolated probes) -- the
-        # previous unconditional thirds were strictly stronger than the
-        # independent final check and rejected states it would accept
-        if ctx.z_prev is not None:
+        # interpolated probes between the previous accepted scene and the
+        # candidate: the final validator interpolates FULL scenes (robot +
+        # box), so the sequential loop must pre-check the same transitions
+        # -- a box sweeping through the robot between keyframes, and the
+        # previous robot state against the previous (not current) box pose
+        # (P0-fix F2, 2026-09-14). Probe count mirrors the validator's
+        # ADAPTIVE subdivision via its own motion metric and respects its
+        # check_interpolated_states flag. Interior probes check only the
+        # collision-family rows against the INTERPOLATED box pose: velocity
+        # and anchor rows are defined between accepted frames over the full
+        # dt, not at interior samples (same scope as the validator's probes)
+        if ctx.z_prev is not None and self.validator.cfg.check_interpolated_states:
             scene_a = np.zeros(43)
             scene_a[0:36] = ctx.z_prev
-            scene_a[36:43] = ctx.box_pose
+            scene_a[36:43] = ctx.box_pose_prev if ctx.box_pose_prev is not None else ctx.box_pose
             scene_b = np.zeros(43)
             scene_b[0:36] = z
             scene_b[36:43] = ctx.box_pose
@@ -171,13 +233,26 @@ class RepairPipeline:
             motion = self.validator._frame_motion_m(scene_a, scene_b)
             n_sub = int(np.clip(np.ceil(motion / vcfg.max_substep_motion_m),
                                 1, vcfg.max_subdivisions + 1))
-            for i in range(1, n_sub):
-                mid = self.validator._interpolate(scene_a, scene_b, i / n_sub)
-                val_m, lo_m, hi_m, scl_m = self.solver.constraint_rows(
-                    mid[0:36], ctx, trust=self.cfg.trust_radius_max, mode="accept"
-                )
-                if self.solver.violation(val_m, lo_m, hi_m, scl_m) > 1e-6:
-                    return False, "transition_interpolated"
+            saved_pairs = self.solver._frame_pairs
+            try:
+                for i in range(1, n_sub):
+                    mid = self.validator._interpolate(scene_a, scene_b, i / n_sub)
+                    ctx_mid = replace(ctx, box_pose=mid[36:43].copy())
+                    # rescan per probe: the endpoint candidate set cannot see
+                    # pairs that come into range only at interior states;
+                    # probes judge at the VALIDATOR floor (band_margin 0) --
+                    # they approximate the final gate, which is the arbiter
+                    self.solver._frame_pairs = None
+                    val_m, lo_m, hi_m, scl_m = self.solver.constraint_rows(
+                        mid[0:36], ctx_mid, trust=self.cfg.trust_radius_max,
+                        mode="accept", band_margin_m=0.0
+                    )
+                    n_coll = 99 + len(self.solver._last_rows)
+                    if self.solver.violation(val_m[99:n_coll], lo_m[99:n_coll],
+                                             hi_m[99:n_coll], scl_m[99:n_coll]) > 1e-6:
+                        return False, "transition_interpolated"
+            finally:
+                self.solver._frame_pairs = saved_pairs
         res = self.solver.evaluate(z, ctx)
         if res["mpjpe"] > self.cfg.task_mpjpe_tol_m:
             return False, "task_quality"
@@ -186,6 +261,14 @@ class RepairPipeline:
     # -- public API ------------------------------------------------------------------
 
     def repair_trajectory(self, prediction: np.ndarray, condition: ReferenceCondition) -> TrajectoryResult:
+        """End-to-end repair; ``diagnostics["total_s"]`` covers both attempts
+        plus all final validations (the timing callers must report)."""
+        t0 = time.perf_counter()
+        result = self._repair_trajectory(prediction, condition)
+        result.diagnostics.setdefault("total_s", round(time.perf_counter() - t0, 3))
+        return result
+
+    def _repair_trajectory(self, prediction: np.ndarray, condition: ReferenceCondition) -> TrajectoryResult:
         prediction = np.asarray(prediction, dtype=float)
         if prediction.ndim != 2 or prediction.shape[1] != 43:
             return TrajectoryResult(False, "rejected_shape")
@@ -209,15 +292,22 @@ class RepairPipeline:
             return result
 
         # suffix rollback: keep the validated prefix (states + anchors) by
-        # replaying it as the prediction, re-solve only the suffix
+        # replaying it as the prediction, re-solve only the suffix. The
+        # retry start comes from the STRUCTURED first-failure frames (min
+        # over failed checks); an unlocated failure retries the FULL
+        # segment -- retrying only the tail would silently keep whatever
+        # the missing location hides (P0-fix F3, 2026-09-14)
         f_frame = self._first_failure_frame(final)
-        start = max(0, (f_frame if f_frame is not None else prediction.shape[0] - 1)
-                    - self.cfg.suffix_retry_window)
+        start = 0 if f_frame is None else max(0, f_frame - self.cfg.suffix_retry_window)
         retry_pred = np.vstack([result.trajectory[:start], prediction[start:]])
         retry = self._run_sequential(retry_pred, condition)
         retry.diagnostics["first_attempt_final"] = f"{final.summary()} @t={f_frame}"
         retry.diagnostics["first_failure_frame"] = f_frame
         retry.diagnostics["suffix_retry_from"] = start
+        retry.diagnostics["failed_checks"] = {
+            k: {"location": v.location, "first_failure_frame": v.first_failure_frame}
+            for k, v in final.checks.items() if not v.passed
+        }
         if not retry.accepted:
             retry.diagnostics["first_attempt"] = {
                 k: v for k, v in result.diagnostics.items() if k != "trajectory"
@@ -231,6 +321,10 @@ class RepairPipeline:
                 for k, v in final2.checks.items()
             }
             return retry
+        retry.diagnostics["final_retry_failed_checks"] = {
+            k: {"location": v.location, "first_failure_frame": v.first_failure_frame}
+            for k, v in final2.checks.items() if not v.passed
+        }
         return TrajectoryResult(False, "rejected_final", diagnostics={
             **retry.diagnostics, "final_retry": final2.summary(),
         })
@@ -246,6 +340,7 @@ class RepairPipeline:
         frame_status: list[str] = []
         iterations: list[int] = []
         timings: list[float] = []
+        slack_flags: list[bool] = []
         fallbacks = 0
 
         for t in range(T):
@@ -270,13 +365,17 @@ class RepairPipeline:
                 # symmetric L1 completion for hands: an anchor the *prediction*
                 # no longer honors (hand drifted beyond the anchor tolerance
                 # in box frame) degrades to unanchored -- band classification
-                # itself stays anchor-driven
-                for side, name in (("l", "left_hand"), ("r", "right_hand")):
-                    anchor = contacts.anchors[name]
-                    if contacts.holding[name] and anchor is not None:
-                        hl = self.ev.hand_local(side)
-                        if float(np.linalg.norm(hl - anchor, axis=-1).max()) > self.cfg.hand_anchor_tol_m:
-                            contacts.release(name)
+                # itself stays anchor-driven. Regeneration mode (Path B)
+                # bypasses this: the hovering warm start would release every
+                # anchor it just pulled in; hand anchors there follow the
+                # reference schedule alone (released at interval end)
+                if not self.cfg.regen_mode:
+                    for side, name in (("l", "left_hand"), ("r", "right_hand")):
+                        anchor = contacts.anchors[name]
+                        if contacts.holding[name] and anchor is not None:
+                            hl = self.ev.hand_local(side)
+                            if float(np.linalg.norm(hl - anchor, axis=-1).max()) > self.cfg.hand_anchor_tol_m:
+                                contacts.release(name)
             ctx = self._frame_ctx(t, prediction, condition, contacts, prev_local, prev_sole, z_prev)
 
             ok, why = self.frame_valid(z_pred, ctx)
@@ -284,6 +383,7 @@ class RepairPipeline:
                 z = z_pred
                 frame_status.append("skipped")
                 iterations.append(0)
+                slack_flags.append(False)
             else:
                 res = self.solver.solve_frame(z_pred, ctx)
                 path = "repaired" if not res.slack_used else "repaired_slack"
@@ -313,11 +413,17 @@ class RepairPipeline:
                         "accepted_frames": len(accepted), "frame_status": frame_status,
                         "iterations": iterations, "timings_s": timings,
                         "fallbacks": fallbacks,
+                        "slack_frames": int(sum(slack_flags)),
                         "skipped": sum(1 for st in frame_status if st == "skipped"),
                     })
                 z = res.z
                 frame_status.append(path)
                 iterations.append(res.iterations)
+                # slack is an independent fact from the chosen solve branch:
+                # multi-start/repaired_prev and backtrack paths overwrite the
+                # path NAME, but the flag travels with the result object
+                # (P0-fix F4, 2026-09-14)
+                slack_flags.append(bool(res.slack_used))
 
             # commit contact transitions from the accepted state only:
             # anchors lock from the geometry that just passed all checks
@@ -338,6 +444,7 @@ class RepairPipeline:
         return TrajectoryResult(True, "accepted", trajectory=trajectory, diagnostics={
             "frame_status": frame_status, "iterations": iterations,
             "timings_s": timings, "fallbacks": fallbacks,
+            "slack_frames": int(sum(slack_flags)),
             "skipped": sum(1 for s in frame_status if s == "skipped"),
         })
 
@@ -371,8 +478,14 @@ class RepairPipeline:
         return res, None
 
     def _first_failure_frame(self, report) -> int | None:
-        for chk in report.checks.values():
-            m = re.search(r"t=(\d+)", chk.location)
-            if not chk.passed and m:
-                return int(m.group(1))
-        return None
+        """Earliest structured failure frame across FAILED checks (P0-fix F3).
+
+        Passing checks never contribute. A failing check without a
+        structured frame leaves the result None, and the caller falls back
+        to a FULL-segment retry -- retrying only the tail would silently
+        keep whatever violation the missing location hides. Check-dict
+        insertion order must not influence the answer.
+        """
+        frames = [c.first_failure_frame for c in report.checks.values()
+                  if not c.passed and c.first_failure_frame is not None]
+        return min(frames) if frames else None

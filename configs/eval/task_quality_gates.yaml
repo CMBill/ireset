@@ -1,12 +1,19 @@
 task_quality_gates:
-  mpjpe_tol_m: 0.101
+  mpjpe_tol_m: 0.113
   calibration:
-    date: '2026-09-13'
-    n_segments: 17
-    n_frames: 1999
-    repair_mpjpe_p50: 0.0656
-    repair_mpjpe_p90: 0.0766
-    repair_mpjpe_p95: 0.0807
+    date: '2026-09-14'
+    n_segments: 22
+    n_frames: 2599
+    repair_mpjpe_p50: 0.0662
+    repair_mpjpe_p90: 0.0809
+    repair_mpjpe_p95: 0.0927
     margin_m: 0.02
-    bias: calibrated on relaxed-mode ACCEPTED teacher segments -- selection bias toward
-      repairable clips; values underestimate the full-distribution tail
+    bias: calibrated on relaxed-mode ACCEPTED teacher segments (registered p02_calibration
+      24-set, gate 0.40, post P0-fix F1-F4 semantics) -- selection bias toward repairable
+      clips; values underestimate the full-distribution tail
+  superseded:
+    mpjpe_tol_m: 0.101
+    reason: P0-fix changed the accepted set (17 -> 22 of the same registered 24) so
+      the old calibration no longer transfers; retained as the fixed control variant
+      in P0-fix closed-loop runs
+    calibrated: 2026-09-13, 17 segments / 1999 frames, p95 0.0807 + 0.02

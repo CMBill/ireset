@@ -61,6 +61,10 @@ class ContactInterval:
 @dataclass
 class ContactSchedule:
     intervals: list[ContactInterval] = field(default_factory=list)
+    #: inference provenance (e.g. hand interval/frame counts from the
+    #: validator's robot-side inference) -- makes "zero grasp intervals
+    #: inferred" distinguishable from "grasp checks passed" in reports
+    stats: dict = field(default_factory=dict)
 
     def mask(self, effector: str, T: int) -> np.ndarray:
         m = np.zeros(T, dtype=bool)

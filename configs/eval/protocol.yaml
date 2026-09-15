@@ -12,8 +12,17 @@ validation:
   base_lin_velocity_limit_mps: 1.8     # teacher max 1.64 + margin
   base_ang_velocity_limit_radps: 7.0   # teacher max 6.26 + margin
   hand_gap_m: 0.01
-  hand_anchor_error_m: 0.01
-  hand_relative_speed_mps: 0.02
+  # hand gates recalibrated 2026-09-15 from the REFERENCE human (6-seg
+  # diagnosis set, 891 grasp frames / 11 intervals): box-frame hand speed
+  # p50 0.042 / p95 0.758 m/s (transient grip adjustments), within-interval
+  # anchor drift p90 18.4mm. Old values (superseded, were inherited by
+  # symmetry from the FOOT model and exclude the reference human itself):
+  #   hand_anchor_error_m  0.01 -> 0.02 (reference p90 0.0184 + margin)
+  #   hand_relative_speed_mps 0.02 -> 0.8 (anti-flail; drift certifies)
+  #   hand_entry_speed_mps 0.02 -> 0.05 (~55% of reference frames qualify)
+  # foot gates unchanged (calibrated from real data in M1)
+  hand_anchor_error_m: 0.02
+  hand_relative_speed_mps: 0.8
   foot_speed_mps: 0.02
   foot_anchor_drift_m: 0.01
   foot_ground_gap_m: 0.005
@@ -27,7 +36,7 @@ contact_inference:
   hand_exit_m: 0.03                   # supersedes 0.06
   foot_enter_m: 0.005                 # supersedes 0.012 (exceeded gap; center-z bug)
   foot_exit_m: 0.02                   # supersedes 0.03
-  hand_entry_speed_mps: 0.02          # P0.1 L1: speed-gated interval entry,
+  hand_entry_speed_mps: 0.05          # P0.1 L1: speed-gated interval entry,
                                       # entry gate <= the check gate it feeds
   foot_entry_speed_mps: 0.02          # P0.1 L1: 0.3 -> 0.02 (== foot_speed_mps);
                                       # sliding grounded stretches are transition,
@@ -57,9 +66,15 @@ relaxed_validation:                    # P0.1 L2 2026-09-13: teacher baseline
   hand_gap_m: 0.035                    # pairs contact_band_gap_m (grasp-gap
                                        # census p95 0.0331 + margin)
   hand_anchor_error_m: 0.20            # pairs hand_anchor_tol_m 0.19 (grasp
-                                       # anchor-drift census p90 0.1819):
-                                       # NON-BINDING, teacher hands do not anchor
-  hand_relative_speed_mps: 0.15        # grasp drift-rate cover; NON-BINDING
+                                       # anchor-drift census p90 0.1819).
+                                       # P0-fix F1: BOX-frame entry gate makes
+                                       # hand checks live when a hand holds
+                                       # within enter distance; on teacher data
+                                       # the hover distribution (gap p95 33mm >
+                                       # enter 10mm) keeps them rarely exercised
+  hand_relative_speed_mps: 0.8         # reference-recalibrated 2026-09-15 (was
+                                       # 0.15, census-based; would be TIGHTER than
+                                       # strict's 0.8 after recalibration)
 # foot_speed_mps / foot_anchor_drift_m / penetration / joint+base limits stay
 # strict: quasi-static support (P0.1 L1 semantics) keeps the 10.1 foot gates
 

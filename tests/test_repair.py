@@ -159,7 +159,12 @@ def test_suffix_rollback_recovers_from_tail_corruption(pipeline) -> None:
     scene = standing_scene(12)
     cond = self_condition(pipeline, scene)
     pert = scene.copy()
-    pert[10:, 7:36] += 0.12  # tail noise that first-pass repair must handle
+    # two-frame ramp (not a single-frame cliff): with the honest slack
+    # relaxation a uniform 0.12 jump in one frame creates interpolation
+    # dips no fixed band margin can shield; ramped corruption keeps the
+    # test's intent (tail re-solve) inside physically repairable steps
+    pert[10:, 7:36] += 0.06
+    pert[11:, 7:36] += 0.06
     res = pipeline.repair_trajectory(pert, cond)
     assert res.accepted, res.diagnostics.get("reason")
 
@@ -322,3 +327,306 @@ def test_root_velocity_rows_are_norm_not_per_component(pipeline) -> None:
     pipeline.ev.forward(z2, ctx2.box_pose)
     val2, lo2, hi2, scl2 = pipeline.solver.constraint_rows(z2, ctx2, trust=1.0, mode="accept")
     assert pipeline.solver.violation(val2, lo2, hi2, scl2) == 0.0
+
+
+# --- P0-fix F2/F3 (p0_fix_plan sections 3-4) ------------------------------------
+
+
+def _transition_ctx(pipeline, z, z_prev, box, box_prev, ref_kpts):
+    from ireset.repair.scp import FrameContext
+
+    return FrameContext(t=1, box_pose=box, z_pred=z, z_prev=z_prev,
+                        ref_kpts_world=ref_kpts, mesh_L=None, delta_ref=None,
+                        mesh_fixed=None, hand_anchor={}, foot_anchor={},
+                        prev_hand_local={}, prev_sole_world={}, box_pose_prev=box_prev)
+
+
+def _self_ref_kpts(pipeline, z, box) -> np.ndarray:
+    import mujoco
+
+    ids = [mujoco.mj_name2id(pipeline.ev.model, mujoco.mjtObj.mjOBJ_SITE, n)
+                           for n in KPT_TO_SMPLH]
+    pipeline.ev.forward(z, box)
+    return pipeline.ev.site_positions(ids)
+
+
+def test_transition_check_catches_box_sweep(pipeline) -> None:
+    """Box translating THROUGH the robot between two clean keyframes: both
+    endpoints are collision-free, the swept midpoint is not -- the
+    sequential pre-check must reject it (F2: probes interpolate the box,
+    not freeze it at the current pose)."""
+    z = standing_scene(1)[0, 0:36].copy()
+    ref = _self_ref_kpts(pipeline, z, BOX_FAR)
+    v = pipeline.validator.cfg
+    reach = 0.22132 + max(0.05, v.max_substep_motion_m)   # box half-x + margin
+    box_prev = np.array([-reach - 0.35, 0.0, 0.80, 1.0, 0, 0, 0])
+    box_cur = np.array([+reach + 0.35, 0.0, 0.80, 1.0, 0, 0, 0])
+    ctx = _transition_ctx(pipeline, z, z, box_cur, box_prev, ref)
+    ok, why = pipeline.frame_valid(z, ctx)
+    assert not ok and why == "transition_interpolated", (ok, why)
+
+
+def test_transition_check_catches_box_rotation_sweep(pipeline) -> None:
+    """Box pitching 180 deg in place beside the legs: both endpoint
+    orientations are ~8 mm clear, the 120-deg interior probe penetrates
+    33 mm. Requires the motion metric to see the box CORNER sweep (0.73 m
+    for this motion) -- a center-only metric sees ~0 motion and would run
+    no probes at all (F2: 旋转运动量须生效). Placement verified numerically
+    against the real collision model."""
+    z = standing_scene(1)[0, 0:36].copy()
+    ref = _self_ref_kpts(pipeline, z, BOX_FAR)
+    c = np.array([0.30, 0.0, 0.12])
+    q0 = np.array([1.0, 0, 0, 0])
+    q180 = np.array([0.0, 0, 1.0, 0])       # pitch +180 deg (w-first)
+    ctx = _transition_ctx(pipeline, z, z, np.r_[c, q180], np.r_[c, q0], ref)
+    ok, why = pipeline.frame_valid(z, ctx)
+    assert not ok and why == "transition_interpolated", (ok, why)
+
+
+def test_transition_check_common_motion_no_false_positive(pipeline) -> None:
+    """Robot and box translating together: the relative configuration is
+    constant at every interpolation point -- mixing the previous robot with
+    interpolated box poses must not fabricate a collision (F2). Step
+    0.055 m > max_substep so an interior probe actually runs."""
+    scene = standing_scene(2)
+    z_prev, z = scene[0, 0:36].copy(), scene[1, 0:36].copy()
+    z[0] += 0.055                          # within the 1.8 m/s norm budget
+    dx = np.array([0.055, 0.0, 0.0])
+    box_prev, box_cur = BOX_FAR.copy(), BOX_FAR + np.r_[dx, np.zeros(4)]
+    ref = _self_ref_kpts(pipeline, z, box_cur)
+    ctx = _transition_ctx(pipeline, z, z_prev, box_cur, box_prev, ref)
+    ok, why = pipeline.frame_valid(z, ctx)
+    assert ok and why == "ok", (ok, why)
+
+
+def test_first_failure_frame_is_min_over_failed_checks(pipeline) -> None:
+    """F3: retry targeting takes the MINIMUM structured frame across failed
+    checks regardless of check-dict insertion order; passing checks and
+    unlocated failures never contribute a frame."""
+    from ireset.repair.validation import CheckResult, ValidationReport
+
+    def report(order):
+        checks = {k: v for k, v in order}
+        return ValidationReport(passed=False, checks=checks)
+
+    late_first = [("penetration", CheckResult(False, 3.0, 2.0, "t=40",
+                                              first_failure_frame=40)),
+                  ("foot_support", CheckResult(False, 2.0, 1.0, "t=5",
+                                               first_failure_frame=5))]
+    early_first = list(reversed(late_first))
+    a = pipeline._first_failure_frame(report(late_first))
+    b = pipeline._first_failure_frame(report(early_first))
+    assert a == b == 5
+    with_pass = report(late_first + [("joint_limits",
+                                      CheckResult(True, 0.0, 1e-5, "", first_failure_frame=2))])
+    assert pipeline._first_failure_frame(with_pass) == 5
+    unlocated = report([("mystery", CheckResult(False, 2.0, 1.0, "somewhere"))])
+    assert pipeline._first_failure_frame(unlocated) is None
+
+
+def test_unlocated_final_failure_retries_full_segment(pipeline, monkeypatch) -> None:
+    """F3: a failing final check WITHOUT a structured frame must trigger a
+    FULL-segment retry (start=0); a located failure retries from
+    frame - window."""
+    from ireset.repair.validation import CheckResult, ValidationReport
+
+    scene = standing_scene(8)
+    cond = self_condition(pipeline, scene)
+    window = pipeline.cfg.suffix_retry_window
+
+    def fake_report(fff):
+        return ValidationReport(passed=False, checks={
+            "mystery": CheckResult(False, 2.0, 1.0, "somewhere",
+                                   first_failure_frame=fff)})
+
+    monkeypatch.setattr(pipeline.validator, "validate",
+                        lambda *a, **k: fake_report(None))
+    res = pipeline.repair_trajectory(scene, cond)
+    assert res.status == "rejected_final"
+    assert res.diagnostics["suffix_retry_from"] == 0
+
+    monkeypatch.setattr(pipeline.validator, "validate",
+                        lambda *a, **k: fake_report(9))
+    res = pipeline.repair_trajectory(scene, cond)
+    assert res.status == "rejected_final"
+    assert res.diagnostics["suffix_retry_from"] == max(0, 9 - window)
+    assert res.diagnostics["failed_checks"]["mystery"]["first_failure_frame"] == 9
+
+
+def test_slack_flag_recorded_independent_of_path_name(pipeline, monkeypatch) -> None:
+    """F4.7: slack usage is a fact about the CHOSEN solve result. When the
+    multi-start restart (path name 'repaired_prev') succeeds with slack,
+    diagnostics must count it -- the path name alone loses the flag."""
+    from ireset.repair.scp import FrameResult
+
+    scene = standing_scene(3)
+    pert = scene.copy()
+    pert[1:, 0] += 0.30                    # 0.3 m jump from frame 1 on: rows fail
+    cond = self_condition(pipeline, scene)
+    calls = {"n": 0}
+
+    def fake_solve(z0, ctx, force_slack=False):
+        calls["n"] += 1
+        if calls["n"] % 2 == 1:            # direct start from z_pred: fail
+            return FrameResult(False, z0.copy(), status="infeasible")
+        # restart from z_prev: accepted, solved WITH slack
+        z_ok = ctx.z_prev.copy() if ctx.z_prev is not None else z0.copy()
+        return FrameResult(True, z_ok, slack_used=True)
+
+    monkeypatch.setattr(pipeline.solver, "solve_frame", fake_solve)
+    res = pipeline.repair_trajectory(pert, cond)
+    assert res.accepted, res.diagnostics.get("reason")
+    fs = res.diagnostics["frame_status"]
+    assert fs.count("repaired_prev") == 2 and "repaired_slack" not in fs
+    assert res.diagnostics["slack_frames"] == 2
+
+
+# --- teacher regeneration mode (Path B) ------------------------------------------
+
+
+def test_slack_qp_bounds_slack_variables_nonnegative(pipeline) -> None:
+    """The slack restoration QP must carry EXPLICIT s >= 0 rows: without
+    them the +penalty linear term drives s negative (over-tightening) and
+    the solver takes destructive steps on near-infeasible systems (found
+    via the Path B corridor; slack sum measured -51)."""
+    import scipy.sparse as spa
+
+    from ireset.repair.scp import FrameContext, N_TANGENT
+
+    scene = standing_scene(1)
+    z = scene[0, 0:36].copy()
+    ctx = FrameContext(t=0, box_pose=BOX_FAR, z_pred=z, z_prev=None,
+                       ref_kpts_world=np.zeros((15, 3)), mesh_L=None, delta_ref=None,
+                       mesh_fixed=None, hand_anchor={}, foot_anchor={},
+                       prev_hand_local={}, prev_sole_world={})
+    pipeline.ev.forward(z, ctx.box_pose)
+    pipeline.solver._frame_pairs = None
+    (P, q, A, lo, hi), n_s = pipeline.solver.build_qp(z, ctx, trust=1.0, slack=True)
+    A = np.asarray(A.todense())
+    n_r = A.shape[0] - 2 * n_s
+    assert n_s > 0
+    # the last block must be identity rows on the slack columns with lo=0
+    S = A[n_r + n_s:, N_TANGENT:]
+    assert S.shape == (n_s, n_s)
+    assert np.allclose(S, np.eye(n_s))
+    assert np.allclose(lo[n_r + n_s:], 0.0) and np.all(np.isfinite(hi[n_r + n_s:]))
+    # and solving with the assembly returns nonnegative slacks
+    x, status = pipeline.solver.solve_qp(P, q, spa.csc_matrix(A), lo, hi)
+    if x is not None:
+        assert x[N_TANGENT:].min() >= -1e-6, x[N_TANGENT:].min()
+
+
+def test_regen_active_hand_rows_ignore_geometric_band(pipeline) -> None:
+    """Path B: during a reference grasp interval the CLOSEST hand geom's
+    box pair carries the ACTIVE upper bound even when it hovers far beyond
+    the geometric band (contact := nearest surface touches; the other hand
+    geoms keep standard classification). Outside the interval, per-pair
+    semantics everywhere."""
+    from dataclasses import replace as _replace
+
+    from ireset.repair.scp import FrameContext
+
+    def ctx(ref_hold, **kw):
+        base = dict(t=0, box_pose=BOX_FAR, z_pred=np.zeros(36), z_prev=None,
+                    ref_kpts_world=np.zeros((15, 3)), mesh_L=None, delta_ref=None,
+                    mesh_fixed=None, hand_anchor={}, foot_anchor={},
+                    prev_hand_local={}, prev_sole_world={},
+                    box_pose_prev=None, ref_hold=ref_hold)
+        base.update(kw)
+        return FrameContext(**base)
+
+    real = pipeline.ev.geom_distance
+    box_pairs = {(ga, gb) for ga, gb, kind in pipeline.ev.pairs if kind == "robot_box"}
+    hand_geoms = set(pipeline.ev._hand_geoms["l"]) | set(pipeline.ev._hand_geoms["r"])
+    closest = pipeline.ev._hand_geoms["l"][0]
+
+    def fake(ga, gb, distmax=1.0):
+        # the closest left-hand geom hovers at 2.8 cm (outside the band,
+        # inside the activation margin); other hand geoms at 3.3 cm; the
+        # rest of the world far away
+        if (ga, gb) not in box_pairs or ga not in hand_geoms:
+            return (0.5, np.zeros(6))
+        return ((0.028 if ga == closest else 0.033), np.zeros(6))
+
+    cfg = _replace(pipeline.cfg, regen_mode=True)
+    stand = standing_scene(1)[0]
+    dt = 1.0 / cfg.fps
+    cases = [
+        ({"left_hand": True}, {}, cfg.regen_hand_contact_gap_m),          # no prev: hard gap
+        ({"left_hand": False}, {}, None),                                 # no hold: standard
+        ({"left_hand": True}, {"l": 0.050},                               # corridor: close by rate
+         max(cfg.regen_hand_contact_gap_m, 0.050 - cfg.regen_closing_rate_mps * dt)),
+        ({"left_hand": True}, {"l": 0.004}, cfg.regen_hand_contact_gap_m),  # inside gap: stays
+    ]
+    for ref_hold, prev_dist, want_upper in cases:
+        pipeline.ev.forward(stand[0:36], stand[36:43])
+        pipeline.solver._frame_pairs = None
+        pipeline.solver.cfg = cfg
+        pipeline.ev.geom_distance = fake
+        try:
+            rows = pipeline.solver._collision_rows(ctx(ref_hold, prev_hand_dist=prev_dist))
+        finally:
+            pipeline.ev.geom_distance = real
+            pipeline.solver.cfg = pipeline.cfg
+        regen_lo = -cfg.contact_band_pen_m + 0.0005
+        active = [r for r in rows
+                  if abs(r[2] - regen_lo) < 1e-9 and r[3] != cfg.contact_band_gap_m
+                  and r[3] != cfg.foot_contact_gap_m]
+        if want_upper is None:
+            assert not active, (ref_hold, prev_dist, len(active))
+        else:
+            # exactly one active row -- the closest geom only, at the corridor bound
+            assert len(active) == 1, (ref_hold, prev_dist, len(active))
+            assert active[0][0] == pytest.approx(0.028)
+            assert active[0][3] == pytest.approx(want_upper)
+
+
+def test_regen_mode_holds_hand_anchors_against_hovering_prediction(pipeline) -> None:
+    """Path B: the prediction-driven hand release is bypassed in regen_mode
+    -- the hovering warm start must not release the anchor established at
+    t=0. Standard mode keeps the P0.1 L1 release semantics."""
+    from dataclasses import replace as _replace
+
+    from ireset.embodied.contact_sites import SMPLH_INDEX
+    from ireset.repair.context import ContactStateMachine as CSM
+    from test_validation import _box_beside_left_hand
+
+    T = 4
+    h = _root_height_for_tangent(pipeline.ev)
+    q0 = np.zeros(43)
+    q0[2] = h
+    q0[3] = 1.0
+    box = _box_beside_left_hand(pipeline.validator, q0)
+    scene = np.zeros((T, 43))
+    scene[:, 0:3] = [0.0, 0.0, h]
+    scene[:, 3] = 1.0
+    scene[:, 36:43] = box
+    ids = [mujoco.mj_name2id(pipeline.ev.model, mujoco.mjtObj.mjOBJ_SITE, n)
+           for n in KPT_TO_SMPLH]
+    kpts = np.zeros((T, len(ids), 3))
+    human = np.zeros((T, 52, 3))
+    for t in range(T):
+        pipeline.ev.forward(scene[t, 0:36], scene[t, 36:43])
+        kpts[t] = pipeline.ev.site_positions(ids)
+    for k, name in enumerate(KPT_TO_SMPLH):
+        human[:, SMPLH_INDEX[KPT_TO_SMPLH[name]]] = kpts[:, k]
+    sched = ContactSchedule(intervals=[ContactInterval("left_hand", 0, T, "object")])
+    cond = ReferenceCondition(human, scene[:, 36:43].copy(), sched)
+    # hovering warm start from frame 1: root jumps -10 cm in x, drifting
+    # the hand ~10 cm off its box-frame anchor (> hand_anchor_tol 1 cm)
+    pred = scene.copy()
+    pred[1:, 0] -= 0.10
+
+    for regen, want_release in ((False, True), (True, False)):
+        cfg = _replace(pipeline.cfg, regen_mode=regen)
+        pipe = RepairPipeline(cfg=cfg)
+        pipe.validator.cfg = pipeline.validator.cfg
+        released: list[str] = []
+        orig = CSM.release
+        CSM.release = lambda self, effector: released.append(effector)
+        try:
+            res = pipe.repair_trajectory(pred, cond)
+        finally:
+            CSM.release = orig
+        assert res.accepted, (regen, res.diagnostics.get("reason"), res.status)
+        assert ("left_hand" in released) == want_release, (regen, released)

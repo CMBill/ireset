@@ -18,6 +18,7 @@ configs/eval/protocol.yaml (the yaml is the locked source for experiments).
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass, field
 
 import mujoco
@@ -26,6 +27,14 @@ import numpy as np
 from ireset.embodied.contact_sites import ContactInterval, ContactSchedule, hysteresis_intervals
 from ireset.embodied.g1_spec import G1Spec, HAND_SITES, SOLE_SITES
 from ireset.geometry.collision_pairs import CollisionPairs, build_collision_pairs
+from ireset.geometry.distance_adapter import LARGEBOX_HALF_EXTENTS
+
+#: the 8 box corners in the box geom frame (motion-metric corner sweep)
+_BOX_CORNERS = np.array(list(itertools.product(
+    (-LARGEBOX_HALF_EXTENTS[0], LARGEBOX_HALF_EXTENTS[0]),
+    (-LARGEBOX_HALF_EXTENTS[1], LARGEBOX_HALF_EXTENTS[1]),
+    (-LARGEBOX_HALF_EXTENTS[2], LARGEBOX_HALF_EXTENTS[2]),
+)))
 
 
 @dataclass
@@ -51,14 +60,24 @@ class ValidationConfig:
     # rejects fails for a configuration reason, not a motion reason).
     # Support := quasi-static; fast approach/release stretches near the box
     # or ground are transition, not certified contact. Supersedes the single
-    # foot_entry_speed_mps=0.3.
-    hand_entry_speed_mps: float = 0.02   # <= hand_relative_speed_mps
-    foot_entry_speed_mps: float = 0.02   # <= foot_speed_mps
+    # foot_entry_speed_mps=0.3. "Relative speed" for hands is measured in
+    # the BOX frame (the hand_local series) -- the same frame as the
+    # rel-speed/anchor checks it feeds; a hand carried with the box is
+    # quasi-static relative to it. Feet are world-frame (ground is fixed).
+    hand_entry_speed_mps: float = 0.05   # box-frame; was 0.02, ~55% of reference frames qualify
+    foot_entry_speed_mps: float = 0.02   # world-frame; <= foot_speed_mps
     min_duration: int = 3
-    # contact quality gates (plan 10.1)
+    # contact quality gates (plan 10.1). Hand gates recalibrated 2026-09-15
+    # from the REFERENCE human distribution on the diagnosis 6 segments
+    # (891 grasp frames / 11 intervals): hand box-frame speed p50 0.042,
+    # p95 0.758 m/s (transient grip adjustments) and within-interval
+    # anchor drift p90 18.4 mm -- the original values (0.01/0.02/0.02),
+    # inherited by symmetry from the FOOT model, exclude even the
+    # reference human itself from certification. The interval speed gate
+    # is now an anti-flail bound; the anchor-drift gate certifies.
     hand_gap_m: float = 0.01
-    hand_anchor_error_m: float = 0.01
-    hand_relative_speed_mps: float = 0.02
+    hand_anchor_error_m: float = 0.02   # was 0.01 (reference p90 0.0184 + margin)
+    hand_relative_speed_mps: float = 0.8   # was 0.02 (reference p95 0.758 + margin)
     foot_speed_mps: float = 0.02
     foot_anchor_drift_m: float = 0.01
     foot_ground_gap_m: float = 0.005
@@ -88,6 +107,17 @@ class CheckResult:
     limit: float
     location: str = ""
     detail: str = ""
+    #: earliest frame index of this check's FIRST violation (None when the
+    #: check passed or the evidence carries no frame). Retry logic reads
+    #: THIS field, never the human-readable ``location`` string (which keeps
+    #: the worst-frame position for display).
+    first_failure_frame: int | None = None
+
+
+def _first_exceed(arr: np.ndarray, limit: float) -> int | None:
+    """Index of the first entry strictly above ``limit``, or None."""
+    idx = np.nonzero(np.asarray(arr) > limit)[0]
+    return int(idx[0]) if len(idx) else None
 
 
 @dataclass
@@ -169,7 +199,8 @@ class IndependentValidator:
                 passed=False, status="rejected_nonfinite",
                 checks={"finite": CheckResult(False, float("inf"), 0.0,
                         location=f"t={bad[0, 0]} qpos_idx={bad[0, 1]}",
-                        detail=f"{len(bad)} non-finite entries")},
+                        detail=f"{len(bad)} non-finite entries",
+                        first_failure_frame=int(bad[0, 0]))},
             )
         for name, sl in (("root_quat", slice(3, 7)), ("box_quat", slice(39, 43))):
             n = np.linalg.norm(q[:, sl], axis=1)
@@ -177,17 +208,19 @@ class IndependentValidator:
                 return ValidationReport(
                     passed=False, status="rejected_degenerate_quaternion",
                     checks={"quaternion": CheckResult(False, float(n.min()), 1e-8,
-                            location=f"{name} t={int(np.argmin(n))}")},
+                            location=f"{name} t={int(np.argmin(n))}",
+                            first_failure_frame=int(np.argmin(n)))},
                 )
 
         checks: dict[str, CheckResult] = {}
         self._exclude = set(exclude)
         checks["joint_limits"] = self._check_joint_limits(q)
         checks["velocities"] = self._check_velocities(q)
-        pen_worst, pen_where, max_interval, capped = self._check_penetration(q)
+        pen_worst, pen_where, max_interval, capped, pen_first = self._check_penetration(q)
         checks["penetration"] = CheckResult(
             pen_worst <= cfg.penetration_tolerance_m, pen_worst,
             cfg.penetration_tolerance_m, pen_where,
+            first_failure_frame=pen_first,
         )
         report = ValidationReport(
             passed=False, checks=checks, max_check_interval_m=max_interval,
@@ -209,11 +242,13 @@ class IndependentValidator:
     def _check_joint_limits(self, q: np.ndarray) -> CheckResult:
         lo, hi = self.spec.joint_range[:, 0], self.spec.joint_range[:, 1]
         joints = q[:, 7:36]
-        viol = np.maximum(lo - joints, joints - hi).max()
-        worst_t = int(np.argmax(np.maximum(lo - joints, joints - hi).max(1)))
+        per_frame = np.maximum(lo - joints, joints - hi).max(1)
+        viol = float(per_frame.max())
+        worst_t = int(np.argmax(per_frame))
         return CheckResult(
             viol <= self.cfg.joint_limit_tolerance_rad, viol,
             self.cfg.joint_limit_tolerance_rad, f"t={worst_t}",
+            first_failure_frame=_first_exceed(per_frame, self.cfg.joint_limit_tolerance_rad),
         )
 
     def _check_velocities(self, q: np.ndarray) -> CheckResult:
@@ -233,7 +268,18 @@ class IndependentValidator:
         w = ang.max() / dt
         worst = max(dq / cfg.joint_velocity_limit_radps, dpos / cfg.base_lin_velocity_limit_mps,
                     w / cfg.base_ang_velocity_limit_radps)
-        return CheckResult(worst <= 1.0, worst, 1.0, f"joint={dq:.2f}rad/s pos={dpos:.2f}m/s ang={w:.2f}rad/s")
+        # per-family first exceedance, attributed to the POST-difference frame
+        firsts = [
+            _first_exceed(np.abs(np.diff(q[:, 7:36], axis=0)).max(1) / dt,
+                          cfg.joint_velocity_limit_radps),
+            _first_exceed(np.linalg.norm(np.diff(q[:, 0:3], axis=0), axis=1) / dt,
+                          cfg.base_lin_velocity_limit_mps),
+            _first_exceed(ang / dt, cfg.base_ang_velocity_limit_radps),
+        ]
+        firsts = [f + 1 for f in firsts if f is not None]
+        return CheckResult(worst <= 1.0, worst, 1.0,
+                           f"joint={dq:.2f}rad/s pos={dpos:.2f}m/s ang={w:.2f}rad/s",
+                           first_failure_frame=min(firsts) if firsts else None)
 
     def _all_site_xpos(self, qp: np.ndarray, d: mujoco.MjData) -> np.ndarray:
         d.qpos = qp
@@ -245,24 +291,24 @@ class IndependentValidator:
 
         Replaces the dimensionally inconsistent ``|dpos| + max|dq|`` metric
         (joint radians and base meters are not addable). Robot-side motion is
-        the max site displacement; the box contributes its geom-center
-        displacement so that box-only motion still triggers subdivision.
+        the max site displacement; the box contributes the max CORNER
+        displacement so that box rotation subdivides even when its center is
+        fixed -- a center-only metric cannot see a box corner sweeping
+        through the robot (P0-fix F2, 2026-09-14).
         """
         d = self._motion_data
         xa = self._all_site_xpos(qa, d)
+        Ra = d.geom_xmat[self.box_geom].reshape(3, 3).copy()
+        ca = d.geom_xpos[self.box_geom].copy()
         xb = self._all_site_xpos(qb, d)
+        Rb = d.geom_xmat[self.box_geom].reshape(3, 3).copy()
+        cb = d.geom_xpos[self.box_geom].copy()
         motion = float(np.linalg.norm(xb - xa, axis=-1).max())
-        ba = self._box_geom_xpos(qa, d)
-        bb = self._box_geom_xpos(qb, d)
-        motion = max(motion, float(np.linalg.norm(bb - ba)))
-        return motion
+        pa = ca + _BOX_CORNERS @ Ra.T
+        pb = cb + _BOX_CORNERS @ Rb.T
+        return max(motion, float(np.linalg.norm(pb - pa, axis=-1).max()))
 
-    def _box_geom_xpos(self, qp: np.ndarray, d: mujoco.MjData) -> np.ndarray:
-        d.qpos = qp
-        mujoco.mj_forward(self.model, d)
-        return d.geom_xpos[self.box_geom].copy()
-
-    def _check_penetration(self, q: np.ndarray) -> tuple[float, str, float, bool]:
+    def _check_penetration(self, q: np.ndarray) -> tuple[float, str, float, bool, int | None]:
         """Max penetration over all pairs at keyframes + adaptive subdivisions.
 
         Each frame pair is subdivided so that the max site motion between
@@ -270,6 +316,10 @@ class IndependentValidator:
         ``max_subdivisions`` extra levels); ``max_check_interval_m`` reports
         the *post-subdivision* interval, and ``capped`` flags pairs where the
         budget could not be met.
+
+        The returned first-failure frame attributes interpolated-probe
+        violations to the interval's RIGHT-end frame so a suffix retry
+        covers the transition that must change.
         """
         cfg = self.cfg
         d = mujoco.MjData(self.model)
@@ -279,9 +329,10 @@ class IndependentValidator:
         where = ""
         max_interval = 0.0
         capped = False
+        first_fail: int | None = None
 
-        def probe(qp: np.ndarray, tag: str) -> float:
-            nonlocal worst, where
+        def probe(qp: np.ndarray, tag: str, frame_idx: int) -> float:
+            nonlocal worst, where, first_fail
             d.qpos = qp
             mujoco.mj_forward(self.model, d)
             local = 0.0
@@ -293,21 +344,24 @@ class IndependentValidator:
                     local = max(local, -dist)
             if local > worst:
                 worst, where = local, tag
+            if local > cfg.penetration_tolerance_m and first_fail is None:
+                first_fail = frame_idx
             return local
 
         for t in range(q.shape[0]):
-            probe(q[t], f"t={t}")
+            probe(q[t], f"t={t}", t)
         if cfg.check_interpolated_states:
             for t in range(q.shape[0] - 1):
                 motion = self._frame_motion_m(q[t], q[t + 1])
                 n_sub = int(np.clip(np.ceil(motion / cfg.max_substep_motion_m), 1, cfg.max_subdivisions + 1))
                 for i in range(1, n_sub):
-                    probe(self._interpolate(q[t], q[t + 1], i / n_sub), f"t={t}+{i}/{n_sub}")
+                    probe(self._interpolate(q[t], q[t + 1], i / n_sub),
+                          f"t={t}+{i}/{n_sub}", t + 1)
                 interval = motion / n_sub
                 max_interval = max(max_interval, interval)
                 if interval > cfg.max_substep_motion_m:
                     capped = True
-        return worst, where, max_interval, capped
+        return worst, where, max_interval, capped, first_fail
 
     def _interpolate(self, qa: np.ndarray, qb: np.ndarray, s: float) -> np.ndarray:
         from scipy.spatial.transform import Rotation as Rot, Slerp
@@ -362,18 +416,26 @@ class IndependentValidator:
                 )
 
         dt = 1.0 / cfg.fps
+        hand_iv = {name: 0 for name in ("left_hand", "right_hand")}
+        hand_frames = {name: 0 for name in ("left_hand", "right_hand")}
         for s, name in (("l", "left_hand"), ("r", "right_hand")):
-            # speed-gated entry (P0.1 L1): fast approach/release stretches are
-            # transition, not certified grasp; the entry gate never exceeds
-            # the rel_speed check it feeds
-            hpts = hand_pts[s]
+            # speed-gated entry (P0.1 L1): fast approach/release stretches
+            # are transition, not certified grasp. The gate is measured on
+            # the BOX-frame series (hand_local) -- the same frame as the
+            # rel-speed check and the anchor drift it feeds: a hand carried
+            # with the box is quasi-static relative to it and must still
+            # certify (P0-fix F1, 2026-09-14; the previous world-frame gate
+            # deleted every carry-phase grasp interval by construction).
+            hl = hand_local[s]
             h_speed = np.concatenate(
-                [[np.inf], np.linalg.norm(np.diff(hpts, axis=0), axis=2).max(1) / dt]
+                [[np.inf], np.linalg.norm(np.diff(hl, axis=0), axis=2).max(1) / dt]
             )
             gated = np.where(h_speed < cfg.hand_entry_speed_mps, hand_dist[s], np.inf)
             for a, b in hysteresis_intervals(gated, cfg.hand_enter_m, cfg.hand_exit_m, cfg.min_duration):
-                anchor = hand_local[s][a].copy()                        # [3,3] sites
+                anchor = hand_local[s][a].copy()                    # [3,3] sites
                 schedule.intervals.append(ContactInterval(name, a, b, "object", anchor=anchor))
+                hand_iv[name] += 1
+                hand_frames[name] += b - a
         for s, name in (("l", "left_foot"), ("r", "right_foot")):
             pts = sole_pts[s]
             per_site_speed = np.concatenate(
@@ -382,6 +444,10 @@ class IndependentValidator:
             gated = np.where(per_site_speed < cfg.foot_entry_speed_mps, sole_gap[s], np.inf)
             for a, b in hysteresis_intervals(gated, cfg.foot_enter_m, cfg.foot_exit_m, cfg.min_duration):
                 schedule.intervals.append(ContactInterval(name, a, b, "ground", anchor=pts[a].copy()))
+        # inference provenance: zero hand intervals is then visible in every
+        # downstream report instead of masquerading as a passing grasp check
+        schedule.stats["hand_intervals"] = dict(hand_iv)
+        schedule.stats["hand_frames"] = dict(hand_frames)
 
         self._cache = dict(hand_dist=hand_dist, sole_gap=sole_gap, hand_pts=hand_pts,
                            sole_pts=sole_pts, hand_local=hand_local)
@@ -402,7 +468,10 @@ class IndependentValidator:
         """Per-site support checks (plan 10.1: *all* constrained sites).
 
         A foot pivoting in place keeps its centroid fixed while individual
-        sole sites sweep — centroid metrics would miss it.
+        sole sites sweep — centroid metrics would miss it. First-failure
+        frames are the FIRST exceedance of each family (speed attributed to
+        the post-difference frame; drift/gap to their own frame), relative
+        to the interval's anchor start.
         """
         cfg = self.cfg
         cache = self._cache
@@ -410,6 +479,7 @@ class IndependentValidator:
         worst = 0.0
         where = ""
         detail = []
+        firsts: list[int] = []
         side_of = {"left_foot": "l", "right_foot": "r"}
         for iv in schedule.intervals:
             if iv.support != "ground" or iv.effector not in side_of:
@@ -423,15 +493,26 @@ class IndependentValidator:
                 ratio = float(sp.max() / cfg.foot_speed_mps)
                 if ratio > worst:
                     worst, where = ratio, f"{iv.effector} speed t={iv.start + 1 + t_w}"
+                f = _first_exceed(sp, cfg.foot_speed_mps)
+                if f is not None:
+                    firsts.append(iv.start + 1 + f)
                 detail.append(f"{iv.effector} speed={sp.max():.3f}")
-            drift = np.linalg.norm(pts - pts[0], axis=-1).max()
-            dr_ratio = float(drift / cfg.foot_anchor_drift_m)
+            drift_t = np.linalg.norm(pts - pts[0], axis=-1).max(1)   # [n]
+            dr_ratio = float(drift_t.max() / cfg.foot_anchor_drift_m)
             if dr_ratio > worst:
-                worst, where = dr_ratio, f"{iv.effector} drift"
+                worst, where = dr_ratio, (
+                    f"{iv.effector} drift t={iv.start + int(np.argmax(drift_t))}")
+            f = _first_exceed(drift_t, cfg.foot_anchor_drift_m)
+            if f is not None:
+                firsts.append(iv.start + f)
             gap_ratio = float(gap.max() / cfg.foot_ground_gap_m)
             if gap_ratio > worst:
                 worst, where = gap_ratio, f"{iv.effector} gap t={iv.start + int(np.argmax(gap))}"
-        return CheckResult(worst <= 1.0, worst, 1.0, where, "; ".join(detail[-3:]))
+            f = _first_exceed(gap, cfg.foot_ground_gap_m)
+            if f is not None:
+                firsts.append(iv.start + f)
+        return CheckResult(worst <= 1.0, worst, 1.0, where, "; ".join(detail[-3:]),
+                           first_failure_frame=min(firsts) if firsts else None)
 
     def _check_hands(self, q: np.ndarray, schedule: ContactSchedule) -> CheckResult:
         """Per-site grasp checks: gap, per-site anchor drift, relative speed."""
@@ -441,25 +522,39 @@ class IndependentValidator:
         worst = 0.0
         where = ""
         detail = []
+        firsts: list[int] = []
         side_of = {"left_hand": "l", "right_hand": "r"}
         for iv in schedule.intervals:
             if iv.support != "object" or iv.effector not in side_of or iv.anchor is None:
                 continue
             s = side_of[iv.effector]
             seg = slice(iv.start, iv.end)
-            gap = float(cache["hand_dist"][s][seg].max())
-            gap_ratio = gap / cfg.hand_gap_m
+            gap_t = cache["hand_dist"][s][seg]
+            gap_ratio = float(gap_t.max() / cfg.hand_gap_m)
             if gap_ratio > worst:
-                worst, where = gap_ratio, f"{iv.effector} gap t={seg.start + int(np.argmax(cache['hand_dist'][s][seg]))}"
+                worst, where = gap_ratio, (
+                    f"{iv.effector} gap t={seg.start + int(np.argmax(gap_t))}")
+            f = _first_exceed(gap_t, cfg.hand_gap_m)
+            if f is not None:
+                firsts.append(seg.start + f)
             local = cache["hand_local"][s][seg]                    # [n, 3 sites, 3]
-            anchor_err = np.linalg.norm(local - iv.anchor, axis=-1).max()
-            ae_ratio = float(anchor_err / cfg.hand_anchor_error_m)
+            anchor_err_t = np.linalg.norm(local - iv.anchor, axis=-1).max(1)   # [n]
+            ae_ratio = float(anchor_err_t.max() / cfg.hand_anchor_error_m)
             if ae_ratio > worst:
-                worst, where = ae_ratio, f"{iv.effector} anchor t={seg.start}"
+                worst, where = ae_ratio, (
+                    f"{iv.effector} anchor t={seg.start + int(np.argmax(anchor_err_t))}")
+            f = _first_exceed(anchor_err_t, cfg.hand_anchor_error_m)
+            if f is not None:
+                firsts.append(seg.start + f)
             if local.shape[0] > 1:
                 rs = np.linalg.norm(np.diff(local, axis=0), axis=-1).max(1) / dt
                 rs_ratio = float(rs.max() / cfg.hand_relative_speed_mps)
                 if rs_ratio > worst:
-                    worst, where = rs_ratio, f"{iv.effector} rel_speed t={seg.start + 1 + int(np.argmax(rs))}"
-            detail.append(f"{iv.effector} gap={gap:.3f} anchor={anchor_err:.3f}")
-        return CheckResult(worst <= 1.0, worst, 1.0, where, "; ".join(detail[-3:]))
+                    worst, where = rs_ratio, (
+                        f"{iv.effector} rel_speed t={seg.start + 1 + int(np.argmax(rs))}")
+                f = _first_exceed(rs, cfg.hand_relative_speed_mps)
+                if f is not None:
+                    firsts.append(seg.start + 1 + f)
+            detail.append(f"{iv.effector} gap={gap_t.max():.3f} anchor={anchor_err_t.max():.3f}")
+        return CheckResult(worst <= 1.0, worst, 1.0, where, "; ".join(detail[-3:]),
+                           first_failure_frame=min(firsts) if firsts else None)
