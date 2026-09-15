@@ -344,13 +344,20 @@ class FrameSolver:
                     continue
                 # approach corridor: the bound must be reachable within one
                 # frame from the previous accepted distance; once inside the
-                # gap it stays at the gap (max of the two)
+                # gap it stays at the gap (max of the two). The interpolation
+                # dip margin is subtracted here with the SAME
+                # ``solver_band_margin`` formula the solver band rows use
+                # (F1, 2026-09-15): solutions riding the corridor sit at the
+                # bound, and between-frame interpolated states dip below the
+                # endpoints by ~ that margin, so the endpooint must close the
+                # corridor by an extra margin for the probes to agree with
+                # the rows the QP actually solved.
                 prev = ctx.prev_hand_dist.get(side)
+                margin = solver_band_margin(ctx, cfg)
                 upper = cfg.regen_hand_contact_gap_m if prev is None else max(
                     cfg.regen_hand_contact_gap_m,
-                    prev - cfg.regen_closing_rate_mps * self.dt)
-                regen_active[(best[1], best[2])] = (best[0], best[3], upper)
-        # regen mode keeps an interior margin above the -2 mm validator
+                    prev - cfg.regen_closing_rate_mps * self.dt - margin)
+                regen_active[(best[1], best[2])] = (best[0], best[3], upper)        # regen mode keeps an interior margin above the -2 mm validator
         # floor on every band row: solutions sit on constraint boundaries
         # by construction, and boundary-sitting states would graze past
         # the gate at the transition probes' interpolated states. Probes

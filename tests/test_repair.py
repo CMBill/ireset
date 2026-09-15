@@ -551,11 +551,23 @@ def test_regen_active_hand_rows_ignore_geometric_band(pipeline) -> None:
     cfg = _replace(pipeline.cfg, regen_mode=True)
     stand = standing_scene(1)[0]
     dt = 1.0 / cfg.fps
+    # F1 (2026-09-15): the corridor upper carries the interpolation-dip
+    # margin with the same formula as the solver band rows; the plain
+    # ctx here has frame_motion_m = 0 -> margin at its 0.5 mm floor
+    from ireset.repair.scp import FrameContext as _FC, solver_band_margin as _sbm
+
+    def _margin():
+        return _sbm(_FC(t=0, box_pose=BOX_FAR, z_pred=np.zeros(36), z_prev=None,
+                        ref_kpts_world=np.zeros((15, 3)), mesh_L=None, delta_ref=None,
+                        mesh_fixed=None, hand_anchor={}, foot_anchor={},
+                        prev_hand_local={}, prev_sole_world={}), cfg)
+    margin = _margin()
     cases = [
         ({"left_hand": True}, {}, cfg.regen_hand_contact_gap_m),          # no prev: hard gap
         ({"left_hand": False}, {}, None),                                 # no hold: standard
-        ({"left_hand": True}, {"l": 0.050},                               # corridor: close by rate
-         max(cfg.regen_hand_contact_gap_m, 0.050 - cfg.regen_closing_rate_mps * dt)),
+        ({"left_hand": True}, {"l": 0.050},                               # corridor: close by rate + dip margin
+         max(cfg.regen_hand_contact_gap_m,
+             0.050 - cfg.regen_closing_rate_mps * dt - margin)),
         ({"left_hand": True}, {"l": 0.004}, cfg.regen_hand_contact_gap_m),  # inside gap: stays
     ]
     for ref_hold, prev_dist, want_upper in cases:
@@ -579,6 +591,71 @@ def test_regen_active_hand_rows_ignore_geometric_band(pipeline) -> None:
             assert len(active) == 1, (ref_hold, prev_dist, len(active))
             assert active[0][0] == pytest.approx(0.028)
             assert active[0][3] == pytest.approx(want_upper)
+
+
+def test_regen_corridor_and_band_share_one_margin_formula(pipeline) -> None:
+    """Plan 5.2 (F1): given a frame motion, the corridor upper and the
+    solver band-row floor must be derived from the SAME
+    ``solver_band_margin`` value -- the endpoint closes the corridor by an
+    extra dip margin so interpolated states cannot both ride the corridor
+    and dip past a row the QP solved."""
+    from dataclasses import replace as _replace
+
+    from ireset.repair.scp import FrameContext, solver_band_margin
+
+    def ctx(motion, prev_dist):
+        return FrameContext(
+            t=1, box_pose=BOX_FAR, z_pred=np.zeros(36), z_prev=np.zeros(36),
+            ref_kpts_world=np.zeros((15, 3)), mesh_L=None, delta_ref=None,
+            mesh_fixed=None, hand_anchor={}, foot_anchor={},
+            prev_hand_local={}, prev_sole_world={}, box_pose_prev=BOX_FAR,
+            ref_hold={"left_hand": True}, prev_hand_dist={"l": prev_dist},
+            frame_motion_m=motion)
+
+    real = pipeline.ev.geom_distance
+    box_pairs = {(ga, gb) for ga, gb, kind in pipeline.ev.pairs if kind == "robot_box"}
+    hand_geoms = set(pipeline.ev._hand_geoms["l"]) | set(pipeline.ev._hand_geoms["r"])
+    closest = pipeline.ev._hand_geoms["l"][0]
+
+    def fake(ga, gb, distmax=1.0):
+        if (ga, gb) not in box_pairs or ga not in hand_geoms:
+            return (0.5, np.zeros(6))
+        return ((0.028 if ga == closest else 0.033), np.zeros(6))
+
+    cfg = _replace(pipeline.cfg, regen_mode=True)
+    stand = standing_scene(1)[0]
+    dt = 1.0 / cfg.fps
+    prev = 0.030
+    for motion in (0.0, 0.02, 0.05, 0.2):   # margin floor / quadratic / cap regimes
+        c = ctx(motion, prev)
+        pipeline.ev.forward(stand[0:36], stand[36:43])
+        pipeline.solver._frame_pairs = None
+        pipeline.solver.cfg = cfg
+        pipeline.ev.geom_distance = fake
+        try:
+            rows_probe = pipeline.solver._collision_rows(c, band_margin_m=0.0)
+            rows_solver = pipeline.solver._collision_rows(
+                c, band_margin_m=solver_band_margin(c, cfg))
+        finally:
+            pipeline.ev.geom_distance = real
+            pipeline.solver.cfg = pipeline.cfg
+        margin = solver_band_margin(c, cfg)
+        want_upper = max(cfg.regen_hand_contact_gap_m,
+                         prev - cfg.regen_closing_rate_mps * dt - margin)
+        regen_probe = [r for r in rows_probe
+                       if abs(r[2] - (-cfg.contact_band_pen_m)) < 1e-9
+                       and r[3] != cfg.contact_band_gap_m and r[3] != cfg.foot_contact_gap_m]
+        assert len(regen_probe) == 1
+        assert regen_probe[0][3] == pytest.approx(want_upper), motion
+        # solver-grade rows: every band/regen row floor raised by the same margin
+        band_floor = -cfg.contact_band_pen_m + margin
+        for r in rows_solver:
+            if r[2] != cfg.noncontact_clearance_m:
+                assert r[2] == pytest.approx(band_floor), (motion, r[2])
+        # and the corridor upper minus the margin equals what the probe-grade
+        # floor (validator grade, no margin) expects of interpolated states:
+        # upper + ... the margin must not exceed the corridor window
+        assert margin <= want_upper - (-cfg.contact_band_pen_m) + 1e-12
 
 
 def test_regen_mode_holds_hand_anchors_against_hovering_prediction(pipeline) -> None:
