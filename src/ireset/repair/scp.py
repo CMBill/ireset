@@ -188,13 +188,15 @@ class FrameSolver:
 
     def constraint_rows(
         self, z: np.ndarray, ctx: FrameContext, trust: float, mode: str = "repair",
-        band_margin_m: float | None = None
+        band_margin_m: float | None = None, probe_mode: bool = False
     ) -> tuple[np.ndarray, np.ndarray]:
         """Nonlinear constraint values and bounds [l, u] (rows as in constraints.py).
 
         ``mode="accept"`` uses validator-grade bounds (penetration tolerated to
         -2mm everywhere) for skip decisions; ``mode="repair"`` keeps the
         proactive +2mm non-contact clearance the solver enforces.
+        ``probe_mode`` marks interpolated mid-state evaluations (stage 2):
+        regen corridor uppers do not bind there, only the penetration floor.
         """
         ev, cfg = self.ev, self.cfg
         # guarantee the evaluator is at z (callers usually forwarded already)
@@ -241,7 +243,7 @@ class FrameSolver:
         u[64:99] = trust
 
         # collision: active pairs recomputed at this state
-        rows = self._collision_rows(ctx, band_margin_m)
+        rows = self._collision_rows(ctx, band_margin_m, probe_mode=probe_mode)
         self._last_rows = rows
         for k, (dist, _J, lo, hi) in enumerate(rows):
             val[99 + k] = dist
@@ -378,7 +380,8 @@ class FrameSolver:
         self._frame_pairs = None
 
     def _collision_rows(self, ctx: FrameContext,
-                        band_margin_m: float | None = None) -> list[tuple[float, np.ndarray, float, float]]:
+                        band_margin_m: float | None = None,
+                        probe_mode: bool = False) -> list[tuple[float, np.ndarray, float, float]]:
         """Active collision rows with contact-band classification.
 
         Hand geoms during hold and sole geoms during support are CONTACT
@@ -386,7 +389,10 @@ class FrameSolver:
         non-contact clearance. A support foot touching the ground is the
         intended state, not a violation. ``band_margin_m`` overrides the
         regeneration interior margin (None -> cfg default; 0.0 gives the
-        validator-grade floor for transition probes).
+        validator-grade floor for transition probes). ``probe_mode=True``
+        marks an INTERPOLATED mid-state evaluation: regen corridor rows
+        keep only their anti-penetration floor there (the closing target
+        is a frame-end bound; see the stage 2 comment below).
 
         Candidate pairs: full registry scan at the attempt's initial state
         (``solve_frame``), partial refresh (fast families + carried extras)
@@ -450,7 +456,8 @@ class FrameSolver:
                     cfg.regen_hand_contact_gap_m,
                     prev - cfg.regen_closing_rate_mps * self.dt - margin)
                 regen_active[(best[1], best[2])] = (best[0], best[3], upper)
-                self.last_corridor[side] = {"dist_m": best[0], "upper_m": upper}        # regen mode keeps an interior margin above the -2 mm validator
+                self.last_corridor[side] = {"dist_m": best[0], "upper_m": upper}
+        # regen mode keeps an interior margin above the -2 mm validator
         # floor on every band row: solutions sit on constraint boundaries
         # by construction, and boundary-sitting states would graze past
         # the gate at the transition probes' interpolated states. Probes
@@ -459,9 +466,20 @@ class FrameSolver:
             band_margin_m if band_margin_m is not None
             else (0.0005 if cfg.regen_mode else 0.0))
         added_regens: set = set()
+        # Stage 2 (2026-09-16): the corridor upper bound is an END-OF-FRAME
+        # closing target -- one full dt of closing from the previous accepted
+        # distance. An interpolated mid-state sits at a FRACTION of the frame,
+        # and binding it to the frame-end upper rejects legal approaches
+        # (30mm -> 24mm closed by 5mm, the 27mm midpoint read the 24.178mm
+        # frame-end bound and failed). Transition probes pass
+        # ``probe_mode=True``: regen rows keep their anti-penetration floor
+        # (band_lo, exactly what the validator also enforces mid-frame) and
+        # drop the corridor upper. The final validator certifies entry
+        # speeds/anchors at keyframes only -- it has no corridor semantics.
         for (ga, gb), (dist, ft, upper) in regen_active.items():
             J = ev.distance_jacobian(ga, gb, ft, dist)
-            rows.append((dist, J, band_lo, upper))
+            hi = INF if probe_mode else upper
+            rows.append((dist, J, band_lo, hi))
             row_names.append(f"{ev.geom_name(ga)}~{ev.geom_name(gb)}:regen")
             row_ids.append((ga, gb, "regen"))
             added_regens.add((ga, gb))

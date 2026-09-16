@@ -874,3 +874,136 @@ def test_probe_violating_pair_reflected_in_retry(pipeline) -> None:
     reasons = [r.get("reason") for r in pipe.frame_log
                if r.get("kind") == "skip_check" and not r.get("ok")]
     assert "state_constraints" in reasons
+
+
+# --- stage 2: interpolation corridor semantics (m2_m3_completion_plan) -----------
+
+
+def test_corridor_upper_is_frame_end_only_mid_states_free(pipeline) -> None:
+    """Stage 2: the regen corridor upper binds ENDPOINT solutions only.
+    A probe-mode row set (transition checks) keeps the anti-penetration
+    floor but must NOT inherit the frame-end closing target."""
+    from dataclasses import replace as _replace
+
+    from ireset.repair.scp import FrameContext, INF
+
+    def ctx(ref_hold, prev_dist):
+        return FrameContext(
+            t=1, box_pose=BOX_FAR, z_pred=np.zeros(36), z_prev=np.zeros(36),
+            ref_kpts_world=np.zeros((15, 3)), mesh_L=None, delta_ref=None,
+            mesh_fixed=None, hand_anchor={}, foot_anchor={},
+            prev_hand_local={}, prev_sole_world={}, box_pose_prev=BOX_FAR,
+            ref_hold=ref_hold, prev_hand_dist=prev_dist, frame_motion_m=0.02)
+
+    real = pipeline.ev.geom_distance
+    box_pairs = {(ga, gb) for ga, gb, kind in pipeline.ev.pairs if kind == "robot_box"}
+    hand_geoms = set(pipeline.ev._hand_geoms["l"]) | set(pipeline.ev._hand_geoms["r"])
+    closest = pipeline.ev._hand_geoms["l"][0]
+
+    def fake(ga, gb, distmax=1.0):
+        if (ga, gb) not in box_pairs or ga not in hand_geoms:
+            return (0.5, np.zeros(6))
+        return ((0.028 if ga == closest else 0.033), np.zeros(6))
+
+    cfg = _replace(pipeline.cfg, regen_mode=True)
+    stand = standing_scene(1)[0]
+    pipeline.ev.forward(stand[0:36], stand[36:43])
+    pipeline.solver._frame_pairs = None
+    pipeline.solver.cfg = cfg
+    pipeline.ev.geom_distance = fake
+    try:
+        rows_solve = pipeline.solver._collision_rows(ctx({"left_hand": True}, {"l": 0.030}))
+        rows_probe = pipeline.solver._collision_rows(
+            ctx({"left_hand": True}, {"l": 0.030}), band_margin_m=0.0, probe_mode=True)
+    finally:
+        pipeline.ev.geom_distance = real
+        pipeline.solver.cfg = pipeline.cfg
+    solve_regen = [r for r in rows_solve if r[3] not in
+                   (cfg.contact_band_gap_m, cfg.foot_contact_gap_m) and r[3] < INF / 2
+                   and r[2] > -cfg.contact_band_pen_m - 1e-9]
+    probe_regen = [r for r in rows_probe
+                   if abs(r[2] - (-cfg.contact_band_pen_m)) < 1e-9
+                   and r[3] > INF / 2]
+    assert len(solve_regen) == 1 and solve_regen[0][3] < 0.030, \
+        "solve rows must carry the frame-end corridor upper"
+    assert len(probe_regen) == 1, \
+        "probe rows must keep the regen row for the penetration floor"
+    assert probe_regen[0][3] > INF / 2, "probe regen upper must be released (INF)"
+
+
+def test_legal_approach_30mm_to_24mm_not_rejected_by_midpoint(pipeline) -> None:
+    """Plan §5 reproduction: an endpoint closing 30mm -> 24mm (legal, inside
+    the corridor at both ends) must pass the transition probe -- the 27mm
+    midpoint previously read the 24.178mm frame-end upper and failed."""
+    from dataclasses import replace as _replace
+
+    import mujoco as mj
+
+    from ireset.embodied.contact_sites import ContactInterval, ContactSchedule, SMPLH_INDEX
+    from ireset.repair.context import ReferenceCondition as RC
+    from ireset.repair.scp import FrameContext
+
+    # box pose beside the LEFT hand at a controlled gap: place box surface
+    # 30mm from the closest left-hand geom at frame 0, 24mm at frame 1
+    h = _root_height_for_tangent(pipeline.ev)
+    q0 = np.zeros(43)
+    q0[2] = h
+    q0[3] = 1.0
+    pipe = pipeline
+
+    def hand_gap_for(box_pose):
+        pipe.ev.forward(q0[0:36], box_pose)
+        return min(pipe.ev.geom_distance(g, pipe.ev.box_geom, distmax=1.0)[0]
+                   for g in pipe.ev._hand_geoms["l"])
+
+    # binary-search the box x-offset placing the nearest hand geom at
+    # 30mm (frame 0) and 24mm (frame 1) from the box surface
+    pipe.ev.forward(q0[0:36], np.array([1.5, 0, 0.25, 1, 0, 0, 0]))
+    hx = pipe.ev.data.geom_xpos[pipe.ev._hand_geoms["l"][0]].copy()
+
+    def box_at(off):
+        return np.array([hx[0] + off, hx[1], hx[2], 1.0, 0, 0, 0])
+
+    def gap_at(off):
+        return hand_gap_for(box_at(off))
+
+    found = {}
+    for target in (0.030, 0.024):
+        lo, hi = 0.05, 0.8
+        glo, ghi = gap_at(lo), gap_at(hi)
+        assert glo < target < ghi, (target, glo, ghi)
+        for _ in range(60):
+            mid = 0.5 * (lo + hi)
+            g = gap_at(mid)
+            if (glo - target) * (g - target) <= 0:
+                hi, ghi = mid, g
+            else:
+                lo, glo = mid, g
+        found[target] = box_at(0.5 * (lo + hi))
+    box0, box1 = found[0.030], found[0.024]
+    T = 2
+    scene = np.zeros((T, 43))
+    scene[:, 0:3] = [0.0, 0.0, h]
+    scene[:, 3] = 1.0
+    scene[0, 36:43] = box0
+    scene[1, 36:43] = box1
+    ids = [mj.mj_name2id(pipe.ev.model, mj.mjtObj.mjOBJ_SITE, n) for n in KPT_TO_SMPLH]
+    human = np.zeros((T, 52, 3))
+    for t in range(T):
+        pipe.ev.forward(scene[t, 0:36], scene[t, 36:43])
+        kpts = pipe.ev.site_positions(ids)
+        for k, name in enumerate(KPT_TO_SMPLH):
+            human[t, SMPLH_INDEX[KPT_TO_SMPLH[name]]] = kpts[k]
+    sched = ContactSchedule(intervals=[ContactInterval("left_hand", 1, T, "object")])
+    cond = RC(human, scene[:, 36:43].copy(), sched)
+    # the prediction IS the legal solution: frame 0 at 30mm (interval not
+    # yet active), frame 1 at 24mm inside the closing corridor
+    # (30 - rate*dt - margin ~= 24.5mm >= 24mm). With the stage-2 semantics
+    # the 27mm midpoint carries no frame-end upper and must pass; the old
+    # code read the 24.178mm frame-end bound there and rejected.
+    cfg = _replace(pipe.cfg, regen_mode=True)
+    p2 = RepairPipeline(cfg=cfg)
+    p2.validator.cfg = pipe.validator.cfg
+    res = p2.repair_trajectory(scene, cond)
+    assert res.accepted, (res.status, res.diagnostics.get("t_fail"),
+                          res.diagnostics.get("skip_reason"))

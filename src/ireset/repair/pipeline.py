@@ -312,7 +312,8 @@ class RepairPipeline:
                     self.solver._frame_pairs = None
                     val_m, lo_m, hi_m, scl_m = self.solver.constraint_rows(
                         mid[0:36], ctx_mid, trust=self.cfg.trust_radius_max,
-                        mode="accept", band_margin_m=0.0
+                        mode="accept", band_margin_m=0.0,
+                        probe_mode=True   # stage 2: mid-states carry no frame-end corridor upper
                     )
                     n_coll = 99 + len(self.solver._last_rows)
                     viol_m = self.solver.violation(val_m[99:n_coll], lo_m[99:n_coll],
