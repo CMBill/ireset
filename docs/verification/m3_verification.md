@@ -1,6 +1,6 @@
 # M3 验证记录:确定性与扩散生成
 
-日期:2026-09-13。对应方案 §7/§9.1/§11-M3 与 `docs/interaction_retarget_impl_plan.md`。
+日期:2026-09-13。对应方案 §7/§9.1/§11-M3 与 `docs/plans/interaction_retarget_impl_plan.md`。
 代码:`src/ireset/{data,model,diffusion,train}/`、`scripts/{precompute_m3_cache,train_generation,eval_generation}.py`,
 配置:`configs/model/*.yaml`、`configs/train/pilot.yaml`,缓存与产物:`derived/data/m3_cache/`、`derived/models/`、`derived/data/validation/generation_eval.json`。
 

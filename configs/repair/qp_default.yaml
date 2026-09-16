@@ -1,7 +1,7 @@
 # M2 repair configuration (plan section 14.3 starting point).
 # Mirrors src/ireset/repair/context.py::RepairConfig defaults; the dataclass
 # is the runtime source, this file is the experimental record.
-# See docs/m2_verification.md for measured behavior and open gaps.
+# See docs/verification/m2_verification.md for measured behavior and open gaps.
 
 objective:
   prediction_weight: 1.0
@@ -90,7 +90,7 @@ relaxed_repair:                           # P0.1 L2 2026-09-13: teacher baseline
 # iteration budgets unchanged: quasi-static support (L1) keeps strict gates
 
 
-m2_acceptance_status:                      # measured 2026-09-12, docs/m2_verification.md
+m2_acceptance_status:                      # measured 2026-09-12, docs/verification/m2_verification.md
   perturbation_acceptance: 0.60            # target 0.95 NOT met
   unreachable_false_accepts: 0
   teacher_full_length_acceptance: 0.0      # screening finding, feeds M3 data prep

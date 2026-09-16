@@ -1,6 +1,6 @@
 # MVP task definition: single largebox carry on flat ground (locked 2026-09-11).
 # Statistics measured over all 312 original teacher demos (not augmentations);
-# see derived/data/split/manifest.json and docs/m0_verification.md.
+# see derived/data/split/manifest.json and docs/verification/m0_verification.md.
 
 task: box_carry
 fps: 30

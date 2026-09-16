@@ -76,7 +76,7 @@
 
 ## 8. 审阅修复与重新锁定(2026-09-11 第二轮)
 
-代码审阅发现 6 个问题,按 [m1_fix_plan.md](m1_fix_plan.md) 四阶段修复。**机制先修、再重标定、后重锁**;以下数字全部为修复后口径。测试 51 项全过(新增 `test_metrics.py`、`test_contacts.py`、`test_baselines.py`,扩展 `test_validation.py`)。
+代码审阅发现 6 个问题,按 [m1_fix_plan.md](../plans/m1_fix_plan.md) 四阶段修复。**机制先修、再重标定、后重锁**;以下数字全部为修复后口径。测试 51 项全过(新增 `test_metrics.py`、`test_contacts.py`、`test_baselines.py`,扩展 `test_validation.py`)。
 
 ### 修复内容
 

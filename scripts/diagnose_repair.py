@@ -4,7 +4,7 @@ For each registered teacher segment: run the sequential repairer with a
 capture wrapper around ``FrameSolver.solve_frame``. On rejection, classify
 the violated accept-mode constraint rows at the failing frame's *prediction*
 (fresh pair scan) into the taxonomy families of
-``docs/p0_relaxed_validation_plan.md`` section 1.3, plus drift / task
+``docs/plans/p0_relaxed_validation_plan.md`` section 1.3, plus drift / task
 diagnostics, so every intervention step (L0/L1/L2) has a measured go/no-go.
 
 ``--geometry-census`` measures teacher contact geometry directly (no repair):

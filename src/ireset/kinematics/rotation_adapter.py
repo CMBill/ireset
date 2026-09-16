@@ -1,6 +1,6 @@
 """Rotation conventions and SO(3) helpers.
 
-Project conventions (docs/interaction_retarget_impl_plan.md section 4.2):
+Project conventions (docs/plans/interaction_retarget_impl_plan.md section 4.2):
 
 - Quaternions stored as ``[qw, qx, qy, qz]`` (MuJoCo order). scipy uses
   ``[x, y, z, w]``; conversion helpers below are the only sanctioned place

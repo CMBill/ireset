@@ -1,6 +1,6 @@
 """Calibrate reference-side contact thresholds against robot-side inference.
 
-Phase C of the M1 review fix plan (docs/m1_fix_plan.md):
+Phase C of the M1 review fix plan (docs/plans/m1_fix_plan.md):
 
 - hand grid extended down to 0.005 (the previous optimum sat on the old
   grid's lower boundary — a grid artifact);

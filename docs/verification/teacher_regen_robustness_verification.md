@@ -1,6 +1,6 @@
 # 教师重生成鲁棒性修复验证记录
 
-日期:2026-09-15。方案:[teacher_regen_robustness_plan.md](teacher_regen_robustness_plan.md)。状态:**P0 已实现(F1 + 诊断增强);P1 检查点完成(F3 前提证伪,按方案自身决策树取消);F2/F4 机理评估后不实现;先导重测 2/6(与基线持平、已保留段零退化),≥4/6 目标未达成——插桩证据表明四段失败机理与方案 §2 假设不符**,修订记录见 §2/§5。strict 容差数值零改动。
+日期:2026-09-15。方案:[teacher_regen_robustness_plan.md](../plans/teacher_regen_robustness_plan.md)。状态:**P0 已实现(F1 + 诊断增强);P1 检查点完成(F3 前提证伪,按方案自身决策树取消);F2/F4 机理评估后不实现;先导重测 2/6(与基线持平、已保留段零退化),≥4/6 目标未达成——插桩证据表明四段失败机理与方案 §2 假设不符**,修订记录见 §2/§5。strict 容差数值零改动。
 
 ## 1. 实现内容
 
@@ -66,7 +66,7 @@
 
 ## 6. 关联
 
-- 方案:`docs/teacher_regen_robustness_plan.md`(修订记录已加)
-- 前序:`docs/teacher_regen_verification.md`(先导 2/6、slack s≥0、dip 余量、手部门重标)
+- 方案:`docs/plans/teacher_regen_robustness_plan.md`(修订记录已加)
+- 前序:`docs/verification/teacher_regen_verification.md`(先导 2/6、slack s≥0、dip 余量、手部门重标)
 - 产物:`derived/data/teachers_regenerated/pilot_diagnosis6_v3_f1/`(含逐段 `frame_log_*.json`)
 - 诊断脚本:机制已并入 `--verbose`;探索期脚本未入库

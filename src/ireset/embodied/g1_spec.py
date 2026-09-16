@@ -6,7 +6,7 @@ correspondence. The derived models are produced by
 ``scripts/build_locked_assets.py``; this module must stay consistent with
 ``derived/robots/lock_record.json`` (checked by tests).
 
-Conventions (project-wide, see docs/interaction_retarget_impl_plan.md section 4.2):
+Conventions (project-wide, see docs/plans/interaction_retarget_impl_plan.md section 4.2):
 
 - Internal root pose storage is ``[x, y, z, qw, qx, qy, qz]`` in meters/radians.
   This matches MuJoCo's freejoint qpos layout, so qpos slices transfer

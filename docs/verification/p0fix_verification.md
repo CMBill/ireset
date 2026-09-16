@@ -1,12 +1,12 @@
 # P0 审阅修复(F1–F4)验证记录
 
-日期:2026-09-14。依据 [p0_fix_plan.md](p0_fix_plan.md) 实施;本文记录四项修复的实现、回归测试与全部重测结果(阶段 A–I)。旧 P0 数字(strict 2/6、relaxed 4/6=66.7%、24 段 17/24=70.8%、P0.3 闭环 12.5–25%)全部降级为 **修复前实现的结果**,保留于 [p0_verification.md](p0_verification.md),不得与本文数字混用。relaxed 产物仍不计入 §10.1 达标。
+日期:2026-09-14。依据 [p0_fix_plan.md](../plans/p0_fix_plan.md) 实施;本文记录四项修复的实现、回归测试与全部重测结果(阶段 A–I)。旧 P0 数字(strict 2/6、relaxed 4/6=66.7%、24 段 17/24=70.8%、P0.3 闭环 12.5–25%)全部降级为 **修复前实现的结果**,保留于 [p0_verification.md](p0_verification.md),不得与本文数字混用。relaxed 产物仍不计入 §10.1 达标。
 
 ## 1. 修复内容与代码位置
 
 ### F1 手部准静态推断改用箱体系速度(P1)
 
-- `repair/validation.py::_infer_robot_schedule`:手部进入门速度源由世界系 `hand_pts` 差分改为**箱体系 `hand_local` 差分**([validation.py:373-386](../src/ireset/repair/validation.py))。旧实现中手随箱平移(搬运的定义)使世界系手速恒超 0.02 m/s 门,**搬运相抓握区间被构造性清零**,手部检查在全部 P0 运行中形同虚设;`_check_hands` 的锚漂与相对速度检查本身就在箱体系上,推断与检查自此同系。
+- `repair/validation.py::_infer_robot_schedule`:手部进入门速度源由世界系 `hand_pts` 差分改为**箱体系 `hand_local` 差分**([validation.py:373-386](../../src/ireset/repair/validation.py))。旧实现中手随箱平移(搬运的定义)使世界系手速恒超 0.02 m/s 门,**搬运相抓握区间被构造性清零**,手部检查在全部 P0 运行中形同虚设;`_check_hands` 的锚漂与相对速度检查本身就在箱体系上,推断与检查自此同系。
 - `ContactSchedule.stats` 新增(`embodied/contact_sites.py`):推断的手部区间数/帧数随 schedule 输出,报告可辨识"零区间"与"检查通过"的区别。
 - 脚部保持世界系(地面是世界固定的),不变性只要求手部满足。
 - 两处 yaml 中"教师手不锚定、无约束力"注释改写为 F1 后语义:门可生效,教师数据因悬浮(gap p95 33mm > enter 10mm)仍少有区间——数据本性(Path B),非永久无约束。

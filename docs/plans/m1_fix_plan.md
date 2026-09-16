@@ -34,7 +34,7 @@ Phase B 的三项必须一次性合并后再进 Phase C:任何一项单独改动
 
 ### 根因
 
-[`eval/metrics.py:21-22`](../src/ireset/eval/metrics.py#L21-L22) 在 `tp+fp==0` 与 `tp+fn==0` 时各自回退 `1.0`。当某末端在参考侧和机器人侧**都没有区间**时,`tp=fp=fn=0`,P=R=1.0 → F1=1.0。
+[`eval/metrics.py:21-22`](../../src/ireset/eval/metrics.py#L21-L22) 在 `tp+fp==0` 与 `tp+fn==0` 时各自回退 `1.0`。当某末端在参考侧和机器人侧**都没有区间**时,`tp=fp=fn=0`,P=R=1.0 → F1=1.0。
 
 **[实测]** 已锁定的 24 段教师报告中,4 个 clip-effector 组合属此情形(`left_hand` 3 个、`right_hand` 1 个),白拿 1.0 计入 0.872 宏平均。
 
@@ -95,7 +95,7 @@ def contact_f1_success_weighted(rows: list[dict | None]) -> float:
 
 ### 根因
 
-[`repair/validation.py:41-52`](../src/ireset/repair/validation.py#L41-L52) 存在阈值倒置:
+[`repair/validation.py:41-52`](../../src/ireset/repair/validation.py#L41-L52) 存在阈值倒置:
 
 | 项 | 建立区间的阈值 | 该区间必须满足的门槛 | 倒置 |
 |---|---|---|---|
@@ -104,7 +104,7 @@ def contact_f1_success_weighted(rows: list[dict | None]) -> float:
 
 一个真实的 1.5cm 间隙抓取会被推断为接触、然后**必然**判失败——失败源于阈值不自洽,不是轨迹坏。
 
-**脚部还叠加了半径 bug**:sole sites 是半径 5mm 碰撞球的**球心**,[`g1_spec.py:16-18`](../src/ireset/embodied/g1_spec.py#L16-L18) 的 docstring 自己写明"必须沿接触法向减去半径",但 `SOLE_SPHERE_RADIUS_M` 常量**全项目零引用**。`_infer_robot_schedule` 用 `site_xpos[:,2].min()` 当离地间隙,完美贴地的脚读数恰为 0.005 = 门槛值,ratio 精确 1.0,任何噪声即失败。
+**脚部还叠加了半径 bug**:sole sites 是半径 5mm 碰撞球的**球心**,[`g1_spec.py:16-18`](../../src/ireset/embodied/g1_spec.py#L16-L18) 的 docstring 自己写明"必须沿接触法向减去半径",但 `SOLE_SPHERE_RADIUS_M` 常量**全项目零引用**。`_infer_robot_schedule` 用 `site_xpos[:,2].min()` 当离地间隙,完美贴地的脚读数恰为 0.005 = 门槛值,ratio 精确 1.0,任何噪声即失败。
 
 **[实测]** 半径修正后的值与 MuJoCo 真实表面距离**完全一致**(相关系数 1.000000,maxdiff 0.000000),证实这是纯 bug 而非近似:
 
@@ -205,7 +205,7 @@ drift = np.linalg.norm(pts - pts[0], axis=-1).max()
 
 ### 根因
 
-[`contact_sites.py:128-129`](../src/ireset/embodied/contact_sites.py#L128-L129) 默认走 `point_box_surface_distance_numpy`(解析 AABB)。[`distance_adapter.py`](../src/ireset/geometry/distance_adapter.py) 的 docstring 明确写"AABB 仅训练代理,验收一律用 hull"——但参考调度正是用来算 F1 这个头等指标、并用来标定阈值的。
+[`contact_sites.py:128-129`](../../src/ireset/embodied/contact_sites.py#L128-L129) 默认走 `point_box_surface_distance_numpy`(解析 AABB)。[`distance_adapter.py`](../../src/ireset/geometry/distance_adapter.py) 的 docstring 明确写"AABB 仅训练代理,验收一律用 hull"——但参考调度正是用来算 F1 这个头等指标、并用来标定阈值的。
 
 **[实测]** 扫描箱是带圆角的非水密容器,AABB 误差在**接触判定区间**恰与阈值同量级:
 
@@ -258,7 +258,7 @@ def largebox_hull_surface_distance(points_world: np.ndarray, box_pose: np.ndarra
 
 `infer_reference_schedule` 默认改用它;`hand_distance_fn` 覆盖点保留,AABB 版本保留供训练损失(其可微性是它存在的唯一理由)。
 
-hull 映射的正确性已由 [`test_geometry.py`](../tests/test_geometry.py) 验证(MuJoCo hull 与 trimesh hull 差 2e-4 = 探测球 2r,即帧映射精确),本修复复用同一路径,无新增几何风险。
+hull 映射的正确性已由 [`test_geometry.py`](../../tests/test_geometry.py) 验证(MuJoCo hull 与 trimesh hull 差 2e-4 = 探测球 2r,即帧映射精确),本修复复用同一路径,无新增几何风险。
 
 ### 验证
 
@@ -270,7 +270,7 @@ hull 映射的正确性已由 [`test_geometry.py`](../tests/test_geometry.py) �
 
 ### 根因
 
-[`eval/baselines.py:58`](../src/ireset/eval/baselines.py#L58):
+[`eval/baselines.py:58`](../../src/ireset/eval/baselines.py#L58):
 
 ```python
 yaw = np.arctan2(-(sh_l[1] - sh_r[1]), sh_l[0] - sh_r[0])  # +x along shoulder line
@@ -354,9 +354,9 @@ def validate(self, scene_qpos: np.ndarray) -> ValidationReport:
 
 ### 根因
 
-`max_substep_motion_m` 与 `max_subdivisions` 在 [`ValidationConfig`](../src/ireset/repair/validation.py#L53-L56) 和 `protocol.yaml` 均声明,**[实测]** 各仅出现 1 次(即定义处),从未被读取:`_check_penetration` 硬编码单级中点插值。`max_check_interval_m` 算出来后也不与任何限值比较。
+`max_substep_motion_m` 与 `max_subdivisions` 在 [`ValidationConfig`](../../src/ireset/repair/validation.py#L53-L56) 和 `protocol.yaml` 均声明,**[实测]** 各仅出现 1 次(即定义处),从未被读取:`_check_penetration` 硬编码单级中点插值。`max_check_interval_m` 算出来后也不与任何限值比较。
 
-`docs/m1_verification.md` §8 承认了这点,但 `protocol.yaml` 呈现为已生效配置——对读者是误导,且方案 §6.3 要求"按运动幅度**自适应细分**的帧间插值"。
+`docs/verification/m1_verification.md` §8 承认了这点,但 `protocol.yaml` 呈现为已生效配置——对读者是误导,且方案 §6.3 要求"按运动幅度**自适应细分**的帧间插值"。
 
 另有语义 bug:`motion` 混用米与弧度(`norm(dpos) + max|dq|`),量纲不一致;且 `max_check_interval_m` 记录的是**细分前**的帧间运动,而非细分后的实际最大检查间隔。
 
@@ -422,8 +422,8 @@ foot_enter: 0.010→LF 0.577  0.020→0.888  0.030→0.890  0.050→0.892  0.080
 
 1. `scripts/validate_teacher.py --n 4 --include-aug` 重跑 → 覆写 `derived/data/validation/teacher_quality.json`。
 2. `scripts/run_baseline.py` 重跑 → 覆写 `baseline_quality.json`(首帧 MPJPE 应从 8.1cm 降至 2.6cm)。
-3. 覆写 `configs/eval/protocol.yaml` 的 `contact_inference` 与 `teacher_quality_m1_baseline` 两节。**旧数字必须在文档中保留并标注失效原因**,不可静默替换——它们已被 `docs/m1_verification.md` 和 `AGENTS.md` 引用为已验证结果。
-4. 更新 `docs/m1_verification.md`(新增"修复后基线"一节,保留原值与差异说明)与 `AGENTS.md` 的进度摘要数字(当前写着 hand 0.04/0.072、foot 0.05/0.08、F1 0.876、教师 F1 0.872)。
+3. 覆写 `configs/eval/protocol.yaml` 的 `contact_inference` 与 `teacher_quality_m1_baseline` 两节。**旧数字必须在文档中保留并标注失效原因**,不可静默替换——它们已被 `docs/verification/m1_verification.md` 和 `AGENTS.md` 引用为已验证结果。
+4. 更新 `docs/verification/m1_verification.md`(新增"修复后基线"一节,保留原值与差异说明)与 `AGENTS.md` 的进度摘要数字(当前写着 hand 0.04/0.072、foot 0.05/0.08、F1 0.876、教师 F1 0.872)。
 
 ### 预期数字变化
 

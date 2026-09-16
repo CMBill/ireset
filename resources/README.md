@@ -1,6 +1,6 @@
 # 本地资源登记
 
-检查日期:2026-09-11。首轮为文件系统与 XML 静态检查;同日已完成 MuJoCo 编译验证、依赖安装(见 `docs/m0_verification.md`)、派生锁定资产生成(`derived/robots/`,脚本 `scripts/build_locked_assets.py`)与 71 样本配对审计(`derived/data/audit/`,脚本 `scripts/audit_data.py`)。
+检查日期:2026-09-11。首轮为文件系统与 XML 静态检查;同日已完成 MuJoCo 编译验证、依赖安装(见 `docs/verification/m0_verification.md`)、派生锁定资产生成(`derived/robots/`,脚本 `scripts/build_locked_assets.py`)与 71 样本配对审计(`derived/data/audit/`,脚本 `scripts/audit_data.py`)。
 
 ## 目录与用途
 
@@ -61,7 +61,7 @@ resources/
 - 项目入口:`resources/data/OMOMO_new`。
 - 软链接目标:`/home/c112/codes/bill/smrt-data/unzipped/OMOMO_new`。
 - 共 4,421 个 `.pt` 文件,合计 1,920,971,225 字节(约 1.79GiB);其中 `*_largebox_*.pt` 共 329 个(6 个受试者)。这是文件数,不是已验证的独立演示数。
-- 示例:`sub3_largebox_003.pt` 存在,属于 PyTorch ZIP 序列化容器。**2026-09-11 已完成数值加载与配对审计**(71 样本,详见 `docs/m0_verification.md` §3)。
+- 示例:`sub3_largebox_003.pt` 存在,属于 PyTorch ZIP 序列化容器。**2026-09-11 已完成数值加载与配对审计**(71 样本,详见 `docs/verification/m0_verification.md` §3)。
 - 将链接入口视为只读输入;软链接本身不提供写保护,写入会修改源数据。转换结果、缓存和标签必须写到项目另设的派生数据目录(`derived/`),不得写入本目录。
 - 软链接避免复制,目录硬链接不适合作为接入方式。迁移机器后需重新建立链接。
 

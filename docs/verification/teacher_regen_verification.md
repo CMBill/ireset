@@ -1,6 +1,6 @@
 # 教师数据重生成(Path B)验证记录
 
-日期:2026-09-15。方案依据:[p0_relaxed_validation_plan.md](p0_relaxed_validation_plan.md) §7 路径 B("用带交互模型约束的修复器/优化器重生成教师轨迹,筛选通过严格验收的作为新教师;重训生成模型")。状态:**机制端到端打通并在先导集实证(2/6 保留);四个被拒段的鲁棒性修复与规模化是后续工作**。源数据未动,产物仅写入 `derived/data/teachers_regenerated/`。
+日期:2026-09-15。方案依据:[p0_relaxed_validation_plan.md](../plans/p0_relaxed_validation_plan.md) §7 路径 B("用带交互模型约束的修复器/优化器重生成教师轨迹,筛选通过严格验收的作为新教师;重训生成模型")。状态:**机制端到端打通并在先导集实证(2/6 保留);四个被拒段的鲁棒性修复与规模化是后续工作**。源数据未动,产物仅写入 `derived/data/teachers_regenerated/`。
 
 ## 1. 方法
 
