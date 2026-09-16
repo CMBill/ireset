@@ -707,3 +707,170 @@ def test_regen_mode_holds_hand_anchors_against_hovering_prediction(pipeline) -> 
             CSM.release = orig
         assert res.accepted, (regen, res.diagnostics.get("reason"), res.status)
         assert ("left_hand" in released) == want_release, (regen, released)
+
+
+# --- stage 1: dynamic collision-pair activation (m2_m3_completion_plan) ----------
+
+
+def test_discovered_pair_is_carried_into_next_linearization(pipeline) -> None:
+    """A pair that an endpoint check found violating OUTSIDE the attempt's
+    frozen candidate set must enter the next solve attempt's rows (stage 1:
+    the solve may no longer fail on a blind spot it cannot see)."""
+    from ireset.repair.scp import FrameContext
+
+    scene = standing_scene(1)[0]
+    box = BOX_FAR.copy()
+    ctx = FrameContext(t=0, box_pose=box, z_pred=scene[0:36], z_prev=None,
+                       ref_kpts_world=np.zeros((15, 3)), mesh_L=None, delta_ref=None,
+                       mesh_fixed=None, hand_anchor={}, foot_anchor={},
+                       prev_hand_local={}, prev_sole_world={})
+    solver = pipeline.solver
+    solver.clear_discovered_pairs()
+    pipeline.ev.forward(scene[0:36], box)
+    solver._frame_pairs = None
+    rows0 = solver._collision_rows(ctx)
+    ids0 = {pid for pid in solver.last_row_ids}
+    # pick a robot_box pair that is FAR (not in the candidate set): the box
+    # sits at (1.5, 0, 0.25), so any left-hand geom vs box qualifies
+    far = [(ga, gb, kind) for ga, gb, kind in pipeline.ev.pairs
+           if kind == "robot_box" and "left" in pipeline.ev.geom_name(ga)]
+    assert far
+    assert all((ga, gb) not in ids0 for ga, gb, _k in far)
+    # pipeline-side carry-back with a fabricated violating row
+    solver.note_discovered_pairs(far[:1])
+    assert solver._extra_pairs, "discovered pair not recorded"
+    pipeline.ev.forward(scene[0:36], box)
+    solver._frame_pairs = None  # next linearization (what note_... scheduled)
+    rows1 = solver._collision_rows(ctx)
+    ids1 = {pid[:2] for pid in solver.last_row_ids}
+    (ga, gb, _k) = far[0]
+    assert (ga, gb) in ids1, "carried pair missing from next linearization rows"
+    # the carried pair's row is a real constraint row now (noncontact bound)
+    k = [i for i, pid in enumerate(solver.last_row_ids) if pid[:2] == (ga, gb)][0]
+    assert rows1[k][2] == pytest.approx(pipeline.cfg.noncontact_clearance_m)
+    # frame boundary clears the mechanism
+    solver.clear_discovered_pairs()
+    pipeline.ev.forward(scene[0:36], box)
+    solver._frame_pairs = None
+    solver._collision_rows(ctx)
+    assert all(pid[:2] != (ga, gb) for pid in solver.last_row_ids)
+
+
+def test_row_budget_reports_truncation_instead_of_silently_dropping(pipeline) -> None:
+    """When candidates exceed the QP row budget the overflow must be
+    REPORTED (last_truncated), matching the plan's 'no silent disappearance'
+    requirement -- and extras survive while far candidates are dropped."""
+    from dataclasses import replace as _replace
+
+    from ireset.repair.scp import FrameContext
+
+    scene = standing_scene(1)[0]
+    ctx = FrameContext(t=0, box_pose=BOX_FAR, z_pred=scene[0:36], z_prev=None,
+                       ref_kpts_world=np.zeros((15, 3)), mesh_L=None, delta_ref=None,
+                       mesh_fixed=None, hand_anchor={}, foot_anchor={},
+                       prev_hand_local={}, prev_sole_world={})
+    solver = pipeline.solver
+    cfg = pipeline.cfg
+    solver.clear_discovered_pairs()
+    # shrink the budget so the standing scene's ~56 active pairs truncate
+    tight = _replace(cfg, max_active_pairs=10)
+    solver.cfg = tight
+    pipeline.ev.forward(scene[0:36], BOX_FAR)
+    solver._frame_pairs = None
+    try:
+        solver._collision_rows(ctx)
+        assert solver.last_truncated > 0
+        n_rows = len(solver.last_row_ids)
+        assert n_rows <= 10
+        # a discovered pair must survive the tight budget: carried extras
+        # are re-added as candidates and rank with the nearest
+        far = [(ga, gb, kind) for ga, gb, kind in pipeline.ev.pairs if kind == "robot_box"]
+        solver.note_discovered_pairs(far[:1])
+        pipeline.ev.forward(scene[0:36], BOX_FAR)
+        solver._frame_pairs = None
+        rows = solver._collision_rows(ctx)
+        (ga, gb, _k) = far[0]
+        assert any(pid[:2] == (ga, gb) for pid in solver.last_row_ids), \
+            "discovered pair dropped by row budget"
+    finally:
+        solver.cfg = cfg
+
+
+def test_success_return_rescans_full_registry(pipeline) -> None:
+    """Stage 1: a state that passes the FROZEN candidate set but violates a
+    pair outside it must NOT be returned as accepted. solve_frame's
+    successful return path rescans the full registry and re-judges."""
+    from unittest.mock import patch
+
+    from ireset.repair.scp import FrameContext
+
+    scene = standing_scene(4)
+    cond = self_condition(pipeline, scene)
+    solver = pipeline.solver
+    calls = {"n": 0}
+    real_scan = solver._scan_pairs
+
+    def counting_scan(full):
+        if full:
+            calls["n"] += 1
+        return real_scan(full)
+
+    with patch.object(solver, "_scan_pairs", side_effect=counting_scan):
+        res = pipeline.repair_trajectory(scene, cond)
+    assert res.accepted
+    # frame 0 skip + 3 repaired frames x (per-iteration rescans happen only
+    # on the success path) => the full scan must have run at least once per
+    # repaired frame beyond the initial linearization scan
+    assert calls["n"] >= 4, calls
+
+
+def test_probe_violating_pair_reflected_in_retry(pipeline) -> None:
+    """Stage 1 convergence: when the prediction's endpoint is illegal but a
+    legal alternative exists, the probe-rejected chord's violating pair is
+    carried back and the retry CONVERGES to the legal state (previously the
+    solver was blind to exactly the pair its checks rejected on). The
+    accepted frame must stay on the legal side of the box wall."""
+    from dataclasses import replace as _replace
+
+    from ireset.embodied.contact_sites import ContactInterval, ContactSchedule, SMPLH_INDEX
+    from ireset.repair.context import ReferenceCondition as RC
+    from test_validation import _box_beside_left_hand
+
+    T = 3
+    h = _root_height_for_tangent(pipeline.ev)
+    q0 = np.zeros(43)
+    q0[2] = h
+    q0[3] = 1.0
+    box = _box_beside_left_hand(pipeline.validator, q0)
+    scene = np.zeros((T, 43))
+    scene[:, 0:3] = [0.0, 0.0, h]
+    scene[:, 3] = 1.0
+    scene[:, 36:43] = box
+    ids = [mujoco.mj_name2id(pipeline.ev.model, mujoco.mjtObj.mjOBJ_SITE, n)
+           for n in KPT_TO_SMPLH]
+    human = np.zeros((T, 52, 3))
+    for t in range(T):
+        pipeline.ev.forward(scene[t, 0:36], scene[t, 36:43])
+        kpts = pipeline.ev.site_positions(ids)
+        for k, name in enumerate(KPT_TO_SMPLH):
+            human[t, SMPLH_INDEX[KPT_TO_SMPLH[name]]] = kpts[k]
+    sched = ContactSchedule(intervals=[ContactInterval("left_hand", 0, T, "object")])
+    cond = RC(human, scene[:, 36:43].copy(), sched)
+    pred = scene.copy()
+    pred[1:, 0] += 0.16   # hand ends up INSIDE the box at the endpoint
+    cfg = _replace(pipeline.cfg, regen_mode=False)
+    pipe = RepairPipeline(cfg=cfg)
+    pipe.validator.cfg = pipeline.validator.cfg
+    pipe.verbose = True   # capture skip_check/attempt records
+    res = pipe.repair_trajectory(pred, cond)
+    assert res.accepted, (res.status, res.diagnostics.get("t_fail"))
+    for t in range(T):
+        pipe.ev.forward(res.trajectory[t, 0:36], res.trajectory[t, 36:43])
+        dl = min(pipe.ev.geom_distance(g, pipe.ev.box_geom, distmax=1.0)[0]
+                 for g in pipe.ev._hand_geoms["l"])
+        assert dl > 0.002, (t, dl)   # outside the wall, on the near side
+    # the prediction's illegal endpoints were caught before repair ran
+    # (multi-start then converged from the legal predecessor)
+    reasons = [r.get("reason") for r in pipe.frame_log
+               if r.get("kind") == "skip_check" and not r.get("ok")]
+    assert "state_constraints" in reasons

@@ -222,6 +222,32 @@ class RepairPipeline:
                             "val_m": float(v), "lo_m": float(l_), "hi_m": float(h_)})
         return out
 
+    def _carry_back_discovered_pairs(self, val, lo, hi, n_rows: int) -> list[str]:
+        """Stage 1: feed pairs found violating at a check back to the solver.
+
+        The candidate set a solve attempt used is frozen at its initial
+        state; an endpoint/probe check can therefore reject on a pair the
+        solve never saw. Pushing the (ga, gb, kind) identity of every
+        violating row into ``note_discovered_pairs`` makes the NEXT
+        linearization carry that pair regardless of its distance at the
+        attempt start -- the loop can then converge on the violation it
+        produced instead of failing on a blind spot. Returns pair names
+        for logging.
+        """
+        names = getattr(self.solver, "last_row_pairs", [])
+        ids = getattr(self.solver, "last_row_ids", [])
+        carried = []
+        discovered = []
+        for k in range(n_rows):
+            v, l_, h_ = val[99 + k], lo[99 + k], hi[99 + k]
+            if v < l_ - 1e-9 or v > h_ + 1e-9:
+                if k < len(ids):
+                    discovered.append(ids[k])
+                carried.append(names[k] if k < len(names) else "?")
+        if discovered:
+            self.solver.note_discovered_pairs(discovered)
+        return carried
+
     def frame_valid(self, z: np.ndarray, ctx: FrameContext) -> tuple[bool, str]:
         # fresh pair scan for acceptance decisions: the solver's per-frame
         # cache reflects the linearization state, not this candidate
@@ -246,8 +272,11 @@ class RepairPipeline:
                      "band_margin_m": solver_band_margin(ctx, self.cfg)}
             if ep_viol > 1e-6:
                 check["rows"] = self._violating_rows_verbose(val, lo, hi, len(self.solver._last_rows))
+                check["carried"] = self._carry_back_discovered_pairs(
+                    val, lo, hi, len(self.solver._last_rows))
             self.frame_log.append(check)
         if ep_viol > 1e-6:
+            self._carry_back_discovered_pairs(val, lo, hi, len(self.solver._last_rows))
             return False, "state_constraints"
         # interpolated probes between the previous accepted scene and the
         # candidate: the final validator interpolates FULL scenes (robot +
@@ -299,6 +328,13 @@ class RepairPipeline:
                             rec["rows"] = self._violating_rows_verbose(val_m, lo_m, hi_m, n_coll - 99)
                         self.frame_log.append(rec)
                     if viol_m > 1e-6:
+                        # stage 1: carry the mid-state's violating pairs back
+                        # even when verbose is off (convergence input, not
+                        # just logging); ids/names are from THIS probe's rows
+                        carried = self._carry_back_discovered_pairs(
+                            val_m, lo_m, hi_m, n_coll - 99)
+                        if self.verbose and carried:
+                            rec["carried"] = carried
                         return False, "transition_interpolated"
             finally:
                 self.solver._frame_pairs = saved_pairs
@@ -397,6 +433,10 @@ class RepairPipeline:
 
         for t in range(T):
             t0 = time.perf_counter()
+            # stage 1: discovered-pair carry-over is a WITHIN-FRAME mechanism
+            # (attempt N learns what attempt N-1's checks caught); a new
+            # frame is a new state and starts from a clean candidate set
+            self.solver.clear_discovered_pairs()
             z_pred = prediction[t, 0:36].copy()
             box = prediction[t, 36:43]
             z_prev = accepted[-1].copy() if accepted else None

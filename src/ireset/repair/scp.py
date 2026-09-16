@@ -125,6 +125,13 @@ class FrameSolver:
         self.dt = 1.0 / cfg.fps
         self._osqp = osqp.OSQP()
         self._frame_pairs: list | None = None
+        #: pairs discovered violating by THIS frame's checks (endpoint/probe)
+        #: and carried into the next solve attempt regardless of their
+        #: distance at the attempt's initial state (stage 1, 2026-09-16)
+        self._extra_pairs: list = []
+        #: pending partial-refresh count: each one triggers a fast-family +
+        #: carried-extras rescan at the next linearization (stage 1)
+        self._refresh_counter: int = 0
         #: diagnostics for the regeneration approach corridor (per side:
         #: bound geom distance + active upper at the LAST linearization);
         #: read by the pipeline's verbose frame log, not by the solver
@@ -132,6 +139,13 @@ class FrameSolver:
         #: geom-pair names parallel to the rows returned by the last
         #: ``_collision_rows`` call (diagnostics)
         self.last_row_pairs: list[str] = []
+        #: (ga, gb, kind) parallel to the rows returned by the last
+        #: ``_collision_rows`` call -- lets the pipeline carry discovered
+        #: violating pairs into the next attempt's candidate set
+        self.last_row_ids: list[tuple[int, int, str]] = []
+        #: candidate pairs silently dropped by the QP row budget at the last
+        #: linearization (nearest-first keep; reported, never hidden)
+        self.last_truncated: int = 0
 
     # -- nonlinear evaluation ------------------------------------------------
 
@@ -294,6 +308,75 @@ class FrameSolver:
                 scale[base : base + 9] = lim_h
         return val, l, u, scale
 
+    def _scan_pairs(self, full: bool) -> None:
+        """(Re)scan the candidate pair set for this frame.
+
+        ``full=False`` rescans only the fast families (robot_box /
+        robot_ground, ~100 pairs, ~0.1 ms) plus whatever the pipeline
+        discovered violating earlier in this frame — those pairs are always
+        carried. ``full=True`` rescans the entire static registry
+        (~1100 pairs, ~1.4 ms): used once per frame at the attempt's
+        initial state, and again before a SUCCESSFUL return (stage 1,
+        2026-09-16: the previous freeze-at-z_init let pairs that entered
+        range mid-iteration into the accepted output unchecked by any row).
+        """
+        ev, cfg = self.ev, self.cfg
+        dmax = cfg.activation_margin_m + 0.01
+        extra_keys = {(ga, gb) for ga, gb, _k in self._extra_pairs}
+        cands: dict[tuple[int, int], tuple] = {}
+        for ga, gb, kind in self._extra_pairs:
+            cands[(ga, gb)] = (ga, gb, kind)
+        families = ev.pairs if full else [
+            p for p in ev.pairs if p[2] in ("robot_box", "robot_ground")]
+        for ga, gb, kind in families:
+            if kind == 'box_ground' or (ga, gb) in cands:
+                continue
+            dist, _ft = ev.geom_distance(ga, gb, distmax=dmax)
+            if dist < cfg.activation_margin_m:
+                cands[(ga, gb)] = (ga, gb, kind)
+        if not full:
+            # slow families (self-collision) are expensive to rescan; when
+            # doing a partial refresh, keep the previously known self pairs
+            # that are still within the margin (they were near at the last
+            # linearization and stay candidates while the frame moves)
+            for ga, gb, kind in self._frame_pairs or []:
+                if kind == "self" and (ga, gb) not in cands:
+                    dist, _ft = ev.geom_distance(ga, gb, distmax=dmax)
+                    if dist < cfg.activation_margin_m:
+                        cands[(ga, gb)] = (ga, gb, kind)
+        # drop discovered pairs that have clearly left the margin again
+        # (extra pairs were added unconditionally; re-check them here so the
+        # set cannot grow unboundedly across attempts)
+        self._frame_pairs = list(cands.values())
+        _ = extra_keys  # readability only; extras already merged above
+
+    def note_discovered_pairs(self, pairs: list[tuple[int, int, str]]) -> None:
+        """Carry check-discovered pairs into the candidate set (stage 1).
+
+        Called by the pipeline when an endpoint/probe check finds a
+        violating pair the current candidate set did not contain. These
+        pairs participate in the NEXT linearization regardless of their
+        distance at the initial state; they are pruned by the periodic
+        rescans once genuinely far.
+        """
+        known = {(ga, gb) for ga, gb, _k in self._extra_pairs}
+        n_new = 0
+        for ga, gb, kind in pairs:
+            if (ga, gb) not in known:
+                self._extra_pairs.append((ga, gb, kind))
+                known.add((ga, gb))
+                n_new += 1
+        if n_new:
+            # new pairs must be rescanned into the candidate set; a partial
+            # refresh (fast families + carried extras + still-near self
+            # pairs) is enough and cheaper than a full registry scan
+            self._frame_pairs = None
+            self._refresh_counter += 1
+
+    def clear_discovered_pairs(self) -> None:
+        self._extra_pairs = []
+        self._frame_pairs = None
+
     def _collision_rows(self, ctx: FrameContext,
                         band_margin_m: float | None = None) -> list[tuple[float, np.ndarray, float, float]]:
         """Active collision rows with contact-band classification.
@@ -305,27 +388,23 @@ class FrameSolver:
         regeneration interior margin (None -> cfg default; 0.0 gives the
         validator-grade floor for transition probes).
 
-        The candidate pair SET is scanned once per frame and reused across
-        SCP iterations (distances/Jacobians are recomputed each call at the
-        current state); pairs entering range mid-frame are caught by the
-        final validator and the suffix rollback.
+        Candidate pairs: full registry scan at the attempt's initial state
+        (``solve_frame``), partial refresh (fast families + carried extras)
+        at later linearizations, and a full rescan before a successful
+        return. Pairs discovered violating by endpoint/probe checks are
+        carried via ``note_discovered_pairs`` and can no longer silently
+        vanish from the solve (stage 1, 2026-09-16; the previous
+        freeze-at-z_init left such pairs to the final validator only).
         """
         ev, cfg = self.ev, self.cfg
         if self._frame_pairs is None:
-            cands = []
-            dmax = cfg.activation_margin_m + 0.01
-            for ga, gb, kind in ev.pairs:
-                if kind == 'box_ground':
-                    # input-owned: the box trajectory is fixed (and its hull
-                    # over-approximates the scanned bin bottom); not a
-                    # repair constraint (matches the final validator scope)
-                    continue
-                dist, ft = ev.geom_distance(ga, gb, distmax=dmax)
-                if dist < cfg.activation_margin_m:
-                    cands.append((ga, gb, kind))
-            self._frame_pairs = cands
+            self._scan_pairs(full=True)
+        elif self._refresh_counter > 0:
+            self._refresh_counter -= 1
+            self._scan_pairs(full=False)
         rows = []
         row_names = []
+        row_ids = []
         self.last_corridor = {}
         scored = []
         for ga, gb, kind in self._frame_pairs:
@@ -384,11 +463,34 @@ class FrameSolver:
             J = ev.distance_jacobian(ga, gb, ft, dist)
             rows.append((dist, J, band_lo, upper))
             row_names.append(f"{ev.geom_name(ga)}~{ev.geom_name(gb)}:regen")
+            row_ids.append((ga, gb, "regen"))
             added_regens.add((ga, gb))
-        # regen rows count against the same fixed budget (99 + MAX_PAIRS):
-        # the capped loop gives up that many slots so the total never
-        # exceeds the QP row layout
-        for dist, ga, gb, kind, ft in scored[: cfg.max_active_pairs - len(added_regens)]:
+        # QP row budget (99 + MAX_PAIRS layout). Pairs this frame's checks
+        # caught violating (``_extra_pairs``) OUTRANK the nearest-first
+        # candidate ordering -- they are the violation evidence the loop
+        # must act on and may not be silently dropped by the cap (stage 1);
+        # remaining slots go to the nearest candidates, and the overflow is
+        # REPORTED (``last_truncated``), never hidden.
+        extra_keys = {(ga, gb) for ga, gb, _k in self._extra_pairs}
+        budget = cfg.max_active_pairs - len(added_regens)
+        chosen = []
+        overflow = []
+        for cand in scored:
+            if (cand[1], cand[2]) in extra_keys:
+                chosen.append(cand)
+            else:
+                overflow.append(cand)
+        if len(chosen) > budget:
+            # pathological (more discovered pairs than rows): keep the
+            # nearest extras and report the rest
+            overflow = chosen[budget:] + overflow
+            chosen = chosen[:budget]
+        elif len(chosen) < budget:
+            chosen.extend(overflow[: budget - len(chosen)])
+            overflow = overflow[budget - len(chosen):]
+        truncated = len(overflow)
+        self.last_truncated = truncated
+        for dist, ga, gb, kind, ft in chosen:
             if (ga, gb) in added_regens:
                 continue
             J = ev.distance_jacobian(ga, gb, ft, dist)
@@ -407,7 +509,9 @@ class FrameSolver:
             else:
                 rows.append((dist, J, cfg.noncontact_clearance_m, INF))
             row_names.append(f"{ev.geom_name(ga)}~{ev.geom_name(gb)}")
+            row_ids.append((ga, gb, kind))
         self.last_row_pairs = row_names
+        self.last_row_ids = row_ids
         return rows
 
     def violation(self, val: np.ndarray, l: np.ndarray, u: np.ndarray,
@@ -692,7 +796,10 @@ class FrameSolver:
         # the cost without new information)
         restoration = force_slack
         max_iters = cfg.scp_max_iters + (cfg.scp_extra_restoration_iters if force_slack else 0)
-        self._frame_pairs = None  # fresh scan for this frame's first linearization
+        # full registry scan for this frame's first linearization; carried
+        # extras from previous attempts (``_extra_pairs``) are merged in
+        self._frame_pairs = None
+        self._refresh_counter = 0
         for it in range(max_iters):
             it_done = it + 1
             res = self.evaluate(z, ctx)
@@ -705,8 +812,16 @@ class FrameSolver:
             if feasible and merit < best_merit:
                 best_z, best_merit, best_feasible = z.copy(), merit, True
             if feasible and res["mpjpe"] <= cfg.task_mpjpe_tol_m and self._stationary(z, ctx):
-                return FrameResult(True, z, it_done, slack_used=used_slack, merit=merit,
-                                   qp_calls=qp_calls)
+                # stage 1: pairs entering range mid-frame used to reach the
+                # accepted output unchecked by any row. Rescan (FULL
+                # registry) and re-judge the candidate; if the fresh scan
+                # exposes a violation, keep iterating instead of returning
+                # an unchecked state.
+                self._frame_pairs = None
+                val_r, lo_r, hi_r, scl_r = self.constraint_rows(z, ctx, trust, mode="accept")
+                if self.violation(val_r, lo_r, hi_r, scl_r) <= 1e-6:
+                    return FrameResult(True, z, it_done, slack_used=used_slack, merit=merit,
+                                       qp_calls=qp_calls)
 
             if restoration:
                 (Ps, qs, As, los, his), _ = self.build_qp(z, ctx, trust, slack=True)
@@ -739,6 +854,12 @@ class FrameSolver:
                 if merit_c < merit:
                     z = cand
                     accepted_step = True
+                    # stage 1: the step may have carried the state near pairs
+                    # outside the frozen candidate set; schedule a partial
+                    # refresh (fast families + carried extras) so later
+                    # linearizations see them. The full registry rescan
+                    # before a successful return remains the correctness gate.
+                    self._refresh_counter += 1
                     if merit_c < 0.5 * merit:
                         trust = min(cfg.trust_radius_max, trust * cfg.expand_factor)
                     break
