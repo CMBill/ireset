@@ -390,6 +390,7 @@ class RepairPipeline:
         prev_sole: dict = {}
         frame_status: list[str] = []
         iterations: list[int] = []
+        qp_calls_hist: list[int] = []
         timings: list[float] = []
         slack_flags: list[bool] = []
         fallbacks = 0
@@ -429,15 +430,42 @@ class RepairPipeline:
                                 contacts.release(name)
             ctx = self._frame_ctx(t, prediction, condition, contacts, prev_local, prev_sole, z_prev)
 
+            # attempt-level diagnostics (stage 0, 2026-09-16): one record per
+            # solver attempt with its state source and outcome, so reports can
+            # be recomputed from per-sample logs (which state, which try)
+            def _log_attempt(source: str, res_, bt_kind: str | None = None) -> None:
+                if not self.verbose:
+                    return
+                self.frame_log.append({
+                    "t": t, "kind": "attempt", "source": source,
+                    "backtrack": bt_kind, "accepted": bool(res_.accepted)
+                    if res_ is not None else None,
+                    "status": getattr(res_, "status", None),
+                    "iterations": getattr(res_, "iterations", None),
+                    "qp_calls": getattr(res_, "qp_calls", None),
+                    "slack_used": bool(getattr(res_, "slack_used", False)),
+                    "merit": float(res_.merit) if res_ is not None
+                    and np.isfinite(res_.merit) else None,
+                    "outcome_frame_valid": self._frame_result_ok(res_, ctx)
+                    if res_ is not None else None,
+                })
+
             ok, why = self.frame_valid(z_pred, ctx)
+            if self.verbose:
+                self.frame_log.append({
+                    "t": t, "kind": "skip_check", "source": "prediction",
+                    "ok": bool(ok), "reason": why,
+                })
             if ok:
                 z = z_pred
                 frame_status.append("skipped")
                 iterations.append(0)
                 slack_flags.append(False)
+                qp_calls_hist.append(0)
             else:
                 res = self.solver.solve_frame(z_pred, ctx)
                 path = "repaired" if not res.slack_used else "repaired_slack"
+                _log_attempt("prediction", res)
                 res, bt = self._transition_backtrack(res, ctx, z_prev)
                 if bt:
                     path = bt
@@ -447,6 +475,7 @@ class RepairPipeline:
                     # z_pred but solve from the accepted predecessor
                     res_alt = self.solver.solve_frame(z_prev, ctx) if z_prev is not None else None
                     if res_alt is not None:
+                        _log_attempt("prev_accepted", res_alt)
                         res_alt, bt2 = self._transition_backtrack(res_alt, ctx, z_prev)
                         if self._frame_result_ok(res_alt, ctx):
                             res, path = res_alt, bt2 or "repaired_prev"
@@ -454,6 +483,7 @@ class RepairPipeline:
                         res2 = self.solver.solve_frame(
                             z_prev if z_prev is not None else z_pred, ctx, force_slack=True
                         )
+                        _log_attempt("slack_fallback", res2)
                         if self._frame_result_ok(res2, ctx):
                             res, path = res2, "repaired_slack"
                             fallbacks += 1
@@ -463,13 +493,14 @@ class RepairPipeline:
                         "t_fail": t, "reason": res.status, "skip_reason": why,
                         "accepted_frames": len(accepted), "frame_status": frame_status,
                         "iterations": iterations, "timings_s": timings,
-                        "fallbacks": fallbacks,
+                        "qp_calls": qp_calls_hist, "fallbacks": fallbacks,
                         "slack_frames": int(sum(slack_flags)),
                         "skipped": sum(1 for st in frame_status if st == "skipped"),
                     })
                 z = res.z
                 frame_status.append(path)
                 iterations.append(res.iterations)
+                qp_calls_hist.append(res.qp_calls)
                 # slack is an independent fact from the chosen solve branch:
                 # multi-start/repaired_prev and backtrack paths overwrite the
                 # path NAME, but the flag travels with the result object
@@ -494,6 +525,7 @@ class RepairPipeline:
         trajectory[:, 36:43] = prediction[:, 36:43]
         return TrajectoryResult(True, "accepted", trajectory=trajectory, diagnostics={
             "frame_status": frame_status, "iterations": iterations,
+            "qp_calls": qp_calls_hist,
             "timings_s": timings, "fallbacks": fallbacks,
             "slack_frames": int(sum(slack_flags)),
             "skipped": sum(1 for s in frame_status if s == "skipped"),

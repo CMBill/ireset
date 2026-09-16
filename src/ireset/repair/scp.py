@@ -96,6 +96,10 @@ class FrameResult:
     slack_used: bool = False
     status: str = "solved"           # solved / infeasible / max_iters
     merit: float = float("inf")
+    #: number of QP solves actually issued for this frame (all branches;
+    #: stage 0 statistics, 2026-09-16 -- the return branches used to hardcode
+    #: ``scp_max_iters``, which reported phantom iterations)
+    qp_calls: int = 0
     diagnostics: dict = field(default_factory=dict)
 
 
@@ -680,6 +684,8 @@ class FrameSolver:
             mu *= cfg.regen_merit_multiplier
         best_z, best_merit, best_feasible = None, float("inf"), False
         used_slack = False
+        it_done = 0
+        qp_calls = 0
 
         # once the tight QP proves infeasible for this frame, stay in
         # restoration mode (re-trying the tight solve each iteration doubles
@@ -688,6 +694,7 @@ class FrameSolver:
         max_iters = cfg.scp_max_iters + (cfg.scp_extra_restoration_iters if force_slack else 0)
         self._frame_pairs = None  # fresh scan for this frame's first linearization
         for it in range(max_iters):
+            it_done = it + 1
             res = self.evaluate(z, ctx)
             # feasibility/merit are judged against ACCEPTANCE bounds; the
             # proactive +2mm clearance lives only inside the QP rows
@@ -698,10 +705,12 @@ class FrameSolver:
             if feasible and merit < best_merit:
                 best_z, best_merit, best_feasible = z.copy(), merit, True
             if feasible and res["mpjpe"] <= cfg.task_mpjpe_tol_m and self._stationary(z, ctx):
-                return FrameResult(True, z, it, merit=merit)
+                return FrameResult(True, z, it_done, slack_used=used_slack, merit=merit,
+                                   qp_calls=qp_calls)
 
             if restoration:
                 (Ps, qs, As, los, his), _ = self.build_qp(z, ctx, trust, slack=True)
+                qp_calls += 1
                 x_s, _ = self.solve_qp(Ps, qs, As, los, his)
                 if x_s is None:
                     trust *= cfg.shrink_factor
@@ -712,6 +721,7 @@ class FrameSolver:
                 xi = x_s[:N_TANGENT]
             else:
                 (P, qv, A, lo_a, hi_a), _ = self.build_qp(z, ctx, trust, slack=False)
+                qp_calls += 1
                 xi, _status = self.solve_qp(P, qv, A, lo_a, hi_a)
                 if xi is None:
                     restoration = True
@@ -737,12 +747,19 @@ class FrameSolver:
                 if trust < cfg.trust_radius_min:
                     break
 
+        # budget exhausted / trust collapsed: report the ACTUAL iteration
+        # count and slack usage (the old hardcoded ``scp_max_iters`` hid
+        # early-exit branches and misreported slack on restoration exits;
+        # stage 0, 2026-09-16)
         if best_feasible:
             res = self.evaluate(best_z, ctx)
             if res["mpjpe"] <= cfg.task_mpjpe_tol_m:
-                return FrameResult(True, best_z, cfg.scp_max_iters, slack_used=used_slack, merit=best_merit)
-            return FrameResult(False, best_z, cfg.scp_max_iters, status="task_quality", merit=best_merit)
-        return FrameResult(False, z, cfg.scp_max_iters, status="infeasible", slack_used=used_slack)
+                return FrameResult(True, best_z, it_done, slack_used=used_slack, merit=best_merit,
+                                   qp_calls=qp_calls)
+            return FrameResult(False, best_z, it_done, status="task_quality",
+                               slack_used=used_slack, merit=best_merit, qp_calls=qp_calls)
+        return FrameResult(False, z, it_done, status="infeasible", slack_used=used_slack,
+                           qp_calls=qp_calls)
 
     def _stationary(self, z: np.ndarray, ctx: FrameContext) -> bool:
         """Prediction-consistent stationarity: near the prediction target."""

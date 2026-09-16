@@ -207,12 +207,34 @@ def main() -> None:
         t0 = time.perf_counter()
         res = pipe.repair_trajectory(scene, cond)
         wall = time.perf_counter() - t0
+        # stage 0 (2026-09-16): the old ms_per_frame divided the WHOLE wall
+        # time by the FULL clip length -- an early rejection amortized its
+        # per-frame cost over frames never processed. Report per PROCESSED
+        # frame (pipeline's own timings_s includes every attempt), the raw
+        # length-normalized value, and both total timings
+        frame_stats = res.diagnostics.get("timings_s", [])
+        n_processed = max(len(frame_stats), res.diagnostics.get("t_fail", -1) + 1
+                          if res.diagnostics.get("t_fail") is not None else len(frame_stats))
+        ms_frame_stats = [s * 1e3 for s in frame_stats]
         row = {"demo": demo, "T": int(scene.shape[0]), "fps": fps,
                "accepted": bool(res.accepted), "status": res.status,
                "wall_s": round(wall, 2),
-               "ms_per_frame": round(wall * 1e3 / scene.shape[0], 1),
+               "n_frames_processed": int(n_processed),
+               "ms_per_processed_frame": (
+                   round(float(np.mean(ms_frame_stats)), 1) if ms_frame_stats else None),
+               "ms_per_frame_p95": (
+                   round(float(np.percentile(ms_frame_stats, 95)), 1) if ms_frame_stats else None),
+               "solve_frames_s": round(float(sum(frame_stats)), 3),
+               # length-normalized legacy metric (kept for comparability; NOT
+               # a per-frame cost for early-rejected segments)
+               "ms_per_input_frame": round(wall * 1e3 / scene.shape[0], 1),
                "t_fail": res.diagnostics.get("t_fail"),
-               "skip_reason": res.diagnostics.get("skip_reason")}
+               "skip_reason": res.diagnostics.get("skip_reason"),
+               "attempts": res.diagnostics.get("fallbacks"),
+               "slack_frames": res.diagnostics.get("slack_frames"),
+               "iterations_sum": int(sum(res.diagnostics.get("iterations", []))),
+               "qp_calls_sum": int(sum(res.diagnostics.get("qp_calls", []))),
+               "screening_s": None}
         if args.verbose:
             print(f"[{demo}] frame log ({len(pipe.frame_log)} records):")
             print_frame_log(pipe)
@@ -222,7 +244,9 @@ def main() -> None:
         keep = False
         if res.accepted and res.trajectory is not None:
             traj = res.trajectory
+            t_screen = time.perf_counter()
             cov = hand_recall(validator, traj, cond)
+            row["screening_s"] = round(time.perf_counter() - t_screen, 3)
             row["hand"] = cov
             row["task_mpjpe"] = task_mpjpe_stats(pipe.ev, traj, cond)
             recalls = [cov[f"{s}_hand_contact_recall"] for s in ("left", "right")
@@ -246,7 +270,8 @@ def main() -> None:
               f"cert={row.get('hand', {}).get('left_hand_interval_recall', '-')}/"
               f"{row.get('hand', {}).get('right_hand_interval_recall', '-')} "
               f"task_p95={row.get('task_mpjpe', {}).get('p95', '-')} "
-              f"({row['ms_per_frame']}ms/f)")
+              f"({row['ms_per_processed_frame']}ms/proc-f, "
+              f"{row['n_frames_processed']}/{row['T']} frames)")
 
     reg_cfg_pub = {k: v for k, v in asdict(regen_cfg).items()
                    if k in ("regen_mode", "regen_hand_contact_gap_m",
