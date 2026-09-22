@@ -64,6 +64,9 @@ def registered_set(name: str) -> list[str]:
         return json.loads(SCREEN.read_text())["registered"]["p0_diagnosis_6"]
     if name == "calibration24":
         return json.loads(SCREEN.read_text())["registered"]["p02_calibration"]
+    if name == "calibration24_train_v1":
+        return json.loads(
+            (SCREEN.parent / "calibration24_train_v1.json").read_text())["demos"]
     demos = json.loads((SPLIT / f"{name}.json").read_text())
     return demos["demos"] if isinstance(demos, dict) else demos
 
@@ -188,7 +191,9 @@ def print_frame_log(pipe: RepairPipeline) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--set", choices=["diagnosis6", "calibration24", "train", "val", "test"],
+    ap.add_argument("--set", choices=["diagnosis6", "calibration24",
+                                      "calibration24_train_v1",
+                                      "train", "val", "test"],
                     default="diagnosis6")
     ap.add_argument("--demos", nargs="*", default=None, help="explicit demo list override")
     ap.add_argument("--frames", type=int, default=0, help="0 = full clip")

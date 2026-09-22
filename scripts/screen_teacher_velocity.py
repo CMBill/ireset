@@ -88,6 +88,13 @@ def main() -> None:
         "per_file": per_file,
     }
     out_path = OUT / "velocity_screen.json"
+    # a pre-registered frozen set (stage-gate fix plan section 8) is not a scan
+    # result: carry it over verbatim so a re-scan cannot silently drop it
+    if out_path.exists():
+        old = json.loads(out_path.read_text())
+        for k, v in old.get("registered", {}).items():
+            if k.startswith("calibration24_train_v") and k not in report["registered"]:
+                report["registered"][k] = v
     out_path.write_text(json.dumps(report, indent=1))
     print(f"{len(files)} originals, {len(excluded)} excluded -> {out_path}")
     print(f"diagnosis set ({len(diag)}): {diag}")
