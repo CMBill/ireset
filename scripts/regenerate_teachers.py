@@ -310,10 +310,13 @@ def main() -> None:
             fa = res.diagnostics["first_attempt"]
             row["suffix_retry"] = {
                 "from_frame": res.diagnostics.get("suffix_retry_from"),
-                "first_attempt_status": fa.get("status"),
                 "first_attempt_t_fail": fa.get("t_fail"),
-                "first_attempt_validator": fa.get("first_attempt_final"),
-                "first_attempt_failed_checks": fa.get("failed_checks"),
+                # the first pass was accepted (trajectory-level) but failed
+                # the independent validator: this summary + failed_checks
+                # describe that failure; the retry's own outcome is below
+                "first_attempt_validator": res.diagnostics.get("first_attempt_final"),
+                "first_attempt_failed_checks": res.diagnostics.get("failed_checks"),
+                "retry_failed_checks": res.diagnostics.get("final_retry_failed_checks"),
                 "first_attempt_solve_s": round(float(sum(fa.get("timings_s", []))), 3),
                 "first_attempt_rejection": {
                     "reason": fa.get("reason"),

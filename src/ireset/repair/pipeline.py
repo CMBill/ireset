@@ -461,6 +461,7 @@ class RepairPipeline:
         # them either)
         retry.diagnostics["first_attempt"] = dict(result.diagnostics)
         if not retry.accepted:
+            self._final_rejection(retry, retry.diagnostics.get("failed_checks", {}))
             return TrajectoryResult(False, "rejected_final", diagnostics=retry.diagnostics)
         t_final = time.perf_counter()
         final2 = self.validator.validate(retry.trajectory, exclude=("box_ground",))
@@ -478,9 +479,24 @@ class RepairPipeline:
             k: {"location": v.location, "first_failure_frame": v.first_failure_frame}
             for k, v in final2.checks.items() if not v.passed
         }
+        self._final_rejection(retry, retry.diagnostics["final_retry_failed_checks"])
         return TrajectoryResult(False, "rejected_final", diagnostics={
             **retry.diagnostics, "final_retry": final2.summary(),
         })
+
+    @staticmethod
+    def _final_rejection(retry: TrajectoryResult, failed: dict) -> None:
+        """Structured rejection evidence for a final-validation failure (F0).
+
+        ``rejected_final`` paths have no solve-stage rejection: the reason is
+        the independent validator's failing checks, with their locations, so
+        the report never shows an empty reason/final_stage pair.
+        """
+        retry.diagnostics.setdefault("reason", "final_validation")
+        retry.diagnostics.setdefault("final_stage", "final_validation")
+        retry.diagnostics.setdefault(
+            "violated_rows",
+            [f"{k}: {v.get('location')}" for k, v in failed.items()])
 
     # -- sequential core ----------------------------------------------------------------
 
