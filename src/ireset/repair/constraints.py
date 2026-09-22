@@ -184,21 +184,68 @@ class FrameEvaluator:
     def geom_name(self, gid: int) -> str:
         return mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, gid)
 
+    def geom_separation_direction(self, ga: int, gb: int, dist: float) -> np.ndarray:
+        """Unit direction in which ga's closest point must move to SEPARATE.
+
+        Needed when MuJoCo's ``fromto`` is degenerate: for a pair in exact
+        contact (dist ~ 0) the two closest points coincide, so both the
+        segment normal and the distance gradient vanish. The old guard
+        (``n > 1e-9`` else zeros) zeroed the Jacobian exactly at the contact
+        configurations the solver must regulate -- the QP row went inert and
+        the solver could sink a supporting foot centimeters into the ground
+        for free while the check (true distance) only saw the penetration
+        afterwards.
+
+        Fallback order: MuJoCo's contact record for the pair (present
+        whenever the pair actually collides), then geometry -- a plane's
+        frame z-axis, otherwise the center-to-center direction (exact for
+        spheres, the standard convex approximation at contact).
+        """
+        for i in range(self.data.ncon):
+            c = self.data.contact[i]
+            if {int(c.geom1), int(c.geom2)} == {ga, gb}:
+                # frame normal points from geom2 to geom1
+                n = np.array(c.frame[0:3], dtype=float)
+                return n if ga == int(c.geom1) else -n
+        for g, other in ((ga, gb), (gb, ga)):
+            if self.model.geom_type[g] == mujoco.mjtGeom.mjGEOM_PLANE:
+                R = self.data.geom_xmat[g].reshape(3, 3)
+                n = R[:, 2].copy()
+                # orient from the plane toward the other geom
+                side = np.dot(n, self.data.geom_xpos[other] - self.data.geom_xpos[g])
+                if side < 0:
+                    n = -n
+                # u points from the other side toward ga (its separation
+                # direction): along n when the plane is gb, against it when
+                # the plane is ga
+                return -n if g == ga else n
+        d = self.data.geom_xpos[ga] - self.data.geom_xpos[gb]
+        n = float(np.linalg.norm(d))
+        if n > 1e-9:
+            return d / n
+        return np.array([0.0, 0.0, 1.0])
+
     def distance_jacobian(self, ga: int, gb: int, fromto: np.ndarray, dist: float) -> np.ndarray:
         """Jacobian of the signed distance wrt xi (rigid closest-point form).
 
         d = s * n . (p2 - p1), s = +1 separated / -1 penetrating: the
         fromto segment always points from p1 to p2, but the signed distance
-        is -|p2-p1| inside, which flips the gradient sign.
+        is -|p2-p1| inside, which flips the gradient sign. Equivalently the
+        gradient is ``u . (Jp1 - Jp2)`` with ``u`` the unit separation
+        direction of ga (``geom_separation_direction``), which stays valid
+        when the fromto segment collapses at exact contact.
         """
         p1, p2 = fromto[0:3], fromto[3:6]
         diff = p2 - p1
-        n = np.linalg.norm(diff)
-        n_hat = diff / n if n > 1e-9 else np.zeros(3)
+        n = float(np.linalg.norm(diff))
         s = 1.0 if dist >= 0 else -1.0
+        if n > 1e-9:
+            u = -s * (diff / n)
+        else:
+            u = self.geom_separation_direction(ga, gb, dist)
         J = np.zeros((1, N_TANGENT))
-        for g, point, sign in ((ga, p1, -1.0), (gb, p2, +1.0)):
+        for g, point, sign in ((ga, p1, +1.0), (gb, p2, -1.0)):
             if g in (self.box_geom, self.ground_geom):
                 continue  # static within a frame
-            J += s * sign * (n_hat[None, :] @ self.geom_point_jacobian_35(g, point))
+            J += sign * (u[None, :] @ self.geom_point_jacobian_35(g, point))
         return J

@@ -7,16 +7,25 @@ repairer runs in ``regen_mode`` -- during reference grasp intervals
 (inferred from the reference HUMAN keypoints, hull metric) the hand-box
 pairs carry an ACTIVE upper bound, pulling the hovering teacher onto the
 box. Feet keep the standard per-pair + quasi-static semantics (P0-fix
-strict 6/6). Screening = the independent validator (strict by default)
-PLUS hand-grasp coverage: per side, the fraction of reference-grasp frames
-covered by inferred robot hand intervals must reach ``--min-hand-recall``
--- a regenerated teacher that still certifies nothing is not a teacher.
+strict 6/6).
+
+KEEP criterion (geometric screening + strict validation, NOT interval
+certification): the independent validator (strict by default) must pass
+AND, per side with at least ``--min-ref-frames`` reference grasp frames,
+the fraction of those frames whose closest hand geom is within the
+validator's ``hand_enter_m`` must reach ``--min-hand-recall``. A sample
+with no screened side is reported as ``no_reference_grasp`` and not kept.
+Certified-interval coverage (quasi-static entry gates) is REPORTED per
+side (count, frames, longest continuous interval) but is not a keep
+criterion -- zero coverage means "geometric proximity only", which the
+report marks explicitly (m2_m3_stage_gate_fix_plan sections 3/6).
 
 Outputs are NEW files only (source data under resources/ is read-only):
 ``<output-dir>/<demo>.npz`` in the source teacher layout (qpos
 quaternion-first, human_joints, fps -- byte-compatible with
 ``ireset.data.teacher.load_teacher_npz``) plus a provenance report JSON
-(source list, git rev, effective config, per-demo screening rows).
+(source list, git rev, effective config, per-demo screening rows with
+cost/timing breakdown and coverage evidence).
 
 Run: uv run --locked python scripts/regenerate_teachers.py --set diagnosis6 \
         --validation-mode strict
@@ -37,6 +46,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import numpy as np
 
 from closed_loop_metrics import git_rev
+from experiment_provenance import provenance as provenance_snapshot
 from ireset.embodied.contact_sites import infer_reference_schedule
 from ireset.paths import DERIVED_DATA_DIR, PROJECT_ROOT, TEACHER_TRAJ_DIR
 from ireset.repair.config_io import MODES, load_mode_configs
@@ -72,7 +82,13 @@ def to_teacher_layout(scene: np.ndarray) -> np.ndarray:
 def hand_recall(validator: IndependentValidator, traj: np.ndarray,
                 cond: ReferenceCondition) -> dict:
     """Per-side recall of reference grasp frames by inferred robot hand
-    intervals, plus the validator's own interval stats."""
+    intervals, plus the validator's own interval stats.
+
+    Two coverage notions are reported separately (plan section 6):
+    ``contact_recall`` (KEEP criterion: physical proximity within the
+    validator's enter threshold) and ``interval_recall`` (certification:
+    quasi-static entry gates; lags contact by construction).
+    """
     T = traj.shape[0]
     rep = validator.validate(traj, exclude=("box_ground",))
     out = {"intervals": rep.schedule.stats.get("hand_intervals", {}),
@@ -88,6 +104,21 @@ def hand_recall(validator: IndependentValidator, traj: np.ndarray,
         out[f"{side}_hand_interval_recall"] = (
             float((ref & rob).sum() / n_ref) if n_ref else None)
         out[f"{side}_hand_ref_frames"] = n_ref
+        # certified intervals of this side: count, frames, longest span and
+        # its reference-grasp overlap (a long interval outside the
+        # reference grasp window is not carry evidence)
+        ivs = [(iv.start, iv.end) for iv in rep.schedule.intervals
+               if iv.effector == eff and iv.support == "object"]
+        out[f"{side}_hand_certified_frames"] = int(sum(b - a for a, b in ivs))
+        if ivs:
+            a, b = max(ivs, key=lambda ab: ab[1] - ab[0])
+            out[f"{side}_hand_longest_interval"] = {
+                "start": int(a), "end": int(b), "frames": int(b - a),
+                "ref_frames_in_span": int(ref[a:b].sum())}
+            out[f"{side}_hand_interval_bounds"] = [[int(a), int(b)] for a, b in ivs]
+        else:
+            out[f"{side}_hand_longest_interval"] = None
+            out[f"{side}_hand_interval_bounds"] = []
         if n_ref:
             # contact recall (KEEP criterion): physical grasp presence --
             # closest hand geom within the enter threshold; interval recall
@@ -170,6 +201,8 @@ def main() -> None:
     ap.add_argument("--output-dir", type=str,
                     default=str(DERIVED_DATA_DIR / "teachers_regenerated"))
     ap.add_argument("--report", type=str, default=None)
+    ap.add_argument("--note", type=str, default=None,
+                    help="free-form run note stored in the report")
     ap.add_argument("--verbose", action="store_true",
                     help="per-frame hand_dist / corridor_upper / probe details "
                          "(printed summary + full frame_log in the report rows)")
@@ -215,26 +248,65 @@ def main() -> None:
         frame_stats = res.diagnostics.get("timings_s", [])
         n_processed = max(len(frame_stats), res.diagnostics.get("t_fail", -1) + 1
                           if res.diagnostics.get("t_fail") is not None else len(frame_stats))
-        ms_frame_stats = [s * 1e3 for s in frame_stats]
+        ms_frame_stats = np.asarray(frame_stats, dtype=float) * 1e3
         row = {"demo": demo, "T": int(scene.shape[0]), "fps": fps,
                "accepted": bool(res.accepted), "status": res.status,
                "wall_s": round(wall, 2),
                "n_frames_processed": int(n_processed),
                "ms_per_processed_frame": (
-                   round(float(np.mean(ms_frame_stats)), 1) if ms_frame_stats else None),
-               "ms_per_frame_p95": (
-                   round(float(np.percentile(ms_frame_stats, 95)), 1) if ms_frame_stats else None),
+                   round(float(ms_frame_stats.mean()), 1) if ms_frame_stats.size else None),
+               "ms_per_processed_frame_p50": (
+                   round(float(np.percentile(ms_frame_stats, 50)), 1)
+                   if ms_frame_stats.size else None),
+               "ms_per_processed_frame_p95": (
+                   round(float(np.percentile(ms_frame_stats, 95)), 1)
+                   if ms_frame_stats.size else None),
+               "ms_per_processed_frame_max": (
+                   round(float(ms_frame_stats.max()), 1) if ms_frame_stats.size else None),
                "solve_frames_s": round(float(sum(frame_stats)), 3),
+               "final_validation_s": res.diagnostics.get("final_validation_s"),
+               "total_s": res.diagnostics.get("total_s"),
                # length-normalized legacy metric (kept for comparability; NOT
                # a per-frame cost for early-rejected segments)
                "ms_per_input_frame": round(wall * 1e3 / scene.shape[0], 1),
                "t_fail": res.diagnostics.get("t_fail"),
                "skip_reason": res.diagnostics.get("skip_reason"),
-               "attempts": res.diagnostics.get("fallbacks"),
+               "final_stage": res.diagnostics.get("final_stage"),
+               "fallbacks": res.diagnostics.get("fallbacks"),
                "slack_frames": res.diagnostics.get("slack_frames"),
-               "iterations_sum": int(sum(res.diagnostics.get("iterations", []))),
-               "qp_calls_sum": int(sum(res.diagnostics.get("qp_calls", []))),
+               # F0 aggregate over ALL attempts of this pass (a suffix retry
+               # never overwrites the first pass; its costs live under
+               # "first_attempt"): attempts/qp/iterations/slack/backtrack and
+               # processed-frame visits vs unique frames vs input frames
+               "cost": {k: res.diagnostics.get(k) for k in (
+                   "attempts", "qp_calls_total", "iterations_total",
+                   "slack_attempts", "backtracks", "processed_frame_visits",
+                   "unique_processed_frames", "input_frames", "skipped_frames",
+                   "suffix_retries", "trajectory_pass")},
                "screening_s": None}
+        if not res.accepted:
+            row["rejection"] = {
+                "reason": res.diagnostics.get("reason"),
+                "reason_source": res.diagnostics.get("reason_source"),
+                "last_attempt": res.diagnostics.get("last_attempt"),
+                "violated_rows": res.diagnostics.get("violated_rows"),
+                "probe": res.diagnostics.get("probe"),
+            }
+        if "first_attempt" in res.diagnostics:
+            fa = res.diagnostics["first_attempt"]
+            row["suffix_retry"] = {
+                "from_frame": res.diagnostics.get("suffix_retry_from"),
+                "first_attempt_status": fa.get("status"),
+                "first_attempt_t_fail": fa.get("t_fail"),
+                "first_attempt_validator": fa.get("first_attempt_final"),
+                "first_attempt_failed_checks": fa.get("failed_checks"),
+                "first_attempt_solve_s": round(float(sum(fa.get("timings_s", []))), 3),
+                "first_attempt_rejection": {
+                    "reason": fa.get("reason"),
+                    "final_stage": fa.get("final_stage"),
+                    "violated_rows": fa.get("violated_rows"),
+                    "probe": fa.get("probe")},
+            }
         if args.verbose:
             print(f"[{demo}] frame log ({len(pipe.frame_log)} records):")
             print_frame_log(pipe)
@@ -277,13 +349,22 @@ def main() -> None:
                    if k in ("regen_mode", "regen_hand_contact_gap_m",
                             "task_mpjpe_tol_m", "contact_band_gap_m",
                             "hand_anchor_tol_m", "scp_max_iters")}
+    # code/input/asset provenance for this report (plan section 10): the
+    # report must be reproducible without /tmp probes -- exact revision and
+    # dirty-diff hash, input NPZ hashes, asset hashes, effective configs
+    prov = provenance_snapshot(demos, note=f"{args.set}/{args.validation_mode}")
     report = {
         "set": args.set, "n_demos": len(demos), "n_kept": n_keep,
         "validation_mode": args.validation_mode,
         "min_hand_recall": args.min_hand_recall,
+        "min_ref_frames": args.min_ref_frames,
         "regen_config": reg_cfg_pub,
         "source_dir": str(TEACHER_TRAJ_DIR),
         "git_rev": git_rev(),
+        "notes": args.note,
+        "provenance": {k: prov[k] for k in
+                       ("git", "configs", "assets", "env", "uv_lock_sha256")},
+        "inputs": prov.get("inputs"),
         "rows": rows,
     }
     report_path = Path(args.report) if args.report else (

@@ -135,14 +135,27 @@ def test_root_offset_is_repaired(pipeline) -> None:
 
 
 def test_unreachable_box_rejected(pipeline) -> None:
-    """Box enclosing the torso with a 2-frame horizon: the root must move
-    >22cm (box half extent) but the velocity budget allows 2x6cm -> truly
-    infeasible -> explicit reject with no trajectory."""
-    scene = standing_scene(2, box=np.array([0.0, 0.0, 0.80, 1.0, 0, 0, 0]))
+    """A box that appears ON the torso with one frame of budget: escaping
+    needs >22cm (box half extent) but the closing velocity row allows 6cm ->
+    the frame cannot be repaired -> explicit reject with no trajectory.
+
+    History (2026-09-22, m2_m3_stage_gate_fix_plan F0/F2): the previous
+    version placed the box at the SAME pose in BOTH frames and was not
+    actually infeasible. Frame 0 has no predecessor, so no velocity row
+    bounds its root motion and the solver could legally teleport the root
+    out of the box -- with the corrected QP scaling it does exactly that and
+    the trajectory passes strict validation. The old rejection was an
+    artifact of the pre-F2 over-scaled linear term (huge drift steps, trust
+    collapse), not of the task geometry. This version puts the box on the
+    torso at the LAST frame, where the per-frame velocity budget bounds the
+    escape."""
+    scene = standing_scene(3)
+    scene[2, 36:43] = np.array([0.0, 0.0, 0.80, 1.0, 0, 0, 0])
     cond = self_condition(pipeline, scene)
     res = pipeline.repair_trajectory(scene, cond)
-    assert not res.accepted
-    assert res.status in ("rejected_frame", "rejected_final")
+    assert not res.accepted, res.diagnostics
+    assert res.status == "rejected_frame", res.diagnostics
+    assert res.diagnostics["t_fail"] == 2
     assert res.trajectory is None  # rejected results never carry trajectories
 
 
@@ -362,8 +375,8 @@ def test_transition_check_catches_box_sweep(pipeline) -> None:
     box_prev = np.array([-reach - 0.35, 0.0, 0.80, 1.0, 0, 0, 0])
     box_cur = np.array([+reach + 0.35, 0.0, 0.80, 1.0, 0, 0, 0])
     ctx = _transition_ctx(pipeline, z, z, box_cur, box_prev, ref)
-    ok, why = pipeline.frame_valid(z, ctx)
-    assert not ok and why == "transition_interpolated", (ok, why)
+    chk = pipeline.frame_valid(z, ctx)
+    assert not chk.ok and chk.reason == "transition_interpolated", (chk.ok, chk.reason)
 
 
 def test_transition_check_catches_box_rotation_sweep(pipeline) -> None:
@@ -379,8 +392,8 @@ def test_transition_check_catches_box_rotation_sweep(pipeline) -> None:
     q0 = np.array([1.0, 0, 0, 0])
     q180 = np.array([0.0, 0, 1.0, 0])       # pitch +180 deg (w-first)
     ctx = _transition_ctx(pipeline, z, z, np.r_[c, q180], np.r_[c, q0], ref)
-    ok, why = pipeline.frame_valid(z, ctx)
-    assert not ok and why == "transition_interpolated", (ok, why)
+    chk = pipeline.frame_valid(z, ctx)
+    assert not chk.ok and chk.reason == "transition_interpolated", (chk.ok, chk.reason)
 
 
 def test_transition_check_common_motion_no_false_positive(pipeline) -> None:
@@ -395,8 +408,8 @@ def test_transition_check_common_motion_no_false_positive(pipeline) -> None:
     box_prev, box_cur = BOX_FAR.copy(), BOX_FAR + np.r_[dx, np.zeros(4)]
     ref = _self_ref_kpts(pipeline, z, box_cur)
     ctx = _transition_ctx(pipeline, z, z_prev, box_cur, box_prev, ref)
-    ok, why = pipeline.frame_valid(z, ctx)
-    assert ok and why == "ok", (ok, why)
+    chk = pipeline.frame_valid(z, ctx)
+    assert chk.ok and chk.reason == "ok", (chk.ok, chk.reason)
 
 
 def test_first_failure_frame_is_min_over_failed_checks(pipeline) -> None:
@@ -861,7 +874,7 @@ def test_probe_violating_pair_reflected_in_retry(pipeline) -> None:
     cfg = _replace(pipeline.cfg, regen_mode=False)
     pipe = RepairPipeline(cfg=cfg)
     pipe.validator.cfg = pipeline.validator.cfg
-    pipe.verbose = True   # capture skip_check/attempt records
+    pipe.verbose = True   # capture check/attempt records
     res = pipe.repair_trajectory(pred, cond)
     assert res.accepted, (res.status, res.diagnostics.get("t_fail"))
     for t in range(T):
@@ -872,7 +885,8 @@ def test_probe_violating_pair_reflected_in_retry(pipeline) -> None:
     # the prediction's illegal endpoints were caught before repair ran
     # (multi-start then converged from the legal predecessor)
     reasons = [r.get("reason") for r in pipe.frame_log
-               if r.get("kind") == "skip_check" and not r.get("ok")]
+               if r.get("kind") == "check" and r.get("caller") == "skip"
+               and not r.get("ok")]
     assert "state_constraints" in reasons
 
 

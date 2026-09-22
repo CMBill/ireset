@@ -31,7 +31,7 @@ from ireset.geometry.distance_adapter import world_to_box_geom
 from ireset.kinematics.mujoco_adapter import retract_batch
 from ireset.repair.constraints import FrameEvaluator, tangent_error
 from ireset.repair.context import EFFECTORS, ContactStateMachine, ReferenceCondition, RepairConfig
-from ireset.repair.scp import FrameContext, FrameSolver, solver_band_margin
+from ireset.repair.scp import FrameCheck, FrameContext, FrameSolver, solver_band_margin
 from ireset.repair.validation import IndependentValidator
 
 KPT_IDX = [SMPLH_INDEX[v] for v in KPT_TO_SMPLH.values()]
@@ -207,77 +207,53 @@ class RepairPipeline:
 
     # -- frame-level checks (skip logic, plan 8.4) ---------------------------------
 
-    def _hand_dists_verbose(self, z: np.ndarray, box: np.ndarray) -> dict:
-        self.ev.forward(z, box)
+    def _hand_gaps(self) -> dict:
+        """Min hand-geom/box distance per side at the CURRENT forwarded state.
+
+        Read-only diagnostics built from the evaluator state a check already
+        forwarded to; no extra FK, no re-forward (F0: verbose must not add
+        checks or FK).
+        """
         return {s: min(self.ev.geom_distance(g, self.ev.box_geom)[0]
                        for g in self.ev._hand_geoms[s]) for s in ("l", "r")}
 
-    def _violating_rows_verbose(self, val, lo, hi, n_rows: int) -> list[dict]:
-        names = getattr(self.solver, "last_row_pairs", [])
-        out = []
-        for k in range(n_rows):
-            v, l_, h_ = val[99 + k], lo[99 + k], hi[99 + k]
-            if v < l_ - 1e-9 or v > h_ + 1e-9:
-                out.append({"pair": names[k] if k < len(names) else "?",
-                            "val_m": float(v), "lo_m": float(l_), "hi_m": float(h_)})
-        return out
+    def _frame_valid(self, z: np.ndarray, ctx: FrameContext) -> FrameCheck:
+        """Endpoint + transition + task-quality check for a candidate state.
 
-    def _carry_back_discovered_pairs(self, val, lo, hi, n_rows: int) -> list[str]:
-        """Stage 1: feed pairs found violating at a check back to the solver.
-
-        The candidate set a solve attempt used is frozen at its initial
-        state; an endpoint/probe check can therefore reject on a pair the
-        solve never saw. Pushing the (ga, gb, kind) identity of every
-        violating row into ``note_discovered_pairs`` makes the NEXT
-        linearization carry that pair regardless of its distance at the
-        attempt start -- the loop can then converge on the violation it
-        produced instead of failing on a blind spot. Returns pair names
-        for logging.
+        Returns the decision plus its evidence. Pairs found violating are
+        recorded with their stable identities; the CALLER decides when to
+        feed them back via ``carry_discovered`` (F0: checks and carry-back
+        are separate actions). Verbose logging serializes this record -- it
+        never triggers another check, FK, carry-back or cache change.
         """
-        names = getattr(self.solver, "last_row_pairs", [])
-        ids = getattr(self.solver, "last_row_ids", [])
-        carried = []
-        discovered = []
-        for k in range(n_rows):
-            v, l_, h_ = val[99 + k], lo[99 + k], hi[99 + k]
-            if v < l_ - 1e-9 or v > h_ + 1e-9:
-                if k < len(ids):
-                    discovered.append(ids[k])
-                carried.append(names[k] if k < len(names) else "?")
-        if discovered:
-            self.solver.note_discovered_pairs(discovered)
-        return carried
-
-    def frame_valid(self, z: np.ndarray, ctx: FrameContext) -> tuple[bool, str]:
         # fresh pair scan for acceptance decisions: the solver's per-frame
-        # cache reflects the linearization state, not this candidate
+        # cache reflects the linearization state, not this candidate; the
+        # check path is UNCAPPED (F1: a success may not hide behind the QP
+        # row budget)
         self.solver._frame_pairs = None
-        val, lo, hi, scl = self.solver.constraint_rows(
-            z, ctx, trust=self.cfg.trust_radius_max, mode="accept"
-        )
+        val, lo, hi, scl, names, ids = self.solver.check_rows(z, ctx)
         ep_viol = self.solver.violation(val, lo, hi, scl)
-        if self.verbose:
-            # corridor snapshot is from THIS endpoint linearization
-            # (constraint_rows -> _collision_rows refreshed it)
-            cand_d = self._hand_dists_verbose(z, ctx.box_pose)
-            prev_d = (self._hand_dists_verbose(
-                ctx.z_prev,
-                ctx.box_pose_prev if ctx.box_pose_prev is not None else ctx.box_pose)
-                if ctx.z_prev is not None else {"l": float("nan"), "r": float("nan")})
-            check = {"t": ctx.t, "kind": "check", "viol": float(ep_viol),
-                     "hand_l_prev_m": float(prev_d["l"]), "hand_l_cand_m": float(cand_d["l"]),
-                     "hand_r_prev_m": float(prev_d["r"]), "hand_r_cand_m": float(cand_d["r"]),
-                     "corridor": {s: self.solver.last_corridor.get(s)
-                                  for s in ("l", "r") if self.solver.last_corridor.get(s)},
-                     "band_margin_m": solver_band_margin(ctx, self.cfg)}
-            if ep_viol > 1e-6:
-                check["rows"] = self._violating_rows_verbose(val, lo, hi, len(self.solver._last_rows))
-                check["carried"] = self._carry_back_discovered_pairs(
-                    val, lo, hi, len(self.solver._last_rows))
-            self.frame_log.append(check)
+        chk = FrameCheck(
+            ok=ep_viol <= 1e-6,
+            viol=float(ep_viol),
+            corridor={s: dict(c) for s, c in self.solver.last_corridor.items()},
+            band_margin=solver_band_margin(ctx, self.cfg),
+            truncated_rows=list(self.solver.last_truncated_names),
+        )
+        chk.hand_prev = {s: float(v) for s, v in ctx.prev_hand_dist.items()}
+        chk.hand_cand = self._hand_gaps()
         if ep_viol > 1e-6:
-            self._carry_back_discovered_pairs(val, lo, hi, len(self.solver._last_rows))
-            return False, "state_constraints"
+            for k in range(len(names)):
+                v, l_, h_ = val[99 + k], lo[99 + k], hi[99 + k]
+                if v < l_ - 1e-9 or v > h_ + 1e-9:
+                    chk.rows.append({"pair": names[k] if k < len(names) else "?",
+                                     "val_m": float(v), "lo_m": float(l_),
+                                     "hi_m": float(h_)})
+                    chk.carried.append(names[k] if k < len(names) else "?")
+                    if k < len(ids):
+                        chk.discovered.append(ids[k])
+            chk.reason = "state_constraints"
+            return chk
         # interpolated probes between the previous accepted scene and the
         # candidate: the final validator interpolates FULL scenes (robot +
         # box), so the sequential loop must pre-check the same transitions
@@ -300,49 +276,102 @@ class RepairPipeline:
             motion = self.validator._frame_motion_m(scene_a, scene_b)
             n_sub = int(np.clip(np.ceil(motion / vcfg.max_substep_motion_m),
                                 1, vcfg.max_subdivisions + 1))
-            saved_pairs = self.solver._frame_pairs
-            try:
-                for i in range(1, n_sub):
-                    mid = self.validator._interpolate(scene_a, scene_b, i / n_sub)
-                    ctx_mid = replace(ctx, box_pose=mid[36:43].copy())
-                    # rescan per probe: the endpoint candidate set cannot see
-                    # pairs that come into range only at interior states;
-                    # probes judge at the VALIDATOR floor (band_margin 0) --
-                    # they approximate the final gate, which is the arbiter
-                    self.solver._frame_pairs = None
-                    val_m, lo_m, hi_m, scl_m = self.solver.constraint_rows(
-                        mid[0:36], ctx_mid, trust=self.cfg.trust_radius_max,
-                        mode="accept", band_margin_m=0.0,
-                        probe_mode=True   # stage 2: mid-states carry no frame-end corridor upper
-                    )
-                    n_coll = 99 + len(self.solver._last_rows)
-                    viol_m = self.solver.violation(val_m[99:n_coll], lo_m[99:n_coll],
-                                                   hi_m[99:n_coll], scl_m[99:n_coll])
-                    if self.verbose:
-                        mid_d = self._hand_dists_verbose(mid[0:36], mid[36:43])
-                        rec = {"t": ctx.t, "kind": "probe", "i": i, "n_sub": int(n_sub),
-                               "viol": float(viol_m),
-                               "hand_l_mid_m": float(mid_d["l"]),
-                               "hand_r_mid_m": float(mid_d["r"]),
-                               "motion_m": float(motion)}
-                        if viol_m > 1e-6:
-                            rec["rows"] = self._violating_rows_verbose(val_m, lo_m, hi_m, n_coll - 99)
-                        self.frame_log.append(rec)
-                    if viol_m > 1e-6:
-                        # stage 1: carry the mid-state's violating pairs back
-                        # even when verbose is off (convergence input, not
-                        # just logging); ids/names are from THIS probe's rows
-                        carried = self._carry_back_discovered_pairs(
-                            val_m, lo_m, hi_m, n_coll - 99)
-                        if self.verbose and carried:
-                            rec["carried"] = carried
-                        return False, "transition_interpolated"
-            finally:
-                self.solver._frame_pairs = saved_pairs
+            chk.motion_m = float(motion)
+            chk.probe_n = int(n_sub)
+            for i in range(1, n_sub):
+                mid = self.validator._interpolate(scene_a, scene_b, i / n_sub)
+                ctx_mid = replace(ctx, box_pose=mid[36:43].copy())
+                # rescan per probe: the endpoint candidate set cannot see
+                # pairs that come into range only at interior states;
+                # probes judge at the VALIDATOR floor (band_margin 0) and
+                # are uncapped like the endpoint check
+                self.solver._frame_pairs = None
+                val_m, lo_m, hi_m, scl_m, names_m, ids_m = self.solver.check_rows(
+                    mid[0:36], ctx_mid, band_margin_m=0.0,
+                    probe_mode=True   # stage 2: mid-states carry no frame-end corridor upper
+                )
+                n_coll = 99 + len(names_m)
+                viol_m = self.solver.violation(val_m[99:n_coll], lo_m[99:n_coll],
+                                               hi_m[99:n_coll], scl_m[99:n_coll])
+                if viol_m <= 1e-6:
+                    continue
+                gaps = self._hand_gaps()
+                # failure snapshot only (F0: representative/failed states,
+                # never every passing probe): the exact interpolated state,
+                # its box pose and the interpolation fraction, so a
+                # "endpoint ok, transition collides" can be replayed without
+                # re-deriving the subdivision
+                rec = {"i": i, "n_sub": int(n_sub), "alpha": i / n_sub,
+                       "viol": float(viol_m),
+                       "hand_l_mid_m": float(gaps["l"]),
+                       "hand_r_mid_m": float(gaps["r"]),
+                       "motion_m": float(motion),
+                       "q_mid": [float(v) for v in mid[0:36]],
+                       "box_pose_mid": [float(v) for v in mid[36:43]],
+                       "rows": []}
+                for k in range(n_coll - 99):
+                    v, l_, h_ = val_m[99 + k], lo_m[99 + k], hi_m[99 + k]
+                    if v < l_ - 1e-9 or v > h_ + 1e-9:
+                        nm = names_m[k] if k < len(names_m) else "?"
+                        rec["rows"].append({"pair": nm, "val_m": float(v),
+                                            "lo_m": float(l_), "hi_m": float(h_)})
+                        chk.carried.append(nm)
+                        if k < len(ids_m):
+                            chk.discovered.append(ids_m[k])
+                chk.probes.append(rec)
+                chk.probe_viol = max(chk.probe_viol, float(viol_m))
+                chk.reason = "transition_interpolated"
+                chk.ok = False           # a failing probe REJECTS the candidate
+                return chk
         res = self.solver.evaluate(z, ctx)
         if res["mpjpe"] > self.cfg.task_mpjpe_tol_m:
-            return False, "task_quality"
-        return True, "ok"
+            chk.ok = False
+            chk.reason = "task_quality"
+        return chk
+
+    def frame_valid(self, z: np.ndarray, ctx: FrameContext) -> FrameCheck:
+        """One-shot acceptance check (no carry-back side effect)."""
+        return self._frame_valid(z, ctx)
+
+    def carry_discovered(self, chk: FrameCheck) -> list[str]:
+        """Feed a FAILED check's violating pairs into the next linearization.
+
+        Algorithm-level action, separate from the check itself (F0); the
+        solver re-resolves the geometric category from the registry (F1).
+        """
+        if chk.discovered:
+            self.solver.note_discovered_pairs(chk.discovered)
+        return chk.carried
+
+    def check_result(self, res, ctx: FrameContext, caller: str) -> FrameCheck:
+        """Cached frame check for a solver result (same state -> one check).
+
+        The outcome is stored on the result so attempt logging and the
+        accept/reject decision share ONE check (F0: verbose adds no checks).
+        """
+        if res.frame_check is None:
+            res.frame_check = self._frame_valid(res.z, ctx)
+        chk = res.frame_check
+        self._log_check(chk, ctx.t, caller, res)
+        return chk
+
+    def _log_check(self, chk: FrameCheck, t: int, caller: str, res=None) -> None:
+        """Serialize an ALREADY computed check (no re-computation)."""
+        if not self.verbose:
+            return
+        rec = {"t": t, "kind": "check", "caller": caller, "ok": bool(chk.ok),
+               "reason": chk.reason, "viol": float(chk.viol),
+               "hand_l_prev_m": float(chk.hand_prev.get("l", float("nan"))),
+               "hand_l_cand_m": float(chk.hand_cand.get("l", float("nan"))),
+               "hand_r_prev_m": float(chk.hand_prev.get("r", float("nan"))),
+               "hand_r_cand_m": float(chk.hand_cand.get("r", float("nan"))),
+               "corridor": chk.corridor, "band_margin_m": chk.band_margin}
+        if chk.rows:
+            rec["rows"] = chk.rows
+            rec["carried"] = chk.carried
+        self.frame_log.append(rec)
+        for p in chk.probes:
+            self.frame_log.append({"t": t, "kind": "probe", "caller": caller, **p})
 
     # -- public API ------------------------------------------------------------------
 
@@ -370,7 +399,9 @@ class RepairPipeline:
         # box_ground is input-owned (fixed box trajectory; the hull of the
         # scanned bin also over-approximates its bottom) -> excluded here,
         # reported by data screening instead
+        t_final = time.perf_counter()
         final = self.validator.validate(result.trajectory, exclude=("box_ground",))
+        result.diagnostics["final_validation_s"] = round(time.perf_counter() - t_final, 3)
         if final.passed:
             result.diagnostics["final_validation"] = "passed"
             result.diagnostics["final_checks"] = {
@@ -388,20 +419,25 @@ class RepairPipeline:
         f_frame = self._first_failure_frame(final)
         start = 0 if f_frame is None else max(0, f_frame - self.cfg.suffix_retry_window)
         retry_pred = np.vstack([result.trajectory[:start], prediction[start:]])
-        retry = self._run_sequential(retry_pred, condition)
+        retry = self._run_sequential(retry_pred, condition, pass_index=1)
         retry.diagnostics["first_attempt_final"] = f"{final.summary()} @t={f_frame}"
         retry.diagnostics["first_failure_frame"] = f_frame
         retry.diagnostics["suffix_retry_from"] = start
+        retry.diagnostics["suffix_retries"] = 1
         retry.diagnostics["failed_checks"] = {
             k: {"location": v.location, "first_failure_frame": v.first_failure_frame}
             for k, v in final.checks.items() if not v.passed
         }
         if not retry.accepted:
-            retry.diagnostics["first_attempt"] = {
-                k: v for k, v in result.diagnostics.items() if k != "trajectory"
-            }
+            # the first pass's cost is reported VERBATIM (a retry must never
+            # overwrite the first round's attempts/QP/iteration totals)
+            retry.diagnostics["first_attempt"] = dict(result.diagnostics)
             return TrajectoryResult(False, "rejected_final", diagnostics=retry.diagnostics)
+        t_final = time.perf_counter()
         final2 = self.validator.validate(retry.trajectory, exclude=("box_ground",))
+        retry.diagnostics["final_validation_s"] = round(
+            retry.diagnostics.get("final_validation_s", 0.0)
+            + time.perf_counter() - t_final, 3)
         if final2.passed:
             retry.diagnostics["final_validation"] = "passed_after_suffix_retry"
             retry.diagnostics["final_checks"] = {
@@ -419,21 +455,80 @@ class RepairPipeline:
 
     # -- sequential core ----------------------------------------------------------------
 
-    def _run_sequential(self, prediction, condition) -> TrajectoryResult:
+    def _record_attempt(self, attempts: list, res, source: str, t: int,
+                        pass_index: int, backtrack: str | None = None) -> None:
+        """Record ONE solver attempt (always on -- the aggregate counters are
+        recomputable from these events; verbose adds the same record to the
+        frame log). Costs are per-attempt, so a retry can never overwrite the
+        first round's totals."""
+        rec = {
+            "t": t, "pass": pass_index, "source": source, "backtrack": backtrack,
+            "accepted": bool(res.accepted), "status": res.status,
+            "iterations": int(res.iterations), "qp_calls": int(res.qp_calls),
+            "slack_used": bool(res.slack_used), "trust": float(res.trust),
+            "last_viol": float(res.last_viol),
+            "last_qp_status": str(res.last_qp_status),
+            "violated_rows": list(res.violated_rows),
+            "truncated_rows": list(res.truncated_rows),
+            "frame_valid": (None if res.frame_check is None
+                            else bool(res.frame_check.ok)),
+            "frame_valid_reason": (None if res.frame_check is None
+                                   else res.frame_check.reason),
+        }
+        attempts.append(rec)
+        if self.verbose:
+            self.frame_log.append({"kind": "attempt", **rec})
+
+    @staticmethod
+    def _aggregate(attempts: list, visits: list, T: int, skipped: int,
+                   backtracks: int, pass_index: int) -> dict:
+        """Counters over ALL attempts (F0): totals, slack/backtrack adoption,
+        processed-frame visits vs unique frames vs the original input length."""
+        return {
+            "trajectory_pass": pass_index,
+            "attempts": len(attempts),
+            "qp_calls_total": int(sum(a["qp_calls"] for a in attempts)),
+            "iterations_total": int(sum(a["iterations"] for a in attempts)),
+            "slack_attempts": sum(1 for a in attempts if a["slack_used"]),
+            "backtracks": int(backtracks),
+            "processed_frame_visits": len(visits),
+            "unique_processed_frames": len(set(visits)),
+            "input_frames": int(T),
+            "skipped_frames": int(skipped),
+            "attempts_detail": attempts,
+        }
+
+    @staticmethod
+    def _timing_stats(timings: list) -> dict:
+        if not timings:
+            return {"mean_ms": None, "p50_ms": None, "p95_ms": None, "max_ms": None}
+        v = np.asarray(timings, dtype=float) * 1e3
+        return {"mean_ms": round(float(v.mean()), 1),
+                "p50_ms": round(float(np.percentile(v, 50)), 1),
+                "p95_ms": round(float(np.percentile(v, 95)), 1),
+                "max_ms": round(float(v.max()), 1)}
+
+    def _run_sequential(self, prediction, condition, pass_index: int = 0) -> TrajectoryResult:
         T = prediction.shape[0]
         contacts = ContactStateMachine(condition.ref_schedule, T)
         accepted: list[np.ndarray] = []
         prev_local: dict = {}
         prev_sole: dict = {}
         frame_status: list[str] = []
-        iterations: list[int] = []
+        adopted_iterations: list[int] = []
+        adopted_qp: list[int] = []
         qp_calls_hist: list[int] = []
         timings: list[float] = []
         slack_flags: list[bool] = []
         fallbacks = 0
+        backtracks = 0
+        attempts: list[dict] = []       # every solve attempt, always recorded
+        visits: list[int] = []          # processed-frame visits in this pass
+        skip_reasons: dict[int, str] = {}
 
         for t in range(T):
             t0 = time.perf_counter()
+            visits.append(t)
             # stage 1: discovered-pair carry-over is a WITHIN-FRAME mechanism
             # (attempt N learns what attempt N-1's checks caught); a new
             # frame is a new state and starts from a clean candidate set
@@ -471,76 +566,84 @@ class RepairPipeline:
                                 contacts.release(name)
             ctx = self._frame_ctx(t, prediction, condition, contacts, prev_local, prev_sole, z_prev)
 
-            # attempt-level diagnostics (stage 0, 2026-09-16): one record per
-            # solver attempt with its state source and outcome, so reports can
-            # be recomputed from per-sample logs (which state, which try)
-            def _log_attempt(source: str, res_, bt_kind: str | None = None) -> None:
-                if not self.verbose:
-                    return
-                self.frame_log.append({
-                    "t": t, "kind": "attempt", "source": source,
-                    "backtrack": bt_kind, "accepted": bool(res_.accepted)
-                    if res_ is not None else None,
-                    "status": getattr(res_, "status", None),
-                    "iterations": getattr(res_, "iterations", None),
-                    "qp_calls": getattr(res_, "qp_calls", None),
-                    "slack_used": bool(getattr(res_, "slack_used", False)),
-                    "merit": float(res_.merit) if res_ is not None
-                    and np.isfinite(res_.merit) else None,
-                    "outcome_frame_valid": self._frame_result_ok(res_, ctx)
-                    if res_ is not None else None,
-                })
-
-            ok, why = self.frame_valid(z_pred, ctx)
-            if self.verbose:
-                self.frame_log.append({
-                    "t": t, "kind": "skip_check", "source": "prediction",
-                    "ok": bool(ok), "reason": why,
-                })
-            if ok:
+            chk = self.frame_valid(z_pred, ctx)
+            self._log_check(chk, t, "skip", None)
+            if chk.ok:
                 z = z_pred
                 frame_status.append("skipped")
-                iterations.append(0)
-                slack_flags.append(False)
+                adopted_iterations.append(0)
+                adopted_qp.append(0)
                 qp_calls_hist.append(0)
+                slack_flags.append(False)
             else:
+                skip_reasons[t] = chk.reason
+                # feed the prediction's violations into the solve (algorithm
+                # input, not logging): the candidate set is frozen at the
+                # attempt's initial state and must see what the check caught
+                self.carry_discovered(chk)
                 res = self.solver.solve_frame(z_pred, ctx)
                 path = "repaired" if not res.slack_used else "repaired_slack"
-                _log_attempt("prediction", res)
+                self._record_attempt(attempts, res, "prediction", t, pass_index)
                 res, bt = self._transition_backtrack(res, ctx, z_prev)
                 if bt:
                     path = bt
-                if not self._frame_result_ok(res, ctx):
+                    backtracks += 1
+                self.check_result(res, ctx, "prediction")
+                if not res.frame_check.ok:
+                    self.carry_discovered(res.frame_check)
                     # multi-start restart from the previous accepted state
                     # (P0.1 L0): deep-violation frames linearize badly from
                     # z_pred but solve from the accepted predecessor
                     res_alt = self.solver.solve_frame(z_prev, ctx) if z_prev is not None else None
                     if res_alt is not None:
-                        _log_attempt("prev_accepted", res_alt)
+                        self._record_attempt(attempts, res_alt, "prev_accepted", t, pass_index)
                         res_alt, bt2 = self._transition_backtrack(res_alt, ctx, z_prev)
-                        if self._frame_result_ok(res_alt, ctx):
+                        if bt2:
+                            backtracks += 1
+                        chk_alt = self.check_result(res_alt, ctx, "prev_accepted")
+                        if chk_alt.ok:
                             res, path = res_alt, bt2 or "repaired_prev"
-                    if not self._frame_result_ok(res, ctx) and self.cfg.enable_slack_fallback:
+                        else:
+                            self.carry_discovered(chk_alt)
+                    if not res.frame_check.ok and self.cfg.enable_slack_fallback:
                         res2 = self.solver.solve_frame(
                             z_prev if z_prev is not None else z_pred, ctx, force_slack=True
                         )
-                        _log_attempt("slack_fallback", res2)
-                        if self._frame_result_ok(res2, ctx):
+                        self._record_attempt(attempts, res2, "slack_fallback", t, pass_index)
+                        chk2 = self.check_result(res2, ctx, "slack_fallback")
+                        if chk2.ok:
                             res, path = res2, "repaired_slack"
                             fallbacks += 1
-                if not self._frame_result_ok(res, ctx):
+                        else:
+                            self.carry_discovered(chk2)
+                if not res.frame_check.ok:
+                    # rejection evidence: the FINAL stage and the last
+                    # attempt's exit state -- never the initial skip_reason
+                    # (which only describes the raw prediction)
                     timings.append(time.perf_counter() - t0)
                     return TrajectoryResult(False, "rejected_frame", diagnostics={
-                        "t_fail": t, "reason": res.status, "skip_reason": why,
+                        "t_fail": t,
+                        "reason": res.status,
+                        "final_stage": res.frame_check.reason,
+                        "skip_reason": skip_reasons.get(t),
+                        "reason_source": "last_solve_attempt",
+                        "last_attempt": attempts[-1] if attempts else None,
+                        "violated_rows": res.frame_check.rows,
+                        "probe": res.frame_check.probes[0] if res.frame_check.probes else None,
                         "accepted_frames": len(accepted), "frame_status": frame_status,
-                        "iterations": iterations, "timings_s": timings,
+                        "iterations": adopted_iterations, "timings_s": timings,
                         "qp_calls": qp_calls_hist, "fallbacks": fallbacks,
                         "slack_frames": int(sum(slack_flags)),
                         "skipped": sum(1 for st in frame_status if st == "skipped"),
+                        "timing_stats": self._timing_stats(timings),
+                        **self._aggregate(attempts, visits, T,
+                                          sum(1 for st in frame_status if st == "skipped"),
+                                          backtracks, pass_index),
                     })
                 z = res.z
                 frame_status.append(path)
-                iterations.append(res.iterations)
+                adopted_iterations.append(res.iterations)
+                adopted_qp.append(res.qp_calls)
                 qp_calls_hist.append(res.qp_calls)
                 # slack is an independent fact from the chosen solve branch:
                 # multi-start/repaired_prev and backtrack paths overwrite the
@@ -565,19 +668,18 @@ class RepairPipeline:
         trajectory[:, 0:36] = np.stack(accepted)
         trajectory[:, 36:43] = prediction[:, 36:43]
         return TrajectoryResult(True, "accepted", trajectory=trajectory, diagnostics={
-            "frame_status": frame_status, "iterations": iterations,
-            "qp_calls": qp_calls_hist,
+            "frame_status": frame_status, "iterations": adopted_iterations,
+            "qp_calls": adopted_qp,
+            "adopted_iterations_sum": int(sum(adopted_iterations)),
+            "adopted_qp_calls_sum": int(sum(adopted_qp)),
             "timings_s": timings, "fallbacks": fallbacks,
             "slack_frames": int(sum(slack_flags)),
             "skipped": sum(1 for s in frame_status if s == "skipped"),
+            "timing_stats": self._timing_stats(timings),
+            **self._aggregate(attempts, visits, T,
+                              sum(1 for s in frame_status if s == "skipped"),
+                              backtracks, pass_index),
         })
-
-    def _frame_result_ok(self, res, ctx) -> bool:
-        """A repaired state must itself pass the frame+transition checks."""
-        if not res.accepted:
-            return False
-        ok, _why = self.frame_valid(res.z, ctx)
-        return ok
 
     def _transition_backtrack(self, res, ctx, z_prev) -> tuple:
         """Transition-aware step backtracking (P0.1 L0).
@@ -590,15 +692,20 @@ class RepairPipeline:
         """
         if not res.accepted or z_prev is None:
             return res, None
-        ok, why = self.frame_valid(res.z, ctx)
-        if ok or why != "transition_interpolated":
+        chk = self.check_result(res, ctx, "prediction")
+        if chk.ok or chk.reason != "transition_interpolated":
             return res, None
+        self.carry_discovered(chk)
         xi = tangent_error(res.z, z_prev)
         for alpha in (0.75, 0.5, 0.25):
             cand = retract_batch(self.ev.model, z_prev[None], (alpha * xi)[None])[0]
-            if self.frame_valid(cand, ctx)[0]:
+            chk_bt = self._frame_valid(cand, ctx)
+            self._log_check(chk_bt, ctx.t, f"backtrack_{alpha}", res)
+            if chk_bt.ok:
                 res.z = cand
+                res.frame_check = chk_bt
                 return res, "repaired_bt"
+            self.carry_discovered(chk_bt)
         return res, None
 
     def _first_failure_frame(self, report) -> int | None:

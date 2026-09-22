@@ -12,6 +12,16 @@ Simplification (documented): the QP is rebuilt per iteration rather than
 warm-starting a persistent fixed-sparsity workspace; at this size (35 vars,
 ~300 rows) MuJoCo geometry dominates runtime, so reuse is a later
 optimization, not a correctness item.
+
+Correctness contracts added 2026-09-22 (m2_m3_stage_gate_fix_plan F1):
+
+- Pair **identity** ``(ga, gb)`` and row **role** (``regen`` vs regular
+  collision) are separate: the geometric category always comes from the
+  static registry, so a check-discovered pair can never lose its active
+  contact semantics (or its band classification) through carry-back.
+- Acceptance checks (``check_rows``) are NOT capped by the QP row budget:
+  a successful return may not hide a violating pair behind
+  ``max_active_pairs``. Every success exit runs the same review.
 """
 
 from __future__ import annotations
@@ -26,6 +36,7 @@ from ireset.kinematics.mujoco_adapter import N_TANGENT, retract_batch
 from ireset.repair.constraints import (
     FrameEvaluator,
     KPT_NAMES,
+    N_FIXED,
     N_FOOT_ROWS,
     N_FOOT_SPEED,
     N_HAND_ROWS,
@@ -38,6 +49,11 @@ from ireset.repair.constraints import (
 )
 
 INF = 1e9
+
+
+def _concat_rows(*blocks) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Concatenate per-block ``(val, lo, hi, scale)`` tuples."""
+    return tuple(np.concatenate([b[i] for b in blocks]) for i in range(4))  # type: ignore[return-value]
 
 
 def cfg_noncontact(cfg) -> float:
@@ -94,13 +110,57 @@ class FrameResult:
     iterations: int = 0
     skipped: bool = False
     slack_used: bool = False
-    status: str = "solved"           # solved / infeasible / max_iters
+    status: str = "solved"           # solved / infeasible / max_iters / task_quality
+                                     # / review_failed
     merit: float = float("inf")
     #: number of QP solves actually issued for this frame (all branches;
     #: stage 0 statistics, 2026-09-16 -- the return branches used to hardcode
     #: ``scp_max_iters``, which reported phantom iterations)
     qp_calls: int = 0
     diagnostics: dict = field(default_factory=dict)
+    #: final trust radius of this attempt (F0: solver exit evidence)
+    trust: float = 0.0
+    #: constraint violation at the LAST evaluated state of this attempt and
+    #: the collision-row names still violated there (F0: last-constraint
+    #: evidence on failure, no re-derivation needed)
+    last_viol: float = 0.0
+    violated_rows: list = field(default_factory=list)
+    #: candidate pairs dropped by the QP row budget at the last linearization
+    truncated_rows: list = field(default_factory=list)
+    #: OSQP exit status of this attempt's LAST QP solve (F0 evidence)
+    last_qp_status: str = ""
+    #: pipeline-side acceptance check cache (scp.FrameCheck); set by the
+    #: pipeline so a state is checked once and the log serializes that result
+    frame_check: object | None = None
+
+
+@dataclass
+class FrameCheck:
+    """Evidence of ONE frame+transition acceptance check (pipeline side).
+
+    ``ok`` is the decision; everything else is serialized evidence for the
+    verbose frame log -- the log never re-computes (F0: verbose must not add
+    checks, FK, carry-back or cache changes). ``discovered`` holds the stable
+    pair identities of violating collision rows; the *caller* decides when to
+    feed them back to the solver.
+    """
+
+    ok: bool
+    reason: str = "ok"                     # ok / state_constraints /
+                                           # transition_interpolated / task_quality
+    viol: float = 0.0
+    rows: list[dict] = field(default_factory=list)
+    discovered: list[tuple] = field(default_factory=list)
+    carried: list[str] = field(default_factory=list)
+    probes: list[dict] = field(default_factory=list)
+    probe_n: int = 0
+    probe_viol: float = 0.0
+    hand_prev: dict = field(default_factory=dict)
+    hand_cand: dict = field(default_factory=dict)
+    corridor: dict = field(default_factory=dict)
+    band_margin: float = 0.0
+    motion_m: float = 0.0
+    truncated_rows: list[str] = field(default_factory=list)
 
 
 def _unit(x: np.ndarray, D: np.ndarray) -> np.ndarray:
@@ -121,14 +181,18 @@ class FrameSolver:
         self.ev = evaluator
         self.cfg = cfg
         self.D = step_scale_matrix(cfg)
+        self.Dinv = 1.0 / self.D
         self.Dinv2 = 1.0 / self.D**2
         self.dt = 1.0 / cfg.fps
         self._osqp = osqp.OSQP()
         self._frame_pairs: list | None = None
         #: pairs discovered violating by THIS frame's checks (endpoint/probe)
         #: and carried into the next solve attempt regardless of their
-        #: distance at the attempt's initial state (stage 1, 2026-09-16)
+        #: distance at the attempt's initial state (stage 1, 2026-09-16);
+        #: identities are registry-normalized (F1, 2026-09-22)
         self._extra_pairs: list = []
+        #: static registry lookup (identity -> geometric category); built once
+        self._pair_kinds: dict | None = None
         #: pending partial-refresh count: each one triggers a fast-family +
         #: carried-extras rescan at the next linearization (stage 1)
         self._refresh_counter: int = 0
@@ -136,16 +200,48 @@ class FrameSolver:
         #: bound geom distance + active upper at the LAST linearization);
         #: read by the pipeline's verbose frame log, not by the solver
         self.last_corridor: dict[str, dict] = {}
+        #: last selected nearest hand geom per side (re-selection evidence)
+        self._last_regen_geom: dict[str, str] = {}
         #: geom-pair names parallel to the rows returned by the last
         #: ``_collision_rows`` call (diagnostics)
         self.last_row_pairs: list[str] = []
-        #: (ga, gb, kind) parallel to the rows returned by the last
-        #: ``_collision_rows`` call -- lets the pipeline carry discovered
-        #: violating pairs into the next attempt's candidate set
+        #: ``(ga, gb, kind)`` parallel to the rows returned by the last
+        #: ``_collision_rows`` call. Always the REGISTRY category (never a
+        #: row role like ``regen``), so carry-back keeps the geometric
+        #: semantics of the pair (F1).
         self.last_row_ids: list[tuple[int, int, str]] = []
+        #: row role per entry of ``last_row_ids``: "regen" (active
+        #: hand-contact row) or "collision" (diagnostics only)
+        self.last_row_roles: list[str] = []
         #: candidate pairs silently dropped by the QP row budget at the last
         #: linearization (nearest-first keep; reported, never hidden)
         self.last_truncated: int = 0
+        self.last_truncated_ids: list[tuple[int, int, str]] = []
+        self.last_truncated_names: list[str] = []
+
+    # -- pair identity -------------------------------------------------------
+
+    def pair_identity(self, ga: int, gb: int) -> tuple[int, int, str]:
+        """Registry-normalized ``(ga, gb, kind)`` for a pair identity.
+
+        The static collision registry is the ONLY source of geometric
+        category (F1): row roles such as ``regen`` describe *why* a row was
+        added, never *what* the pair is. The lookup accepts either order but
+        returns the registry order so every consumer (nearest-hand-geom
+        selection, band classification, carry-back) sees one canonical form.
+        An unknown pair is an implementation error and raises instead of
+        silently losing a constraint row.
+        """
+        if self._pair_kinds is None:
+            self._pair_kinds = {(a, b): k for a, b, k in self.ev.pairs}
+        key = (ga, gb)
+        if key not in self._pair_kinds:
+            key = (gb, ga)
+            if key not in self._pair_kinds:
+                raise ValueError(
+                    f"pair ({ga}, {gb}) is not in the collision registry: "
+                    f"{self.ev.geom_name(ga)}~{self.ev.geom_name(gb)}")
+        return key[0], key[1], self._pair_kinds[key]
 
     # -- nonlinear evaluation ------------------------------------------------
 
@@ -186,28 +282,16 @@ class FrameSolver:
             out["r_hand"] = None
         return out
 
-    def constraint_rows(
-        self, z: np.ndarray, ctx: FrameContext, trust: float, mode: str = "repair",
-        band_margin_m: float | None = None, probe_mode: bool = False
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Nonlinear constraint values and bounds [l, u] (rows as in constraints.py).
-
-        ``mode="accept"`` uses validator-grade bounds (penetration tolerated to
-        -2mm everywhere) for skip decisions; ``mode="repair"`` keeps the
-        proactive +2mm non-contact clearance the solver enforces.
-        ``probe_mode`` marks interpolated mid-state evaluations (stage 2):
-        regen corridor uppers do not bind there, only the penetration floor.
-        """
+    def _fixed_pre_rows(self, z: np.ndarray, ctx: FrameContext, trust: float):
+        """Rows ``[0, N_FIXED)``: joint limits, velocities, trust region."""
         ev, cfg = self.ev, self.cfg
-        # guarantee the evaluator is at z (callers usually forwarded already)
-        ev.forward(z, ctx.box_pose)
-        l = np.full(N_ROWS, -INF)
-        u = np.full(N_ROWS, INF)
-        val = np.zeros(N_ROWS)
+        l = np.full(N_FIXED, -INF)
+        u = np.full(N_FIXED, INF)
+        val = np.zeros(N_FIXED)
         # per-row physical scales for violation normalization: a 2mm gate
         # violation must outweigh a 5cm tracking step, so one-sided rows
         # normalize by their own tolerance, not by a meter
-        scale = np.ones(N_ROWS)
+        scale = np.ones(N_FIXED)
         scale[0:29] = np.minimum(ev.spec.joint_range[:, 1] - ev.spec.joint_range[:, 0], 0.02)
 
         val[0:29] = z[7:36]
@@ -241,19 +325,21 @@ class FrameSolver:
         val[64:99] = np.zeros(35)
         l[64:99] = -trust
         u[64:99] = trust
+        return val, l, u, scale
 
-        # collision: active pairs recomputed at this state
-        rows = self._collision_rows(ctx, band_margin_m, probe_mode=probe_mode)
-        self._last_rows = rows
-        for k, (dist, _J, lo, hi) in enumerate(rows):
-            val[99 + k] = dist
-            if mode == "accept" and hi > INF / 2:
-                # non-contact rows relax to the validator penetration gate;
-                # contact-band rows keep their band
-                l[99 + k], u[99 + k] = cfg_noncontact(self.cfg), hi
-            else:
-                l[99 + k], u[99 + k] = lo, hi
-            scale[99 + k] = max(min(hi - l[99 + k], self.cfg.penetration_scale_m), 1e-4)
+    def _fixed_post_rows(self, z: np.ndarray, ctx: FrameContext):
+        """Rows AFTER the collision block (block-local layout, 96 rows).
+
+        Hand anchors, foot anchors, foot support speeds and the regen
+        box-frame hand speed rows. Kept separate from the collision block so
+        the QP path (budgeted) and the check path (uncapped) can share them.
+        """
+        ev, cfg = self.ev, self.cfg
+        n = N_HAND_ROWS + N_FOOT_ROWS + N_FOOT_SPEED + N_HAND_SPEED
+        l = np.full(n, -INF)
+        u = np.full(n, INF)
+        val = np.zeros(n)
+        scale = np.ones(n)
 
         # hand anchors
         for si, side in enumerate(("l", "r")):
@@ -261,7 +347,7 @@ class FrameSolver:
             if anchor is None:
                 continue
             local = ev.hand_local(side)
-            base = 99 + MAX_PAIRS + si * 9
+            base = si * N_HAND_ROWS // 2
             val[base : base + 9] = local.reshape(-1)
             l[base : base + 9] = (anchor - cfg.hand_anchor_tol_m).reshape(-1)
             u[base : base + 9] = (anchor + cfg.hand_anchor_tol_m).reshape(-1)
@@ -272,13 +358,13 @@ class FrameSolver:
             anchor = ctx.foot_anchor.get(side)
             ids = ev.sole_sites[side]
             pts = ev.site_positions(ids)
-            base = 99 + MAX_PAIRS + N_HAND_ROWS + si * 15
+            base = N_HAND_ROWS + si * 15
             if anchor is not None:
                 val[base : base + 15] = pts.reshape(-1)
                 l[base : base + 15] = (anchor - cfg.foot_anchor_tol_m).reshape(-1)
                 u[base : base + 15] = (anchor + cfg.foot_anchor_tol_m).reshape(-1)
                 scale[base : base + 15] = cfg.foot_anchor_tol_m
-            base_s = 99 + MAX_PAIRS + N_HAND_ROWS + N_FOOT_ROWS + si * 15
+            base_s = N_HAND_ROWS + N_FOOT_ROWS + si * 15
             prev = ctx.prev_sole_world.get(side)
             if anchor is not None and prev is not None:
                 val[base_s : base_s + 15] = (pts - prev).reshape(-1)
@@ -303,12 +389,77 @@ class FrameSolver:
                 if (prev_local is None or prev_dist is None
                         or prev_dist > 0.006):
                     continue
-                base = HAND_SPEED_OFF + si * 9
+                base = N_HAND_ROWS + N_FOOT_ROWS + N_FOOT_SPEED + si * 9
                 val[base : base + 9] = (ev.hand_local(side) - prev_local).reshape(-1)
                 l[base : base + 9] = -lim_h
                 u[base : base + 9] = lim_h
                 scale[base : base + 9] = lim_h
         return val, l, u, scale
+
+    def _collision_block(self, rows: list, mode: str):
+        """``(val, lo, hi, scale)`` for a list of ``(dist, J, lo, hi)`` rows."""
+        n = len(rows)
+        l = np.full(n, -INF)
+        u = np.full(n, INF)
+        val = np.zeros(n)
+        scale = np.ones(n)
+        for k, (dist, _J, lo, hi) in enumerate(rows):
+            val[k] = dist
+            if mode == "accept" and hi > INF / 2:
+                # non-contact rows relax to the validator penetration gate;
+                # contact-band rows keep their band
+                l[k], u[k] = cfg_noncontact(self.cfg), hi
+            else:
+                l[k], u[k] = lo, hi
+            scale[k] = max(min(hi - l[k], self.cfg.penetration_scale_m), 1e-4)
+        return val, l, u, scale
+
+    def constraint_rows(
+        self, z: np.ndarray, ctx: FrameContext, trust: float, mode: str = "repair",
+        band_margin_m: float | None = None, probe_mode: bool = False
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Nonlinear constraint values and bounds [l, u] (rows as in constraints.py).
+
+        ``mode="accept"`` uses validator-grade bounds (penetration tolerated to
+        -2mm everywhere) for skip decisions; ``mode="repair"`` keeps the
+        proactive +2mm non-contact clearance the solver enforces.
+        ``probe_mode`` marks interpolated mid-state evaluations (stage 2):
+        regen corridor uppers do not bind there, only the penetration floor.
+
+        Uses the QP row budget (``max_active_pairs``); acceptance checks use
+        :meth:`check_rows`, which evaluates every candidate pair.
+        """
+        ev = self.ev
+        # guarantee the evaluator is at z (callers usually forwarded already)
+        ev.forward(z, ctx.box_pose)
+        pre = self._fixed_pre_rows(z, ctx, trust)
+        rows = self._collision_rows(ctx, band_margin_m, probe_mode=probe_mode,
+                                    need_jacobian=False)
+        self._last_rows = rows
+        block = self._collision_block(rows, mode)
+        post = self._fixed_post_rows(z, ctx)
+        return _concat_rows(pre, block, post)
+
+    def check_rows(self, z: np.ndarray, ctx: FrameContext,
+                   band_margin_m: float | None = None, probe_mode: bool = False):
+        """Acceptance-grade rows for a FULL check (no QP row budget).
+
+        Every candidate pair gets a row regardless of ``max_active_pairs``:
+        a successful return must not hide a violating pair behind the QP row
+        limit (F1). Returns ``(val, lo, hi, scale, names, ids)`` with the
+        descriptors parallel to the collision block starting at ``N_FIXED``.
+        """
+        ev = self.ev
+        ev.forward(z, ctx.box_pose)
+        pre = self._fixed_pre_rows(z, ctx, self.cfg.trust_radius_max)
+        rows = self._collision_rows(ctx, band_margin_m, probe_mode=probe_mode,
+                                    budget=False, need_jacobian=False)
+        self._last_rows = rows
+        names, ids = list(self.last_row_pairs), list(self.last_row_ids)
+        block = self._collision_block(rows, "accept")
+        post = self._fixed_post_rows(z, ctx)
+        val, lo, hi, scale = _concat_rows(pre, block, post)
+        return val, lo, hi, scale, names, ids
 
     def _scan_pairs(self, full: bool) -> None:
         """(Re)scan the candidate pair set for this frame.
@@ -324,7 +475,6 @@ class FrameSolver:
         """
         ev, cfg = self.ev, self.cfg
         dmax = cfg.activation_margin_m + 0.01
-        extra_keys = {(ga, gb) for ga, gb, _k in self._extra_pairs}
         cands: dict[tuple[int, int], tuple] = {}
         for ga, gb, kind in self._extra_pairs:
             cands[(ga, gb)] = (ga, gb, kind)
@@ -350,20 +500,33 @@ class FrameSolver:
         # (extra pairs were added unconditionally; re-check them here so the
         # set cannot grow unboundedly across attempts)
         self._frame_pairs = list(cands.values())
-        _ = extra_keys  # readability only; extras already merged above
+        if full:
+            # a full scan already re-absorbed every pending refresh; leaving
+            # the counter set would trigger redundant partial rescans
+            self._refresh_counter = 0
 
-    def note_discovered_pairs(self, pairs: list[tuple[int, int, str]]) -> None:
+    def note_discovered_pairs(self, pairs: list) -> None:
         """Carry check-discovered pairs into the candidate set (stage 1).
 
-        Called by the pipeline when an endpoint/probe check finds a
-        violating pair the current candidate set did not contain. These
-        pairs participate in the NEXT linearization regardless of their
-        distance at the initial state; they are pruned by the periodic
-        rescans once genuinely far.
+        Called by the pipeline when an endpoint/probe/review check finds a
+        violating pair the current candidate set did not contain. ``pairs``
+        carry the stable pair IDENTITY (``(ga, gb)`` or ``(ga, gb, role)``);
+        the geometric category is always re-resolved from the static registry
+        (F1, 2026-09-22). The old code copied the row label verbatim, so a
+        pair discovered as an active ``regen`` contact row re-entered the
+        candidate set labelled ``regen`` -- after which it was no longer
+        eligible for the nearest-hand-geom contact selection or the
+        ``robot_box`` band classification, silently dropping the contact
+        requirement that had just been violated.
+
+        Carried pairs participate in the NEXT linearization regardless of
+        their distance at the initial state; they are pruned by the periodic
+        rescans once genuinely far. Unknown identities raise.
         """
         known = {(ga, gb) for ga, gb, _k in self._extra_pairs}
         n_new = 0
-        for ga, gb, kind in pairs:
+        for pair in pairs:
+            ga, gb, kind = self.pair_identity(pair[0], pair[1])
             if (ga, gb) not in known:
                 self._extra_pairs.append((ga, gb, kind))
                 known.add((ga, gb))
@@ -381,7 +544,9 @@ class FrameSolver:
 
     def _collision_rows(self, ctx: FrameContext,
                         band_margin_m: float | None = None,
-                        probe_mode: bool = False) -> list[tuple[float, np.ndarray, float, float]]:
+                        probe_mode: bool = False,
+                        budget: bool = True,
+                        need_jacobian: bool = True) -> list[tuple[float, np.ndarray, float, float]]:
         """Active collision rows with contact-band classification.
 
         Hand geoms during hold and sole geoms during support are CONTACT
@@ -394,13 +559,18 @@ class FrameSolver:
         keep only their anti-penetration floor there (the closing target
         is a frame-end bound; see the stage 2 comment below).
 
+        ``budget=False`` skips the QP row cap: the check path evaluates
+        EVERY candidate pair (F1 -- a successful return may not hide a
+        violating pair behind ``max_active_pairs``). ``need_jacobian=False``
+        skips the per-row distance Jacobian for pure value checks.
+
         Candidate pairs: full registry scan at the attempt's initial state
         (``solve_frame``), partial refresh (fast families + carried extras)
-        at later linearizations, and a full rescan before a successful
-        return. Pairs discovered violating by endpoint/probe checks are
-        carried via ``note_discovered_pairs`` and can no longer silently
-        vanish from the solve (stage 1, 2026-09-16; the previous
-        freeze-at-z_init left such pairs to the final validator only).
+        at later linearizations, and a full rescan in the success review.
+        Pairs discovered violating by endpoint/probe checks are carried via
+        ``note_discovered_pairs`` with their REGISTRY category, so the
+        active-contact selection and band classification survive the
+        carry-back (F1, 2026-09-22).
         """
         ev, cfg = self.ev, self.cfg
         if self._frame_pairs is None:
@@ -411,6 +581,7 @@ class FrameSolver:
         rows = []
         row_names = []
         row_ids = []
+        row_roles = []
         self.last_corridor = {}
         scored = []
         for ga, gb, kind in self._frame_pairs:
@@ -427,7 +598,8 @@ class FrameSolver:
         # would demand the whole hand lie flat on the box). The row
         # bypasses the pair cap; pairs farther than the activation margin
         # are simply not candidates yet, and the selection re-runs at
-        # every linearization.
+        # every linearization. Selection uses the REGISTRY category only
+        # (F1), so a carried pair cannot lose its eligibility.
         regen_active: dict[tuple[int, int], tuple[float, object, float]] = {}
         if cfg.regen_mode:
             for side, name in (("l", "left_hand"), ("r", "right_hand")):
@@ -456,7 +628,16 @@ class FrameSolver:
                     cfg.regen_hand_contact_gap_m,
                     prev - cfg.regen_closing_rate_mps * self.dt - margin)
                 regen_active[(best[1], best[2])] = (best[0], best[3], upper)
-                self.last_corridor[side] = {"dist_m": best[0], "upper_m": upper}
+                sel = {"dist_m": best[0], "upper_m": upper,
+                       "geom": ev.geom_name(best[1])}
+                prev_sel = self._last_regen_geom.get(side)
+                if prev_sel is not None and prev_sel != sel["geom"]:
+                    # a REAL state change re-selected the nearest hand geom;
+                    # keep the reason so this cannot be confused with the old
+                    # carry-back label pollution (F1)
+                    sel["reselected_from"] = prev_sel
+                self._last_regen_geom[side] = sel["geom"]
+                self.last_corridor[side] = sel
         # regen mode keeps an interior margin above the -2 mm validator
         # floor on every band row: solutions sit on constraint boundaries
         # by construction, and boundary-sitting states would graze past
@@ -477,41 +658,42 @@ class FrameSolver:
         # drop the corridor upper. The final validator certifies entry
         # speeds/anchors at keyframes only -- it has no corridor semantics.
         for (ga, gb), (dist, ft, upper) in regen_active.items():
-            J = ev.distance_jacobian(ga, gb, ft, dist)
+            J = ev.distance_jacobian(ga, gb, ft, dist) if need_jacobian else None
             hi = INF if probe_mode else upper
             rows.append((dist, J, band_lo, hi))
             row_names.append(f"{ev.geom_name(ga)}~{ev.geom_name(gb)}:regen")
-            row_ids.append((ga, gb, "regen"))
+            row_ids.append((ga, gb, self.pair_identity(ga, gb)[2]))
+            row_roles.append("regen")
             added_regens.add((ga, gb))
         # QP row budget (99 + MAX_PAIRS layout). Pairs this frame's checks
         # caught violating (``_extra_pairs``) OUTRANK the nearest-first
         # candidate ordering -- they are the violation evidence the loop
         # must act on and may not be silently dropped by the cap (stage 1);
         # remaining slots go to the nearest candidates, and the overflow is
-        # REPORTED (``last_truncated``), never hidden.
+        # REPORTED with its identities (``last_truncated_ids``), never
+        # hidden. Active regen rows are DEDUPLICATED out of the candidate
+        # list first: a pair that is both an active contact row and a
+        # discovered extra occupies exactly one slot (F1).
         extra_keys = {(ga, gb) for ga, gb, _k in self._extra_pairs}
-        budget = cfg.max_active_pairs - len(added_regens)
-        chosen = []
-        overflow = []
-        for cand in scored:
-            if (cand[1], cand[2]) in extra_keys:
-                chosen.append(cand)
+        cands = [c for c in scored if (c[1], c[2]) not in added_regens]
+        extras = [c for c in cands if (c[1], c[2]) in extra_keys]
+        others = [c for c in cands if (c[1], c[2]) not in extra_keys]
+        if budget:
+            slot = cfg.max_active_pairs - len(added_regens)
+            if len(extras) > slot:
+                overflow = extras[slot:] + others
+                chosen = extras[:slot]
             else:
-                overflow.append(cand)
-        if len(chosen) > budget:
-            # pathological (more discovered pairs than rows): keep the
-            # nearest extras and report the rest
-            overflow = chosen[budget:] + overflow
-            chosen = chosen[:budget]
-        elif len(chosen) < budget:
-            chosen.extend(overflow[: budget - len(chosen)])
-            overflow = overflow[budget - len(chosen):]
-        truncated = len(overflow)
-        self.last_truncated = truncated
+                chosen = extras + others[: max(0, slot - len(extras))]
+                overflow = others[max(0, slot - len(extras)):]
+        else:
+            chosen, overflow = extras + others, []
+        self.last_truncated = len(overflow)
+        self.last_truncated_ids = [(ga, gb, kind) for _, ga, gb, kind, _ in overflow]
+        self.last_truncated_names = [f"{ev.geom_name(ga)}~{ev.geom_name(gb)}"
+                                    for _, ga, gb, _k, _ft in overflow]
         for dist, ga, gb, kind, ft in chosen:
-            if (ga, gb) in added_regens:
-                continue
-            J = ev.distance_jacobian(ga, gb, ft, dist)
+            J = ev.distance_jacobian(ga, gb, ft, dist) if need_jacobian else None
             # P0.1 L1: contact bands classify PER PAIR by geometry alone -- a
             # pair closer than the band upper is a contact pair (touching
             # allowed; [2mm, band_hi] satisfies both classifications, so
@@ -528,8 +710,10 @@ class FrameSolver:
                 rows.append((dist, J, cfg.noncontact_clearance_m, INF))
             row_names.append(f"{ev.geom_name(ga)}~{ev.geom_name(gb)}")
             row_ids.append((ga, gb, kind))
+            row_roles.append("collision")
         self.last_row_pairs = row_names
         self.last_row_ids = row_ids
+        self.last_row_roles = row_roles
         return rows
 
     def violation(self, val: np.ndarray, l: np.ndarray, u: np.ndarray,
@@ -576,6 +760,9 @@ class FrameSolver:
             J_mesh = self._mesh_jacobian(ctx.mesh_L, J_kpt)
             P += 2.0 * cfg.laplacian_weight * (J_mesh.T @ J_mesh)
             q += 2.0 * cfg.laplacian_weight * (J_mesh.T @ r_mesh)
+        # step damping only: f_reg = w_reg ||D^-1 xi||^2 is NOT part of
+        # ``objective`` (the line search / merit never sees it), so it lives
+        # in P alone and must not be counted as a state-objective Hessian
         P += 2.0 * cfg.regularization_weight * np.diag(self.Dinv2)
 
         # regeneration hand tracking (Gauss-Newton block)
@@ -795,6 +982,55 @@ class FrameSolver:
             return None, status
         return x, status
 
+    # -- success review ------------------------------------------------------
+
+    def _violating(self, val, lo, hi, scl, names, ids, offset: int = N_FIXED):
+        """Violating rows (from ``offset`` on) as ``(names, ids, records)``."""
+        out_names, out_ids, recs = [], [], []
+        for k in range(len(val) - offset):
+            v, l_, h_ = val[offset + k], lo[offset + k], hi[offset + k]
+            if v < l_ - 1e-9 or v > h_ + 1e-9:
+                nm = names[k] if k < len(names) else "?"
+                out_names.append(nm)
+                if k < len(ids):
+                    out_ids.append(ids[k])
+                recs.append({"row": nm, "val_m": float(v),
+                             "lo_m": float(l_), "hi_m": float(h_)})
+        return out_names, out_ids, recs
+
+    def success_review(self, z: np.ndarray, ctx: FrameContext) -> tuple[bool, dict]:
+        """Unified review for EVERY successful return (F1).
+
+        Re-forwards to the candidate state, rescans the FULL registry and
+        checks all applicable constraints with ``check_rows`` -- uncapped by
+        the QP row budget, so a success can never hide behind
+        ``max_active_pairs``. Covers the early-return branch, budget
+        exhaustion, trust collapse and the historical ``best_z``: the old
+        code only reviewed the early return, letting ``best_feasible`` hand
+        back a state whose collisions had gone stale.
+
+        A violation invalidates the candidate and is fed back to the solver
+        (``note_discovered_pairs``) so the next linearization can act on it;
+        the caller decides whether to continue iterating or fail explicitly.
+        """
+        self._frame_pairs = None                     # full registry rescan
+        try:
+            val, lo, hi, scl, names, ids = self.check_rows(z, ctx)
+        finally:
+            # leave the cache cleared: the next linearization must rescan with
+            # whatever ``note_discovered_pairs`` just added
+            self._frame_pairs = None
+        viol = self.violation(val, lo, hi, scl)
+        info = {"viol": float(viol)}
+        if viol <= 1e-6:
+            return True, info
+        vnames, vids, recs = self._violating(val, lo, hi, scl, names, ids)
+        info.update({"violated_rows": vnames, "rows": recs})
+        if vids:
+            self.note_discovered_pairs(vids)
+        info["carried"] = vnames
+        return False, info
+
     # -- SCP loop ------------------------------------------------------------
 
     def solve_frame(self, z_init: np.ndarray, ctx: FrameContext, force_slack: bool = False) -> FrameResult:
@@ -808,6 +1044,9 @@ class FrameSolver:
         used_slack = False
         it_done = 0
         qp_calls = 0
+        last_viol, last_names = 0.0, []
+        last_qp_status = ""
+        review = {}
 
         # once the tight QP proves infeasible for this frame, stay in
         # restoration mode (re-trying the tight solve each iteration doubles
@@ -825,26 +1064,33 @@ class FrameSolver:
             # proactive +2mm clearance lives only inside the QP rows
             val, lo, hi, scl = self.constraint_rows(z, ctx, trust, mode="accept")
             viol = self.violation(val, lo, hi, scl)
+            last_viol = viol
+            last_names, _ids, _recs = self._violating(val, lo, hi, scl,
+                                                       self.last_row_pairs,
+                                                       self.last_row_ids)
             merit = self.objective(res) + mu * viol
             feasible = viol <= 1e-6
             if feasible and merit < best_merit:
                 best_z, best_merit, best_feasible = z.copy(), merit, True
             if feasible and res["mpjpe"] <= cfg.task_mpjpe_tol_m and self._stationary(z, ctx):
-                # stage 1: pairs entering range mid-frame used to reach the
-                # accepted output unchecked by any row. Rescan (FULL
-                # registry) and re-judge the candidate; if the fresh scan
-                # exposes a violation, keep iterating instead of returning
-                # an unchecked state.
-                self._frame_pairs = None
-                val_r, lo_r, hi_r, scl_r = self.constraint_rows(z, ctx, trust, mode="accept")
-                if self.violation(val_r, lo_r, hi_r, scl_r) <= 1e-6:
-                    return FrameResult(True, z, it_done, slack_used=used_slack, merit=merit,
-                                       qp_calls=qp_calls)
+                # stage 1 + F1: a candidate could satisfy the budgeted rows
+                # while violating a pair they could not carry. EVERY success
+                # exit runs the uncapped full-registry review; a failure does
+                # NOT return -- it invalidates this best and feeds the
+                # discovered pairs into the next linearization.
+                ok, info = self.success_review(z, ctx)
+                review = info
+                if ok:
+                    return self._result(True, z, it_done, used_slack, merit,
+                                        qp_calls, trust, last_viol, last_names,
+                                        qp_status=last_qp_status)
+                if best_z is not None and np.array_equal(best_z, z):
+                    best_z, best_merit, best_feasible = None, float("inf"), False
 
             if restoration:
                 (Ps, qs, As, los, his), _ = self.build_qp(z, ctx, trust, slack=True)
                 qp_calls += 1
-                x_s, _ = self.solve_qp(Ps, qs, As, los, his)
+                x_s, last_qp_status = self.solve_qp(Ps, qs, As, los, his)
                 if x_s is None:
                     trust *= cfg.shrink_factor
                     if trust < cfg.trust_radius_min:
@@ -855,7 +1101,7 @@ class FrameSolver:
             else:
                 (P, qv, A, lo_a, hi_a), _ = self.build_qp(z, ctx, trust, slack=False)
                 qp_calls += 1
-                xi, _status = self.solve_qp(P, qv, A, lo_a, hi_a)
+                xi, last_qp_status = self.solve_qp(P, qv, A, lo_a, hi_a)
                 if xi is None:
                     restoration = True
                     continue
@@ -875,8 +1121,8 @@ class FrameSolver:
                     # stage 1: the step may have carried the state near pairs
                     # outside the frozen candidate set; schedule a partial
                     # refresh (fast families + carried extras) so later
-                    # linearizations see them. The full registry rescan
-                    # before a successful return remains the correctness gate.
+                    # linearizations see them. The uncapped success review
+                    # remains the correctness gate.
                     self._refresh_counter += 1
                     if merit_c < 0.5 * merit:
                         trust = min(cfg.trust_radius_max, trust * cfg.expand_factor)
@@ -889,16 +1135,46 @@ class FrameSolver:
         # budget exhausted / trust collapsed: report the ACTUAL iteration
         # count and slack usage (the old hardcoded ``scp_max_iters`` hid
         # early-exit branches and misreported slack on restoration exits;
-        # stage 0, 2026-09-16)
+        # stage 0, 2026-09-16). The historical best gets the SAME review as
+        # the early return (F1): if the fresh scan exposes a violation, it is
+        # explicitly rejected instead of being handed back unchecked.
         if best_feasible:
             res = self.evaluate(best_z, ctx)
-            if res["mpjpe"] <= cfg.task_mpjpe_tol_m:
-                return FrameResult(True, best_z, it_done, slack_used=used_slack, merit=best_merit,
-                                   qp_calls=qp_calls)
-            return FrameResult(False, best_z, it_done, status="task_quality",
-                               slack_used=used_slack, merit=best_merit, qp_calls=qp_calls)
-        return FrameResult(False, z, it_done, status="infeasible", slack_used=used_slack,
-                           qp_calls=qp_calls)
+            if res["mpjpe"] > cfg.task_mpjpe_tol_m:
+                return self._result(False, best_z, it_done, used_slack, best_merit,
+                                    qp_calls, trust, last_viol, last_names,
+                                    status="task_quality", qp_status=last_qp_status)
+            ok, info = self.success_review(best_z, ctx)
+            review = info
+            if not ok:
+                return self._result(False, best_z, it_done, used_slack, best_merit,
+                                    qp_calls, trust, last_viol, last_names,
+                                    status="review_failed", review=info,
+                                    qp_status=last_qp_status)
+            return self._result(True, best_z, it_done, used_slack, best_merit,
+                                qp_calls, trust, last_viol, last_names,
+                                qp_status=last_qp_status)
+        return self._result(False, z, it_done, used_slack, float("inf"), qp_calls,
+                            trust, last_viol, last_names, status="infeasible",
+                            review=review, qp_status=last_qp_status)
+
+    def _result(self, accepted, z, it_done, used_slack, merit, qp_calls, trust,
+                last_viol, last_names, status=None, review=None,
+                qp_status: str = "") -> FrameResult:
+        """FrameResult with the exit evidence F0 requires (trust, last
+        constraint, QP exit status, budget truncation, review outcome)."""
+        res = FrameResult(
+            accepted, z, it_done, slack_used=used_slack,
+            status=status or ("solved" if accepted else "max_iters"),
+            merit=float(merit), qp_calls=qp_calls, trust=float(trust),
+            last_viol=float(last_viol), violated_rows=list(last_names),
+            truncated_rows=list(self.last_truncated_names),
+            last_qp_status=str(qp_status))
+        if review:
+            res.diagnostics["review"] = review
+        if self.last_truncated_ids:
+            res.diagnostics["row_budget_truncated_ids"] = list(self.last_truncated_ids)
+        return res
 
     def _stationary(self, z: np.ndarray, ctx: FrameContext) -> bool:
         """Prediction-consistent stationarity: near the prediction target."""
