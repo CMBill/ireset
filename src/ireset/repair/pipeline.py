@@ -176,10 +176,12 @@ class RepairPipeline:
         # Path B approach corridor input + hand-tracking target
         prev_hand_dist = {}
         ref_hand_kpts = {}
+        ref_hand_delta = {}
         if self.cfg.regen_mode:
             z_ref = z_prev if z_prev is not None else prediction[t, 0:36]
             self.ev.forward(z_ref, prediction[t, 36:43])
             pose = prediction[t, 36:43]
+            pose_prev = prediction[t - 1, 36:43] if t > 0 else pose
             for side in ("l", "r"):
                 prev_hand_dist[side] = min(
                     self.ev.geom_distance(g, self.ev.box_geom)[0]
@@ -187,6 +189,15 @@ class RepairPipeline:
                 ids = [SMPLH_INDEX[n] for n in HAND_TIP_JOINTS["left" if side == "l" else "right"]]
                 p = condition.human_kpts_world[t][ids].mean(0)
                 ref_hand_kpts[side] = _surface_target(p, pose)
+                # reference box-frame displacement (F4 section 7.2): the
+                # human hand centroid in the box GEOM frame (the frame
+                # hand_local lives in), this frame minus the previous one --
+                # computed from the INPUT (box trajectory + reference
+                # keypoints), never from the robot output
+                if t > 0:
+                    p_prev = condition.human_kpts_world[t - 1][ids].mean(0)
+                    ref_hand_delta[side] = (self._box_geom_local(p, pose)
+                                            - self._box_geom_local(p_prev, pose_prev))
         return FrameContext(
             t=t, box_pose=prediction[t, 36:43].copy(),
             z_pred=prediction[t, 0:36].copy(), z_prev=z_prev,
@@ -198,6 +209,7 @@ class RepairPipeline:
             ref_hold={name: contacts.reference_wants_hold(name, t) for name in EFFECTORS},
             prev_hand_dist=prev_hand_dist,
             ref_hand_kpts=ref_hand_kpts,
+            ref_hand_delta=ref_hand_delta,
             frame_motion_m=(
                 self.validator._frame_motion_m(
                     np.r_[z_prev, prediction[t - 1, 36:43]],
@@ -206,6 +218,17 @@ class RepairPipeline:
         )
 
     # -- frame-level checks (skip logic, plan 8.4) ---------------------------------
+
+    def _box_geom_local(self, p_world: np.ndarray, box_pose: np.ndarray) -> np.ndarray:
+        """World point -> box GEOM frame (the frame ``ev.hand_local`` uses).
+
+        Evaluated on the evaluator's probe data: the box frame depends only
+        on the box pose, so the endpoint state stays untouched.
+        """
+        self.ev.probe_forward(np.r_[np.zeros(3), [1.0, 0.0, 0.0, 0.0], np.zeros(29)],
+                              box_pose)
+        R, x = self.ev.probe_box_frame()
+        return R.T @ (np.asarray(p_world, dtype=float) - x)
 
     def _hand_gaps(self) -> dict:
         """Min hand-geom/box distance per side at the CURRENT forwarded state.

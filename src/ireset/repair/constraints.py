@@ -246,6 +246,17 @@ class FrameEvaluator:
                                    distmax, self._probe_fromto)
         return float(d), self._probe_fromto.copy()
 
+    def probe_box_frame(self) -> tuple[np.ndarray, np.ndarray]:
+        """Box geom frame ``(R, x)`` of the PROBE state (F4).
+
+        The box frame depends only on the box pose, so ``probe_forward`` with
+        any robot state yields it without disturbing the endpoint state the
+        solver linearized at.
+        """
+        R = self._probe_data.geom_xmat[self.box_geom].reshape(3, 3)
+        x = self._probe_data.geom_xpos[self.box_geom].copy()
+        return R, x
+
     def geom_name(self, gid: int) -> str:
         return mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, gid)
 

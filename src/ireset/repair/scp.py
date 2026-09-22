@@ -107,6 +107,14 @@ class FrameContext:
     #: reference HUMAN hand centroid per side (world, [3]) at this frame --
     #: target of the regeneration hand-tracking objective
     ref_hand_kpts: dict = field(default_factory=dict)
+    #: reference-driven box-frame hand motion per side ([3], BOX frame):
+    #: the human hand centroid's displacement from the previous frame. The
+    #: grasp-stability soft target (F4 section 7.2) penalizes the robot
+    #: hand's box-frame displacement DEVIATING from this -- a quasi-static
+    #: reference then suppresses chatter, a moving reference is still
+    #: followed (the plan forbids forcing all hand motion to zero and any
+    #: robot-output-based frame selection)
+    ref_hand_delta: dict = field(default_factory=dict)
     #: site motion (m) between z_prev and z_pred for this frame -- scales
     #: the solver's interpolation-dip margin (dip grows ~ quadratically
     #: with the per-frame step)
@@ -313,7 +321,53 @@ class FrameSolver:
                              else np.zeros(0))
         else:
             out["r_hand"] = None
+        # grasp stability (F4 section 7.2): box-frame hand displacement must
+        # follow the REFERENCE's displacement -- active only while the
+        # reference schedule holds this hand
+        out["r_stab"] = self._stab_residual(ctx)
         return out
+
+    def _stab_residual(self, ctx: FrameContext) -> np.ndarray | None:
+        """``[3*n_active]`` grasp-stability residual at the current state.
+
+        ``r = (hand_local(z).mean(0) - prev hand_local.mean(0) - ref_delta)/scale``
+        per active side: zero when the robot hand moves exactly like the
+        reference in the box frame. ``None`` when regeneration is off, the
+        side is not held, or the previous accepted state is unknown.
+        """
+        cfg = self.cfg
+        if not cfg.regen_mode or ctx.z_prev is None:
+            return None
+        ev = self.ev
+        rows = []
+        for side in ("l", "r"):
+            if not ctx.ref_hold.get(f"left_hand" if side == "l" else "right_hand"):
+                continue
+            ref_delta = ctx.ref_hand_delta.get(side)
+            prev = ctx.prev_hand_local.get(side)
+            if ref_delta is None or prev is None:
+                continue
+            step = (ev.hand_local(side).mean(0)
+                    - np.asarray(prev, dtype=float).mean(0))
+            rows.append((step - np.asarray(ref_delta, dtype=float))
+                        / cfg.regen_hand_stab_scale_m)
+        if not rows:
+            return None
+        return np.concatenate(rows)
+
+    def _stab_jacobian(self, ctx: FrameContext) -> np.ndarray:
+        """``[3*n_active, 35]`` Jacobian of :meth:`_stab_residual`."""
+        cfg = self.cfg
+        ev = self.ev
+        rows = []
+        for side in ("l", "r"):
+            if not ctx.ref_hold.get(f"left_hand" if side == "l" else "right_hand"):
+                continue
+            if ctx.ref_hand_delta.get(side) is None or ctx.prev_hand_local.get(side) is None:
+                continue
+            J = ev.hand_local_jac(side).mean(0)                    # [3,35]
+            rows.append(J / cfg.regen_hand_stab_scale_m)
+        return np.vstack(rows) if rows else np.zeros((0, N_TANGENT))
 
     def _fixed_pre_rows(self, z: np.ndarray, ctx: FrameContext, trust: float):
         """Rows ``[0, N_FIXED)``: joint limits, velocities, trust region."""
@@ -943,6 +997,8 @@ class FrameSolver:
             f += cfg.laplacian_weight * float((res["r_mesh"] ** 2).sum())
         if res.get("r_hand") is not None and len(res["r_hand"]):
             f += cfg.regen_hand_track_weight * float((res["r_hand"] ** 2).sum())
+        if res.get("r_stab") is not None:
+            f += cfg.regen_hand_stab_weight * float((res["r_stab"] ** 2).sum())
         return f
 
     # -- linearization + QP ----------------------------------------------------
@@ -1026,6 +1082,15 @@ class FrameSolver:
                 r_hand = np.concatenate(r_hand) / cfg.regen_hand_track_scale_m
                 P += 2.0 * cfg.regen_hand_track_weight * (J_hand.T @ J_hand)
                 q += 2.0 * cfg.regen_hand_track_weight * (J_hand.T @ r_hand)
+
+        # grasp-stability soft target (F4 section 7.2): same Gauss-Newton
+        # assembly as the tracking terms, so the QP model and the merit the
+        # line search evaluates stay one objective
+        r_stab = self._stab_residual(ctx)
+        if r_stab is not None and len(r_stab):
+            J_stab = self._stab_jacobian(ctx)
+            P += 2.0 * cfg.regen_hand_stab_weight * (J_stab.T @ J_stab)
+            q += 2.0 * cfg.regen_hand_stab_weight * (J_stab.T @ r_stab)
 
         # constraint rows
         A_rows = []

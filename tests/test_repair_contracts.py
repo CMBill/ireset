@@ -786,6 +786,103 @@ def test_probe_rows_inert_below_substep_threshold(pipeline) -> None:
     assert rows == []
     val, lo, hi, scl = solver._probe_block(ctx, z)
     assert len(val) == 0
+
+
+# --- F4 section 7.2: grasp-stability soft target -----------------------------------
+
+
+def _stab_ctx(pipeline: RepairPipeline, hold: bool = True):
+    """Regen frame with the previous accepted state and a reference-driven
+    box-frame hand displacement."""
+    z, ctx, _gid = _probe_scenario(pipeline)
+    ctx = replace(ctx, frame_motion_m=0.02)
+    ctx.ref_hold = {"left_hand": hold, "right_hand": False,
+                    "left_foot": False, "right_foot": False}
+    ctx.prev_hand_local = {"l": None, "r": None}
+    ev = pipeline.ev
+    ev.forward(ctx.z_prev, ctx.box_pose_prev)
+    ctx.prev_hand_local["l"] = ev.hand_local("l").copy()
+    ctx.ref_hand_delta = {"l": np.array([0.001, -0.0005, 0.0002])}
+    return z, ctx
+
+
+def test_grasp_stability_term_is_reference_driven(regen_pipeline) -> None:
+    """The stability residual is zero when the robot hand repeats the
+    reference's box-frame displacement, and scales with the deviation."""
+    solver, ev = regen_pipeline.solver, regen_pipeline.ev
+    z, ctx = _stab_ctx(regen_pipeline)
+    # local construction: freeze the box pose (the current one) so the only
+    # motion in the box frame is the robot's, then solve for a hand centroid
+    # that moved exactly by the reference displacement
+    ctx = replace(ctx, box_pose=ctx.box_pose_prev.copy())
+    z_ref = ctx.z_prev.copy()
+    step_target = ctx.ref_hand_delta["l"]
+    for _ in range(60):     # small Newton iterations on the 3-dim hand task
+        ev.forward(z_ref, ctx.box_pose)
+        r = (ev.hand_local("l").mean(0)
+             - ctx.prev_hand_local["l"].mean(0) - step_target)
+        if np.linalg.norm(r) < 1e-6:
+            break
+        J = ev.hand_local_jac("l").mean(0)
+        xi = np.linalg.lstsq(J, -r, rcond=None)[0]
+        z_ref = retract_batch(ev.model, z_ref[None], xi[None])[0]
+    res = solver.evaluate(z_ref, ctx)
+    assert np.abs(res["r_stab"]).max() < 1e-3, res["r_stab"]
+    # a robot hand that did not move in the box frame deviates by exactly
+    # -ref_delta/scale
+    res0 = solver.evaluate(ctx.z_prev, ctx)
+    expect = -ctx.ref_hand_delta["l"] / solver.cfg.regen_hand_stab_scale_m
+    assert np.allclose(res0["r_stab"], expect, atol=1e-6)
+    # with the real box motion the displacement is measured in the CURRENT
+    # box geom frame: recompute the step independently from hand_local
+    z2_, ctx2_ = _stab_ctx(regen_pipeline)
+    ev.forward(ctx2_.z_prev, ctx2_.box_pose)
+    step = ev.hand_local("l").mean(0) - ctx2_.prev_hand_local["l"].mean(0)
+    res1 = solver.evaluate(ctx2_.z_prev, ctx2_)
+    assert np.allclose(res1["r_stab"],
+                       (step - ctx2_.ref_hand_delta["l"])
+                       / solver.cfg.regen_hand_stab_scale_m, atol=1e-9)
+    # outside a reference hold the term is absent
+    z2, ctx2 = _stab_ctx(regen_pipeline, hold=False)
+    assert solver.evaluate(z2, ctx2)["r_stab"] is None
+
+
+def test_grasp_stability_block_matches_objective_gradient(regen_pipeline) -> None:
+    """The QP's stability block is the Gauss-Newton term of the SAME residual
+    the objective evaluates: q == d/dxi objective and P == d/dxi (grad)."""
+    solver, ev = regen_pipeline.solver, regen_pipeline.ev
+    cfg = replace(regen_pipeline.cfg, regen_hand_stab_weight=1.0)
+    solver.cfg = cfg
+    z, ctx = _stab_ctx(regen_pipeline)
+    ev.forward(z, ctx.box_pose)
+    (P, q, _A, _lo, _hi), _ = solver.build_qp(z, ctx, trust=1.0, slack=False)
+    P = np.asarray(P.todense())
+    # isolate the stability block: rebuild the same QP without the term
+    cfg_off = replace(cfg, regen_hand_stab_weight=0.0)
+    solver.cfg = cfg_off
+    (P0, q0, _A0, _l0, _h0), _ = solver.build_qp(z, ctx, trust=1.0, slack=False)
+    solver.cfg = cfg
+    dP = P - np.asarray(P0.todense())
+    dq = q - q0
+
+    r = solver._stab_residual(ctx)
+    J = solver._stab_jacobian(ctx)
+    assert np.allclose(dq, 2.0 * cfg.regen_hand_stab_weight * (J.T @ r), atol=1e-9)
+    assert np.allclose(dP, 2.0 * cfg.regen_hand_stab_weight * (J.T @ J), atol=1e-9)
+
+    def f_of_xi(xi):
+        zz = retract_batch(ev.model, z[None], xi[None])[0]
+        return cfg.regen_hand_stab_weight * float((solver.evaluate(zz, ctx)["r_stab"] ** 2).sum())
+
+    h = 1e-6
+    g = np.zeros(35)
+    for k in range(35):
+        e = np.zeros(35)
+        e[k] = h
+        g[k] = (f_of_xi(e) - f_of_xi(-e)) / (2 * h)
+    assert np.allclose(dq, g, atol=1e-6, rtol=1e-4), dq - g
+
+
 # --- box-frame Jacobians (coordinate-axis contraction fix) ------------------------
 
 

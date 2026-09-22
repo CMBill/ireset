@@ -134,6 +134,16 @@ class RepairConfig:
     probe_row_margin_m: float = 0.003
     regen_hand_track_weight: float = 25.0
     regen_hand_track_scale_m: float = 0.02
+    # grasp-stability soft target (F4, 2026-09-22, plan section 7.2): during a
+    # reference grasp the robot hand's BOX-frame displacement must follow the
+    # reference's displacement; the residual (step - ref_step)/scale is
+    # penalized with this weight. The teacher reference itself moves (release
+    # transients, grip adjustments), so the term tracks the reference's
+    # motion instead of forcing zero -- a quasi-static reference then
+    # suppresses solver chatter that the certification entry gate rejects.
+    # Pre-registered weight comparison: off (0.0) / 0.1 / 1.0.
+    regen_hand_stab_weight: float = 0.0
+    regen_hand_stab_scale_m: float = 0.01
     # hard box-frame speed rows for in-band hands: DISABLED (0.0) after
     # a negative result -- any bound tight enough to kill the per-frame
     # QP chatter (~1 mm/frame) also forbids following the reference's own

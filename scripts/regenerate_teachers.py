@@ -208,6 +208,10 @@ def main() -> None:
     ap.add_argument("--report", type=str, default=None)
     ap.add_argument("--note", type=str, default=None,
                     help="free-form run note stored in the report")
+    ap.add_argument("--stab-weight", type=float, default=None,
+                    help="grasp-stability soft-target weight (F4 section 7.2); "
+                         "pre-registered comparison: 0 / 0.1 / 1.0. Default: "
+                         "the config value (0.0)")
     ap.add_argument("--verbose", action="store_true",
                     help="per-frame hand_dist / corridor_upper / probe details "
                          "(printed summary + full frame_log in the report rows)")
@@ -229,6 +233,8 @@ def main() -> None:
     # standard objective (regression check for the stage gate; report-only,
     # no NPZ output -- this is not a regeneration run).
     regen_cfg = replace(rcfg, regen_mode=(args.mode == "regen"))
+    if args.stab_weight is not None:
+        regen_cfg = replace(regen_cfg, regen_hand_stab_weight=args.stab_weight)
     pipe = RepairPipeline(cfg=regen_cfg)
     pipe.validator.cfg = vcfg
     pipe.verbose = args.verbose
