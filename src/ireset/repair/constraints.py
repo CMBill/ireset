@@ -231,8 +231,10 @@ class FrameEvaluator:
         return (R_g.T @ (self.site_positions(self.hand_sites[side]) - x_g).T).T
 
     def hand_local_jac(self, side: str) -> np.ndarray:
+        """[S, 3, 35] hand-site Jacobians in the BOX GEOM frame."""
         R_g, _ = self.box_frame()
-        return np.einsum("ij,sak->sik", R_g.T, self.site_jacobians_35(self.hand_sites[side]))
+        # 'j' contracts the site-point axis; "sak->sik" summed the coordinate
+        return np.einsum("ij,sjk->sik", R_g.T, self.site_jacobians_35(self.hand_sites[side]))
 
     def geom_distance(self, ga: int, gb: int, distmax: float = 1.0) -> tuple[float, np.ndarray]:
         d = mujoco.mj_geomDistance(self.model, self.data, ga, gb, distmax, self._fromto)

@@ -998,7 +998,9 @@ class FrameSolver:
             kpt_g = (R_g.T @ (kpt_w - x_g).T).T
             X = np.vstack([kpt_g, ctx.mesh_fixed])
             r_mesh = (ctx.mesh_L @ X - ctx.delta_ref).reshape(-1)
-            J_kpt = np.einsum("ij,sak->sik", R_g.T, ev.site_jacobians_35(ev.kpt_ids))
+            # NB: contract the site-point axis (see eval.hand_local_jac --
+            # the old "ij,sak->sik" summed over the coordinate axis)
+            J_kpt = np.einsum("ij,sjk->sik", R_g.T, ev.site_jacobians_35(ev.kpt_ids))
             J_mesh = self._mesh_jacobian(ctx.mesh_L, J_kpt)
             P += 2.0 * cfg.laplacian_weight * (J_mesh.T @ J_mesh)
             q += 2.0 * cfg.laplacian_weight * (J_mesh.T @ r_mesh)

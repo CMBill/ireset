@@ -786,3 +786,50 @@ def test_probe_rows_inert_below_substep_threshold(pipeline) -> None:
     assert rows == []
     val, lo, hi, scl = solver._probe_block(ctx, z)
     assert len(val) == 0
+# --- box-frame Jacobians (coordinate-axis contraction fix) ------------------------
+
+
+def test_box_frame_jacobians_match_finite_differences(regen_pipeline) -> None:
+    """``hand_local_jac`` and the mesh residual's kpt Jacobian must contract
+    the SITE-POINT axis. The old ``"ij,sak->sik"`` einsum summed over it
+    instead, producing a rank-1 wrong-direction row (anchor rows and the
+    Laplacian mesh block linearized a different function than they judged).
+    """
+    solver, ev = regen_pipeline.solver, regen_pipeline.ev
+    z, ctx = _stab_ctx(regen_pipeline)
+    ev.forward(z, ctx.box_pose)
+    R_g, _x_g = ev.box_frame()
+    sites = ev.hand_sites["l"]
+    J = ev.hand_local_jac("l")
+    h = 1e-6
+    fd = np.zeros((len(sites), 3, 35))
+    for site, sid in enumerate(sites):
+        for k in range(35):
+            e = np.zeros(35)
+            e[k] = h
+            vals = []
+            for sign in (1.0, -1.0):
+                zz = retract_batch(ev.model, z[None], (sign * e)[None])[0]
+                ev.forward(zz, ctx.box_pose)
+                vals.append(R_g.T @ ev.site_positions([sid])[0])
+            fd[site][:, k] = (vals[0] - vals[1]) / (2.0 * h)
+    assert np.allclose(J, fd, atol=1e-6, rtol=1e-4), np.abs(J - fd).max()
+
+    # the same contraction for the kpt Jacobian feeding the mesh block: an
+    # isotropic Laplacian (all-ones row) must reproduce the mean site motion
+    L = np.ones((1, 15)) / 15.0
+    J_kpt = np.einsum("ij,sjk->sik", R_g.T, ev.site_jacobians_35(ev.kpt_ids))
+    J_mesh = solver._mesh_jacobian(L, J_kpt)
+    kpt_ids = list(ev.kpt_ids)
+    fd_mesh = np.zeros((3, 35))
+    for k in range(35):
+        e = np.zeros(35)
+        e[k] = h
+        vals = []
+        for sign in (1.0, -1.0):
+            zz = retract_batch(ev.model, z[None], (sign * e)[None])[0]
+            ev.forward(zz, ctx.box_pose)
+            pts = R_g.T @ (ev.site_positions(kpt_ids) - _x_g).T
+            vals.append(pts.T.mean(0))
+        fd_mesh[:, k] = (vals[0] - vals[1]) / (2.0 * h)
+    assert np.allclose(J_mesh.reshape(3, 35), fd_mesh, atol=1e-6, rtol=1e-4)
