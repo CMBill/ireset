@@ -101,6 +101,13 @@ class FrameEvaluator:
         }
         self._fromto = np.zeros(6)
         self._jac_buf = np.zeros((3, self.model.nv))
+        # transition-probe state (F4, 2026-09-22): an interpolated mid state
+        # must be evaluated WITHOUT disturbing the endpoint state the solver
+        # linearized at -- own data, own fromto buffer
+        self._probe_data = mujoco.MjData(self.model)
+        self._probe_fromto = np.zeros(6)
+        self._probe_jac_buf = np.zeros((3, self.model.nv))
+        self._motion_data = mujoco.MjData(self.model)
 
     # -- forward -----------------------------------------------------------
 
@@ -112,6 +119,51 @@ class FrameEvaluator:
         self.data.qpos = qpos
         mujoco.mj_forward(self.model, self.data)
         self._root_R = quat_to_mat_wxyz(z[3:7][None])[0]
+
+    def probe_forward(self, q_robot: np.ndarray, box_pose: np.ndarray) -> None:
+        """Forward the PROBE data to an interpolated mid state (F4)."""
+        qpos = np.zeros(43)
+        qpos[0:36] = q_robot
+        qpos[36:39] = box_pose[0:3]
+        qpos[39:43] = box_pose[3:7]
+        self._probe_data.qpos = qpos
+        mujoco.mj_forward(self.model, self._probe_data)
+        self._probe_R = quat_to_mat_wxyz(np.asarray(q_robot[3:7], dtype=float)[None])[0]
+
+    def motion_between(self, z_a: np.ndarray, box_a: np.ndarray,
+                       z_b: np.ndarray, box_b: np.ndarray) -> float:
+        """Max collision-relevant displacement between two scenes (m).
+
+        Same protocol as the independent validator's frame motion: the max
+        robot site displacement plus the max box CORNER displacement (a
+        center-only metric cannot see a rotating box sweeping through the
+        robot). The solver uses it to reproduce the validator's adaptive
+        subdivision, so probe rows and checks probe the same states.
+        """
+        m = self._motion_data
+        out = []
+        for z, box in ((z_a, box_a), (z_b, box_b)):
+            qpos = np.zeros(43)
+            qpos[0:36] = z
+            qpos[36:39] = box[0:3]
+            qpos[39:43] = box[3:7]
+            m.qpos = qpos
+            mujoco.mj_forward(self.model, m)
+            sites = m.site_xpos.copy()
+            R = m.geom_xmat[self.box_geom].reshape(3, 3)
+            c = m.geom_xpos[self.box_geom].copy()
+            out.append((sites, c + self.box_corners() @ R.T))
+        (sa, ca), (sb, cb) = out
+        robot = float(np.linalg.norm(sb - sa, axis=-1).max()) if len(sa) else 0.0
+        corners = float(np.linalg.norm(cb - ca, axis=-1).max())
+        return max(robot, corners)
+
+    def box_corners(self) -> np.ndarray:
+        """[8, 3] box-local AABB corners (mirrors the validator's metric)."""
+        half = self.model.geom_size[self.box_geom, 0:3]
+        signs = np.array([[sx, sy, sz] for sx in (-1, 1) for sy in (-1, 1)
+                          for sz in (-1, 1)], dtype=float)
+        return signs * half
 
     def site_positions(self, ids: list[int]) -> np.ndarray:
         return self.data.site_xpos[ids]
@@ -139,24 +191,29 @@ class FrameEvaluator:
         J[:, 6:35] = self._jac_buf[:, 6:35]  # scene nv=42: drop box dofs
         return J
 
-    def geom_point_jacobian_35(self, gid: int, point_world: np.ndarray) -> np.ndarray:
+    def geom_point_jacobian_35(self, gid: int, point_world: np.ndarray,
+                               probe: bool = False) -> np.ndarray:
         """[3, 35] rigid-point Jacobian for a point rigidly attached to the geom.
 
         ``v_point = v_center + omega x r`` with ``r = point - geom_xpos``:
         for mesh geoms the closest point sits centimeters from the frame
         origin, and ignoring the rotational term mispredicts the distance
-        gradient badly enough to stall the SCP.
+        gradient badly enough to stall the SCP. ``probe=True`` evaluates the
+        same quantity at the probe (interpolated) state instead.
         """
-        R = self._root_R
+        if probe:
+            data, R, buf = self._probe_data, self._probe_R, self._probe_jac_buf
+        else:
+            data, R, buf = self.data, self._root_R, self._jac_buf
         jacp = np.zeros((3, self.model.nv))
         jacr = np.zeros((3, self.model.nv))
-        mujoco.mj_jacGeom(self.model, self.data, jacp, jacr, gid)
+        mujoco.mj_jacGeom(self.model, data, jacp, jacr, gid)
         to35 = lambda J: np.concatenate([  # noqa: E731
             J[:, 0:3], J[:, 3:6] @ R.T, J[:, 6:35]
         ], axis=1)
         Jp = to35(jacp)
         Jr = to35(jacr)
-        r = np.asarray(point_world, dtype=float) - self.data.geom_xpos[gid]
+        r = np.asarray(point_world, dtype=float) - data.geom_xpos[gid]
         skew = np.array([
             [0.0, -r[2], r[1]],
             [r[2], 0.0, -r[0]],
@@ -181,10 +238,17 @@ class FrameEvaluator:
         d = mujoco.mj_geomDistance(self.model, self.data, ga, gb, distmax, self._fromto)
         return float(d), self._fromto.copy()
 
+    def probe_geom_distance(self, ga: int, gb: int, distmax: float = 1.0) -> tuple[float, np.ndarray]:
+        """Distance at the PROBE state (F4)."""
+        d = mujoco.mj_geomDistance(self.model, self._probe_data, ga, gb,
+                                   distmax, self._probe_fromto)
+        return float(d), self._probe_fromto.copy()
+
     def geom_name(self, gid: int) -> str:
         return mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, gid)
 
-    def geom_separation_direction(self, ga: int, gb: int, dist: float) -> np.ndarray:
+    def geom_separation_direction(self, ga: int, gb: int, dist: float,
+                                  probe: bool = False) -> np.ndarray:
         """Unit direction in which ga's closest point must move to SEPARATE.
 
         Needed when MuJoCo's ``fromto`` is degenerate: for a pair in exact
@@ -201,31 +265,33 @@ class FrameEvaluator:
         frame z-axis, otherwise the center-to-center direction (exact for
         spheres, the standard convex approximation at contact).
         """
-        for i in range(self.data.ncon):
-            c = self.data.contact[i]
+        data = self._probe_data if probe else self.data
+        for i in range(data.ncon):
+            c = data.contact[i]
             if {int(c.geom1), int(c.geom2)} == {ga, gb}:
                 # frame normal points from geom2 to geom1
                 n = np.array(c.frame[0:3], dtype=float)
                 return n if ga == int(c.geom1) else -n
         for g, other in ((ga, gb), (gb, ga)):
             if self.model.geom_type[g] == mujoco.mjtGeom.mjGEOM_PLANE:
-                R = self.data.geom_xmat[g].reshape(3, 3)
+                R = data.geom_xmat[g].reshape(3, 3)
                 n = R[:, 2].copy()
                 # orient from the plane toward the other geom
-                side = np.dot(n, self.data.geom_xpos[other] - self.data.geom_xpos[g])
+                side = np.dot(n, data.geom_xpos[other] - data.geom_xpos[g])
                 if side < 0:
                     n = -n
                 # u points from the other side toward ga (its separation
                 # direction): along n when the plane is gb, against it when
                 # the plane is ga
                 return -n if g == ga else n
-        d = self.data.geom_xpos[ga] - self.data.geom_xpos[gb]
+        d = data.geom_xpos[ga] - data.geom_xpos[gb]
         n = float(np.linalg.norm(d))
         if n > 1e-9:
             return d / n
         return np.array([0.0, 0.0, 1.0])
 
-    def distance_jacobian(self, ga: int, gb: int, fromto: np.ndarray, dist: float) -> np.ndarray:
+    def distance_jacobian(self, ga: int, gb: int, fromto: np.ndarray, dist: float,
+                          probe: bool = False) -> np.ndarray:
         """Jacobian of the signed distance wrt xi (rigid closest-point form).
 
         d = s * n . (p2 - p1), s = +1 separated / -1 penetrating: the
@@ -242,10 +308,10 @@ class FrameEvaluator:
         if n > 1e-9:
             u = -s * (diff / n)
         else:
-            u = self.geom_separation_direction(ga, gb, dist)
+            u = self.geom_separation_direction(ga, gb, dist, probe=probe)
         J = np.zeros((1, N_TANGENT))
         for g, point, sign in ((ga, p1, +1.0), (gb, p2, -1.0)):
             if g in (self.box_geom, self.ground_geom):
                 continue  # static within a frame
-            J += sign * (u[None, :] @ self.geom_point_jacobian_35(g, point))
+            J += sign * (u[None, :] @ self.geom_point_jacobian_35(g, point, probe=probe))
         return J

@@ -318,6 +318,7 @@ class RepairPipeline:
                         chk.carried.append(nm)
                         if k < len(ids_m):
                             chk.discovered.append(ids_m[k])
+                            chk.probe_discovered.append(ids_m[k])
                 chk.probes.append(rec)
                 chk.probe_viol = max(chk.probe_viol, float(viol_m))
                 chk.reason = "transition_interpolated"
@@ -341,6 +342,8 @@ class RepairPipeline:
         """
         if chk.discovered:
             self.solver.note_discovered_pairs(chk.discovered)
+        if chk.probe_discovered:
+            self.solver.note_probe_pairs(chk.probe_discovered)
         return chk.carried
 
     def check_result(self, res, ctx: FrameContext, caller: str) -> FrameCheck:
@@ -379,6 +382,7 @@ class RepairPipeline:
         """End-to-end repair; ``diagnostics["total_s"]`` covers both attempts
         plus all final validations (the timing callers must report)."""
         t0 = time.perf_counter()
+        self.solver.probe_cfg = self.validator.cfg
         if self.verbose:
             self.frame_log = []
         result = self._repair_trajectory(prediction, condition)
@@ -428,10 +432,12 @@ class RepairPipeline:
             k: {"location": v.location, "first_failure_frame": v.first_failure_frame}
             for k, v in final.checks.items() if not v.passed
         }
+        # the first pass's cost is reported VERBATIM whichever way the retry
+        # ends (a retry must never overwrite the first round's
+        # attempts/QP/iteration totals, and a SUCCESSFUL retry must not drop
+        # them either)
+        retry.diagnostics["first_attempt"] = dict(result.diagnostics)
         if not retry.accepted:
-            # the first pass's cost is reported VERBATIM (a retry must never
-            # overwrite the first round's attempts/QP/iteration totals)
-            retry.diagnostics["first_attempt"] = dict(result.diagnostics)
             return TrajectoryResult(False, "rejected_final", diagnostics=retry.diagnostics)
         t_final = time.perf_counter()
         final2 = self.validator.validate(retry.trajectory, exclude=("box_ground",))
@@ -470,6 +476,8 @@ class RepairPipeline:
             "last_qp_status": str(res.last_qp_status),
             "violated_rows": list(res.violated_rows),
             "truncated_rows": list(res.truncated_rows),
+            "probe_rows": list(res.probe_rows),
+            "probe_truncated": list(res.probe_truncated),
             "frame_valid": (None if res.frame_check is None
                             else bool(res.frame_check.ok)),
             "frame_valid_reason": (None if res.frame_check is None
@@ -533,6 +541,7 @@ class RepairPipeline:
             # (attempt N learns what attempt N-1's checks caught); a new
             # frame is a new state and starts from a clean candidate set
             self.solver.clear_discovered_pairs()
+            self.solver.clear_probe_pairs()
             z_pred = prediction[t, 0:36].copy()
             box = prediction[t, 36:43]
             z_prev = accepted[-1].copy() if accepted else None

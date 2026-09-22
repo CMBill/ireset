@@ -662,3 +662,127 @@ def test_distance_jacobian_valid_at_exact_contact(pipeline) -> None:
     ev.forward(z, box)
     u = ev.geom_separation_direction(ev.sole_geoms["l"][2], ground, 0.0)
     assert u[2] == pytest.approx(1.0, abs=1e-9)   # away from the ground: up
+
+
+# --- F4: transition-probe constraints (plan section 7.1) --------------------------
+
+
+def _probe_scenario(pipeline: RepairPipeline, box0: float = 0.120, box1: float = 0.030,
+                    rot=(0.12, -0.08, 0.05), dpos=(0.03, -0.02, 0.01), dj: float = 0.15):
+    """One high-motion frame: the box closes on the right hand while the robot
+    root rotates/translates and a joint moves. Endpoints are row-legal, the
+    interpolated path dips into the box -- the F4 regression scenario."""
+    ev = pipeline.ev
+    z_prev = standing_scene(1)[0, 0:36].copy()
+    gid = ev._hand_geoms["r"][0]
+    box_prev = _box_at_gap(ev, z_prev, gid, box0)
+    z = z_prev.copy()
+    z[3:7] = mat_to_quat_wxyz(so3_exp_np(np.asarray(rot, dtype=float)[None])[0])
+    z[0:3] += np.asarray(dpos, dtype=float)
+    z[7] += dj
+    box_cur = _box_at_gap(ev, z, gid, box1)
+    from test_repair import _self_ref_kpts
+
+    ref = _self_ref_kpts(pipeline, z, box_cur)
+    ctx = FrameContext(t=1, box_pose=box_cur, z_pred=z, z_prev=z_prev,
+                       ref_kpts_world=ref, mesh_L=None, delta_ref=None,
+                       mesh_fixed=None, hand_anchor={}, foot_anchor={},
+                       prev_hand_local={}, prev_sole_world={}, box_pose_prev=box_prev,
+                       ref_hold={"right_hand": True},
+                       prev_hand_dist={"r": box0, "l": box0})
+    return z, ctx, ev._hand_geoms["r"][0]
+
+
+def test_probe_interpolation_matches_validator(pipeline) -> None:
+    """The solver's probe states must BE the validator's interpolated states
+    (translation lerp, rotation slerp, joint lerp, box pose lerp) -- otherwise
+    probe rows linearize a different path than the checks evaluate."""
+    z, ctx, _gid = _probe_scenario(pipeline)
+    scene_a = np.zeros(43)
+    scene_a[0:36] = ctx.z_prev
+    scene_a[36:43] = ctx.box_pose_prev
+    scene_b = np.zeros(43)
+    scene_b[0:36] = z
+    scene_b[36:43] = ctx.box_pose
+    for alpha in (0.2, 1 / 3, 0.5, 2 / 3, 0.8):
+        v_mid = pipeline.validator._interpolate(scene_a, scene_b, alpha)
+        q_mid, box_mid = pipeline.solver._probe_mid(ctx, z, alpha)
+        assert np.array_equal(q_mid, v_mid[0:36]), alpha
+        assert np.array_equal(box_mid, v_mid[36:43]), alpha
+
+
+def test_probe_jacobian_matches_finite_differences(pipeline) -> None:
+    """The composite chain rule (endpoint increment -> interpolated state ->
+    distance) must equal central differences of the true probe distance,
+    covering root rotation, box motion, several alphas and a self pair."""
+    z, ctx, gid = _probe_scenario(pipeline)
+    solver, ev = pipeline.solver, pipeline.ev
+    pairs = [(gid, ev.box_geom), (ev._hand_geoms["r"][0], ev.box_geom),
+             (ev._hand_geoms["l"][2], ev.box_geom)]
+    h = 1e-6
+    for ga, gb in pairs:
+        for alpha in (0.25, 1 / 3, 0.5, 2 / 3):
+            q_mid, box_mid = solver._probe_mid(ctx, z, alpha)
+            ev.probe_forward(q_mid, box_mid)
+            dist, ft = ev.probe_geom_distance(ga, gb, distmax=1.0)
+            J_mid = ev.distance_jacobian(ga, gb, ft, dist, probe=True)
+            J = solver._probe_composite_jacobian(J_mid, ctx, z, alpha)
+            g = np.zeros(35)
+            for k in range(35):
+                e = np.zeros(35)
+                e[k] = h
+                vals = []
+                for sign in (1.0, -1.0):
+                    z_pert = retract_batch(ev.model, z[None], (sign * e)[None])[0]
+                    qm, bm = solver._probe_mid(ctx, z_pert, alpha)
+                    ev.probe_forward(qm, bm)
+                    d, _ft = ev.probe_geom_distance(ga, gb, distmax=1.0)
+                    vals.append(d)
+                g[k] = (vals[0] - vals[1]) / (2.0 * h)
+            assert np.allclose(J[0], g, atol=1e-5, rtol=1e-3), (ga, gb, alpha,
+                                                               J[0] - g)
+
+
+def test_probe_rows_repair_a_colliding_transition(pipeline) -> None:
+    """The F4 contract: an endpoint-only solve returns a state whose
+    interpolated transition still penetrates the box (the pipeline then
+    rejects the frame). With probe rows the same solve returns a state that
+    passes the SAME check -- the violation is repaired, not merely detected,
+    and the probe rows are the reason."""
+    z, ctx, _gid = _probe_scenario(pipeline)
+    solver = pipeline.solver
+    out = {}
+    for probes in (False, True):
+        solver.probe_cfg = pipeline.validator.cfg if probes else None
+        solver.clear_probe_pairs()
+        solver._frame_pairs = None
+        res = solver.solve_frame(z, ctx)
+        chk = pipeline.frame_valid(res.z, ctx)
+        out[probes] = (res, chk)
+    res_off, chk_off = out[False]
+    res_on, chk_on = out[True]
+    assert res_off.accepted and res_on.accepted
+    assert not chk_off.ok and chk_off.reason == "transition_interpolated", \
+        (chk_off.ok, chk_off.reason)
+    assert chk_on.ok, (chk_on.reason, chk_on.probes)
+    assert res_on.probe_rows, "probe rows must have been active"
+
+
+def test_probe_rows_inert_below_substep_threshold(pipeline) -> None:
+    """No interior probe states exist below max_substep_motion_m: the probe
+    block stays empty (zero rows, no false constraints) and the mechanism is
+    free."""
+    z, ctx, _gid = _probe_scenario(pipeline, box0=0.0205, box1=0.020,
+                                   rot=(0.004, -0.003, 0.002),
+                                   dpos=(0.002, -0.001, 0.001), dj=0.01)
+    solver = pipeline.solver
+    solver.probe_cfg = pipeline.validator.cfg
+    alphas, motion = solver._probe_grid(ctx, z)
+    assert motion <= pipeline.validator.cfg.max_substep_motion_m, motion
+    assert alphas == []
+    solver._frame_pairs = None
+    solver.clear_probe_pairs()
+    rows = solver._probe_rows(ctx, z, need_jacobian=False)
+    assert rows == []
+    val, lo, hi, scl = solver._probe_block(ctx, z)
+    assert len(val) == 0

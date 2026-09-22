@@ -121,6 +121,17 @@ class RepairConfig:
     # interpolation-dip margin coefficient for solver band rows
     # (margin = min(6mm, max(0.5mm, coef * frame_motion^2)))
     dip_margin_coef: float = 0.3
+    # transition-probe rows (F4, 2026-09-22, plan section 7.1): the solver
+    # carries a linearized anti-penetration row at each interior
+    # interpolation state of the frame's transition. Separate row budget --
+    # probe rows never displace endpoint/anchor rows; over budget the most
+    # violated rows survive and the rest are reported (the pipeline's
+    # uncapped probe check remains the arbiter, so a dropped row cannot
+    # become a silent accept).
+    max_probe_rows: int = 12
+    # a probe row is built for a pair whose probe distance is within this
+    # margin above the penetration floor (and for anything violating)
+    probe_row_margin_m: float = 0.003
     regen_hand_track_weight: float = 25.0
     regen_hand_track_scale_m: float = 0.02
     # hard box-frame speed rows for in-band hands: DISABLED (0.0) after

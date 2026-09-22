@@ -61,6 +61,43 @@ def skew_np(w: np.ndarray) -> np.ndarray:
     ], axis=-2)
 
 
+def so3_left_jacobian_np(w: np.ndarray) -> np.ndarray:
+    """Left Jacobian of SO(3) at axis-angle ``w`` ([..., 3] -> [..., 3, 3]).
+
+    Series ``I + c1 K + c3 K^2`` with ``c1 = (1-cos t)/t^2``,
+    ``c3 = (t - sin t)/t^3`` (for ``w = t e_z`` this is the textbook
+    ``[[sin t/t, -(1-cos t)/t, 0], ...]`` form). Equal to
+    ``Exp(w) J_r^{-1}(w)``: the world-frame increment of ``Exp(w + dw)`` is
+    ``J_l(w) dw``. Taylor branches keep t -> 0 finite.
+    """
+    w = np.atleast_2d(np.asarray(w, dtype=float))
+    theta = np.linalg.norm(w, axis=-1, keepdims=True)
+    theta_safe = np.maximum(theta, 1e-12)
+    K = skew_np(w)
+    c1 = np.where(theta < 1e-3, 0.5 - theta**2 / 24.0,
+                  (1.0 - np.cos(theta_safe)) / theta_safe**2)
+    c3 = np.where(theta < 1e-3, 1.0 / 6.0 - theta**2 / 120.0,
+                  (theta_safe - np.sin(theta_safe)) / theta_safe**3)
+    eye = np.eye(3)[None]
+    return eye + c1[..., None] * K + c3[..., None] * (K @ K)
+
+
+def _so3_jacobian_c2(w: np.ndarray) -> np.ndarray:
+    """``[..., 1]`` coefficient of K^2 in the inverse left Jacobian.
+
+    Taylor branch at theta -> 0 (1/12 + theta^2/720) keeps the series finite;
+    the closed form loses digits when sin(theta) -> 0.
+    """
+    theta = np.linalg.norm(w, axis=-1, keepdims=True)
+    theta_safe = np.maximum(theta, 1e-12)
+    return np.where(
+        theta < 1e-3,
+        1.0 / 12.0 + theta**2 / 720.0,
+        1.0 / theta_safe**2
+        - (1.0 + np.cos(theta_safe)) / (2.0 * theta_safe * np.sin(theta_safe)),
+    )
+
+
 def so3_left_jacobian_inverse_np(w: np.ndarray) -> np.ndarray:
     """Inverse left Jacobian of SO(3) at axis-angle ``w`` ([..., 3] -> [..., 3, 3]).
 
@@ -72,15 +109,8 @@ def so3_left_jacobian_inverse_np(w: np.ndarray) -> np.ndarray:
     A Taylor branch keeps theta -> 0 finite.
     """
     w = np.atleast_2d(np.asarray(w, dtype=float))
-    theta = np.linalg.norm(w, axis=-1, keepdims=True)
-    theta_safe = np.maximum(theta, 1e-12)
     K = skew_np(w)
-    c2 = np.where(
-        theta < 1e-3,
-        1.0 / 12.0 + theta**2 / 720.0,
-        1.0 / theta_safe**2
-        - (1.0 + np.cos(theta_safe)) / (2.0 * theta_safe * np.sin(theta_safe)),
-    )
+    c2 = _so3_jacobian_c2(w)
     eye = np.eye(3)[None]
     return eye - 0.5 * K + c2[..., None] * (K @ K)
 

@@ -193,6 +193,11 @@ def main() -> None:
     ap.add_argument("--demos", nargs="*", default=None, help="explicit demo list override")
     ap.add_argument("--frames", type=int, default=0, help="0 = full clip")
     ap.add_argument("--validation-mode", choices=MODES, default="strict")
+    ap.add_argument("--mode", choices=("regen", "standard"), default="regen",
+                    help="regen = Path B regeneration (hand-contact objective, "
+                         "strict screening); standard = the same six-segment "
+                         "measurement with regen_mode OFF (regression check "
+                         "for the stage gate; no NPZ is written)")
     ap.add_argument("--task-gate-yaml", type=str, default=None)
     ap.add_argument("--min-hand-recall", type=float, default=0.5,
                     help="screening threshold per grasping side")
@@ -219,8 +224,11 @@ def main() -> None:
     # regularization), not the old teacher's joints: the teacher's hand
     # drifts in box frame (p90 18cm) and a prediction-tracking objective
     # drags the regenerated hand at 0.1-0.4 m/s -- the quasi-static entry
-    # gate (0.02) can then never certify anything
-    regen_cfg = replace(rcfg, regen_mode=True)
+    # gate (0.02) can then never certify anything.
+    # ``--mode standard`` keeps the identical measurement path with the
+    # standard objective (regression check for the stage gate; report-only,
+    # no NPZ output -- this is not a regeneration run).
+    regen_cfg = replace(rcfg, regen_mode=(args.mode == "regen"))
     pipe = RepairPipeline(cfg=regen_cfg)
     pipe.validator.cfg = vcfg
     pipe.verbose = args.verbose
@@ -329,7 +337,7 @@ def main() -> None:
             row["hand_screen"] = ("pass" if screened and grasping else
                                   "no_reference_grasp" if not grasping else "fail")
             keep = cov["validator_passed"] and screened and grasping
-            if keep:
+            if keep and args.mode == "regen":
                 np.savez(out_dir / f"{demo}.npz",
                          qpos=to_teacher_layout(traj),
                          human_joints=human, fps=fps)
@@ -352,9 +360,10 @@ def main() -> None:
     # code/input/asset provenance for this report (plan section 10): the
     # report must be reproducible without /tmp probes -- exact revision and
     # dirty-diff hash, input NPZ hashes, asset hashes, effective configs
-    prov = provenance_snapshot(demos, note=f"{args.set}/{args.validation_mode}")
+    prov = provenance_snapshot(demos, note=f"{args.set}/{args.validation_mode}/{args.mode}")
     report = {
         "set": args.set, "n_demos": len(demos), "n_kept": n_keep,
+        "mode": args.mode,
         "validation_mode": args.validation_mode,
         "min_hand_recall": args.min_hand_recall,
         "min_ref_frames": args.min_ref_frames,
@@ -368,7 +377,7 @@ def main() -> None:
         "rows": rows,
     }
     report_path = Path(args.report) if args.report else (
-        out_dir / f"regen_report_{args.set}_{args.validation_mode}.json")
+        out_dir / f"{args.mode}_report_{args.set}_{args.validation_mode}.json")
     report_path.write_text(json.dumps(report, indent=1, default=float))
     print(f"kept {n_keep}/{len(demos)} -> {out_dir}")
     print(f"report -> {report_path}")

@@ -37,7 +37,12 @@ import osqp
 import scipy.sparse as spa
 
 from ireset.kinematics.mujoco_adapter import N_TANGENT, retract_batch
-from ireset.kinematics.rotation_adapter import so3_left_jacobian_inverse_np
+from ireset.kinematics.rotation_adapter import (
+    quat_to_mat_wxyz,
+    so3_left_jacobian_inverse_np,
+    so3_left_jacobian_np,
+    so3_log_np,
+)
 from ireset.repair.constraints import (
     FrameEvaluator,
     KPT_NAMES,
@@ -134,6 +139,9 @@ class FrameResult:
     truncated_rows: list = field(default_factory=list)
     #: OSQP exit status of this attempt's LAST QP solve (F0 evidence)
     last_qp_status: str = ""
+    #: probe-row names active at the last linearization (F4 evidence)
+    probe_rows: list = field(default_factory=list)
+    probe_truncated: list = field(default_factory=list)
     #: pipeline-side acceptance check cache (scp.FrameCheck); set by the
     #: pipeline so a state is checked once and the log serializes that result
     frame_check: object | None = None
@@ -156,6 +164,10 @@ class FrameCheck:
     viol: float = 0.0
     rows: list[dict] = field(default_factory=list)
     discovered: list[tuple] = field(default_factory=list)
+    #: identity-tagged pairs found violating at an INTERPOLATED state (F4:
+    #: the solver watches these with probe rows; kept separate from the
+    #: endpoint violations, which the candidate set already carries)
+    probe_discovered: list[tuple] = field(default_factory=list)
     carried: list[str] = field(default_factory=list)
     probes: list[dict] = field(default_factory=list)
     probe_n: int = 0
@@ -223,6 +235,22 @@ class FrameSolver:
         self.last_truncated: int = 0
         self.last_truncated_ids: list[tuple[int, int, str]] = []
         self.last_truncated_names: list[str] = []
+        # -- transition probes (F4, 2026-09-22, plan section 7.1) -------------
+        #: validation config carrying the interpolation protocol
+        #: (``check_interpolated_states`` / ``max_substep_motion_m`` /
+        #: ``max_subdivisions``); wired by the pipeline, None -> probes off
+        self.probe_cfg = None
+        #: pairs a check found violating at an INTERPOLATED state: watched in
+        #: every probe row build of this frame (within-frame mechanism)
+        self._probe_watch: list[tuple[int, int, str]] = []
+        #: per-state cache of the probe row definitions, so the merit
+        #: evaluation and the QP assembly of one iteration share one probe
+        #: computation (they are always called at the same linearization state)
+        self._probe_cache: dict | None = None
+        self.last_probe_rows: list[str] = []
+        self.last_probe_truncated: list[str] = []
+        #: full probe row records of the last build (name/alpha/dist/J)
+        self._probe_rows_detail: list[dict] = []
 
     # -- pair identity -------------------------------------------------------
 
@@ -443,7 +471,11 @@ class FrameSolver:
         self._last_rows = rows
         block = self._collision_block(rows, mode)
         post = self._fixed_post_rows(z, ctx)
-        return _concat_rows(pre, block, post)
+        # transition-probe rows LAST (F4): appended after every existing
+        # block so all frozen row offsets stay valid; the probe block is
+        # separate from the endpoint/anchor layout and never crowds it out
+        probe = self._probe_block(ctx, z)
+        return _concat_rows(pre, block, post, probe)
 
     def check_rows(self, z: np.ndarray, ctx: FrameContext,
                    band_margin_m: float | None = None, probe_mode: bool = False):
@@ -465,6 +497,179 @@ class FrameSolver:
         post = self._fixed_post_rows(z, ctx)
         val, lo, hi, scale = _concat_rows(pre, block, post)
         return val, lo, hi, scale, names, ids
+
+    # -- transition probes (F4, 2026-09-22) -----------------------------------
+
+    def note_probe_pairs(self, pairs: list) -> None:
+        """Watch pairs a check found violating at an INTERPOLATED state.
+
+        The transition violation is a fact about the *path* between the
+        previous accepted state and the candidate; the solver can only
+        repair it if its linearization carries rows for those pairs at the
+        probe positions. Identities are registry-normalized (F1); unknown
+        pairs raise.
+        """
+        known = {(ga, gb) for ga, gb, _k in self._probe_watch}
+        for pair in pairs:
+            ga, gb, kind = self.pair_identity(pair[0], pair[1])
+            if (ga, gb) not in known:
+                self._probe_watch.append((ga, gb, kind))
+                known.add((ga, gb))
+
+    def clear_probe_pairs(self) -> None:
+        self._probe_watch = []
+        self._probe_cache = None
+
+    def _probe_grid(self, ctx: FrameContext, z: np.ndarray) -> tuple[list[float], float]:
+        """Interior interpolation fractions for the (z_prev -> z) interval.
+
+        Reproduces the validator's protocol (same motion metric, same
+        ``max_substep_motion_m`` / ``max_subdivisions`` clipping), so probe
+        rows constrain exactly the states the transition check and the final
+        validator probe. Empty for the first frame or when motion needs no
+        subdivision.
+        """
+        pcfg = self.probe_cfg
+        if pcfg is None or ctx.z_prev is None or not pcfg.check_interpolated_states:
+            return [], 0.0
+        box_prev = ctx.box_pose_prev if ctx.box_pose_prev is not None else ctx.box_pose
+        motion = self.ev.motion_between(ctx.z_prev, box_prev, z, ctx.box_pose)
+        n_sub = int(np.clip(np.ceil(motion / pcfg.max_substep_motion_m), 1,
+                            pcfg.max_subdivisions + 1))
+        return [i / n_sub for i in range(1, n_sub)], motion
+
+    def _probe_mid(self, ctx: FrameContext, z: np.ndarray,
+                   alpha: float) -> tuple[np.ndarray, np.ndarray]:
+        """Interpolated scene (robot, box) at fraction ``alpha``.
+
+        Identical protocol to ``IndependentValidator._interpolate`` (root
+        translation lerp, rotation slerp, joint lerp, box pose lerp --
+        validated by a contract test), so a solver-side probe row is a
+        linearization of the exact state the check evaluates.
+        """
+        from scipy.spatial.transform import Rotation as Rot, Slerp
+
+        q_a = ctx.z_prev
+        box_a = ctx.box_pose_prev if ctx.box_pose_prev is not None else ctx.box_pose
+        q_mid = q_a.copy()
+        q_mid[0:3] = (1 - alpha) * q_a[0:3] + alpha * z[0:3]
+        ra = Rot.from_quat(q_a[3:7][[1, 2, 3, 0]])
+        rb = Rot.from_quat(z[3:7][[1, 2, 3, 0]])
+        q_mid[3:7] = Slerp([0, 1], Rot.concatenate([ra, rb]))(alpha).as_quat()[[3, 0, 1, 2]]
+        q_mid[7:36] = (1 - alpha) * q_a[7:36] + alpha * z[7:36]
+        box_mid = (1 - alpha) * box_a + alpha * ctx.box_pose
+        return q_mid, box_mid
+
+    def _probe_composite_jacobian(self, J_mid: np.ndarray, ctx: FrameContext,
+                                  z: np.ndarray, alpha: float) -> np.ndarray:
+        """Chain the mid-state distance gradient back to the endpoint increment.
+
+        ``q_mid`` depends on the endpoint increment ``xi`` through the
+        interpolation: root translation and joints carry ``alpha``, the root
+        rotation carries ``alpha * J_l(alpha*D) J_l^{-1}(D)`` with
+        ``D = log(R_b R_a^T)`` the world-frame relative rotation (the
+        retraction is left-multiplicative and the rotation path is the slerp
+        geodesic, whose world increment is exactly that combination -- FD
+        verified in the contract tests). Using the endpoint Jacobian
+        directly, or ``alpha`` on the rotation block, is a linearization of a
+        different function (plan section 7.1).
+        """
+        R_a = quat_to_mat_wxyz(np.asarray(ctx.z_prev[3:7], dtype=float)[None])[0]
+        R_b = quat_to_mat_wxyz(np.asarray(z[3:7], dtype=float)[None])[0]
+        d_vec = so3_log_np((R_b @ R_a.T)[None])[0]
+        T = (alpha * so3_left_jacobian_np((alpha * d_vec)[None])[0]
+             @ so3_left_jacobian_inverse_np(d_vec[None])[0])
+        M = np.zeros((N_TANGENT, N_TANGENT))
+        M[0:3, 0:3] = alpha * np.eye(3)
+        M[3:6, 3:6] = T
+        M[6:35, 6:35] = alpha * np.eye(29)
+        return J_mid @ M
+
+    def _probe_rows(self, ctx: FrameContext, z: np.ndarray,
+                    need_jacobian: bool) -> list[dict]:
+        """Probe point constraints for the current linearization state.
+
+        Rows enforce the anti-penetration floor at every interior
+        interpolation state (stage 2: no corridor upper there) for the pairs
+        that are near/below at the probe -- the pairs with endpoint rows plus
+        everything a check caught violating at a probe. The nonlinear path
+        value is what the solver's merit and the checks use; the row's
+        Jacobian is the composite chain rule above.
+
+        The row budget is separate from the endpoint/anchor rows
+        (``max_probe_rows``): over budget the most violated rows are kept and
+        the rest are REPORTED (``last_probe_truncated``) -- the pipeline's
+        uncapped probe check stays the arbiter, so a dropped row can never
+        turn into a silent accept.
+        """
+        cfg = self.cfg
+        cache = self._probe_cache
+        if cache is not None and np.array_equal(cache["state"], z):
+            if not need_jacobian or cache["jacobian"]:
+                return cache["rows"]
+        alphas, motion = self._probe_grid(ctx, z)
+        floor = cfg_noncontact(cfg)
+        if not alphas:
+            self.last_probe_rows, self.last_probe_truncated = [], []
+            self._probe_cache = {"state": z.copy(), "rows": [], "jacobian": True}
+            return []
+        # probe pairs: the pairs carrying endpoint rows at this linearization
+        # (near at the frame end) plus the check-discovered watch list
+        cand: list[tuple[int, int, str]] = []
+        seen = set()
+        for ga, gb, kind in self._probe_watch:
+            cand.append((ga, gb, kind))
+            seen.add((ga, gb))
+        for ga, gb, kind in self.last_row_ids:
+            if (ga, gb) not in seen:
+                cand.append((ga, gb, kind))
+                seen.add((ga, gb))
+        rows = []
+        margin = cfg.probe_row_margin_m
+        for alpha in alphas:
+            q_mid, box_mid = self._probe_mid(ctx, z, alpha)
+            self.ev.probe_forward(q_mid, box_mid)
+            for ga, gb, kind in cand:
+                dist, ft = self.ev.probe_geom_distance(ga, gb, distmax=floor + margin)
+                if dist > floor + margin:
+                    continue
+                nm = f"{self.ev.geom_name(ga)}~{self.ev.geom_name(gb)}"
+                rows.append({"alpha": alpha, "dist": float(dist), "lo": floor,
+                             "hi": INF, "name": nm, "id": (ga, gb, kind),
+                             "J": None, "ft": ft})
+        rows.sort(key=lambda r: r["dist"])
+        if len(rows) > cfg.max_probe_rows:
+            self.last_probe_truncated = [f"{r['name']}@a={r['alpha']:.3f}"
+                                         for r in rows[cfg.max_probe_rows:]]
+            rows = rows[:cfg.max_probe_rows]
+        else:
+            self.last_probe_truncated = []
+        if need_jacobian:
+            for r in rows:
+                ga, gb, _k = r["id"]
+                self.ev.probe_forward(*self._probe_mid(ctx, z, r["alpha"]))
+                J_mid = self.ev.distance_jacobian(ga, gb, r["ft"], r["dist"], probe=True)
+                r["J"] = self._probe_composite_jacobian(J_mid, ctx, z, r["alpha"])
+        self.last_probe_rows = [f"{r['name']}@a={r['alpha']:.3f}" for r in rows]
+        self._probe_cache = {"state": z.copy(), "rows": rows,
+                             "jacobian": bool(need_jacobian)}
+        return rows
+
+    def _probe_block(self, ctx: FrameContext, z: np.ndarray) -> tuple:
+        """``(val, lo, hi, scale)`` of the probe rows at the current state.
+
+        Values are the true nonlinear probe distances (the merit must judge
+        what the checks judge); bounds are the acceptance-grade penetration
+        floor (the stage 2 probe semantics: floor only, no corridor upper).
+        """
+        rows = self._probe_rows(ctx, z, need_jacobian=False)
+        self._probe_rows_detail = rows
+        n = len(rows)
+        val = np.array([r["dist"] for r in rows])
+        lo = np.full(n, cfg_noncontact(self.cfg))
+        hi = np.full(n, INF)
+        scale = np.full(n, self.cfg.penetration_scale_m)
+        return val, lo, hi, scale
 
     def _scan_pairs(self, full: bool) -> None:
         """(Re)scan the candidate pair set for this frame.
@@ -892,6 +1097,15 @@ class FrameSolver:
             A_rows.append(J)
             l_rows.append(np.array([lo - dist])); u_rows.append(np.array([hi - dist]) if hi < INF / 2 else np.array([INF]))
 
+        # transition-probe rows (F4): the same linearized floor at interior
+        # interpolation states, with the composite chain-rule Jacobian.
+        # Separate layout/count (``max_probe_rows``), never displacing the
+        # endpoint, anchor or speed rows above.
+        for r in self._probe_rows(ctx, z, need_jacobian=True):
+            A_rows.append(r["J"])
+            l_rows.append(np.array([r["lo"] - r["dist"]]))
+            u_rows.append(np.array([INF]))
+
         # hand anchors
         for side in ("l", "r"):
             anchor = ctx.hand_anchor.get(side)
@@ -949,13 +1163,13 @@ class FrameSolver:
             l_rows.append(np.full(N_HAND_SPEED, -INF)); u_rows.append(np.full(N_HAND_SPEED, INF))
 
         # pad to the fixed layout length with inactive rows (collision block
-        # may have fewer than MAX_PAIRS active pairs)
+        # may have fewer than MAX_PAIRS active pairs). The transition-probe
+        # block (F4) has its OWN budgeted layout appended after the frozen
+        # endpoint/anchor rows: padding target = N_ROWS + max_probe_rows
         A = np.vstack(A_rows)
         lo = np.concatenate(l_rows)
         hi = np.concatenate(u_rows)
-        # pad collision to fixed MAX_PAIRS block: rows already appended variable;
-        # pad total to N_ROWS with inactive rows
-        n_missing = N_ROWS - A.shape[0]
+        n_missing = N_ROWS + self.cfg.max_probe_rows - A.shape[0]
         if n_missing > 0:
             A = np.vstack([A, np.zeros((n_missing, N_TANGENT))])
             lo = np.concatenate([lo, np.full(n_missing, -INF)])
@@ -1021,10 +1235,16 @@ class FrameSolver:
 
     # -- success review ------------------------------------------------------
 
-    def _violating(self, val, lo, hi, scl, names, ids, offset: int = N_FIXED):
-        """Violating rows (from ``offset`` on) as ``(names, ids, records)``."""
+    def _violating(self, val, lo, hi, scl, names, ids, offset: int = N_FIXED,
+                   end: int | None = None):
+        """Violating rows (``[offset, end)``) as ``(names, ids, records)``.
+
+        ``end`` must be passed whenever the row array carries blocks beyond
+        the descriptor lists (the F4 probe block is appended last).
+        """
         out_names, out_ids, recs = [], [], []
-        for k in range(len(val) - offset):
+        end = len(val) if end is None else end
+        for k in range(max(0, end - offset)):
             v, l_, h_ = val[offset + k], lo[offset + k], hi[offset + k]
             if v < l_ - 1e-9 or v > h_ + 1e-9:
                 nm = names[k] if k < len(names) else "?"
@@ -1061,7 +1281,8 @@ class FrameSolver:
         info = {"viol": float(viol)}
         if viol <= 1e-6:
             return True, info
-        vnames, vids, recs = self._violating(val, lo, hi, scl, names, ids)
+        vnames, vids, recs = self._violating(val, lo, hi, scl, names, ids,
+                                             end=N_FIXED + len(names))
         info.update({"violated_rows": vnames, "rows": recs})
         if vids:
             self.note_discovered_pairs(vids)
@@ -1102,9 +1323,13 @@ class FrameSolver:
             val, lo, hi, scl = self.constraint_rows(z, ctx, trust, mode="accept")
             viol = self.violation(val, lo, hi, scl)
             last_viol = viol
-            last_names, _ids, _recs = self._violating(val, lo, hi, scl,
-                                                       self.last_row_pairs,
-                                                       self.last_row_ids)
+            probe_names = [f"probe:{r['name']}@a={r['alpha']:.3f}"
+                           for r in self._probe_rows_detail]
+            last_names, _ids, _recs = self._violating(
+                val, lo, hi, scl,
+                list(self.last_row_pairs) + probe_names,
+                list(self.last_row_ids) + [r["id"] for r in self._probe_rows_detail],
+                end=N_FIXED + len(self.last_row_pairs) + len(probe_names))
             merit = self.objective(res) + mu * viol
             feasible = viol <= 1e-6
             if feasible and merit < best_merit:
@@ -1206,6 +1431,8 @@ class FrameSolver:
             merit=float(merit), qp_calls=qp_calls, trust=float(trust),
             last_viol=float(last_viol), violated_rows=list(last_names),
             truncated_rows=list(self.last_truncated_names),
+            probe_rows=list(self.last_probe_rows),
+            probe_truncated=list(self.last_probe_truncated),
             last_qp_status=str(qp_status))
         if review:
             res.diagnostics["review"] = review
