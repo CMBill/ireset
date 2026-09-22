@@ -50,6 +50,41 @@ def so3_log_np(R: np.ndarray) -> np.ndarray:
     return _Rot.from_matrix(R).as_rotvec()
 
 
+def skew_np(w: np.ndarray) -> np.ndarray:
+    """[..., 3] -> [..., 3, 3] skew-symmetric (cross-product) matrices."""
+    w = np.atleast_2d(np.asarray(w, dtype=float))
+    zero = np.zeros(w.shape[:-1])
+    return np.stack([
+        np.stack([zero, -w[..., 2], w[..., 1]], axis=-1),
+        np.stack([w[..., 2], zero, -w[..., 0]], axis=-1),
+        np.stack([-w[..., 1], w[..., 0], zero], axis=-1),
+    ], axis=-2)
+
+
+def so3_left_jacobian_inverse_np(w: np.ndarray) -> np.ndarray:
+    """Inverse left Jacobian of SO(3) at axis-angle ``w`` ([..., 3] -> [..., 3, 3]).
+
+    Exact tangent Jacobian of the world-frame rotation residual under the
+    project's left-multiplicative retraction (``R_next = Exp(dtheta) R``):
+    ``d/dtheta [log(Exp(theta) Exp(w))]|_0 = J_l^{-1}(w)``. The identity is
+    only first-order correct (2.5% at 0.05 rad) and does not satisfy the
+    q-vs-objective finite-difference contract (m2_m3_stage_gate_fix_plan F2).
+    A Taylor branch keeps theta -> 0 finite.
+    """
+    w = np.atleast_2d(np.asarray(w, dtype=float))
+    theta = np.linalg.norm(w, axis=-1, keepdims=True)
+    theta_safe = np.maximum(theta, 1e-12)
+    K = skew_np(w)
+    c2 = np.where(
+        theta < 1e-3,
+        1.0 / 12.0 + theta**2 / 720.0,
+        1.0 / theta_safe**2
+        - (1.0 + np.cos(theta_safe)) / (2.0 * theta_safe * np.sin(theta_safe)),
+    )
+    eye = np.eye(3)[None]
+    return eye - 0.5 * K + c2[..., None] * (K @ K)
+
+
 # --- Torch differentiable helpers --------------------------------------------
 
 def rot6d_to_mat_torch(r6: torch.Tensor) -> torch.Tensor:

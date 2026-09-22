@@ -1,4 +1,4 @@
-"""F0/F1 correctness contracts (m2_m3_stage_gate_fix_plan sections 3-4).
+"""F0/F1/F2 correctness contracts (m2_m3_stage_gate_fix_plan sections 3-5).
 
 Regression tests for the defects confirmed by the 2026-09-17 reviews:
 
@@ -11,6 +11,10 @@ Regression tests for the defects confirmed by the 2026-09-17 reviews:
   placeholders and reports overflow identities, and every success return
   (early return, budget exhaustion, historical best) runs the uncapped
   full-registry review.
+- F2: the QP linear/quadratic terms equal the true objective gradient /
+  Gauss-Newton term of the two tracking residuals, including the SO(3)
+  left-Jacobian inverse for the world-frame rotation residual, and the
+  distance Jacobian stays valid at exact contact (collapsed fromto).
 """
 
 from __future__ import annotations
@@ -26,7 +30,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
 
 from ireset.kinematics.mujoco_adapter import retract_batch  # noqa: E402
-from ireset.kinematics.rotation_adapter import mat_to_quat_wxyz, so3_exp_np  # noqa: E402
+from ireset.kinematics.rotation_adapter import (  # noqa: E402
+    mat_to_quat_wxyz,
+    so3_exp_np,
+    so3_left_jacobian_inverse_np,
+)
 from ireset.repair.context import RepairConfig  # noqa: E402
 from ireset.repair.pipeline import RepairPipeline  # noqa: E402
 from ireset.repair.scp import INF, FrameContext, tangent_error  # noqa: E402
@@ -463,3 +471,194 @@ def test_suffix_retry_keeps_first_pass_costs(pipeline) -> None:
     assert first["attempts"] >= 0 and first["qp_calls_total"] >= 0
     assert first["trajectory_pass"] == 0
     assert res.diagnostics["processed_frame_visits"] >= res.diagnostics["input_frames"]
+
+
+# --- F2: QP model vs objective ----------------------------------------------------
+
+
+def _fd_grad(f, z0: np.ndarray, model, h: float = 1e-6) -> np.ndarray:
+    g = np.zeros(35)
+    for k in range(35):
+        e = np.zeros(35)
+        e[k] = h
+        zp = retract_batch(model, z0[None], e[None])[0]
+        zm = retract_batch(model, z0[None], (-e)[None])[0]
+        g[k] = (f(zp) - f(zm)) / (2.0 * h)
+    return g
+
+
+def _tracking_ctx(pipeline: RepairPipeline, rot: bool = True,
+                  z_prev: np.ndarray | None = None) -> tuple:
+    """``(z, ctx)`` with the current state ``z`` offset from BOTH references:
+    a non-zero prediction residual (translation + joint, plus a world-frame
+    root rotation when ``rot``) and a non-zero temporal residual."""
+    base = standing_scene(1)[0, 0:36].copy()
+    z = base.copy()
+    if rot:
+        ang = np.array([[0.02, -0.015, 0.01]])
+        z[3:7] = mat_to_quat_wxyz(so3_exp_np(ang)[0])
+    z_pred = base.copy()
+    z_pred[0:3] += np.array([0.003, -0.002, 0.0015])
+    z_pred[7] += 0.01          # a JOINT (index 6 is a quaternion slot)
+    if z_prev is None:
+        z_prev = base.copy()
+        z_prev[0:3] += np.array([0.001, 0.0, 0.0])
+    ctx = FrameContext(t=1, box_pose=BOX_FAR.copy(), z_pred=z_pred, z_prev=z_prev,
+                       ref_kpts_world=np.zeros((15, 3)), mesh_L=None,
+                       delta_ref=None, mesh_fixed=None, hand_anchor={},
+                       foot_anchor={}, prev_hand_local={}, prev_sole_world={})
+    return z, ctx
+
+
+def test_qp_linear_term_equals_objective_gradient(pipeline) -> None:
+    """F2 core contract: q == d objective / d xi at the linearization point
+    (isolated tracking terms: no mesh, no hand term, regen off). The old code
+    multiplied the ALREADY normalized residual by D^-2 again, giving a 50x
+    (root translation) / 10x (joint) too-large linear term."""
+    solver, ev = pipeline.solver, pipeline.ev
+    for rot in (False, True):
+        z, ctx = _tracking_ctx(pipeline, rot=rot)
+        ev.forward(z, ctx.box_pose)
+        (P, q, _A, _lo, _hi), _ = solver.build_qp(z, ctx, trust=1.0, slack=False)
+        P = np.asarray(P.todense())
+
+        def f(zz, ctx=ctx):
+            return solver.objective(solver.evaluate(zz, ctx))
+
+        for h in (1e-5, 1e-6, 1e-7):
+            g = _fd_grad(f, z, ev.model, h)
+            assert np.allclose(q, g, atol=1e-6, rtol=1e-4), (rot, h, q - g)
+        # closed form for the additive components (prediction + temporal):
+        # q = 2 w_p e_pred / D^2 + 2 w_t e_temp / D^2
+        cfg = pipeline.cfg
+        d2 = solver.D ** 2
+        e_pred = tangent_error(z, ctx.z_pred)
+        e_temp = tangent_error(z, ctx.z_prev)
+        q_closed = (2.0 * cfg.prediction_weight * e_pred
+                    + 2.0 * cfg.temporal_weight * e_temp) / d2
+        assert q[0:3] == pytest.approx(q_closed[0:3], rel=1e-9, abs=1e-9)
+        assert q[7] == pytest.approx(q_closed[7], rel=1e-9, abs=1e-12)
+        # the old buggy term had an extra 1/D (2 w e / D^3, 50x at D_t=0.02)
+        q_old = (2.0 * cfg.prediction_weight * e_pred) / (solver.D ** 3)
+        assert not np.allclose(q[0:3], q_old[0:3], rtol=1e-3), "pre-F2 scale regression"
+
+
+def test_qp_quadratic_term_is_residual_gauss_newton(pipeline) -> None:
+    """P must be the Gauss-Newton term of the SAME residual Jacobian used for
+    q: d/dxi (grad f) == 2 w J^T J == P. The additive (translation/joint)
+    subspace is checked by finite differences -- the residual Jacobian is
+    exactly constant there -- while the rotation block's Jacobian is
+    J_l^{-1}(e_rot) (residual-dependent, so its P carries a second-order term
+    of size O(|e_rot|) ~ 1e-3) and is verified analytically instead."""
+    solver, ev = pipeline.solver, pipeline.ev
+    z, ctx = _tracking_ctx(pipeline, rot=True)
+    rng = np.random.default_rng(0)
+    ev.forward(z, ctx.box_pose)
+    (P, _q0, _A, _lo, _hi), _ = solver.build_qp(z, ctx, trust=1.0, slack=False)
+    P = np.asarray(P.todense())
+    # the regularization term is a step damping, NOT an objective Hessian
+    # (it has no q contribution and never enters the merit): subtract it
+    # before comparing P against the finite difference of the gradient
+    cfg = pipeline.cfg
+    damping = 2.0 * cfg.regularization_weight * np.diag(solver.Dinv2)
+    assert np.allclose(P - damping, P - damping)  # shape sanity
+    assert np.allclose(P[0, 0] - damping[0, 0],
+                       2.0 * (cfg.prediction_weight + cfg.temporal_weight)
+                       / solver.D[0] ** 2, rtol=1e-9)
+    P_obj = P - damping
+    d = 1e-6
+    for trial in range(3):
+        xi = rng.standard_normal(35) * 1e-3
+        xi[3:6] = 0.0
+        edges = []
+        for s in (+1.0, -1.0):
+            zp = retract_batch(ev.model, z[None], (s * d * xi)[None])[0]
+            ev.forward(zp, ctx.box_pose)
+            (Pv, qv, _A2, _l2, _h2), _ = solver.build_qp(zp, ctx, trust=1.0, slack=False)
+            assert np.isfinite(Pv.todense()).all()
+            edges.append(qv)
+        lhs = (edges[0] - edges[1]) / (2.0 * d)
+        rhs = P_obj @ xi
+        assert np.allclose(lhs, rhs, atol=1e-6, rtol=1e-4), (trial, lhs - rhs)
+    # rotation block: P_rot == 2 w (Jinv/D)^T (Jinv/D) (tracking only)
+    _w, J_r, r = solver.tracking_qp_blocks(z, ctx)[0]
+    Jinv = so3_left_jacobian_inverse_np((r[3:6] * solver.D[3])[None])[0]
+    w_sum = cfg.prediction_weight + cfg.temporal_weight
+    P_rot = 2.0 * w_sum * (Jinv.T @ Jinv) / solver.D[3] ** 2
+    assert np.allclose(P_obj[3:6, 3:6], P_rot, rtol=1e-9, atol=1e-9)
+
+
+def test_rotation_block_uses_left_jacobian_inverse(pipeline) -> None:
+    """The world-frame rotation residual is not additive under the project's
+    left-multiplicative retraction: the identity Jacobian is only first-order
+    correct and fails the gradient contract above at a 0.025 rad residual."""
+    solver, ev = pipeline.solver, pipeline.ev
+    z, ctx = _tracking_ctx(pipeline, rot=True)
+    ev.forward(z, ctx.box_pose)
+    _w, J_r, r = solver.tracking_qp_blocks(z, ctx)[0]
+    e_rot = r[3:6] * solver.D[3]
+    assert np.abs(e_rot).max() > 0.01, "test needs a non-zero rotation residual"
+    Jinv = so3_left_jacobian_inverse_np(e_rot[None])[0]
+    assert np.allclose(J_r[3:6, 3:6], Jinv / solver.D[3])
+    assert not np.allclose(Jinv, np.eye(3), atol=1e-3), \
+        "identity must be measurably wrong here"
+
+
+def test_temporal_block_absent_without_previous_frame(pipeline) -> None:
+    """z_prev=None: the merit's temporal residual is identically zero, so the
+    QP must not add a temporal Hessian the merit does not have."""
+    solver, ev = pipeline.solver, pipeline.ev
+    z, ctx = _tracking_ctx(pipeline, rot=False)
+    ev.forward(z, ctx.box_pose)
+    (P0, _q0, _A, _l, _h), _ = solver.build_qp(z, ctx, trust=1.0, slack=False)
+    (P1, q1, _A1, _l1, _h1), _ = solver.build_qp(
+        z, replace(ctx, z_prev=None), trust=1.0, slack=False)
+    P0, P1 = np.asarray(P0.todense()), np.asarray(P1.todense())
+    cfg = pipeline.cfg
+    pred_only = 2.0 * (cfg.prediction_weight + cfg.regularization_weight) * np.diag(
+        solver.Dinv2)
+    assert np.allclose(P1, pred_only, rtol=1e-9, atol=1e-9)
+    temp = 2.0 * cfg.temporal_weight * np.diag(solver.Dinv2)
+    assert np.allclose(P0 - P1, temp, rtol=1e-9, atol=1e-9)
+    assert q1[3:6] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_distance_jacobian_valid_at_exact_contact(pipeline) -> None:
+    """Collapsed-fromto guard: at exact contact MuJoCo returns p1 == p2 and
+    the old code zeroed the row's Jacobian, leaving the QP blind exactly at
+    the contact configurations it must regulate (feet sank centimeters into
+    the ground for free while the check saw only the penetration). Sphere vs
+    ground is the smooth reference case; the mesh-vs-plane rows are treated
+    as non-smooth and excluded from the tight tolerance."""
+    ev = pipeline.ev
+    h = _root_height_for_tangent(ev)
+    ground, box = ev.ground_geom, BOX_FAR.copy()
+    rng = np.random.default_rng(2)
+    checked = 0
+    for dz, label in ((0.0, "tangent"), (-0.003, "penetrating"), (0.004, "clear")):
+        z = np.zeros(36)
+        z[2] = h + dz
+        z[3] = 1.0
+        ev.forward(z, box)
+        for gid in ev.sole_geoms["l"]:
+            dist, ft = ev.geom_distance(gid, ground, distmax=1.0)
+            J = np.asarray(ev.distance_jacobian(gid, ground, ft, dist)).reshape(-1)
+            if abs(dist) < 1e-12:
+                assert J[2] == pytest.approx(1.0, abs=1e-9), "collapsed fromto row"
+            xi = rng.standard_normal(35) * 1e-3
+            fd = 0.0
+            for sgn in (+1.0, -1.0):
+                zp = retract_batch(ev.model, z[None], (sgn * xi)[None])[0]
+                ev.forward(zp, box)
+                fd += sgn * ev.geom_distance(gid, ground, distmax=1.0)[0]
+            fd /= 2.0
+            lin = float(J @ xi)
+            assert abs(fd - lin) <= 1e-5 + 1e-3 * abs(fd), (label, gid, fd, lin)
+            checked += 1
+    assert checked == 15
+    z = np.zeros(36)
+    z[2] = h
+    z[3] = 1.0
+    ev.forward(z, box)
+    u = ev.geom_separation_direction(ev.sole_geoms["l"][2], ground, 0.0)
+    assert u[2] == pytest.approx(1.0, abs=1e-9)   # away from the ground: up

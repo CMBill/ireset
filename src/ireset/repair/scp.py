@@ -13,7 +13,7 @@ warm-starting a persistent fixed-sparsity workspace; at this size (35 vars,
 ~300 rows) MuJoCo geometry dominates runtime, so reuse is a later
 optimization, not a correctness item.
 
-Correctness contracts added 2026-09-22 (m2_m3_stage_gate_fix_plan F1):
+Correctness contracts added 2026-09-22 (m2_m3_stage_gate_fix_plan F1/F2):
 
 - Pair **identity** ``(ga, gb)`` and row **role** (``regen`` vs regular
   collision) are separate: the geometric category always comes from the
@@ -22,6 +22,10 @@ Correctness contracts added 2026-09-22 (m2_m3_stage_gate_fix_plan F1):
 - Acceptance checks (``check_rows``) are NOT capped by the QP row budget:
   a successful return may not hide a violating pair behind
   ``max_active_pairs``. Every success exit runs the same review.
+- The QP linear term must equal the true objective gradient: with
+  ``r = e/D`` and physical-increment variables, ``q = 2 w J_r^T r`` where
+  ``J_r = diag(1/D)`` for the additive (translation/joint) blocks and the
+  world-frame SO(3) left-Jacobian inverse for the rotation block.
 """
 
 from __future__ import annotations
@@ -33,6 +37,7 @@ import osqp
 import scipy.sparse as spa
 
 from ireset.kinematics.mujoco_adapter import N_TANGENT, retract_batch
+from ireset.kinematics.rotation_adapter import so3_left_jacobian_inverse_np
 from ireset.repair.constraints import (
     FrameEvaluator,
     KPT_NAMES,
@@ -737,19 +742,51 @@ class FrameSolver:
 
     # -- linearization + QP ----------------------------------------------------
 
+    def tracking_qp_blocks(self, z: np.ndarray, ctx: FrameContext):
+        """Gauss-Newton blocks of the two tracking terms (F2).
+
+        The true objective is ``f = w ||e/D||^2`` with ``r = e/D``; the QP
+        variables are PHYSICAL tangent increments xi, so the residual
+        Jacobian is ``J_r = dr/dxi`` and the consistent assembly is
+        ``P += 2 w J_r^T J_r``, ``q += 2 w J_r^T r``.
+
+        - translation/joint blocks: ``e`` is additive, ``J_r = diag(1/D)``,
+          hence ``q = 2 w r/D = 2 w e/D^2``. (The old code used
+          ``Dinv2 * r = 2 w e/D^3``: a 50x / 10x-too-large linear term at the
+          default D, i.e. a QP model that disagreed with the merit the line
+          search evaluates -- m2_m3_stage_gate_fix_plan F2.)
+        - rotation block: the retraction is left-multiplicative
+          (``R_next = Exp(dtheta) R``), so ``d r_rot/d dtheta =
+          J_l^{-1}(e_rot)/D`` -- the SO(3) left-Jacobian inverse, not the
+          identity (2.5% at 0.05 rad).
+        """
+        r_pred = _unit(tangent_error(z, ctx.z_pred), self.D)
+        blocks = [(self.cfg.prediction_weight, r_pred)]
+        if ctx.z_prev is not None:
+            # no previous frame -> no temporal objective at all (the merit's
+            # r_temp is identically zero, so a w_t J^T J term in P would be a
+            # Hessian the merit does not have)
+            blocks.append((self.cfg.temporal_weight,
+                           _unit(tangent_error(z, ctx.z_prev), self.D)))
+        out = []
+        for w, r in blocks:
+            J_r = np.diag(self.Dinv)
+            e_rot = r[3:6] * self.D[3]                # r = e/D (uniform D_rot)
+            Jinv = so3_left_jacobian_inverse_np(e_rot[None])[0]
+            J_r[3:6, 3:6] = Jinv / self.D[3]
+            out.append((w, J_r, r))
+        return out
+
     def build_qp(self, z: np.ndarray, ctx: FrameContext, trust: float, slack: bool = False):
         """Assemble the QP at state z (caller must have forwarded to z)."""
         ev, cfg = self.ev, self.cfg
 
         # objective blocks
-        r_pred = _unit(tangent_error(z, ctx.z_pred), self.D)
-        r_temp = _unit(tangent_error(z, ctx.z_prev), self.D) if ctx.z_prev is not None else np.zeros(N_TANGENT)
         P = np.zeros((N_TANGENT, N_TANGENT))
         q = np.zeros(N_TANGENT)
-        P += 2.0 * cfg.prediction_weight * np.diag(self.Dinv2)
-        q += 2.0 * cfg.prediction_weight * self.Dinv2 * r_pred
-        P += 2.0 * cfg.temporal_weight * np.diag(self.Dinv2)
-        q += 2.0 * cfg.temporal_weight * self.Dinv2 * r_temp
+        for w, J_r, r in self.tracking_qp_blocks(z, ctx):
+            P += 2.0 * w * (J_r.T @ J_r)
+            q += 2.0 * w * (J_r.T @ r)
         if ctx.mesh_L is not None:
             R_g, x_g = ev.box_frame()
             kpt_w = ev.site_positions(ev.kpt_ids)
