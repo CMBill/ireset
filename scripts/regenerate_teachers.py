@@ -178,6 +178,30 @@ def task_mpjpe_stats(ev, traj: np.ndarray, cond: ReferenceCondition) -> dict:
             "max": round(float(v.max()), 4)}
 
 
+def rejection_evidence(diag: dict) -> dict:
+    """Structured rejection evidence for one row (R5).
+
+    A ``rejected_frame`` yields the solve-stage attempt/check ids, the
+    violating rows and the probe record. A ``rejected_final`` reason is the
+    independent validator's, so the failing checks of the round that produced
+    it belong here too, with their locations and STRUCTURED first-failure
+    frames (the other round's checks stay under ``suffix_retry``; the
+    string-only ``violated_rows`` is the framed view of the same evidence).
+    """
+    return {
+        "reason": diag.get("reason"),
+        "reason_source": diag.get("reason_source"),
+        "last_attempt": diag.get("last_attempt"),
+        "last_attempt_id": diag.get("last_attempt_id"),
+        "last_check_id": diag.get("last_check_id"),
+        "violated_rows": diag.get("violated_rows"),
+        "probe": diag.get("probe"),
+        "validator_failed_checks": (diag.get("final_retry_failed_checks")
+                                    or diag.get("failed_checks")),
+        "final_retry": diag.get("final_retry"),
+    }
+
+
 def print_frame_log(pipe: RepairPipeline) -> None:
     """--verbose: one compact line per frame (last check call = the decided
     state) plus every failing endpoint/probe record with violating rows."""
@@ -360,15 +384,7 @@ def main() -> None:
                "quality_stats_s": None,
                "output_s": None}
         if not res.accepted:
-            row["rejection"] = {
-                "reason": res.diagnostics.get("reason"),
-                "reason_source": res.diagnostics.get("reason_source"),
-                "last_attempt": res.diagnostics.get("last_attempt"),
-                "last_attempt_id": res.diagnostics.get("last_attempt_id"),
-                "last_check_id": res.diagnostics.get("last_check_id"),
-                "violated_rows": res.diagnostics.get("violated_rows"),
-                "probe": res.diagnostics.get("probe"),
-            }
+            row["rejection"] = rejection_evidence(res.diagnostics)
         if "first_attempt" in res.diagnostics:
             fa = res.diagnostics["first_attempt"]
             row["suffix_retry"] = {

@@ -248,3 +248,47 @@ def test_regenerate_cli_report_has_effective_config(tmp_path, monkeypatch) -> No
     # the report echoes the frozen inputs it actually consumed
     assert report["inputs"][0]["demo"] == "sub10_largebox_000"
     assert report["field_notes"]["schema"].startswith("2")
+
+
+# --- R5: rejection evidence --------------------------------------------------------
+
+def test_rejection_evidence_carries_structured_validator_checks() -> None:
+    """R5: a ``rejected_final`` reason comes from the independent validator, so
+    the report's rejection block must carry the failing checks of the round
+    that produced it -- location AND structured ``first_failure_frame`` -- not
+    only the free-text ``violated_rows`` lines."""
+    from regenerate_teachers import rejection_evidence
+
+    # suffix-retry round failed its final validation: ITS checks are the reason
+    diag = {
+        "reason": "final_validation", "final_stage": "final_validation",
+        "violated_rows": ["velocities: joint=12.00rad/s pos=1.72m/s ang=6.87rad/s"],
+        "failed_checks": {"contacts": {"location": "x", "first_failure_frame": 9}},
+        "final_retry_failed_checks": {
+            "velocities": {"location": "joint=12.00rad/s pos=1.72m/s ang=6.87rad/s",
+                           "first_failure_frame": 3}},
+        "final_retry": "failed: velocities @t=3",
+        "reason_source": None, "last_attempt": None, "last_attempt_id": None,
+        "last_check_id": None, "probe": None,
+    }
+    rej = rejection_evidence(diag)
+    assert rej["reason"] == "final_validation"
+    assert rej["validator_failed_checks"]["velocities"]["first_failure_frame"] == 3
+    assert rej["validator_failed_checks"]["velocities"]["location"] == \
+        "joint=12.00rad/s pos=1.72m/s ang=6.87rad/s"
+    assert rej["final_retry"] == "failed: velocities @t=3"
+
+    # the retry died in its SOLVE stage: the FIRST round's validator checks are
+    # the reason (and the solve-stage ids describe that stage separately)
+    diag2 = {
+        "reason": "rejected_frame", "reason_source": "task_quality",
+        "last_attempt": 1, "last_attempt_id": 4, "last_check_id": "p1:t=12:c7",
+        "violated_rows": ["hand_anchor: viol=0.19"],
+        "probe": {"probed": [0.5], "adopted": None, "state": "candidate"},
+        "failed_checks": {"velocities": {"location": "l", "first_failure_frame": 5}},
+    }
+    rej2 = rejection_evidence(diag2)
+    assert rej2["reason_source"] == "task_quality"
+    assert rej2["last_check_id"] == "p1:t=12:c7"
+    assert rej2["validator_failed_checks"]["velocities"]["first_failure_frame"] == 5
+    assert rej2["final_retry"] is None
