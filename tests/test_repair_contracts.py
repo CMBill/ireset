@@ -1564,3 +1564,141 @@ def test_assembled_probe_row_jacobians_match_fd(regen_pipeline) -> None:
             (r["name"], r["alpha"], float(np.abs(J - fd).max()))
     solver.clear_probe_pairs()
     solver.clear_discovered_pairs()
+
+
+# --- R2: contact normal sign --------------------------------------------------------
+
+
+def test_contact_separation_direction_sign_and_root_gradient(pipeline) -> None:
+    """R2: MuJoCo's contact frame normal points geom1 -> geom2, so the
+    separation direction of ga is the OPPOSITE normal when ga is geom1. The
+    old sign returned -1 for the analytic root-height gradient of a foot
+    sphere 1e-10 m inside the ground (the review's evidence); the analytic
+    value is +1.
+
+    Covered: the -1e-10 m contact-record case, exact zero distance without a
+    contact record, and a normal non-degenerate distance; the distance
+    gradient must be identical after swapping ga/gb.
+    """
+    ev = pipeline.ev
+    h = _root_height_for_tangent(ev)
+    ground = ev.ground_geom
+    rng = np.random.default_rng(7)
+    checked_zero = 0
+    for dz, label in ((0.0, "exact contact"), (-1e-10, "shallow penetration"),
+                      (-0.003, "penetrating"), (0.004, "clear")):
+        z = np.zeros(36)
+        z[2] = h + dz
+        z[3] = 1.0
+        for gid in ev.sole_geoms["l"]:
+            ev.forward(z, BOX_FAR)
+            dist, ft = ev.geom_distance(gid, ground, distmax=1.0)
+            J = np.asarray(ev.distance_jacobian(gid, ground, ft, dist)).reshape(-1)
+            if abs(dist) < 1e-9:
+                checked_zero += 1
+                assert J[2] == pytest.approx(1.0, abs=1e-9), (label, gid)
+                u = ev.geom_separation_direction(gid, ground, dist)
+                assert u[2] == pytest.approx(1.0, abs=1e-9)
+            # swapped ga/gb: the distance gradient is unchanged
+            dist_rev, ft_rev = ev.geom_distance(ground, gid, distmax=1.0)
+            J_rev = np.asarray(
+                ev.distance_jacobian(ground, gid, ft_rev, dist_rev)).reshape(-1)
+            assert np.allclose(J, J_rev, atol=1e-12), (label, gid, J - J_rev)
+            # central differences at three step sizes, re-forwarding every time
+            for eps in (1e-5, 1e-6, 1e-7):
+                xi = rng.standard_normal(35) * 1e-3
+                fd = 0.0
+                for sgn in (+1.0, -1.0):
+                    zp = retract_batch(ev.model, z[None], (sgn * xi)[None])[0]
+                    ev.forward(zp, BOX_FAR)
+                    fd += sgn * ev.geom_distance(gid, ground, distmax=1.0)[0]
+                fd /= 2.0
+                lin = float(J @ xi)
+                assert abs(fd - lin) <= 1e-5 + 1e-3 * abs(fd), (label, gid, eps, fd, lin)
+    assert checked_zero >= 10, "need the near-zero cases to exercise the fallback"
+    # zero distance WITHOUT a contact record: the geometric fallback must be
+    # sign-correct as well (robot floating 10 cm above the ground)
+    z_air = np.zeros(36)
+    z_air[2] = h + 0.10
+    z_air[3] = 1.0
+    ev.forward(z_air, BOX_FAR)
+    for gid in ev.sole_geoms["l"]:
+        assert not [c for c in ev.data.contact
+                    if {int(c.geom1), int(c.geom2)} == {gid, ground}]
+        u = ev.geom_separation_direction(gid, ground, 0.0)
+        assert u[2] == pytest.approx(1.0, abs=1e-9)
+
+
+def test_contact_direction_non_vertical_smooth_case(pipeline) -> None:
+    """R2: a tilted box tangent to a hand sphere -- a smooth CONTACT-RECORD
+    case whose normal is NOT vertical, so the fix is not a ground-plane
+    special case.
+
+    The box is a mesh whose facets are not axis-aligned in its geom frame, so
+    the expected direction is not taken from an assumed face axis: the
+    assertion is that the returned separation direction agrees with the
+    nearest-point segment MuJoCo itself returned (``fromto``, the analytic
+    definition), points away from the box, and is non-vertical; the sign error
+    makes all three fail (the old sign gave the opposite direction). The
+    analytic gradient is then checked against FD on the same state.
+    """
+    from ireset.kinematics.rotation_adapter import mat_to_quat_wxyz, so3_exp_np
+
+    ev = pipeline.ev
+    pinky = ev._hand_geoms["l"][2]
+    z = standing_scene(1)[0, 0:36].copy()
+    ev.forward(z, BOX_FAR)
+    R_q = ev.data.geom_xmat[ev.box_geom].reshape(3, 3)   # geom frame at rest
+    c = int(np.argmax(np.abs(R_q[2, :])))                # most vertical face axis
+    R = so3_exp_np(np.array([[0.0, 0.6, 0.0]]))[0]
+    q = mat_to_quat_wxyz(R)
+    approach = R @ R_q[:, c]                             # clearly non-vertical
+    assert abs(approach[2]) < 0.95, "the test needs a visibly non-vertical case"
+    p = ev.data.geom_xpos[pinky].copy()
+    lo, hi = 0.0, 0.8
+    for _ in range(80):                                  # bisect the tangent offset
+        mid = 0.5 * (lo + hi)
+        ev.forward(z, np.r_[p - mid * approach, q])
+        if ev.geom_distance(pinky, ev.box_geom, distmax=2.0)[0] < -1e-10:
+            lo = mid
+        else:
+            hi = mid
+    box = np.r_[p - 0.5 * (lo + hi) * approach, q]
+    ev.forward(z, box)
+    dist, ft = ev.geom_distance(pinky, ev.box_geom, distmax=2.0)
+    assert abs(dist) < 1e-6, dist
+    assert [ct for ct in ev.data.contact
+            if {int(ct.geom1), int(ct.geom2)} == {pinky, ev.box_geom}], \
+        "the contact-record path must be the one under test"
+    diff = ft[3:6] - ft[0:3]
+    seg = diff / np.linalg.norm(diff)                    # geom1 -> geom2
+    s = 1.0 if dist >= 0 else -1.0
+    u = ev.geom_separation_direction(pinky, ev.box_geom, dist)
+    assert abs(float(u[2])) < 0.95, "not a non-vertical case: {}".format(u)
+    # ga = geom1: the separation direction is the OPPOSITE of the segment (and
+    # of the contact-frame normal), as the intrinsic-distance gradient is
+    assert float(np.dot(u, -s * seg)) > 0.999, (u, seg, dist)
+    rec = next(ct for ct in ev.data.contact
+               if {int(ct.geom1), int(ct.geom2)} == {pinky, ev.box_geom})
+    n_rec = np.array(rec.frame[0:3], dtype=float)        # geom1 -> geom2
+    u_rec = -n_rec if pinky == int(rec.geom1) else n_rec
+    assert float(np.dot(u, u_rec)) > 0.999, (u, u_rec)
+    assert float(np.dot(u, p - ev.data.geom_xpos[ev.box_geom])) > 0.0
+    J = np.asarray(ev.distance_jacobian(pinky, ev.box_geom, ft, dist)).reshape(-1)
+    # the probe path uses the same convention at the same state
+    ev.probe_forward(z, box)
+    assert np.allclose(ev.geom_separation_direction(pinky, ev.box_geom, dist,
+                                                    probe=True), u, atol=1e-9)
+    J_probe = np.asarray(ev.distance_jacobian(pinky, ev.box_geom, ft, dist,
+                                              probe=True)).reshape(-1)
+    assert np.allclose(J, J_probe, atol=1e-9)
+    rng = np.random.default_rng(11)
+    for eps in (1e-5, 1e-7):
+        xi = rng.standard_normal(35) * 1e-3
+        fd = 0.0
+        for sgn in (+1.0, -1.0):
+            zp = retract_batch(ev.model, z[None], (sgn * xi)[None])[0]
+            ev.forward(zp, box)
+            fd += sgn * ev.geom_distance(pinky, ev.box_geom, distmax=2.0)[0]
+        fd /= 2.0
+        assert abs(fd - float(J @ xi)) <= 1e-5 + 1e-3 * abs(fd)

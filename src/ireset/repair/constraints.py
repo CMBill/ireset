@@ -279,17 +279,23 @@ class FrameEvaluator:
         afterwards.
 
         Fallback order: MuJoCo's contact record for the pair (present
-        whenever the pair actually collides), then geometry -- a plane's
-        frame z-axis, otherwise the center-to-center direction (exact for
-        spheres, the standard convex approximation at contact).
+        whenever the pair actually collides; its frame normal points
+        geom1 -> geom2 and is oriented for ``ga`` here), then geometry -- a
+        plane's frame z-axis, otherwise the center-to-center direction (exact
+        for spheres, the standard convex approximation at contact).
         """
         data = self._probe_data if probe else self.data
         for i in range(data.ncon):
             c = data.contact[i]
             if {int(c.geom1), int(c.geom2)} == {ga, gb}:
-                # frame normal points from geom2 to geom1
+                # the frame normal points geom1 -> geom2; the direction in
+                # which ga separates is therefore the OPPOSITE normal when ga
+                # is geom1 and the normal itself when ga is geom2. Verified on
+                # the locked scene: a sole sphere above the ground is geom2 and
+                # the normal is +z, so the analytic root-height gradient of the
+                # distance is +1 (the old sign gave -1, R2).
                 n = np.array(c.frame[0:3], dtype=float)
-                return n if ga == int(c.geom1) else -n
+                return -n if ga == int(c.geom1) else n
         for g, other in ((ga, gb), (gb, ga)):
             if self.model.geom_type[g] == mujoco.mjtGeom.mjGEOM_PLANE:
                 R = data.geom_xmat[g].reshape(3, 3)
