@@ -1702,3 +1702,128 @@ def test_contact_direction_non_vertical_smooth_case(pipeline) -> None:
             fd += sgn * ev.geom_distance(pinky, ev.box_geom, distmax=2.0)[0]
         fd /= 2.0
         assert abs(fd - float(J @ xi)) <= 1e-5 + 1e-3 * abs(fd)
+
+
+# --- R3: the probe cache follows every dependency ----------------------------------
+
+
+def test_probe_cache_invalidated_by_carried_pairs(regen_pipeline) -> None:
+    """R3: the probe cache was keyed on z alone, so a ``frame_valid ->
+    carry_discovered``回流 at an UNCHANGED z served the old rows and the next
+    constraint/QP assembly never saw the violation the check had just found."""
+    solver, ev = regen_pipeline.solver, regen_pipeline.ev
+    solver.probe_cfg = regen_pipeline.validator.cfg
+    solver.clear_probe_pairs()
+    solver.clear_discovered_pairs()
+    ctx = _sweep_ctx(regen_pipeline)
+    z = ctx.z_pred
+    solver._frame_pairs = None
+    solver.constraint_rows(z, ctx, regen_pipeline.cfg.trust_radius_init, mode="accept")
+    before = {r["id"][:2] for r in solver._probe_rows_detail}
+    solver._probe_rows(ctx, z, need_jacobian=True)      # populate the Jacobian cache
+    chk = regen_pipeline.frame_valid(z, ctx)
+    assert not chk.ok and chk.probe_discovered
+    regen_pipeline.carry_discovered(chk)
+    new_ids = {solver.pair_identity(p[0], p[1])[:2] for p in chk.probe_discovered}
+    assert new_ids - before, (new_ids, before)
+    # same z, same context: the rebuild must contain the carried pairs
+    solver.constraint_rows(z, ctx, regen_pipeline.cfg.trust_radius_init, mode="accept")
+    after = {r["id"][:2] for r in solver._probe_rows_detail}
+    assert new_ids & after, "carried pairs missing from the next assembly"
+    # expected values come from a DIRECT re-query (clearing the cache is not
+    # the oracle)
+    n_checked = 0
+    for r in solver._probe_rows_detail:
+        if r["id"][:2] in new_ids:
+            ga, gb, _k = r["id"]
+            ev.probe_forward(*solver._probe_mid(ctx, z, r["alpha"]))
+            d, _ft = ev.probe_geom_distance(ga, gb, distmax=2.0)
+            assert r["dist"] == pytest.approx(d, abs=1e-12)
+            n_checked += 1
+    assert n_checked >= 1
+    solver.clear_probe_pairs()
+    solver.clear_discovered_pairs()
+
+
+def test_probe_cache_invalidation_is_identity_scoped(regen_pipeline) -> None:
+    """R3: adding a NEW watched identity invalidates immediately; repeating an
+    already-watched identity is idempotent (no cache thrash)."""
+    solver, ev = regen_pipeline.solver, regen_pipeline.ev
+    solver.probe_cfg = regen_pipeline.validator.cfg
+    solver.clear_probe_pairs()
+    solver.clear_discovered_pairs()
+    pair = (ev._hand_geoms["l"][0], ev.box_geom)
+    solver.note_probe_pairs([pair])
+    assert solver._probe_watch
+    assert solver._probe_cache is None
+    solver._probe_cache = {"key": ("sentinel",), "rows": [], "jacobian": False,
+                           "last_rows": [], "last_truncated": []}
+    solver.note_probe_pairs([pair])                     # idempotent
+    assert solver._probe_cache is not None, "repeat carry invalidated the cache"
+    solver.note_probe_pairs([(ev._hand_geoms["r"][0], ev.box_geom)])
+    assert solver._probe_cache is None, "a new identity must invalidate"
+    solver.clear_probe_pairs()
+
+
+def test_probe_cache_follows_every_dependency(regen_pipeline, monkeypatch) -> None:
+    """R3: same z but a changed box pose, previous frame, probe config, row
+    budget or candidate set must rebuild; a value-only build is UPGRADED when
+    Jacobians are requested instead of masquerading as a Jacobian cache."""
+    solver, ev = regen_pipeline.solver, regen_pipeline.ev
+    solver.probe_cfg = regen_pipeline.validator.cfg
+    solver.clear_probe_pairs()
+    solver.clear_discovered_pairs()
+    ctx = _sweep_ctx(regen_pipeline)
+    z = ctx.z_pred
+    solver._frame_pairs = None
+    solver.constraint_rows(z, ctx, regen_pipeline.cfg.trust_radius_init, mode="accept")
+
+    def sig(rows):
+        return [(r["name"], round(float(r["dist"]), 12)) for r in rows]
+
+    r0 = solver._probe_rows(ctx, z, need_jacobian=False)
+    assert all(r["J"] is None for r in r0)
+    r1 = solver._probe_rows(ctx, z, need_jacobian=True)     # value-only upgrade
+    assert all(r["J"] is not None for r in r1)
+    assert sig(r0) == sig(r1)
+    # box pose changed at the same z
+    ctx_box = replace(ctx, box_pose=ctx.box_pose + np.r_[0.05, 0.0, 0.0, np.zeros(4)])
+    assert sig(solver._probe_rows(ctx_box, z, need_jacobian=False)) != sig(r0)
+    # previous accepted frame changed at the same z
+    ctx_prev = replace(ctx, z_prev=ctx.z_prev + np.r_[0.01, np.zeros(35)])
+    assert sig(solver._probe_rows(ctx_prev, z, need_jacobian=False)) != sig(r0)
+    # probe protocol changed (fewer subdivisions -> different alphas)
+    solver.probe_cfg = replace(regen_pipeline.validator.cfg, max_subdivisions=0)
+    assert sig(solver._probe_rows(ctx, z, need_jacobian=False)) != sig(r0)
+    solver.probe_cfg = regen_pipeline.validator.cfg
+    # row budget changed
+    owner, solver.cfg = solver.cfg, replace(solver.cfg, max_probe_rows=1)
+    try:
+        r_budget = solver._probe_rows(ctx, z, need_jacobian=False)
+    finally:
+        solver.cfg = owner
+    assert len(r_budget) <= 1 and solver.last_probe_truncated
+    # candidate set refreshed at the same z: the cache is rebuilt under a new
+    # key because the candidate identities entered it
+    key_before = solver._probe_cache["key"]
+    pair = (ev._hand_geoms["l"][0], ev.box_geom)
+    solver.note_discovered_pairs([pair])
+    solver._collision_rows(ctx)
+    solver._probe_rows(ctx, z, need_jacobian=False)
+    assert pair in [pid[:2] for pid in solver.last_row_ids]
+    assert solver._probe_cache["key"] != key_before
+    # cross-attempt: solve_frame must start from a clean probe cache
+    seen = []
+    real = solver._probe_rows
+
+    def spy(ctx_, z_, need_jacobian):
+        seen.append(solver._probe_cache is None)
+        return real(ctx_, z_, need_jacobian)
+
+    monkeypatch.setattr(solver, "_probe_rows", spy)
+    solver.solve_frame(z, ctx)
+    assert seen and seen[0] is True, "attempt did not clear the probe cache"
+    # frame switch clears both the watch list and the cache
+    solver.clear_probe_pairs()
+    assert solver._probe_cache is None and solver._probe_watch == []
+    solver.clear_discovered_pairs()

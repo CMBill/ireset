@@ -571,14 +571,20 @@ class FrameSolver:
         previous accepted state and the candidate; the solver can only
         repair it if its linearization carries rows for those pairs at the
         probe positions. Identities are registry-normalized (F1); unknown
-        pairs raise.
+        pairs raise. A NEW identity changes the row set of the current
+        state, so it invalidates the probe cache immediately (R3); repeating
+        an already-watched identity is idempotent.
         """
         known = {(ga, gb) for ga, gb, _k in self._probe_watch}
+        n_new = 0
         for pair in pairs:
             ga, gb, kind = self.pair_identity(pair[0], pair[1])
             if (ga, gb) not in known:
                 self._probe_watch.append((ga, gb, kind))
                 known.add((ga, gb))
+                n_new += 1
+        if n_new:
+            self._probe_cache = None
 
     def clear_probe_pairs(self) -> None:
         self._probe_watch = []
@@ -649,6 +655,41 @@ class FrameSolver:
         M[6:35, 6:35] = alpha * np.eye(29)
         return J_mid @ M
 
+    def _probe_cache_key(self, ctx: FrameContext, z: np.ndarray) -> tuple:
+        """Every dependency of a probe row build (R3).
+
+        ``z`` alone is NOT the state: the rows also depend on the previous
+        accepted frame (the interpolation endpoints), the current and previous
+        box poses, the watched pair identities, the candidate identities of
+        the last linearization, the probe protocol and the row budget/floor.
+        The old z-only key served stale rows after a carry-back added a pair,
+        so the next QP solved a system without the violation the check had
+        just found. Byte snapshots are compared, never live references.
+        """
+        pcfg = self.probe_cfg
+        cfg = self.cfg
+        return (
+            np.asarray(z, dtype=float).tobytes(),
+            None if ctx.z_prev is None
+            else np.asarray(ctx.z_prev, dtype=float).tobytes(),
+            np.asarray(ctx.box_pose, dtype=float).tobytes(),
+            None if ctx.box_pose_prev is None
+            else np.asarray(ctx.box_pose_prev, dtype=float).tobytes(),
+            None if pcfg is None else (
+                bool(pcfg.check_interpolated_states),
+                float(pcfg.max_substep_motion_m), int(pcfg.max_subdivisions)),
+            tuple((ga, gb) for ga, gb, _k in self._probe_watch),
+            tuple((ga, gb) for ga, gb, _k in self.last_row_ids),
+            int(cfg.max_probe_rows), float(cfg.probe_row_margin_m),
+            float(cfg_noncontact(cfg)),
+        )
+
+    def _restore_probe_diagnostics(self, cache: dict) -> None:
+        """Restore the diagnostics parallel to cached rows (R3): a cache hit
+        must not lose the row names, alphas or truncation evidence."""
+        self.last_probe_rows = list(cache["last_rows"])
+        self.last_probe_truncated = list(cache["last_truncated"])
+
     def _probe_rows(self, ctx: FrameContext, z: np.ndarray,
                     need_jacobian: bool) -> list[dict]:
         """Probe point constraints for the current linearization state.
@@ -668,17 +709,24 @@ class FrameSolver:
         and the rest are REPORTED (``last_probe_truncated``) -- the pipeline's
         uncapped probe check stays the arbiter, so a dropped row can never
         turn into a silent accept.
+
+        The result is cached under :meth:`_probe_cache_key` (R3): a hit is only
+        valid for the same state AND the same dependencies, and a value-only
+        entry is never served when Jacobians are requested.
         """
         cfg = self.cfg
+        key = self._probe_cache_key(ctx, z)
         cache = self._probe_cache
-        if cache is not None and np.array_equal(cache["state"], z):
+        if cache is not None and cache["key"] == key:
             if not need_jacobian or cache["jacobian"]:
+                self._restore_probe_diagnostics(cache)
                 return cache["rows"]
         alphas, motion = self._probe_grid(ctx, z)
         floor = cfg_noncontact(cfg)
         if not alphas:
             self.last_probe_rows, self.last_probe_truncated = [], []
-            self._probe_cache = {"state": z.copy(), "rows": [], "jacobian": True}
+            self._probe_cache = {"key": key, "rows": [], "jacobian": True,
+                                 "last_rows": [], "last_truncated": []}
             return []
         # probe pairs: the pairs carrying endpoint rows at this linearization
         # (near at the frame end) plus the check-discovered watch list
@@ -724,8 +772,10 @@ class FrameSolver:
                 J_mid = self.ev.distance_jacobian(ga, gb, r["ft"], r["dist"], probe=True)
                 r["J"] = self._probe_composite_jacobian(J_mid, ctx, z, r["alpha"])
         self.last_probe_rows = [f"{r['name']}@a={r['alpha']:.3f}" for r in rows]
-        self._probe_cache = {"state": z.copy(), "rows": rows,
-                             "jacobian": bool(need_jacobian)}
+        self._probe_cache = {"key": key, "rows": rows,
+                             "jacobian": bool(need_jacobian),
+                             "last_rows": list(self.last_probe_rows),
+                             "last_truncated": list(self.last_probe_truncated)}
         return rows
 
     def _probe_block(self, ctx: FrameContext, z: np.ndarray) -> tuple:
@@ -1464,9 +1514,13 @@ class FrameSolver:
         restoration = force_slack
         max_iters = cfg.scp_max_iters + (cfg.scp_extra_restoration_iters if force_slack else 0)
         # full registry scan for this frame's first linearization; carried
-        # extras from previous attempts (``_extra_pairs``) are merged in
+        # extras from previous attempts (``_extra_pairs``) are merged in. The
+        # probe cache of the PREVIOUS attempt belongs to a different
+        # linearization program and is dropped too (R3); the frame switch
+        # drops it via ``clear_probe_pairs``.
         self._frame_pairs = None
         self._refresh_counter = 0
+        self._probe_cache = None
         for it in range(max_iters):
             it_done = it + 1
             res = self.evaluate(z, ctx)
