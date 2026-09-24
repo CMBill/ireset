@@ -39,6 +39,11 @@ N_FOOT_ROWS = 30   # 2 feet x 5 sites x 3 axes
 N_FOOT_SPEED = 30
 N_HAND_SPEED = 18  # 2 hands x 3 sites x 3 axes (regen box-frame speed rows)
 N_FIXED = 29 + 29 + 3 + 3 + 35
+#: rows between the collision block and the transition-probe block (hand
+#: anchors, foot anchors, foot support speeds, regen hand-speed rows). The
+#: nonlinear row order is fixed-pre, collision, post, probe -- any descriptor
+#: built for the value array must count this block explicitly (R7).
+N_POST_ROWS = N_HAND_ROWS + N_FOOT_ROWS + N_FOOT_SPEED + N_HAND_SPEED
 COLLISION_OFF = N_FIXED                       # 99
 HAND_OFF = COLLISION_OFF + MAX_PAIRS          # 147
 FOOT_OFF = HAND_OFF + N_HAND_ROWS             # 165

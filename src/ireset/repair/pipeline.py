@@ -80,6 +80,152 @@ class TrajectoryResult:
     diagnostics: dict = field(default_factory=dict)
 
 
+@dataclass
+class PassRecord:
+    """One trajectory pass's OWN accounting (R6).
+
+    Kept as an object (not merged into the result diagnostics) so a suffix
+    retry can never overwrite the first pass, and so the run-level total view
+    is built once from these records instead of being re-derived by each
+    caller. ``attempts``/``checks`` are the pass's event paths.
+    """
+
+    trajectory_pass: int
+    status: str
+    complete: bool                      # processed every input frame
+    accepted_frames: int                # frames adopted into the output
+    skipped_frames: int
+    slack_frames: int
+    input_frames: int
+    attempts: list[dict]
+    checks: list[dict]
+    visits: list[int]
+    timings_s: list[float]
+    backtracks_adopted: int
+    backtrack_probes: int
+    t_fail: int | None = None
+    final_validation_s: float = 0.0     # set by the caller (validator call)
+
+    @property
+    def attempts_total(self) -> int:
+        return len(self.attempts)
+
+    @property
+    def qp_calls_total(self) -> int:
+        return int(sum(a["qp_calls"] for a in self.attempts))
+
+    @property
+    def iterations_total(self) -> int:
+        return int(sum(a["iterations"] for a in self.attempts))
+
+    @property
+    def slack_attempts(self) -> int:
+        return sum(1 for a in self.attempts if a["slack_used"])
+
+    @property
+    def solve_s(self) -> float:
+        return float(sum(self.timings_s))
+
+    @property
+    def processed_frame_visits(self) -> int:
+        return len(self.visits)
+
+    @property
+    def unique_processed_frames(self) -> int:
+        return len(set(self.visits))
+
+    def to_dict(self) -> dict:
+        return {
+            "trajectory_pass": self.trajectory_pass,
+            "status": self.status,
+            "complete": self.complete,
+            "t_fail": self.t_fail,
+            "accepted_frames": self.accepted_frames,
+            "skipped_frames": self.skipped_frames,
+            "slack_frames": self.slack_frames,
+            "input_frames": self.input_frames,
+            "attempts": len(self.attempts),
+            "qp_calls_total": self.qp_calls_total,
+            "iterations_total": self.iterations_total,
+            "slack_attempts": self.slack_attempts,
+            "backtracks_adopted": self.backtracks_adopted,
+            "backtrack_probes": self.backtrack_probes,
+            "checks_total": len(self.checks),
+            "processed_frame_visits": self.processed_frame_visits,
+            "unique_processed_frames": self.unique_processed_frames,
+            "solve_s": round(self.solve_s, 3),
+            "final_validation_s": round(float(self.final_validation_s), 3),
+            "timings_s": [round(float(v), 6) for v in self.timings_s],
+            "attempts_detail": self.attempts,
+            "checks": self.checks,
+        }
+
+
+def _timing_stats(timings: list) -> dict:
+    """Per-visit ms statistics from a series of unrounded seconds."""
+    if not timings:
+        return {"mean_ms": None, "p50_ms": None, "p95_ms": None, "max_ms": None}
+    v = np.asarray(timings, dtype=float) * 1e3
+    return {"mean_ms": round(float(v.mean()), 1),
+            "p50_ms": round(float(np.percentile(v, 50)), 1),
+            "p95_ms": round(float(np.percentile(v, 95)), 1),
+            "max_ms": round(float(v.max()), 1)}
+
+
+def cost_view(passes: list[PassRecord], input_frames: int, *,
+              accepted_pass: int | None = None,
+              rejected_before_run: bool = False) -> dict:
+    """Explicit TOTAL-EXECUTION view over every trajectory pass (R6).
+
+    - ``attempts`` / ``qp_calls_total`` / ``iterations_total`` /
+      ``slack_attempts`` sum ALL passes, failed attempts included;
+      ``backtrack_probes`` and ``backtracks_adopted`` are separate so an
+      unadopted probe is not silently free.
+    - ``processed_frame_visits`` counts every entry into the frame loop (a
+      suffix retry replays the kept prefix); ``unique_processed_frames`` is
+      the UNION of frame numbers -- adding per-pass dedup counts would
+      double-count the replay. ``input_frames`` is the original T and never
+      doubles.
+    - per-visit percentiles come from the MERGED unrounded per-visit series,
+      never from averaging per-pass percentiles.
+    - ``solve_s`` accumulates frame processing of every pass;
+      ``final_validation_s`` accumulates every independent validator call.
+      Both are part of -- not additional to -- the repair wall time reported
+      by the caller.
+    - every counter is recomputable from ``passes[i]["attempts_detail"]`` /
+      ``["checks"]``; readers must NOT add the nested ``first_attempt``
+      diagnostics to these totals (that nesting describes the first pass).
+    """
+    timings = [v for p in passes for v in p.timings_s]
+    visits = [v for p in passes for v in p.visits]
+    output = next((p for p in passes if p.trajectory_pass == accepted_pass), None)
+    return {
+        "schema": 2,
+        "input_frames": int(input_frames),
+        "rejected_before_run": bool(rejected_before_run),
+        "attempts": sum(p.attempts_total for p in passes),
+        "qp_calls_total": sum(p.qp_calls_total for p in passes),
+        "iterations_total": sum(p.iterations_total for p in passes),
+        "slack_attempts": sum(p.slack_attempts for p in passes),
+        "backtrack_probes": sum(p.backtrack_probes for p in passes),
+        "backtracks_adopted": sum(p.backtracks_adopted for p in passes),
+        "checks_total": sum(len(p.checks) for p in passes),
+        "processed_frame_visits": len(visits),
+        "unique_processed_frames": len(set(visits)),
+        "per_visit_ms": _timing_stats(timings),
+        "solve_s": round(sum(p.solve_s for p in passes), 3),
+        "final_validation_s": round(sum(p.final_validation_s for p in passes), 3),
+        "final_output": {
+            "trajectory_pass": None if output is None else output.trajectory_pass,
+            "accepted": bool(output is not None and output.complete),
+            "accepted_frames": None if output is None else output.accepted_frames,
+            "skipped_frames": None if output is None else output.skipped_frames,
+            "slack_frames": None if output is None else output.slack_frames,
+        },
+        "passes": [p.to_dict() for p in passes],
+    }
+
+
 class RepairPipeline:
     def __init__(self, spec: G1Spec | None = None, cfg: RepairConfig | None = None) -> None:
         self.cfg = cfg or RepairConfig()
@@ -95,6 +241,8 @@ class RepairPipeline:
         #: path never reads it
         self.verbose: bool = False
         self.frame_log: list[dict] = []
+        #: trajectory pass currently running (check ids are scoped by it)
+        self._pass_index: int = 0
 
     # -- interaction mesh precompute -------------------------------------------
 
@@ -386,6 +534,7 @@ class RepairPipeline:
         if not self.verbose:
             return
         rec = {"t": t, "kind": "check", "caller": caller, "ok": bool(chk.ok),
+               "check_id": chk.check_id,
                "reason": chk.reason, "viol": float(chk.viol),
                "hand_l_prev_m": float(chk.hand_prev.get("l", float("nan"))),
                "hand_l_cand_m": float(chk.hand_cand.get("l", float("nan"))),
@@ -402,8 +551,10 @@ class RepairPipeline:
     # -- public API ------------------------------------------------------------------
 
     def repair_trajectory(self, prediction: np.ndarray, condition: ReferenceCondition) -> TrajectoryResult:
-        """End-to-end repair; ``diagnostics["total_s"]`` covers both attempts
-        plus all final validations (the timing callers must report)."""
+        """End-to-end repair; ``diagnostics["cost"]`` (schema 2) is the
+        run-level TOTAL view over every trajectory pass (R6), and
+        ``diagnostics["total_s"]`` covers both attempts plus all final
+        validations (the timing callers must report)."""
         t0 = time.perf_counter()
         self.solver.probe_cfg = self.validator.cfg
         if self.verbose:
@@ -412,30 +563,48 @@ class RepairPipeline:
         result.diagnostics.setdefault("total_s", round(time.perf_counter() - t0, 3))
         return result
 
+    @staticmethod
+    def _finish(result: TrajectoryResult, passes: list[PassRecord], T: int,
+                accepted_pass: int | None = None,
+                rejected_before_run: bool = False) -> TrajectoryResult:
+        """Attach the run-level cost view (every exit path, R6)."""
+        result.diagnostics["cost"] = cost_view(
+            passes, T, accepted_pass=accepted_pass,
+            rejected_before_run=rejected_before_run)
+        return result
+
     def _repair_trajectory(self, prediction: np.ndarray, condition: ReferenceCondition) -> TrajectoryResult:
         prediction = np.asarray(prediction, dtype=float)
         if prediction.ndim != 2 or prediction.shape[1] != 43:
-            return TrajectoryResult(False, "rejected_shape")
+            # nothing was executed: the cost view reports zeros, not a
+            # missing total (R6)
+            return self._finish(TrajectoryResult(False, "rejected_shape"),
+                                [], 0, rejected_before_run=True)
+        T = int(prediction.shape[0])
         if not np.isfinite(prediction).all():
-            return TrajectoryResult(False, "rejected_nonfinite")
+            return self._finish(TrajectoryResult(False, "rejected_nonfinite"),
+                                [], T, rejected_before_run=True)
 
+        passes: list[PassRecord] = []
         result = self._run_sequential(prediction, condition)
+        passes.append(result.diagnostics.pop("_pass_record"))
         if not result.accepted:
-            return result
+            return self._finish(result, passes, T)
 
         # box_ground is input-owned (fixed box trajectory; the hull of the
         # scanned bin also over-approximates its bottom) -> excluded here,
         # reported by data screening instead
         t_final = time.perf_counter()
         final = self.validator.validate(result.trajectory, exclude=("box_ground",))
-        result.diagnostics["final_validation_s"] = round(time.perf_counter() - t_final, 3)
+        passes[0].final_validation_s = time.perf_counter() - t_final
+        result.diagnostics["final_validation_s"] = round(passes[0].final_validation_s, 3)
         if final.passed:
             result.diagnostics["final_validation"] = "passed"
             result.diagnostics["final_checks"] = {
                 k: {"worst": round(float(v.worst), 4), "limit": float(v.limit)}
                 for k, v in final.checks.items()
             }
-            return result
+            return self._finish(result, passes, T, accepted_pass=0)
 
         # suffix rollback: keep the validated prefix (states + anchors) by
         # replaying it as the prediction, re-solve only the suffix. The
@@ -447,6 +616,9 @@ class RepairPipeline:
         start = 0 if f_frame is None else max(0, f_frame - self.cfg.suffix_retry_window)
         retry_pred = np.vstack([result.trajectory[:start], prediction[start:]])
         retry = self._run_sequential(retry_pred, condition, pass_index=1)
+        passes.append(retry.diagnostics.pop("_pass_record"))
+        # the first attempt's validator verdict (checks + structured frames)
+        # is kept separately from the retry's own exit evidence
         retry.diagnostics["first_attempt_final"] = f"{final.summary()} @t={f_frame}"
         retry.diagnostics["first_failure_frame"] = f_frame
         retry.diagnostics["suffix_retry_from"] = start
@@ -458,31 +630,38 @@ class RepairPipeline:
         # the first pass's cost is reported VERBATIM whichever way the retry
         # ends (a retry must never overwrite the first round's
         # attempts/QP/iteration totals, and a SUCCESSFUL retry must not drop
-        # them either)
-        retry.diagnostics["first_attempt"] = dict(result.diagnostics)
+        # them either). This nested copy describes the FIRST pass only -- the
+        # run-level totals live under ``diagnostics["cost"]``; a reader must
+        # not add the two (R6).
+        retry.diagnostics["first_attempt"] = {
+            k: v for k, v in result.diagnostics.items() if k != "cost"}
         if not retry.accepted:
+            # the retry failed in its SOLVE stage: keep that stage and the
+            # first round's validator cause side by side (R5: they are
+            # different facts about different rounds)
             self._final_rejection(retry, retry.diagnostics.get("failed_checks", {}))
-            return TrajectoryResult(False, "rejected_final", diagnostics=retry.diagnostics)
+            return self._finish(
+                TrajectoryResult(False, "rejected_final", diagnostics=retry.diagnostics),
+                passes, T)
         t_final = time.perf_counter()
         final2 = self.validator.validate(retry.trajectory, exclude=("box_ground",))
-        retry.diagnostics["final_validation_s"] = round(
-            retry.diagnostics.get("final_validation_s", 0.0)
-            + time.perf_counter() - t_final, 3)
+        passes[1].final_validation_s = time.perf_counter() - t_final
+        retry.diagnostics["final_validation_s"] = round(passes[1].final_validation_s, 3)
         if final2.passed:
             retry.diagnostics["final_validation"] = "passed_after_suffix_retry"
             retry.diagnostics["final_checks"] = {
                 k: {"worst": round(float(v.worst), 4), "limit": float(v.limit)}
                 for k, v in final2.checks.items()
             }
-            return retry
+            return self._finish(retry, passes, T, accepted_pass=1)
         retry.diagnostics["final_retry_failed_checks"] = {
             k: {"location": v.location, "first_failure_frame": v.first_failure_frame}
             for k, v in final2.checks.items() if not v.passed
         }
         self._final_rejection(retry, retry.diagnostics["final_retry_failed_checks"])
-        return TrajectoryResult(False, "rejected_final", diagnostics={
+        return self._finish(TrajectoryResult(False, "rejected_final", diagnostics={
             **retry.diagnostics, "final_retry": final2.summary(),
-        })
+        }), passes, T)
 
     @staticmethod
     def _final_rejection(retry: TrajectoryResult, failed: dict) -> None:
@@ -500,15 +679,42 @@ class RepairPipeline:
 
     # -- sequential core ----------------------------------------------------------------
 
-    def _record_attempt(self, attempts: list, res, source: str, t: int,
-                        pass_index: int, backtrack: str | None = None) -> None:
-        """Record ONE solver attempt (always on -- the aggregate counters are
-        recomputable from these events; verbose adds the same record to the
-        frame log). Costs are per-attempt, so a retry can never overwrite the
-        first round's totals."""
-        rec = {
-            "t": t, "pass": pass_index, "source": source, "backtrack": backtrack,
-            "accepted": bool(res.accepted), "status": res.status,
+    def _note_check(self, checks: list[dict], chk: FrameCheck, source: str,
+                    t: int, attempt_id: int | None) -> None:
+        """Record ONE check event (always on -- quiet runs keep the lightweight
+        events too). The id is stable, unique per pass, and referenced by the
+        attempt (or by the skip event) it belongs to; re-noting the same
+        ``FrameCheck`` object is a no-op, so a cached check (the attempt's
+        candidate check reused by the caller and by the backtrack path) is
+        never double-counted (R8)."""
+        if chk.check_id:
+            return
+        cid = f"p{self._pass_index}:t{t}:c{len(checks)}"
+        chk.check_id = cid
+        checks.append({"check_id": cid, "pass": self._pass_index, "t": t,
+                       "source": source, "attempt_id": attempt_id,
+                       "ok": bool(chk.ok), "reason": chk.reason,
+                       "viol": float(chk.viol)})
+
+    def _begin_attempt(self, res, source: str, t: int, attempt_id: int) -> dict:
+        """Open ONE solver attempt event (always on -- the aggregate counters
+        are recomputable from these events; verbose adds the same record to
+        the frame log).
+
+        ``(trajectory_pass, frame, attempt_id)`` is the attempt's stable
+        identity. The solver-side fields describe the attempt's LAST
+        linearization state / last QP; the pipeline-side fields
+        (``check_id``, ``frame_valid``, ``backtrack``, ``adopted``) are
+        finalized by :meth:`_finalize_attempt` only after the checks and the
+        transition backtracking have run -- R8: the old record was written
+        before them, so every check/backtrack field was null and solver
+        acceptance was indistinguishable from pipeline acceptance.
+        """
+        return {
+            "attempt_id": int(attempt_id), "pass": self._pass_index, "t": t,
+            "source": source,
+            # solver exit evidence (state: the attempt's LAST linearization)
+            "solver_accepted": bool(res.accepted), "status": res.status,
             "iterations": int(res.iterations), "qp_calls": int(res.qp_calls),
             "slack_used": bool(res.slack_used), "trust": float(res.trust),
             "last_viol": float(res.last_viol),
@@ -517,46 +723,95 @@ class RepairPipeline:
             "truncated_rows": list(res.truncated_rows),
             "probe_rows": list(res.probe_rows),
             "probe_truncated": list(res.probe_truncated),
-            "frame_valid": (None if res.frame_check is None
-                            else bool(res.frame_check.ok)),
-            "frame_valid_reason": (None if res.frame_check is None
-                                   else res.frame_check.reason),
+            "counters_state": "solver_last_linearization",
+            # pipeline-side evidence, filled by _finalize_attempt
+            "check_id": None, "frame_valid": None, "frame_valid_reason": None,
+            "check_state": None, "backtrack": None, "adopted": None,
         }
-        attempts.append(rec)
+
+    def _finalize_attempt(self, rec: dict, res, chk: FrameCheck,
+                          bt_info: dict) -> None:
+        """Finalize an attempt event after its check and backtracking."""
+        rec.update({
+            "check_id": chk.check_id or None,
+            "frame_valid": bool(chk.ok),
+            "frame_valid_reason": chk.reason,
+            "check_state": "solver_candidate",
+            "backtrack": {"probed": list(bt_info["probed"]),
+                          "adopted": bt_info["adopted"],
+                          "state": "candidate_along_prev_accepted"},
+        })
         if self.verbose:
             self.frame_log.append({"kind": "attempt", **rec})
 
-    @staticmethod
-    def _aggregate(attempts: list, visits: list, T: int, skipped: int,
-                   backtracks: int, pass_index: int) -> dict:
-        """Counters over ALL attempts (F0): totals, slack/backtrack adoption,
-        processed-frame visits vs unique frames vs the original input length."""
+    def _solve_attempt(self, z_start, source: str, ctx: FrameContext, t: int,
+                       z_prev, attempt_id: int, attempts: list, checks: list,
+                       frame_recs: list, force_slack: bool = False) -> tuple:
+        """Solve + check + transition-backtrack ONE attempt, then finalize.
+
+        Returns ``(res, chk, backtrack_path, bt_info, rec)``. ``force_slack``
+        keeps the historical slack-fallback path: no transition backtracking,
+        exactly one check. Nothing extra is executed for the record (R8).
+        """
+        res = self.solver.solve_frame(z_start, ctx, force_slack=force_slack)
+        rec = self._begin_attempt(res, source, t, attempt_id)
+        attempts.append(rec)
+        frame_recs.append(rec)
+        res, bt, bt_info = self._transition_backtrack(
+            res, ctx, z_prev, source=source, attempt_id=attempt_id,
+            backtrack=not force_slack)
+        chk = self.check_result(res, ctx, source)
+        self._note_check(checks, chk, source, t, attempt_id)
+        self._finalize_attempt(rec, res, chk, bt_info)
+        return res, chk, bt, bt_info, rec
+
+    def _aggregate(self, rec: PassRecord) -> dict:
+        """Flat counters of ONE pass (legacy names; the multi-pass totals live
+        in ``diagnostics["cost"]``, schema 2 -- a reader must not add the two)."""
         return {
-            "trajectory_pass": pass_index,
-            "attempts": len(attempts),
-            "qp_calls_total": int(sum(a["qp_calls"] for a in attempts)),
-            "iterations_total": int(sum(a["iterations"] for a in attempts)),
-            "slack_attempts": sum(1 for a in attempts if a["slack_used"]),
-            "backtracks": int(backtracks),
-            "processed_frame_visits": len(visits),
-            "unique_processed_frames": len(set(visits)),
-            "input_frames": int(T),
-            "skipped_frames": int(skipped),
-            "attempts_detail": attempts,
+            "trajectory_pass": rec.trajectory_pass,
+            "attempts": rec.attempts_total,
+            "qp_calls_total": rec.qp_calls_total,
+            "iterations_total": rec.iterations_total,
+            "slack_attempts": rec.slack_attempts,
+            "backtracks": rec.backtracks_adopted,
+            "backtrack_probes": rec.backtrack_probes,
+            "checks_total": len(rec.checks),
+            "processed_frame_visits": rec.processed_frame_visits,
+            "unique_processed_frames": rec.unique_processed_frames,
+            "input_frames": rec.input_frames,
+            "skipped_frames": rec.skipped_frames,
+            "adopted_frames": rec.accepted_frames,
+            "attempts_detail": rec.attempts,
         }
 
     @staticmethod
     def _timing_stats(timings: list) -> dict:
-        if not timings:
-            return {"mean_ms": None, "p50_ms": None, "p95_ms": None, "max_ms": None}
-        v = np.asarray(timings, dtype=float) * 1e3
-        return {"mean_ms": round(float(v.mean()), 1),
-                "p50_ms": round(float(np.percentile(v, 50)), 1),
-                "p95_ms": round(float(np.percentile(v, 95)), 1),
-                "max_ms": round(float(v.max()), 1)}
+        return _timing_stats(timings)
+
+    def _pass_record(self, prediction, pass_index: int, status: str,
+                     accepted_frames: int, skipped: int, slack_frames: int,
+                     attempts: list, checks: list, visits: list, timings: list,
+                     backtracks: int, backtrack_probes: int,
+                     t_fail: int | None = None) -> PassRecord:
+        """Close a pass: its own counters, no cross-pass merging (R6)."""
+        return PassRecord(
+            trajectory_pass=pass_index,
+            status=status,
+            complete=t_fail is None,
+            accepted_frames=int(accepted_frames),
+            skipped_frames=int(skipped),
+            # slack is a property of the ADOPTED result object, not of the
+            # path name (multi-start/backtrack paths can carry either)
+            slack_frames=int(slack_frames),
+            input_frames=int(prediction.shape[0]),
+            attempts=attempts, checks=checks, visits=visits, timings_s=timings,
+            backtracks_adopted=int(backtracks), backtrack_probes=int(backtrack_probes),
+            t_fail=t_fail)
 
     def _run_sequential(self, prediction, condition, pass_index: int = 0) -> TrajectoryResult:
         T = prediction.shape[0]
+        self._pass_index = pass_index
         contacts = ContactStateMachine(condition.ref_schedule, T)
         accepted: list[np.ndarray] = []
         prev_local: dict = {}
@@ -569,7 +824,9 @@ class RepairPipeline:
         slack_flags: list[bool] = []
         fallbacks = 0
         backtracks = 0
+        backtrack_probes = 0
         attempts: list[dict] = []       # every solve attempt, always recorded
+        checks: list[dict] = []         # every acceptance check, always recorded
         visits: list[int] = []          # processed-frame visits in this pass
         skip_reasons: dict[int, str] = {}
 
@@ -615,6 +872,7 @@ class RepairPipeline:
             ctx = self._frame_ctx(t, prediction, condition, contacts, prev_local, prev_sole, z_prev)
 
             chk = self.frame_valid(z_pred, ctx)
+            self._note_check(checks, chk, "skip", t, None)
             self._log_check(chk, t, "skip", None)
             if chk.ok:
                 z = z_pred
@@ -629,64 +887,86 @@ class RepairPipeline:
                 # input, not logging): the candidate set is frozen at the
                 # attempt's initial state and must see what the check caught
                 self.carry_discovered(chk)
-                res = self.solver.solve_frame(z_pred, ctx)
-                path = "repaired" if not res.slack_used else "repaired_slack"
-                self._record_attempt(attempts, res, "prediction", t, pass_index)
-                res, bt = self._transition_backtrack(res, ctx, z_prev)
-                if bt:
-                    path = bt
-                    backtracks += 1
-                self.check_result(res, ctx, "prediction")
-                if not res.frame_check.ok:
-                    self.carry_discovered(res.frame_check)
+                frame_recs: list[dict] = []
+                # attempt 1: the prediction's own state
+                res, chk2, bt, _bti, rec = self._solve_attempt(
+                    z_pred, "prediction", ctx, t, z_prev, 0, attempts, checks,
+                    frame_recs)
+                path = bt or ("repaired_slack" if res.slack_used else "repaired")
+                backtracks += 1 if bt else 0
+                backtrack_probes += len(_bti["probed"])
+                adopted_rec = rec if chk2.ok else None
+                last_chk = chk2
+                if not chk2.ok:
+                    self.carry_discovered(chk2)
                     # multi-start restart from the previous accepted state
                     # (P0.1 L0): deep-violation frames linearize badly from
                     # z_pred but solve from the accepted predecessor
-                    res_alt = self.solver.solve_frame(z_prev, ctx) if z_prev is not None else None
-                    if res_alt is not None:
-                        self._record_attempt(attempts, res_alt, "prev_accepted", t, pass_index)
-                        res_alt, bt2 = self._transition_backtrack(res_alt, ctx, z_prev)
-                        if bt2:
-                            backtracks += 1
-                        chk_alt = self.check_result(res_alt, ctx, "prev_accepted")
+                    if z_prev is not None:
+                        res_alt, chk_alt, bt2, bti2, rec_alt = self._solve_attempt(
+                            z_prev, "prev_accepted", ctx, t, z_prev,
+                            len(frame_recs), attempts, checks, frame_recs)
+                        backtracks += 1 if bt2 else 0
+                        backtrack_probes += len(bti2["probed"])
+                        adopted_rec = rec_alt if chk_alt.ok else None
+                        last_chk = chk_alt
                         if chk_alt.ok:
-                            res, path = res_alt, bt2 or "repaired_prev"
+                            res, chk2, path = res_alt, chk_alt, (bt2 or "repaired_prev")
                         else:
                             self.carry_discovered(chk_alt)
-                    if not res.frame_check.ok and self.cfg.enable_slack_fallback:
-                        res2 = self.solver.solve_frame(
-                            z_prev if z_prev is not None else z_pred, ctx, force_slack=True
-                        )
-                        self._record_attempt(attempts, res2, "slack_fallback", t, pass_index)
-                        chk2 = self.check_result(res2, ctx, "slack_fallback")
-                        if chk2.ok:
-                            res, path = res2, "repaired_slack"
+                    if not chk2.ok and self.cfg.enable_slack_fallback:
+                        res2, chk_sl, _bt3, _bti3, rec_sl = self._solve_attempt(
+                            z_prev if z_prev is not None else z_pred,
+                            "slack_fallback", ctx, t, z_prev,
+                            len(frame_recs), attempts, checks, frame_recs,
+                            force_slack=True)
+                        adopted_rec = rec_sl if chk_sl.ok else None
+                        last_chk = chk_sl
+                        if chk_sl.ok:
+                            res, chk2, path = res2, chk_sl, "repaired_slack"
                             fallbacks += 1
                         else:
-                            self.carry_discovered(chk2)
-                if not res.frame_check.ok:
-                    # rejection evidence: the FINAL stage and the last
-                    # attempt's exit state -- never the initial skip_reason
-                    # (which only describes the raw prediction)
+                            self.carry_discovered(chk_sl)
+                for a in frame_recs:
+                    a["adopted"] = a is adopted_rec
+                if not chk2.ok:
+                    # rejection evidence binds the LAST EXECUTED attempt: its
+                    # case in ``last_chk`` and its own status. The adopted
+                    # candidate and the last try are different objects (the
+                    # fallback can fail on slack/task-quality after the first
+                    # attempt failed on a transition), and the initial
+                    # skip_reason describes only the raw prediction (R5).
+                    last_rec = frame_recs[-1]
                     timings.append(time.perf_counter() - t0)
+                    rec_pass = self._pass_record(
+                        prediction, pass_index, "rejected_frame", len(accepted),
+                        sum(1 for st in frame_status if st == "skipped"),
+                        int(sum(slack_flags)), attempts, checks, visits,
+                        timings, backtracks, backtrack_probes, t_fail=t)
                     return TrajectoryResult(False, "rejected_frame", diagnostics={
                         "t_fail": t,
-                        "reason": res.status,
-                        "final_stage": res.frame_check.reason,
-                        "skip_reason": skip_reasons.get(t),
+                        "reason": last_rec["status"],
+                        "final_stage": last_chk.reason,
                         "reason_source": "last_solve_attempt",
-                        "last_attempt": attempts[-1] if attempts else None,
-                        "violated_rows": res.frame_check.rows,
-                        "probe": res.frame_check.probes[0] if res.frame_check.probes else None,
+                        "last_attempt": last_rec,
+                        "last_attempt_id": [pass_index, t, last_rec["attempt_id"]],
+                        "last_check_id": last_rec["check_id"],
+                        "evidence_states": {
+                            "solver_rows": "last_linearization_state",
+                            "check_rows": "candidate_state",
+                            "probe": "interpolated_state",
+                        },
+                        "skip_reason": skip_reasons.get(t),
+                        "violated_rows": last_chk.rows,
+                        "probe": last_chk.probes[0] if last_chk.probes else None,
                         "accepted_frames": len(accepted), "frame_status": frame_status,
                         "iterations": adopted_iterations, "timings_s": timings,
                         "qp_calls": qp_calls_hist, "fallbacks": fallbacks,
                         "slack_frames": int(sum(slack_flags)),
                         "skipped": sum(1 for st in frame_status if st == "skipped"),
                         "timing_stats": self._timing_stats(timings),
-                        **self._aggregate(attempts, visits, T,
-                                          sum(1 for st in frame_status if st == "skipped"),
-                                          backtracks, pass_index),
+                        "_pass_record": rec_pass,
+                        **self._aggregate(rec_pass),
                     })
                 z = res.z
                 frame_status.append(path)
@@ -715,6 +995,11 @@ class RepairPipeline:
         trajectory = np.zeros((T, 43))
         trajectory[:, 0:36] = np.stack(accepted)
         trajectory[:, 36:43] = prediction[:, 36:43]
+        rec_pass = self._pass_record(
+            prediction, pass_index, "accepted", len(accepted),
+            sum(1 for st in frame_status if st == "skipped"),
+            int(sum(slack_flags)), attempts, checks, visits, timings,
+            backtracks, backtrack_probes)
         return TrajectoryResult(True, "accepted", trajectory=trajectory, diagnostics={
             "frame_status": frame_status, "iterations": adopted_iterations,
             "qp_calls": adopted_qp,
@@ -724,12 +1009,13 @@ class RepairPipeline:
             "slack_frames": int(sum(slack_flags)),
             "skipped": sum(1 for s in frame_status if s == "skipped"),
             "timing_stats": self._timing_stats(timings),
-            **self._aggregate(attempts, visits, T,
-                              sum(1 for s in frame_status if s == "skipped"),
-                              backtracks, pass_index),
+            "_pass_record": rec_pass,
+            **self._aggregate(rec_pass),
         })
 
-    def _transition_backtrack(self, res, ctx, z_prev) -> tuple:
+    def _transition_backtrack(self, res, ctx, z_prev, source: str = "prediction",
+                              attempt_id: int = 0, checks: list | None = None,
+                              backtrack: bool = True) -> tuple:
         """Transition-aware step backtracking (P0.1 L0).
 
         The QP never sees the interpolated-third corner-cut check that
@@ -737,24 +1023,36 @@ class RepairPipeline:
         solver's output fails *only* that check, shrink the step along the
         same tangent direction from z_prev and re-check. Pure solver
         improvement: no gate or tolerance changes.
+
+        Returns ``(res, path, bt_info)`` with ``bt_info`` recording the alphas
+        actually probed and the one adopted (``None`` when no probe happened)
+        -- the event distinguishes "no backtracking occurred" from "all probes
+        failed" (R8). The caller passes ``False`` for the slack fallback, which
+        historically never backtracks.
         """
-        if not res.accepted or z_prev is None:
-            return res, None
-        chk = self.check_result(res, ctx, "prediction")
+        if not res.accepted or z_prev is None or not backtrack:
+            return res, None, {"probed": [], "adopted": None}
+        chk = self.check_result(res, ctx, source)
+        if checks is not None:
+            self._note_check(checks, chk, source, ctx.t, attempt_id)
         if chk.ok or chk.reason != "transition_interpolated":
-            return res, None
+            return res, None, {"probed": [], "adopted": None}
         self.carry_discovered(chk)
         xi = tangent_error(res.z, z_prev)
+        probed: list[float] = []
         for alpha in (0.75, 0.5, 0.25):
             cand = retract_batch(self.ev.model, z_prev[None], (alpha * xi)[None])[0]
+            probed.append(float(alpha))
             chk_bt = self._frame_valid(cand, ctx)
+            if checks is not None:
+                self._note_check(checks, chk_bt, f"backtrack_{alpha}", ctx.t, attempt_id)
             self._log_check(chk_bt, ctx.t, f"backtrack_{alpha}", res)
             if chk_bt.ok:
                 res.z = cand
                 res.frame_check = chk_bt
-                return res, "repaired_bt"
+                return res, "repaired_bt", {"probed": probed, "adopted": float(alpha)}
             self.carry_discovered(chk_bt)
-        return res, None
+        return res, None, {"probed": probed, "adopted": None}
 
     def _first_failure_frame(self, report) -> int | None:
         """Earliest structured failure frame across FAILED checks (P0-fix F3).

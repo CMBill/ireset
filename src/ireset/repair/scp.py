@@ -36,6 +36,7 @@ import numpy as np
 import osqp
 import scipy.sparse as spa
 
+from ireset.embodied.g1_spec import HAND_SITES
 from ireset.kinematics.mujoco_adapter import N_TANGENT, retract_batch
 from ireset.kinematics.rotation_adapter import (
     quat_to_mat_wxyz,
@@ -51,6 +52,7 @@ from ireset.repair.constraints import (
     N_FOOT_SPEED,
     N_HAND_ROWS,
     N_HAND_SPEED,
+    N_POST_ROWS,
     HAND_SPEED_OFF,
     N_ROWS,
     MAX_PAIRS,
@@ -59,6 +61,7 @@ from ireset.repair.constraints import (
 )
 
 INF = 1e9
+_AXES = ("x", "y", "z")
 
 
 def _concat_rows(*blocks) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -169,6 +172,9 @@ class FrameCheck:
     ok: bool
     reason: str = "ok"                     # ok / state_constraints /
                                            # transition_interpolated / task_quality
+    #: stable id of this check event, assigned by the pipeline
+    #: (``pass:frame:check``); the attempt it belongs to references it (R8)
+    check_id: str = ""
     viol: float = 0.0
     rows: list[dict] = field(default_factory=list)
     discovered: list[tuple] = field(default_factory=list)
@@ -259,6 +265,10 @@ class FrameSolver:
         self.last_probe_truncated: list[str] = []
         #: full probe row records of the last build (name/alpha/dist/J)
         self._probe_rows_detail: list[dict] = []
+        #: cached descriptors of the fixed-pre / fixed-post blocks (static
+        #: layouts; built once, R7)
+        self._pre_desc: list[str] | None = None
+        self._post_desc: list[str] | None = None
 
     # -- pair identity -------------------------------------------------------
 
@@ -422,7 +432,7 @@ class FrameSolver:
         the QP path (budgeted) and the check path (uncapped) can share them.
         """
         ev, cfg = self.ev, self.cfg
-        n = N_HAND_ROWS + N_FOOT_ROWS + N_FOOT_SPEED + N_HAND_SPEED
+        n = N_POST_ROWS
         l = np.full(n, -INF)
         u = np.full(n, INF)
         val = np.zeros(n)
@@ -1302,21 +1312,85 @@ class FrameSolver:
 
     # -- success review ------------------------------------------------------
 
-    def _violating(self, val, lo, hi, scl, names, ids, offset: int = N_FIXED,
-                   end: int | None = None):
-        """Violating rows (``[offset, end)``) as ``(names, ids, records)``.
+    def _pre_row_descriptors(self) -> list[str]:
+        """Descriptors of the fixed-pre block, parallel to ``_fixed_pre_rows``."""
+        if self._pre_desc is None:
+            self._pre_desc = (
+                [f"joint_limit[j{j}]" for j in range(7, 36)]
+                + [f"joint_vel[j{j}]" for j in range(7, 36)]
+                + ["root_lin_vel", "root_lin_vel[slot1]", "root_lin_vel[slot2]",
+                   "root_ang_vel", "root_ang_vel[slot1]", "root_ang_vel[slot2]"]
+                + [f"trust[k{k}]" for k in range(N_TANGENT)])
+        return self._pre_desc
 
-        ``end`` must be passed whenever the row array carries blocks beyond
-        the descriptor lists (the F4 probe block is appended last).
+    def _post_row_descriptors(self) -> list[str]:
+        """Descriptors of the fixed-post block, parallel to ``_fixed_post_rows``."""
+        if self._post_desc is None:
+            hand = [f"hand_anchor[{side}:{label}:{ax}]"
+                    for side in ("l", "r") for label in HAND_SITES[side]
+                    for ax in _AXES]
+            foot_a = [f"foot_anchor[{side}:sole{i}:{ax}]"
+                      for side in ("l", "r") for i in range(1, 6)
+                      for ax in _AXES]
+            foot_s = [f"foot_speed[{side}:sole{i}:{ax}]"
+                      for side in ("l", "r") for i in range(1, 6)
+                      for ax in _AXES]
+            hand_s = [f"hand_speed[{side}:{label}:{ax}]"
+                      for side in ("l", "r") for label in HAND_SITES[side]
+                      for ax in _AXES]
+            self._post_desc = hand + foot_a + foot_s + hand_s
+        return self._post_desc
+
+    def row_descriptors(self) -> tuple[list[str], list]:
+        """Full-length descriptors of the LAST ``constraint_rows`` call.
+
+        The nonlinear row order is fixed-pre, endpoint collision, fixed-post
+        (hand anchors / foot anchors / foot speed / hand speed) and the probe
+        block appended last -- the descriptors are built to match that order
+        one-to-one, so a violating index maps to its OWN block. The old
+        extraction indexed the collision+probe name list directly at offsets
+        that ignored the 96 post rows, so every probe row was reported as
+        whatever row happened to sit at that offset and the real probe
+        violations were missed (R7).
+
+        Returns ``(names, ids)``; ``ids`` entries are the stable pair
+        identities for collision/probe rows, ``None`` for fixed rows.
+        """
+        pre = self._pre_row_descriptors()
+        post = self._post_row_descriptors()
+        names = pre + list(self.last_row_pairs) + post
+        ids = [None] * len(pre) + list(self.last_row_ids) + [None] * len(post)
+        for r in self._probe_rows_detail:
+            names.append(f"probe:{r['name']}@a={r['alpha']:.3f}")
+            ids.append(r["id"])
+        return names, ids
+
+    def _check_descriptors(self, names, ids) -> tuple[list[str], list]:
+        """Descriptors parallel to a ``check_rows`` value array.
+
+        ``check_rows`` returns fixed-pre + collision + fixed-post (no probe
+        block), so the descriptors must be built in the same order.
+        """
+        pre, post = self._pre_row_descriptors(), self._post_row_descriptors()
+        return (pre + list(names) + post,
+                [None] * len(pre) + list(ids) + [None] * len(post))
+
+    def _violating(self, val, lo, hi, names, ids=None,
+                   offset: int = 0, end: int | None = None):
+        """Violating rows ``[offset, end)`` as ``(names, ids, records)``.
+
+        ``names``/``ids`` must be parallel to the FULL value array (see
+        :meth:`row_descriptors`); ``end`` trims trailing blocks when the
+        caller deliberately excludes them.
         """
         out_names, out_ids, recs = [], [], []
         end = len(val) if end is None else end
-        for k in range(max(0, end - offset)):
-            v, l_, h_ = val[offset + k], lo[offset + k], hi[offset + k]
+        for k in range(max(0, offset), min(end, len(names))):
+            v, l_, h_ = val[k], lo[k], hi[k]
             if v < l_ - 1e-9 or v > h_ + 1e-9:
-                nm = names[k] if k < len(names) else "?"
+                nm = names[k]
                 out_names.append(nm)
-                if k < len(ids):
+                if ids is not None and k < len(ids) and ids[k] is not None:
                     out_ids.append(ids[k])
                 recs.append({"row": nm, "val_m": float(v),
                              "lo_m": float(l_), "hi_m": float(h_)})
@@ -1348,7 +1422,9 @@ class FrameSolver:
         info = {"viol": float(viol)}
         if viol <= 1e-6:
             return True, info
-        vnames, vids, recs = self._violating(val, lo, hi, scl, names, ids,
+        dnames, dids = self._check_descriptors(names, ids)
+        vnames, vids, recs = self._violating(val, lo, hi, dnames, dids,
+                                             offset=N_FIXED,
                                              end=N_FIXED + len(names))
         info.update({"violated_rows": vnames, "rows": recs})
         if vids:
@@ -1390,13 +1466,19 @@ class FrameSolver:
             val, lo, hi, scl = self.constraint_rows(z, ctx, trust, mode="accept")
             viol = self.violation(val, lo, hi, scl)
             last_viol = viol
-            probe_names = [f"probe:{r['name']}@a={r['alpha']:.3f}"
-                           for r in self._probe_rows_detail]
-            last_names, _ids, _recs = self._violating(
-                val, lo, hi, scl,
-                list(self.last_row_pairs) + probe_names,
-                list(self.last_row_ids) + [r["id"] for r in self._probe_rows_detail],
-                end=N_FIXED + len(self.last_row_pairs) + len(probe_names))
+            if viol <= 1e-6:
+                last_names = []
+            else:
+                # descriptors are parallel to the FULL nonlinear value array
+                # (pre + collision + post + probe); the old extraction skipped
+                # the 96 post rows, mislabelling every probe row and losing
+                # the real probe violations (R7)
+                names_all, ids_all = self.row_descriptors()
+                if len(names_all) != len(val):
+                    raise RuntimeError(
+                        f"row descriptors out of sync with the value array "
+                        f"({len(names_all)} vs {len(val)})")
+                last_names, _ids, _recs = self._violating(val, lo, hi, names_all, ids_all)
             merit = self.objective(res) + mu * viol
             feasible = viol <= 1e-6
             if feasible and merit < best_merit:

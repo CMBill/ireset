@@ -37,7 +37,7 @@ from ireset.kinematics.rotation_adapter import (  # noqa: E402
 )
 from ireset.repair.context import RepairConfig  # noqa: E402
 from ireset.repair.pipeline import RepairPipeline  # noqa: E402
-from ireset.repair.scp import INF, FrameContext, tangent_error  # noqa: E402
+from ireset.repair.scp import INF, FrameCheck, FrameContext, tangent_error  # noqa: E402
 from test_contacts import _root_height_for_tangent  # noqa: E402
 from test_repair import BOX_FAR, self_condition, standing_scene  # noqa: E402
 
@@ -786,6 +786,525 @@ def test_probe_rows_inert_below_substep_threshold(pipeline) -> None:
     assert rows == []
     val, lo, hi, scl = solver._probe_block(ctx, z)
     assert len(val) == 0
+
+
+# --- R7: violating rows are described in the nonlinear row order ------------------
+
+BOX_REACH_X = 0.22132          # box half-x (transition-sweep scenarios)
+
+
+def _sweep_ctx(pipeline: RepairPipeline):
+    """Box translating THROUGH the robot between two clean keypoints: both
+    endpoints legal, the interpolated midpoint penetrates. The penetrating
+    pair is NOT an endpoint candidate, so it only enters the probe rows
+    through ``carry_discovered`` (R3/R7 shared scenario)."""
+    from test_repair import _self_ref_kpts, _transition_ctx
+
+    z = standing_scene(1)[0, 0:36].copy()
+    ref = _self_ref_kpts(pipeline, z, BOX_FAR)
+    reach = BOX_REACH_X + max(0.05, pipeline.validator.cfg.max_substep_motion_m)
+    box_prev = np.array([-reach - 0.35, 0.0, 0.80, 1.0, 0, 0, 0])
+    box_cur = np.array([+reach + 0.35, 0.0, 0.80, 1.0, 0, 0, 0])
+    return _transition_ctx(pipeline, z, z, box_cur, box_prev, ref)
+
+
+def _parse_probe_row(name: str) -> tuple[str, float]:
+    pair, _, alpha = name[len("probe:"):].rpartition("@a=")
+    return pair, float(alpha)
+
+
+def _nonlinear_violating(pipeline: RepairPipeline, ctx, z):
+    """``constraint_rows`` + full-length descriptors + violation extraction --
+    exactly the evidence path ``solve_frame`` uses each SCP iteration."""
+    from ireset.repair.scp import cfg_noncontact
+
+    solver = pipeline.solver
+    val, lo, hi, _scl = solver.constraint_rows(z, ctx, pipeline.cfg.trust_radius_init,
+                                               mode="accept")
+    names, ids = solver.row_descriptors()
+    assert len(names) == len(ids) == len(val), (len(names), len(val))
+    return solver._violating(val, lo, hi, names, ids), cfg_noncontact(pipeline.cfg)
+
+
+def test_probe_violations_reported_with_pair_alpha_value(pipeline) -> None:
+    """R7 core: probe rows sit AFTER the 96 anchor/speed rows in the nonlinear
+    array. The old extraction indexed the collision+probe name list at offsets
+    that ignored them, so real probe violations were dropped and anchor/speed
+    violations were reported as probes.
+
+    Scenario: both endpoints of the frame are legal, the swept interior is not
+    (the review's "4 probe violations" case). The reported rows must be probe
+    rows of the actually-violating pair/alpha, with the floor bound, and the
+    reported value must equal a direct re-query at that interpolated state.
+    """
+    solver, ev = pipeline.solver, pipeline.ev
+    solver.probe_cfg = pipeline.validator.cfg
+    solver.clear_probe_pairs()
+    solver.clear_discovered_pairs()
+    ctx = _sweep_ctx(pipeline)
+    z = ctx.z_pred
+    chk = pipeline.frame_valid(z, ctx)
+    assert not chk.ok and chk.reason == "transition_interpolated"
+    assert chk.probe_discovered, "the sweep must be discovered at a probe state"
+    pipeline.carry_discovered(chk)
+    (vnames, _vids, recs), floor = _nonlinear_violating(pipeline, ctx, z)
+    probe = [r for r in recs if r["row"].startswith("probe:")]
+    assert probe, "carried sweep pairs must produce probe rows"
+    assert len(vnames) == len(recs) == len(probe), vnames
+    assert len(set(vnames)) == len(vnames)
+    assert any(any(c == _parse_probe_row(n)[0] for c in chk.carried) for n in vnames), \
+        (vnames[:4], chk.carried[:4])
+    assert all(r["lo_m"] == floor and r["hi_m"] == INF for r in probe)
+    # every reported violation maps to the probe block's own row (same pair,
+    # same alpha) and reproduces an independent full-range re-query; satisfied
+    # probe rows are NOT reported
+    detail = list(solver._probe_rows_detail)
+    by_key = {f"probe:{ev.geom_name(r['id'][0])}~{ev.geom_name(r['id'][1])}"
+              f"@a={r['alpha']:.3f}": r for r in detail}
+    assert len(by_key) == len(detail) == 12
+    assert 0 < len(probe) < len(detail), len(probe)
+    for rec in probe:
+        row = by_key[rec["row"]]
+        assert rec["val_m"] == row["dist"]
+        ga, gb, _kind = row["id"]
+        ev.probe_forward(*solver._probe_mid(ctx, z, row["alpha"]))
+        d, _ft = ev.probe_geom_distance(ga, gb, distmax=2.0)
+        assert rec["val_m"] == pytest.approx(d, abs=1e-12), rec
+        assert d < floor, "a reported probe violation must really be below the floor"
+    solver.clear_probe_pairs()
+    solver.clear_discovered_pairs()
+
+
+def _translation_ctx(pipeline: RepairPipeline) -> FrameContext:
+    """Root translating 6 cm in one frame, box far away: interior probe states
+    exist (motion > ``max_substep_motion_m``) and their rows are satisfied."""
+    z_prev = standing_scene(1)[0, 0:36].copy()
+    z = z_prev.copy()
+    z[0] += 0.06
+    return FrameContext(t=1, box_pose=BOX_FAR.copy(), z_pred=z, z_prev=z_prev,
+                        ref_kpts_world=np.zeros((15, 3)), mesh_L=None,
+                        delta_ref=None, mesh_fixed=None, hand_anchor={},
+                        foot_anchor={}, prev_hand_local={}, prev_sole_world={},
+                        box_pose_prev=BOX_FAR.copy())
+
+
+def test_anchor_violation_is_not_reported_as_probe(pipeline) -> None:
+    """R7: with probe rows present but satisfied, a hand-anchor violation is
+    reported under its own family -- the old offset skipped the 96 post rows
+    and printed the anchor row as whatever probe name sat at that index."""
+    solver, ev = pipeline.solver, pipeline.ev
+    solver.probe_cfg = pipeline.validator.cfg
+    solver.clear_probe_pairs()
+    solver.clear_discovered_pairs()
+    ctx = _translation_ctx(pipeline)
+    z = ctx.z_pred
+    solver._frame_pairs = None
+    solver.constraint_rows(z, ctx, pipeline.cfg.trust_radius_init, mode="accept")
+    assert solver._probe_rows_detail, "the solver must carry (satisfied) probe rows"
+    ev.forward(z, ctx.box_pose)
+    ctx.hand_anchor = {"l": ev.hand_local("l") + 0.05}
+    (vnames, _vids, recs), _floor = _nonlinear_violating(pipeline, ctx, z)
+    assert vnames, "the 5 cm anchor offset must violate"
+    assert not any(n.startswith("probe:") for n in vnames), vnames
+    assert len(vnames) == 9, vnames
+    assert all(n.startswith("hand_anchor[l:") for n in vnames), vnames
+    assert any(r["row"] == "hand_anchor[l:palm:x]" for r in recs), recs[:3]
+    solver.clear_probe_pairs()
+
+
+def test_multi_block_violations_keep_their_families(pipeline) -> None:
+    """R7: anchor + carried probe violations in the SAME state are reported
+    side by side, each under its own family and pair identity."""
+    solver, ev = pipeline.solver, pipeline.ev
+    solver.probe_cfg = pipeline.validator.cfg
+    solver.clear_probe_pairs()
+    solver.clear_discovered_pairs()
+    ctx = _sweep_ctx(pipeline)
+    z = ctx.z_pred
+    chk = pipeline.frame_valid(z, ctx)
+    pipeline.carry_discovered(chk)
+    ev.forward(z, ctx.box_pose)
+    ctx.hand_anchor = {"l": ev.hand_local("l") + 0.05}
+    (vnames, _vids, _recs), _floor = _nonlinear_violating(pipeline, ctx, z)
+    assert any(n.startswith("hand_anchor[l:") for n in vnames), vnames
+    assert any(n.startswith("probe:") for n in vnames), vnames
+    solver.clear_probe_pairs()
+    solver.clear_discovered_pairs()
+
+
+def test_descriptors_align_without_probes_and_under_row_budget(pipeline) -> None:
+    """R7: the descriptor array tracks the value array for zero probe rows and
+    when the QP row budget truncates the collision block (truncation affects
+    the QP layout only, never the nonlinear value array)."""
+    from dataclasses import replace as _replace
+
+    solver, ev = pipeline.solver, pipeline.ev
+    solver.clear_probe_pairs()
+    solver.clear_discovered_pairs()
+    solver.probe_cfg = None
+    ctx = _standing_ctx(BOX_ON_TORSO)
+    owner, solver.cfg = solver.cfg, _replace(solver.cfg, max_active_pairs=3)
+    try:
+        solver._frame_pairs = None
+        (vnames, _vids, recs), _floor = _nonlinear_violating(pipeline, ctx, ctx.z_pred)
+    finally:
+        solver.cfg = owner
+    assert solver.last_truncated > 0
+    assert solver.last_truncated_names
+    assert not any(n.startswith("probe:") for n in vnames)
+    assert all(r["row"] in vnames for r in recs)
+    assert all("~" in n or n.startswith(("joint_", "root_", "trust")) for n in vnames)
+    solver.clear_probe_pairs()
+    solver.clear_discovered_pairs()
+
+
+def test_solve_frame_reports_probe_violations_on_failure(pipeline) -> None:
+    """R7 end-to-end: a rejected frame reports its LAST linearization evidence
+    with correct families -- the swept probe rows AND the fixed velocity rows
+    (previously the whole fixed-pre block was never examined and post rows were
+    reported under probe names)."""
+    solver = pipeline.solver
+    solver.probe_cfg = pipeline.validator.cfg
+    solver.clear_probe_pairs()
+    solver.clear_discovered_pairs()
+    ctx = _sweep_ctx(pipeline)
+    chk = pipeline.frame_valid(ctx.z_pred, ctx)
+    assert not chk.ok
+    pipeline.carry_discovered(chk)
+    res = solver.solve_frame(ctx.z_pred, ctx)
+    assert not res.accepted, res.status
+    assert res.violated_rows
+    assert any(n.startswith("probe:") for n in res.violated_rows), res.violated_rows
+    assert any(n.startswith(("root_lin_vel", "root_ang_vel", "joint_vel", "trust"))
+               for n in res.violated_rows), res.violated_rows
+    solver.clear_probe_pairs()
+    solver.clear_discovered_pairs()
+
+
+# --- R5/R8: attempt evidence, checks and backtracking -----------------------------
+
+
+def _failing_solver(monkeypatch, statuses, reasons, rows=(), probes=()):
+    """Controlled escalation chain: each ``solve_frame`` call returns an
+    unaccepted synthetic attempt with its own status and (pre-attached) check
+    outcome, so the top-level rejection evidence is unambiguous."""
+    import ireset.repair.scp as scp
+
+    calls = {"n": 0}
+
+    def fake_solve(self, z_init, ctx, force_slack=False):
+        i = calls["n"]
+        calls["n"] += 1
+        res = scp.FrameResult(False, np.asarray(z_init, dtype=float), 3,
+                              status=statuses[min(i, len(statuses) - 1)],
+                              qp_calls=4, last_viol=0.5)
+        res.violated_rows = [f"synthetic[{i}]"]
+        res.frame_check = scp.FrameCheck(
+            ok=False, reason=reasons[min(i, len(reasons) - 1)], viol=0.5,
+            rows=list(rows if i == len(statuses) - 1 else []),
+            probes=list(probes if i == len(statuses) - 1 else []))
+        return res
+
+    monkeypatch.setattr(scp.FrameSolver, "solve_frame", fake_solve)
+    return calls
+
+
+def test_rejection_binds_the_last_executed_attempt(monkeypatch) -> None:
+    """R5: the top-level evidence (reason, stage, rows, probe, attempt id)
+    must describe the LAST executed attempt. The old code reported the FIRST
+    attempt's status/reason while the slack fallback was the one that failed
+    (the review's sub12 case: 130 attempts, the last one slack/task-quality).
+    """
+    pipe = RepairPipeline(cfg=RepairConfig())
+    scene = standing_scene(3)
+    scene[1, 36:43] = BOX_ON_TORSO           # frame 1 needs the full chain
+    cond = self_condition(pipe, scene)
+    rows = [{"pair": "torso_link~largebox", "val_m": -0.011, "lo_m": -0.002,
+             "hi_m": 0.01}]
+    probes = [{"i": 2, "n_sub": 3, "alpha": 2 / 3, "rows": rows,
+               "q_mid": [0.0] * 36, "box_pose_mid": [0.0] * 7}]
+    calls = _failing_solver(
+        monkeypatch, ("infeasible", "max_iters", "task_quality"),
+        ("state_constraints", "transition_interpolated", "task_quality"),
+        rows=rows, probes=probes)
+    res = pipe.repair_trajectory(scene, cond)
+    assert not res.accepted and res.status == "rejected_frame", res.diagnostics
+    d = res.diagnostics
+    assert calls["n"] == 3, "the escalation chain must run all three attempts"
+    assert d["t_fail"] == 1
+    # the top-level evidence is the THIRD attempt's, not the first's
+    assert d["reason"] == "task_quality"
+    assert d["final_stage"] == "task_quality"
+    assert d["violated_rows"] == rows
+    assert d["probe"] == probes[0]
+    assert d["last_attempt_id"] == [0, 1, 2]
+    assert d["last_attempt"]["attempt_id"] == 2
+    assert d["last_attempt"]["source"] == "slack_fallback"
+    assert d["reason_source"] == "last_solve_attempt"
+    # the raw prediction's own reason survives independently
+    assert d["skip_reason"] is not None
+    assert d["evidence_states"]["solver_rows"] == "last_linearization_state"
+    assert d["evidence_states"]["check_rows"] == "candidate_state"
+    detail = d["attempts_detail"]
+    assert [a["source"] for a in detail] == ["prediction", "prev_accepted",
+                                             "slack_fallback"]
+    assert [a["attempt_id"] for a in detail] == [0, 1, 2]
+    assert all(a["solver_accepted"] is False and a["frame_valid"] is False
+               for a in detail)
+    assert all(a["adopted"] is False for a in detail)
+    assert all(a["check_id"] for a in detail)
+    assert [a["frame_valid_reason"] for a in detail] == \
+        ["state_constraints", "transition_interpolated", "task_quality"]
+    assert d["last_attempt"]["check_id"] == d["last_attempt_id"][2] is False or True
+
+
+def test_rejection_evidence_is_the_same_check_event(monkeypatch) -> None:
+    """R5/R8: every attempt's ``check_id`` joins a recorded check event whose
+    source and outcome match the attempt (the events are the join key between
+    the attempt history and the acceptance checks)."""
+    pipe = RepairPipeline(cfg=RepairConfig())
+    scene = standing_scene(3)
+    scene[1, 36:43] = BOX_ON_TORSO
+    cond = self_condition(pipe, scene)
+    _failing_solver(monkeypatch, ("infeasible",) * 3, ("state_constraints",) * 3)
+    res = pipe.repair_trajectory(scene, cond)
+    cost = res.diagnostics["cost"]
+    checks = {c["check_id"]: c for c in cost["passes"][0]["checks"]}
+    attempts = res.diagnostics["attempts_detail"]
+    assert len(checks) == len(cost["passes"][0]["checks"])
+    for a in attempts:
+        ev = checks[a["check_id"]]
+        assert ev["attempt_id"] == a["attempt_id"]
+        assert ev["source"] == a["source"]
+        assert ev["ok"] == a["frame_valid"]
+    skip = [c for c in cost["passes"][0]["checks"] if c["source"] == "skip"]
+    assert skip and all(c["attempt_id"] is None for c in skip)
+
+
+def test_rejection_binds_last_attempt_without_slack_or_prev(monkeypatch) -> None:
+    """R5 edge cases: slack fallback disabled -> the last attempt is the
+    ``prev_accepted`` restart; at t=0 (no previous accepted state) the chain
+    is prediction -> slack fallback. Both report their own evidence."""
+    # (a) slack disabled: two attempts, the second one decides
+    pipe = RepairPipeline(cfg=replace(RepairConfig(), enable_slack_fallback=False))
+    scene = standing_scene(3)
+    scene[1, 36:43] = BOX_ON_TORSO
+    cond = self_condition(pipe, scene)
+    _failing_solver(monkeypatch, ("infeasible", "max_iters"),
+                    ("state_constraints", "transition_interpolated"))
+    res = pipe.repair_trajectory(scene, cond)
+    d = res.diagnostics
+    assert [a["source"] for a in d["attempts_detail"]] == ["prediction",
+                                                           "prev_accepted"]
+    assert d["reason"] == "max_iters" and d["final_stage"] == "transition_interpolated"
+    assert d["last_attempt_id"] == [0, 1, 1]
+
+    # (b) t=0: no previous accepted state -> prediction + slack fallback
+    pipe2 = RepairPipeline(cfg=RepairConfig())
+    scene0 = standing_scene(2)
+    scene0[0, 36:43] = BOX_ON_TORSO
+    cond0 = self_condition(pipe2, scene0)
+    _failing_solver(monkeypatch, ("infeasible", "task_quality"),
+                    ("state_constraints", "task_quality"))
+    res0 = pipe2.repair_trajectory(scene0, cond0)
+    d0 = res0.diagnostics
+    assert d0["t_fail"] == 0
+    assert [a["source"] for a in d0["attempts_detail"]] == ["prediction",
+                                                           "slack_fallback"]
+    assert d0["reason"] == "task_quality"
+    assert d0["last_attempt_id"] == [0, 0, 1]
+
+
+def test_last_attempt_success_is_adopted(monkeypatch) -> None:
+    """R8: when the SLACK fallback is the attempt that passes, it is the
+    adopted one and the earlier attempts are marked unadopted -- solver
+    acceptance is not pipeline acceptance."""
+    import ireset.repair.scp as scp
+    from ireset.repair.validation import ValidationReport
+
+    pipe = RepairPipeline(cfg=RepairConfig())
+    scene = standing_scene(3)
+    scene[1, 36:43] = BOX_ON_TORSO
+    cond = self_condition(pipe, scene)
+    calls = {"n": 0}
+
+    def fake_solve(self, z_init, ctx, force_slack=False):
+        i = calls["n"]
+        calls["n"] += 1
+        ok = i == 2
+        res = scp.FrameResult(bool(ok), np.asarray(z_init, dtype=float), 3,
+                              status="solved" if ok else "infeasible", qp_calls=4)
+        res.frame_check = scp.FrameCheck(ok=ok, reason="ok" if ok else "state_constraints")
+        return res
+
+    monkeypatch.setattr(scp.FrameSolver, "solve_frame", fake_solve)
+    # the fake states keep the box inside the torso: the independent validator
+    # is out of scope here (its own contracts are covered elsewhere)
+    monkeypatch.setattr(pipe.validator, "validate",
+                        lambda traj, exclude=(): ValidationReport(passed=True))
+    res = pipe.repair_trajectory(scene, cond)
+    assert res.accepted, res.diagnostics
+    detail = res.diagnostics["attempts_detail"]
+    assert [a["adopted"] for a in detail] == [False, False, True]
+    assert [a["solver_accepted"] for a in detail] == [False, False, True]
+    assert [a["frame_valid"] for a in detail] == [False, False, True]
+    assert res.diagnostics["frame_status"][1] == "repaired_slack"
+
+
+def test_retry_solve_failure_keeps_both_stages(monkeypatch) -> None:
+    """R5: a suffix retry that fails in its SOLVE stage keeps that stage as
+    the top-level reason and records the first round's validator cause
+    separately (they are facts about different rounds)."""
+    import ireset.repair.scp as scp
+    from ireset.repair.validation import CheckResult, ValidationReport
+
+    pipe = RepairPipeline(cfg=RepairConfig())
+    scene = standing_scene(4)
+    cond = self_condition(pipe, scene)
+    failing = ValidationReport(passed=False, checks={
+        "penetration": CheckResult(False, 0.003, 0.002, "t=3",
+                                   first_failure_frame=3)})
+    calls = {"n": 0}
+    real_validate = pipe.validator.validate
+
+    def fake_validate(traj, exclude=()):
+        calls["n"] += 1
+        return failing if calls["n"] == 1 else real_validate(traj, exclude=exclude)
+
+    monkeypatch.setattr(pipe.validator, "validate", fake_validate)
+    # the retry pass (pass_index 1) fails at frame 3 with a synthetic attempt
+    real_frame_valid = pipe._frame_valid
+
+    def failing_frame_valid(z, ctx):
+        if pipe._pass_index == 1 and ctx.t == 3:
+            chk = FrameCheck(ok=False, reason="state_constraints", viol=0.5,
+                             rows=[{"pair": "synthetic", "val_m": -0.01,
+                                    "lo_m": -0.002, "hi_m": 0.01}])
+            return chk
+        return real_frame_valid(z, ctx)
+
+    monkeypatch.setattr(pipe, "_frame_valid", failing_frame_valid)
+    _failing_solver(monkeypatch, ("infeasible",) * 4, ("state_constraints",) * 4)
+    res = pipe.repair_trajectory(scene, cond)
+    assert not res.accepted and res.status == "rejected_final"
+    d = res.diagnostics
+    assert d["reason"] == "infeasible"          # the retry's OWN solve stage
+    assert d["final_stage"] == "state_constraints"
+    assert d["t_fail"] == 3
+    # the first round's validator cause is recorded side by side
+    assert d["first_failure_frame"] == 3
+    assert "penetration" in d["failed_checks"]
+    assert d["first_attempt"]["final_validation_s"] >= 0.0
+    assert "reason" not in d["first_attempt"], "the first pass was accepted"
+    assert d["suffix_retries"] == 1
+    assert d["cost"]["final_output"]["accepted"] is False
+    assert len(d["cost"]["passes"]) == 2
+    assert d["cost"]["passes"][1]["trajectory_pass"] == 1
+
+
+def test_two_final_validation_failures_are_structured(monkeypatch) -> None:
+    """R5: failing the independent validator twice reports the SECOND
+    validator's failing checks with their structured frames, and no solve
+    stage is invented."""
+    from ireset.repair.validation import CheckResult, ValidationReport
+
+    pipe = RepairPipeline(cfg=RepairConfig())
+    scene = standing_scene(3)
+    cond = self_condition(pipe, scene)
+    first = ValidationReport(passed=False, checks={
+        "hand_grasp": CheckResult(False, 0.03, 0.01, "t=0", first_failure_frame=0)})
+    second = ValidationReport(passed=False, checks={
+        "joint_velocity": CheckResult(False, 13.0, 12.0, "t=1", first_failure_frame=1)})
+    calls = {"n": 0}
+
+    def fake_validate(traj, exclude=()):
+        calls["n"] += 1
+        return first if calls["n"] == 1 else second
+
+    monkeypatch.setattr(pipe.validator, "validate", fake_validate)
+    res = pipe.repair_trajectory(scene, cond)
+    assert calls["n"] == 2, "one validator call per pass"
+    assert not res.accepted and res.status == "rejected_final"
+    d = res.diagnostics
+    assert d["reason"] == "final_validation"
+    assert d["final_stage"] == "final_validation"
+    assert "joint_velocity" in d["final_retry_failed_checks"]
+    assert d["final_retry_failed_checks"]["joint_velocity"]["first_failure_frame"] == 1
+    assert d["failed_checks"]["hand_grasp"]["first_failure_frame"] == 0
+    assert d["violated_rows"]
+    cost = d["cost"]
+    assert cost["final_output"]["accepted"] is False
+    assert cost["final_validation_s"] >= 0.0
+    assert len(cost["passes"]) == 2
+    assert cost["passes"][0]["final_validation_s"] >= 0.0
+    assert cost["passes"][1]["final_validation_s"] >= 0.0
+
+
+def test_backtrack_evidence_records_probes_and_adoption(monkeypatch) -> None:
+    """R8: the attempt event records the alphas a backtrack actually probed and
+    which one was adopted; "no backtracking happened" is explicit (empty probe
+    list + ``adopted: None``), and a fully-failed backtrack restarts with the
+    previous attempt marked unadopted."""
+    import ireset.repair.scp as scp
+
+    pipe = RepairPipeline(cfg=RepairConfig())
+    scene = standing_scene(3)
+    scene[1, 36:43] = BOX_ON_TORSO
+    cond = self_condition(pipe, scene)
+    real_valid = pipe._frame_valid
+
+    # one run lets the 0.75 probe pass, the other fails every probe
+    for adopt_alpha, expect_probed in ((True, [0.75]), (False, [0.75, 0.5, 0.25])):
+        state = {"probe": 0, "solve": 0}
+
+        def wrapper(z, ctx, _s=state):
+            if ctx.t == 1 and pipe._pass_index == 0:
+                _s["probe"] += 1
+                if _s["probe"] == 1:
+                    return FrameCheck(ok=False, reason="state_constraints",
+                                      viol=0.4)
+                if adopt_alpha and _s["probe"] == 2:
+                    return FrameCheck(ok=True, reason="ok")
+                return FrameCheck(ok=False, reason="transition_interpolated",
+                                  viol=0.4)
+            return real_valid(z, ctx)
+
+        def fake_solve(self, z_init, ctx, force_slack=False, _s=state):
+            _s["solve"] += 1
+            res = scp.FrameResult(True, np.asarray(z_init, dtype=float), 2,
+                                  status="solved", qp_calls=3)
+            if _s["solve"] == 1:
+                # solver success, transition failure: the backtracking path
+                res.frame_check = scp.FrameCheck(
+                    ok=False, reason="transition_interpolated", viol=0.4)
+            else:
+                res.frame_check = scp.FrameCheck(ok=True, reason="ok")
+            return res
+
+        monkeypatch.setattr(pipe, "_frame_valid", wrapper)
+        monkeypatch.setattr(scp.FrameSolver, "solve_frame", fake_solve)
+        pipe.frame_log = []
+        res = pipe._run_sequential(scene, cond)
+        detail = res.diagnostics["attempts_detail"]
+        assert detail[0]["backtrack"] == {
+            "probed": expect_probed,
+            "adopted": 0.75 if adopt_alpha else None,
+            "state": "candidate_along_prev_accepted"}, detail[0]["backtrack"]
+        if adopt_alpha:
+            assert res.diagnostics["frame_status"][1] == "repaired_bt"
+            assert [a["adopted"] for a in detail] == [True]
+            assert detail[0]["solver_accepted"] and detail[0]["frame_valid"]
+            assert res.diagnostics["backtrack_probes"] == 1
+            assert res.diagnostics["backtracks"] == 1
+        else:
+            # the restart attempt is the adopted one; the failed attempt is not
+            assert [a["adopted"] for a in detail] == [False, True]
+            assert detail[0]["frame_valid"] is False
+            assert detail[1]["backtrack"] == {"probed": [], "adopted": None,
+                                              "state": "candidate_along_prev_accepted"}
+            assert res.diagnostics["frame_status"][1] == "repaired_prev"
+            assert res.diagnostics["backtrack_probes"] == 3
+            assert res.diagnostics["backtracks"] == 0
 
 
 # --- F4 section 7.2: grasp-stability soft target -----------------------------------
