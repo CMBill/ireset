@@ -45,7 +45,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import numpy as np
 
-from closed_loop_metrics import git_rev
+from closed_loop_metrics import git_rev, sha256
+from experiment_provenance import (
+    THREAD_ENV_VARS,
+    asset_hashes,
+    config_unchanged,
+    dirty_evidence,
+    effective_record,
+    git_state,
+)
 from experiment_provenance import provenance as provenance_snapshot
 from ireset.embodied.contact_sites import infer_reference_schedule
 from ireset.paths import DERIVED_DATA_DIR, PROJECT_ROOT, TEACHER_TRAJ_DIR
@@ -144,14 +152,26 @@ def hand_recall(validator: IndependentValidator, traj: np.ndarray,
     return out
 
 
-def task_mpjpe_stats(ev, traj: np.ndarray, cond: ReferenceCondition) -> dict:
-    vals = []
+def task_mpjpe_series(ev, traj: np.ndarray, cond: ReferenceCondition) -> np.ndarray:
+    """Per-frame world-frame task MPJPE (robot keypoints vs reference human).
+
+    THE shared series: every MPJPE statistic (percentiles, quintile growth)
+    must be derived from this one array -- the growth field used to read the
+    evaluator's LAST forward for every frame (R4: -0.2242 m reported instead
+    of ~-0.0030 m). One FK forward per frame, the evaluator is left at the
+    last frame's state.
+    """
+    vals = np.empty(traj.shape[0], dtype=float)
     for t in range(traj.shape[0]):
         ev.forward(traj[t, 0:36], traj[t, 36:43])
         kpt_w = ev.site_positions(ev.kpt_ids)
-        vals.append(float(np.linalg.norm(kpt_w - cond.human_kpts_world[t][KPT_IDX],
-                                         axis=-1).mean()))
-    v = np.array(vals)
+        vals[t] = float(np.linalg.norm(kpt_w - cond.human_kpts_world[t][KPT_IDX],
+                                       axis=-1).mean())
+    return vals
+
+
+def task_mpjpe_stats(ev, traj: np.ndarray, cond: ReferenceCondition) -> dict:
+    v = task_mpjpe_series(ev, traj, cond)
     return {"p50": round(float(np.percentile(v, 50)), 4),
             "p95": round(float(np.percentile(v, 95)), 4),
             "max": round(float(v.max()), 4)}
@@ -244,47 +264,78 @@ def main() -> None:
     pipe.validator.cfg = vcfg
     pipe.verbose = args.verbose
     validator = IndependentValidator(cfg=vcfg)
+    if asdict(validator.cfg) != asdict(pipe.validator.cfg):
+        # the screening validator and the pipeline's interpolation config MUST
+        # agree: a divergence would screen with different gates than the run
+        # reports (R9)
+        raise ValueError("screening validator config differs from the pipeline's")
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    # R9: the EFFECTIVE configuration of THIS instance (after every CLI/YAML
+    # override, before the first solve), the frozen code/input/asset/lock/
+    # thread state, and -- on a dirty tree -- the real patch plus the content
+    # of untracked/modified code files. A default config or a diff hash alone
+    # must never stand in for what the run actually used.
+    effective = effective_record(
+        pipe.cfg, pipe.validator.cfg, argv=sys.argv, mode=args.mode,
+        validation_mode=args.validation_mode, demos=demos, frames=args.frames,
+        note=args.note, task_gate_yaml=args.task_gate_yaml,
+        screening={"min_hand_recall": args.min_hand_recall,
+                   "min_ref_frames": args.min_ref_frames,
+                   "verbose": bool(args.verbose)})
+    freeze = {
+        "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "git": git_state(),
+        "dirty": dirty_evidence(out_dir),
+        "assets": asset_hashes(),
+        "uv_lock_sha256": sha256(PROJECT_ROOT / "uv.lock"),
+        "thread_env": {k: os.environ.get(k) for k in THREAD_ENV_VARS},
+        "probe_cfg_wired": pipe.solver.probe_cfg is not None,
+    }
     rows = []
     n_keep = 0
     for demo in demos:
+        t_segment = time.perf_counter()
+        t_pre = time.perf_counter()
         src = TEACHER_TRAJ_DIR / f"{demo}_original.npz"
         scene, human, fps = load_teacher_npz(src)
         if args.frames:
             scene, human = scene[: args.frames], human[: args.frames]
         cond = ReferenceCondition(human, scene[:, 36:43],
                                   infer_reference_schedule(human, scene[:, 36:43]))
+        preprocess_s = time.perf_counter() - t_pre
         t0 = time.perf_counter()
         res = pipe.repair_trajectory(scene, cond)
         wall = time.perf_counter() - t0
         # stage 0 (2026-09-16): the old ms_per_frame divided the WHOLE wall
         # time by the FULL clip length -- an early rejection amortized its
-        # per-frame cost over frames never processed. Report per PROCESSED
-        # frame (pipeline's own timings_s includes every attempt), the raw
-        # length-normalized value, and both total timings
-        frame_stats = res.diagnostics.get("timings_s", [])
-        n_processed = max(len(frame_stats), res.diagnostics.get("t_fail", -1) + 1
-                          if res.diagnostics.get("t_fail") is not None else len(frame_stats))
-        ms_frame_stats = np.asarray(frame_stats, dtype=float) * 1e3
+        # per-frame cost over frames never processed. The per-visit statistics
+        # below come from the run-level cost view: all passes merged, from the
+        # unrounded series, never by averaging per-pass percentiles (R6). The
+        # final pass alone was the old (documented) semantics.
+        cost = res.diagnostics.get("cost") or {}
+        ms = cost.get("per_visit_ms") or {}
+        final_pass = next((p for p in cost.get("passes", [])
+                           if p["trajectory_pass"] == res.diagnostics.get(
+                               "trajectory_pass")), None)
+        n_processed = (final_pass or {}).get("processed_frame_visits", 0)
         row = {"demo": demo, "T": int(scene.shape[0]), "fps": fps,
                "accepted": bool(res.accepted), "status": res.status,
                "wall_s": round(wall, 2),
                "n_frames_processed": int(n_processed),
-               "ms_per_processed_frame": (
-                   round(float(ms_frame_stats.mean()), 1) if ms_frame_stats.size else None),
-               "ms_per_processed_frame_p50": (
-                   round(float(np.percentile(ms_frame_stats, 50)), 1)
-                   if ms_frame_stats.size else None),
-               "ms_per_processed_frame_p95": (
-                   round(float(np.percentile(ms_frame_stats, 95)), 1)
-                   if ms_frame_stats.size else None),
-               "ms_per_processed_frame_max": (
-                   round(float(ms_frame_stats.max()), 1) if ms_frame_stats.size else None),
-               "solve_frames_s": round(float(sum(frame_stats)), 3),
+               "ms_per_processed_frame": ms.get("mean_ms"),
+               "ms_per_processed_frame_p50": ms.get("p50_ms"),
+               "ms_per_processed_frame_p95": ms.get("p95_ms"),
+               "ms_per_processed_frame_max": ms.get("max_ms"),
+               "solve_frames_s": cost.get("solve_s"),
                "final_validation_s": res.diagnostics.get("final_validation_s"),
                "total_s": res.diagnostics.get("total_s"),
+               # nested timing relations (never summed again by the reader):
+               # total_s (repair call, incl. final validation) <= segment_wall_s
+               # (adds preprocessing, screening, quality stats and output)
+               "preprocess_s": round(preprocess_s, 3),
+               "segment_wall_s": None,          # filled after screening/output
                # length-normalized legacy metric (kept for comparability; NOT
                # a per-frame cost for early-rejected segments)
                "ms_per_input_frame": round(wall * 1e3 / scene.shape[0], 1),
@@ -293,21 +344,27 @@ def main() -> None:
                "final_stage": res.diagnostics.get("final_stage"),
                "fallbacks": res.diagnostics.get("fallbacks"),
                "slack_frames": res.diagnostics.get("slack_frames"),
-               # F0 aggregate over ALL attempts of this pass (a suffix retry
-               # never overwrites the first pass; its costs live under
-               # "first_attempt"): attempts/qp/iterations/slack/backtrack and
-               # processed-frame visits vs unique frames vs input frames
-               "cost": {k: res.diagnostics.get(k) for k in (
+               # R6: the run-level TOTAL view (schema 2, every trajectory pass)
+               # plus the per-pass event paths. The flat fields below describe
+               # the FINAL pass only -- a reader must not add them to `cost`.
+               "cost": cost,
+               "cost_legacy_final_pass": {k: res.diagnostics.get(k) for k in (
                    "attempts", "qp_calls_total", "iterations_total",
-                   "slack_attempts", "backtracks", "processed_frame_visits",
+                   "slack_attempts", "backtracks", "backtrack_probes",
+                   "checks_total", "processed_frame_visits",
                    "unique_processed_frames", "input_frames", "skipped_frames",
-                   "suffix_retries", "trajectory_pass")},
-               "screening_s": None}
+                   "adopted_frames", "trajectory_pass")},
+               "screening_s": None,
+               "hand_recall_s": None,
+               "quality_stats_s": None,
+               "output_s": None}
         if not res.accepted:
             row["rejection"] = {
                 "reason": res.diagnostics.get("reason"),
                 "reason_source": res.diagnostics.get("reason_source"),
                 "last_attempt": res.diagnostics.get("last_attempt"),
+                "last_attempt_id": res.diagnostics.get("last_attempt_id"),
+                "last_check_id": res.diagnostics.get("last_check_id"),
                 "violated_rows": res.diagnostics.get("violated_rows"),
                 "probe": res.diagnostics.get("probe"),
             }
@@ -340,9 +397,12 @@ def main() -> None:
             traj = res.trajectory
             t_screen = time.perf_counter()
             cov = hand_recall(validator, traj, cond)
-            row["screening_s"] = round(time.perf_counter() - t_screen, 3)
+            row["hand_recall_s"] = round(time.perf_counter() - t_screen, 3)
+            row["screening_s"] = row["hand_recall_s"]
             row["hand"] = cov
+            t_quality = time.perf_counter()
             row["task_mpjpe"] = task_mpjpe_stats(pipe.ev, traj, cond)
+            row["quality_stats_s"] = round(time.perf_counter() - t_quality, 3)
             recalls = [cov[f"{s}_hand_contact_recall"] for s in ("left", "right")
                        if cov[f"{s}_hand_ref_frames"] >= args.min_ref_frames]
             screened = all(r is None or r >= args.min_hand_recall for r in recalls) \
@@ -352,10 +412,13 @@ def main() -> None:
                                   "no_reference_grasp" if not grasping else "fail")
             keep = cov["validator_passed"] and screened and grasping
             if keep and args.mode == "regen":
+                t_out = time.perf_counter()
                 np.savez(out_dir / f"{demo}.npz",
                          qpos=to_teacher_layout(traj),
                          human_joints=human, fps=fps)
+                row["output_s"] = round(time.perf_counter() - t_out, 3)
                 n_keep += 1
+        row["segment_wall_s"] = round(time.perf_counter() - t_segment, 3)
         rows.append(row)
         print(f"[{demo}] accepted={row['accepted']} keep={keep} "
               f"hand={row.get('hand', {}).get('intervals', '-')} "
@@ -375,7 +438,19 @@ def main() -> None:
     # report must be reproducible without /tmp probes -- exact revision and
     # dirty-diff hash, input NPZ hashes, asset hashes, effective configs
     prov = provenance_snapshot(demos, note=f"{args.set}/{args.validation_mode}/{args.mode}")
+    end = {
+        "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "git": git_state(),
+        "config_unchanged": config_unchanged(effective, pipe.cfg, pipe.validator.cfg),
+    }
+    # a code change DURING the run is flagged, never silently absorbed into
+    # the reported revision (R9); a dirty START is recorded with its patch
+    end["code_changed_during_run"] = (
+        end["git"]["rev"] != freeze["git"]["rev"]
+        or end["git"]["status_sha256"] != freeze["git"]["status_sha256"]
+        or end["git"]["diff_sha256"] != freeze["git"]["diff_sha256"])
     report = {
+        "schema": 2,
         "set": args.set, "n_demos": len(demos), "n_kept": n_keep,
         "mode": args.mode,
         "validation_mode": args.validation_mode,
@@ -385,9 +460,32 @@ def main() -> None:
         "source_dir": str(TEACHER_TRAJ_DIR),
         "git_rev": git_rev(),
         "notes": args.note,
+        # R9: what THIS instance actually ran with, and what was frozen
+        "effective": effective,
+        "freeze": freeze,
+        "end": end,
+        # loader-default snapshot (never the effective parameters of this run)
         "provenance": {k: prov[k] for k in
-                       ("git", "configs", "assets", "env", "uv_lock_sha256")},
+                       ("kind", "git", "configs", "assets", "env",
+                        "uv_lock_sha256")},
         "inputs": prov.get("inputs"),
+        "field_notes": {
+            "schema": "2 = per-row cost view over EVERY trajectory pass",
+            "cost": "totals over all passes; recomputable from cost.passes[*]"
+                    ".attempts_detail / .checks; do NOT add the nested "
+                    "first_attempt block to these totals",
+            "cost_legacy_final_pass": "flat counters of the FINAL pass only "
+                                      "(pre-schema-2 semantics)",
+            "cost.solve_s": "sum of per-visit frame processing over all passes",
+            "cost.final_validation_s": "sum of independent validator calls; "
+                                       "contained in wall_s, not additional",
+            "total_s": "repair call wall time incl. final validation",
+            "segment_wall_s": "total_s plus preprocessing, screening, quality "
+                              "statistics and output",
+            "ms_per_processed_frame_p95": "percentile of the MERGED per-visit "
+                                          "series over all passes (not an "
+                                          "average of per-pass percentiles)",
+        },
         "rows": rows,
     }
     report_path = Path(args.report) if args.report else (

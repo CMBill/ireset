@@ -37,7 +37,7 @@ from ireset.repair.config_io import MODES, load_mode_configs
 from ireset.repair.constraints import FrameEvaluator
 from ireset.repair.context import ReferenceCondition, RepairConfig
 from ireset.repair.validation import IndependentValidator
-from regenerate_teachers import hand_recall, task_mpjpe_stats
+from regenerate_teachers import hand_recall, task_mpjpe_series, task_mpjpe_stats
 from ireset.repair.pipeline import KPT_IDX
 
 
@@ -117,11 +117,16 @@ def side_metrics(vcfg, traj: np.ndarray, cond: ReferenceCondition,
 
 
 def mpjpe_growth(ev, traj: np.ndarray, cond: ReferenceCondition) -> dict:
-    vals = np.array([
-        float(np.linalg.norm(ev.site_positions(ev.kpt_ids)
-                             - cond.human_kpts_world[t][KPT_IDX], axis=-1).mean())
-        for t in range(traj.shape[0])
-    ])
+    """Growth of the task MPJPE over the clip, from the SHARED per-frame series.
+
+    R4: the evaluator must be forwarded per frame -- reading
+    ``site_positions`` in a loop without forwarding reports the LAST state's
+    error for every t (sub10 reported growth -0.2242 m instead of -0.0030 m).
+    Definition unchanged (world frame, the same keypoint map and units); the
+    first/last quintile sampling is the historical one, and a clip shorter
+    than 5 frames has ``k = 1`` (growth of a single frame is 0 by definition).
+    """
+    vals = task_mpjpe_series(ev, traj, cond)
     n = vals.size
     k = max(1, n // 5)
     return {"p50": round(float(np.percentile(vals, 50)), 4),

@@ -1,10 +1,21 @@
-"""Experiment provenance snapshot (m2_m3_stage_gate_fix_plan sections 3/10).
+"""Experiment provenance snapshot (m2_m3_stage_gate_fix_plan sections 3/10,
+extended by the review-fix plan section 5.2 / R9).
 
 A run's report must be reproducible and comparable without /tmp probes:
 this module records the exact code revision (plus a hash of any dirty-tree
-diff), the effective strict/relaxed configs, input and asset hashes, the
-dependency lock, thread-limit environment and the number of parallel
-workers a run used.
+diff AND the content of files git does not track), the effective configs of
+the RUNNING instance, input and asset hashes, the dependency lock, thread
+limits and the number of parallel workers a run used.
+
+Two different things are deliberately separated (R9):
+
+- ``provenance()`` -- a standalone SNAPSHOT (CLI): it declares the configs
+  that would be loaded for the registered demos. It never claims to be some
+  experiment's effective parameters, because no instance exists.
+- ``effective_record()`` -- the effective configuration of ONE run instance,
+  captured AFTER all CLI/YAML overrides and BEFORE the first solve, with the
+  default dataclasses recorded separately (a default must never masquerade
+  as an effective value).
 
 CLI: write a standalone snapshot JSON for a registered demo set.
 """
@@ -16,8 +27,10 @@ import hashlib
 import json
 import os
 import platform
+import shutil
 import subprocess
 import sys
+import time
 from dataclasses import asdict
 from pathlib import Path
 
@@ -27,9 +40,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from closed_loop_metrics import git_rev, sha256  # noqa: E402
 from ireset.paths import DERIVED_ROBOTS_DIR, PROJECT_ROOT, TEACHER_TRAJ_DIR  # noqa: E402
 from ireset.repair.config_io import MODES, load_mode_configs  # noqa: E402
+from ireset.repair.context import RepairConfig  # noqa: E402
+from ireset.repair.validation import ValidationConfig  # noqa: E402
 
 THREAD_ENV_VARS = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
                    "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS")
+
+#: directories whose untracked/modified contents must be recoverable from a
+#: dirty-run record (code that can change behaviour)
+_CODE_DIRS = ("src/", "scripts/", "configs/", "tests/")
 
 
 def _sha16(text: str) -> str:
@@ -41,6 +60,31 @@ def _git(*args: str) -> str:
                           cwd=PROJECT_ROOT).stdout
 
 
+def canonical_json(obj) -> str:
+    """Deterministic JSON (sorted keys, compact) for hashing configs."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def config_sha256(*cfgs) -> str:
+    """Hash of a tuple of effective configs (field-by-field, canonical)."""
+    return hashlib.sha256(
+        canonical_json([asdict(c) for c in cfgs]).encode()).hexdigest()[:16]
+
+
+def config_roundtrip(cfg):
+    """``asdict -> JSON -> constructor`` round-trip of an effective config.
+
+    An exported config that cannot be reconstructed is not a usable record;
+    this raises instead of silently writing a lossy snapshot (R9 regression).
+    """
+    payload = json.loads(json.dumps(asdict(cfg)))
+    back = type(cfg)(**payload)
+    if back != cfg:
+        raise ValueError(f"config round-trip mismatch for {type(cfg).__name__}: "
+                         f"{payload}")
+    return back
+
+
 def git_state() -> dict:
     status = _git("status", "--porcelain")
     return {
@@ -49,6 +93,87 @@ def git_state() -> dict:
         "status_sha256": _sha16(status),
         "diff_sha256": _sha16(_git("diff", "HEAD")),
     }
+
+
+def effective_record(rcfg, vcfg, *, argv, mode: str, validation_mode: str,
+                     demos: list[str], frames: int, note: str | None = None,
+                     task_gate_yaml: str | None = None,
+                     screening: dict | None = None) -> dict:
+    """Effective configuration of ONE run instance, after every override.
+
+    Round-trips both configs through JSON before exporting them, records the
+    task-gate YAML path AND hash, and keeps the default dataclasses under
+    explicit ``default_*`` keys plus an ``is_default_*`` flag -- a default
+    value must never be presented as the instance's effective parameter (R9).
+    """
+    config_roundtrip(rcfg)
+    config_roundtrip(vcfg)
+    gate_path = Path(task_gate_yaml) if task_gate_yaml else None
+    rec = {
+        "argv": [str(a) for a in argv],
+        "mode": mode,
+        "validation_mode": validation_mode,
+        "demos": list(demos),
+        "frames": int(frames),
+        "note": note,
+        "screening": dict(screening or {}),
+        "task_gate_yaml": None if gate_path is None else str(gate_path),
+        "task_gate_yaml_sha256": (None if gate_path is None or not gate_path.exists()
+                                  else sha256(gate_path)),
+        "task_mpjpe_tol_m": float(rcfg.task_mpjpe_tol_m),
+        "effective_repair_config": asdict(rcfg),
+        "effective_validation_config": asdict(vcfg),
+        "effective_config_sha256": config_sha256(rcfg, vcfg),
+        "default_repair_config": asdict(RepairConfig()),
+        "default_validation_config": asdict(ValidationConfig()),
+        "is_default_repair_config": RepairConfig() == rcfg,
+        "is_default_validation_config": ValidationConfig() == vcfg,
+    }
+    return rec
+
+
+def config_unchanged(rec: dict, rcfg, vcfg) -> bool:
+    """True when the running configs still equal the record's effective ones.
+
+    Called at the END of a run: a parameter mutated mid-run must be flagged,
+    not silently reported as the startup value (R9).
+    """
+    return (asdict(rcfg) == rec["effective_repair_config"]
+            and asdict(vcfg) == rec["effective_validation_config"])
+
+
+def dirty_evidence(out_dir: Path) -> dict:
+    """Persist what a dirty working tree ACTUALLY contains (R9).
+
+    A diff hash alone cannot reconstruct the run: the tracked diff is written
+    as a real patch and every untracked/modified file under the code
+    directories is copied into ``<out_dir>/dirty_files/`` with its sha256. A
+    clean tree records ``dirty: false`` and nothing else.
+    """
+    status = _git("status", "--porcelain")
+    out = {"dirty": bool(status.strip()), "status": status,
+           "diff_sha256": _sha16(_git("diff", "HEAD")), "files": []}
+    if not out["dirty"]:
+        return out
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    patch = out_dir / f"dirty_diff_{stamp}.patch"
+    patch.write_text(_git("diff", "HEAD"))
+    out["patch_path"] = str(patch)
+    out["patch_sha256"] = sha256(patch)
+    copy_root = out_dir / "dirty_files"
+    for line in status.splitlines():
+        code, _, rel = line[:2], line[2:3], line[3:].strip()
+        if not rel.startswith(_CODE_DIRS) or code.strip() == "D":
+            continue
+        src = PROJECT_ROOT / rel
+        if not src.is_file():
+            continue
+        dst = copy_root / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        out["files"].append({"path": rel, "status": code.strip(),
+                             "sha256": sha256(src), "copy": str(dst)})
+    return out
 
 
 def effective_configs() -> dict:
@@ -105,7 +230,16 @@ def env_snapshot() -> dict:
 
 
 def provenance(demos: list[str] | None = None, note: str | None = None) -> dict:
-    out = {"note": note, "git": git_state(), "configs": effective_configs(),
+    """Standalone SNAPSHOT for a demo set (no running instance).
+
+    ``configs`` here are the configs that WOULD be loaded for the requested
+    modes -- a snapshot of the loaders, NOT the effective parameters of an
+    experiment. Run reports must use :func:`effective_record` instead (R9);
+    the ``kind`` field makes the distinction machine-readable.
+    """
+    out = {"kind": "snapshot", "note": note, "git": git_state(),
+           "configs": effective_configs(),
+           "configs_are_loader_defaults_not_effective": True,
            "assets": asset_hashes(), "env": env_snapshot(),
            "uv_lock_sha256": sha256(PROJECT_ROOT / "uv.lock")}
     if demos:
