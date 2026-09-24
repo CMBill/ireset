@@ -1,5 +1,7 @@
 # P0 审阅修复(F1–F4)验证记录
 
+> **订正指针(2026-09-24)**:本文的 strict 6/6、relaxed 22/24、任务门 0.113 等数字为 P0-fix 版本的历史结果;`skip_reason`/最后失败归因、运行级成本与安静/verbose 成本口径受 2026-09-23 审阅 R5/R6/R8 影响,已由[实现审阅修复验证记录](m2_m3_stage_gate_review_fix_verification.md)替代。relaxed 产物仍不计入 §10.1,阈值未改。
+
 日期:2026-09-14。依据 [p0_fix_plan.md](../plans/p0_fix_plan.md) 实施;本文记录四项修复的实现、回归测试与全部重测结果(阶段 A–I)。旧 P0 数字(strict 2/6、relaxed 4/6=66.7%、24 段 17/24=70.8%、P0.3 闭环 12.5–25%)全部降级为 **修复前实现的结果**,保留于 [p0_verification.md](p0_verification.md),不得与本文数字混用。relaxed 产物仍不计入 §10.1 达标。
 
 ## 1. 修复内容与代码位置

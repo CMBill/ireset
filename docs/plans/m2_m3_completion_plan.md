@@ -2,7 +2,9 @@
 
 日期:2026-09-16;审阅订正:2026-09-17;**阶段门修复实施:2026-09-22**。状态:**阶段 0/1 的正确性与诊断缺口已按[阶段门修复方案](m2_m3_stage_gate_fix_plan.md)修复(F0/F1/F2/F4 分项提交 `736f676`→`23bc211`);六段重测:regen 5/6 keep(sub12 拒绝)、标准模式 6/6 无撤回、认证底线达标;“每侧几何接近覆盖不低于 v3”2/12 项偏差未达标,按修复方案 §9 不自动转段,阶段 4-7 与 24/312 段仍未执行。** 详见[验证记录](../verification/m2_m3_stage_gate_fix_verification.md)。strict 容差不变;任务门保持 0.40 工作值;`calibration24_train_v1` 已冻结(train-only),旧 `p02_calibration` 保留作历史。M4 strict 闭环与最终测试不在本方案范围。
 
-**审阅订正优先于下文历史完成注释:**`skip_reason` 不能代表最终失败阶段,sub12/sub16 存在端点通过但插值碰撞;“教师 120mm/帧滑步”混用了求解候选运动量;回流 `regen` 类型污染、QP 跟踪尺度、best 返回复核及 verbose 副作用尚未正式修复。临时类别修正 3/6 不计入验收。旧 `p02_calibration` 实际为 19 train/2 val/3 test,进入阶段 5 前须冻结新的 train24 清单,不得沿用“旧清单 train-only”的声明。
+**最新补充(2026-09-24,已实施):**阶段门实现审阅确认的 9 项数值/缓存/诊断/报告缺陷已按[实现审阅修复方案](m2_m3_stage_gate_review_fix_plan.md)全部修复并分项提交(R1 `c8d266f`、R2 `b9fc080`、R3 `a22e775`、R5/R7/R8 `c991f6b`、R4/R9 `12c5741`、R5 补全 `9658b02`,165 项测试),历史受影响字段已重算。统一版本六段:Nq/Nv regen **5/6 keep**(sub12 恢复接受、sub7 转为终检速度 @t=101 拒绝,两轮同因)、Ns 标准模式 **6/6** 与旧标准逐段一致;“每侧几何接近覆盖不低于 v3”仍有 2 项偏差(sub10 右 −5.4 pp、sub8 右 −1.25 pp,与第十轮同值;S01/S10 证明与稳定权重无关),按方案 §8 保留新结果、**不自动进入 train24**,阶段 4-7 与 24/312 段仍未执行。详见[修复验证记录](../verification/m2_m3_stage_gate_review_fix_verification.md)。上段 5/6、6/6 保留为 2026-09-22 历史快照,其质量/成本字段表述以本轮结论为准。
+
+**2026-09-17 历史审阅订正(后续状态见上文):**`skip_reason` 不能代表最终失败阶段,sub12/sub16 存在端点通过但插值碰撞;“教师 120mm/帧滑步”混用了求解候选运动量;回流 `regen` 类型污染、QP 跟踪尺度、best 返回复核及 verbose 副作用当时尚未正式修复。临时类别修正 3/6 不计入验收。旧 `p02_calibration` 实际为 19 train/2 val/3 test,进入阶段 5 前须冻结新的 train24 清单,不得沿用“旧清单 train-only”的声明。
 
 主方案:[interaction_retarget_impl_plan.md](interaction_retarget_impl_plan.md) §8-10(M4 闭环测试不在本方案范围)。
 前序:[教师重生成鲁棒性方案](teacher_regen_robustness_plan.md)及其[验证记录](../verification/teacher_regen_robustness_verification.md)。

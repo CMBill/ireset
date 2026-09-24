@@ -1,5 +1,7 @@
 # P0 验证记录:分层干预建立教师基准
 
+> **订正指针(2026-09-24)**:本文中 `skip_reason`/`rejected_final` 归因与逐段成本/计时的表述受后续 F0 与 2026-09-23 审阅 R5/R6/R8 影响,已由[实现审阅修复验证记录](m2_m3_stage_gate_review_fix_verification.md)的 schema-2 成本与尝试/检查事件替代;本文数值保留为 P0 版本的历史证据。
+
 > **适用版本声明(2026-09-14)**:本文全部数字为 **P0-fix(F1–F4)修复前实现**的结果——手部推断速度用世界系使搬运相抓握区间构造性清零、终检失败定位依赖字符串解析且无定位失败退化为末 5 帧重试、转移检查冻结箱姿且纯旋转不细分。修复后重测见 [p0fix_verification.md](p0fix_verification.md):strict 6/6、relaxed 22/24 = 91.7%、任务门重标 0.113。本文保留为历史证据,两套数字不得混用;§4 的 8.2cm/11.0-11.1cm 已归类为裸输出教师拟合误差,不再用作闭环任务质量依据。
 
 日期:2026-09-13。方案:[p0_relaxed_validation_plan.md](../plans/p0_relaxed_validation_plan.md)(修订版)。所有实验命令与产物见文中路径;探针级一次性脚本未入库,其结论已由入库的 `scripts/diagnose_repair.py` 系统化复现。

@@ -1,6 +1,8 @@
 # M2-M3 阶段门修复与后续推进方案
 
-日期:2026-09-17。状态:**仅完成方案制定,以下实现、对照实验和验收均未执行。** 正式基线仍为 v4 的 2/6;审阅中的运行时 pair 类别修正为临时 3/6,不计入正式验收。本方案补齐[收尾方案](m2_m3_completion_plan.md)阶段 0/1,并细化阶段 4;通过后接回其阶段 5-7。
+制定日期:2026-09-17;实施记录更新:2026-09-22;实现审阅补充:2026-09-23。本方案补齐[收尾方案](m2_m3_completion_plan.md)阶段 0/1,并细化阶段 4;通过后接回其阶段 5-7。2026-09-22 已完成下述实现与实验,历史六段结果为 regen 5/6、标准模式 6/6,覆盖项未完全达标。
+
+**当前状态(2026-09-24,已实施):对 `736f676^..cb8e4c0` 的审阅另确认 9 项数值、缓存、诊断和报告缺陷,已按[实现审阅修复方案](m2_m3_stage_gate_review_fix_plan.md)全部修复并分项提交(R1 `c8d266f`、R2 `b9fc080`、R3 `a22e775`、R5/R7/R8 `c991f6b`、R4/R9 `12c5741`、R5 补全 `9658b02`;165 项测试)。统一版本六段重测:Nq/Nv regen 5/6 keep(sub12 恢复、sub7 转为终检速度 @t=101 拒绝)、Ns 标准模式 6/6 与旧标准逐段一致;“每侧几何接近覆盖不低于 v3”仍有 2 项偏差(sub10 右、sub8 右,与第十轮同值且与稳定权重无关),按方案不自动转 train24,详见[修复验证记录](../verification/m2_m3_stage_gate_review_fix_verification.md)。** 下文完成勾选及结果保留为 2026-09-22 的实施记录,受影响字段(`mpjpe_growth`/q1/q5、`rejected_final` 归因、运行级成本、标准模式迭代数)已按新实现重算或标注缺失。
 
 依据:[Astra 审阅](../review/m2_m3_completion_failure_analysis_astra.md)、[Codex 审阅](../review/m2_m3_completion_review_codex.md)、[GLM 审阅](../review/m2_m3_completion_gate_analysis_glm.md)、[Kimi 审阅](../review/m2_m3_stage_gate_analysis_kimi.md)。实现与尝试级日志支持前两份关于正确性缺陷的结论。后两份关于串联瓶颈、路径约束和认证质量的建议保留为条件策略,其“输入不可恢复/剩余均非实现问题”归因不作为执行依据。
 
