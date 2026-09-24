@@ -1449,3 +1449,118 @@ def test_box_frame_jacobians_match_finite_differences(regen_pipeline) -> None:
             vals.append(pts.T.mean(0))
         fd_mesh[:, k] = (vals[0] - vals[1]) / (2.0 * h)
     assert np.allclose(J_mesh.reshape(3, 35), fd_mesh, atol=1e-6, rtol=1e-4)
+
+
+# --- R1: probe rows carry only valid nearest-point queries ------------------------
+
+
+def test_probe_rows_skip_truncated_distance_queries(regen_pipeline) -> None:
+    """R1: ``mj_geomDistance`` returns exactly ``distmax`` when nothing closer
+    was found (and leaves ``fromto`` zeroed); that search bound used to enter
+    the QP as a 1.2 mm "distance" with a degenerate segment and a meaningless
+    Jacobian (the review's P1: 5.22-9.18 mm pairs carrying zero ``fromto``).
+
+    The validity test must be the RETURNED DISTANCE vs the search bound, not
+    the segment: a real zero-distance contact collapses the segment the same
+    way and must keep its row (see the companion test).
+    """
+    from ireset.repair.scp import cfg_noncontact
+
+    solver, ev = regen_pipeline.solver, regen_pipeline.ev
+    solver.probe_cfg = regen_pipeline.validator.cfg
+    z, ctx, _gid = _probe_scenario(regen_pipeline)
+    far = (ev._hand_geoms["l"][0], ev.box_geom)      # ~0.19 m away at the probes
+    solver.clear_probe_pairs()
+    solver.clear_discovered_pairs()
+    solver.note_probe_pairs([far])
+    rows = solver._probe_rows(ctx, z, need_jacobian=True)
+    assert not [r for r in rows if r["id"][:2] == far], \
+        "a truncated query became a probe row"
+    assert solver.last_probe_truncated == [], \
+        "distance-truncated queries are not row-budget truncation"
+    floor = cfg_noncontact(regen_pipeline.cfg)
+    for r in rows:
+        ga, gb, _k = r["id"]
+        ev.probe_forward(*solver._probe_mid(ctx, z, r["alpha"]))
+        d, ft = ev.probe_geom_distance(ga, gb, distmax=2.0)
+        assert r["dist"] == pytest.approx(d, abs=1e-12), r["name"]
+        assert r["dist"] < floor + regen_pipeline.cfg.probe_row_margin_m
+        assert np.allclose(r["ft"], ft, atol=1e-12), "nearest points must agree"
+    solver.clear_probe_pairs()
+
+
+def test_probe_rows_keep_zero_distance_contact(pipeline) -> None:
+    """R1: exact zero-distance contact produces a collapsed segment too -- it
+    must keep its anti-penetration row (the fix filters on the returned
+    distance, never on a degenerate ``fromto``; the companion of the
+    truncation test, so an over-strict filter cannot pass both)."""
+    solver, ev = pipeline.solver, pipeline.ev
+    solver.probe_cfg = pipeline.validator.cfg
+    solver.clear_probe_pairs()
+    solver.clear_discovered_pairs()
+    h = _root_height_for_tangent(ev)
+    z_prev = standing_scene(1)[0, 0:36].copy()
+    z_prev[2] = h                       # exact sole-ground tangency at both ends
+    z = z_prev.copy()
+    z[0] += 0.06                        # 6 cm in one frame -> interior probes
+    ctx = FrameContext(t=1, box_pose=BOX_FAR.copy(), z_pred=z, z_prev=z_prev,
+                       ref_kpts_world=np.zeros((15, 3)), mesh_L=None,
+                       delta_ref=None, mesh_fixed=None, hand_anchor={},
+                       foot_anchor={}, prev_hand_local={}, prev_sole_world={},
+                       box_pose_prev=BOX_FAR.copy())
+    solver._frame_pairs = None
+    solver.constraint_rows(z, ctx, pipeline.cfg.trust_radius_init, mode="accept")
+    rows = solver._probe_rows(ctx, z, need_jacobian=True)
+    zero = [r for r in rows
+            if abs(r["dist"]) < 1e-9 and r["name"].endswith("ground")]
+    assert zero, "zero-distance contact rows must survive the validity filter"
+    assert all(r["J"] is not None for r in zero)
+    for r in zero:
+        ga, gb, _k = r["id"]
+        ev.probe_forward(*solver._probe_mid(ctx, z, r["alpha"]))
+        d, _ft = ev.probe_geom_distance(ga, gb, distmax=2.0)
+        assert r["dist"] == pytest.approx(d, abs=1e-12)
+    solver.clear_probe_pairs()
+
+
+def test_assembled_probe_row_jacobians_match_fd(regen_pipeline) -> None:
+    """R1: the rows the solver ACTUALLY assembles (``_probe_rows(True)`` --
+    not a direct large-range query) linearize the true probe distance, checked
+    by central differences through the same assembly path.
+
+    Covers both assembled families (robot-box penetrations and the
+    sphere/mesh ground contacts) in the sweep scenario, i.e. the rows that
+    survive the R1 validity filter are meaningful constraints, not merely
+    fewer rows. The step is small (``3e-7``) because mesh-plane queries have a
+    kink where the deepest mesh vertex switches; a larger step averages across
+    it and the slope error (O(step)) exceeds the row's own accuracy.
+    """
+    solver, ev = regen_pipeline.solver, regen_pipeline.ev
+    solver.probe_cfg = regen_pipeline.validator.cfg
+    solver.clear_probe_pairs()
+    solver.clear_discovered_pairs()
+    ctx = _sweep_ctx(regen_pipeline)
+    z = ctx.z_pred
+    solver._frame_pairs = None
+    solver.constraint_rows(z, ctx, regen_pipeline.cfg.trust_radius_init, mode="accept")
+    rows = solver._probe_rows(ctx, z, need_jacobian=True)
+    kinds = {r["id"][2] for r in rows}
+    assert {"robot_box", "robot_ground"} <= kinds, kinds
+    h = 3e-7
+    for r in rows:
+        ga, gb, _k = r["id"]
+        fd = np.zeros(35)
+        for k in range(35):
+            e = np.zeros(35)
+            e[k] = h
+            vals = []
+            for sign in (1.0, -1.0):
+                zp = retract_batch(ev.model, z[None], (sign * e)[None])[0]
+                ev.probe_forward(*solver._probe_mid(ctx, zp, r["alpha"]))
+                vals.append(ev.probe_geom_distance(ga, gb, distmax=2.0)[0])
+            fd[k] = (vals[0] - vals[1]) / (2.0 * h)
+        J = np.asarray(r["J"]).reshape(-1)
+        assert np.allclose(J, fd, atol=1e-6, rtol=1e-4), \
+            (r["name"], r["alpha"], float(np.abs(J - fd).max()))
+    solver.clear_probe_pairs()
+    solver.clear_discovered_pairs()

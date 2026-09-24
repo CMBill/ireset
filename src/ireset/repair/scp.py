@@ -660,9 +660,12 @@ class FrameSolver:
         value is what the solver's merit and the checks use; the row's
         Jacobian is the composite chain rule above.
 
-        The row budget is separate from the endpoint/anchor rows
-        (``max_probe_rows``): over budget the most violated rows are kept and
-        the rest are REPORTED (``last_probe_truncated``) -- the pipeline's
+        Only queries that actually found a closer configuration produce rows:
+        ``mj_geomDistance`` returns exactly ``distmax`` when nothing was found
+        (and leaves ``fromto`` zeroed), and that search bound is not a
+        distance (R1). The row budget is separate from the endpoint/anchor
+        rows (``max_probe_rows``): over budget the most violated rows are kept
+        and the rest are REPORTED (``last_probe_truncated``) -- the pipeline's
         uncapped probe check stays the arbiter, so a dropped row can never
         turn into a silent accept.
         """
@@ -690,12 +693,18 @@ class FrameSolver:
                 seen.add((ga, gb))
         rows = []
         margin = cfg.probe_row_margin_m
+        dmax = floor + margin
         for alpha in alphas:
             q_mid, box_mid = self._probe_mid(ctx, z, alpha)
             self.ev.probe_forward(q_mid, box_mid)
             for ga, gb, kind in cand:
-                dist, ft = self.ev.probe_geom_distance(ga, gb, distmax=floor + margin)
-                if dist > floor + margin:
+                dist, ft = self.ev.probe_geom_distance(ga, gb, distmax=dmax)
+                # a truncated search returns the bound itself: not a distance,
+                # no row (the old ``dist > dmax`` test let it through carrying
+                # a zeroed segment and a meaningless Jacobian, R1). The test
+                # is the returned DISTANCE -- a real zero-distance contact
+                # collapses the segment the same way and keeps its row.
+                if not dist < dmax:
                     continue
                 nm = f"{self.ev.geom_name(ga)}~{self.ev.geom_name(gb)}"
                 rows.append({"alpha": alpha, "dist": float(dist), "lo": floor,
