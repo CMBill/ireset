@@ -202,3 +202,49 @@ def test_standalone_provenance_is_declared_a_snapshot() -> None:
     assert snap["configs_are_loader_defaults_not_effective"] is True
     assert snap["inputs"][0]["demo"] == "sub10_largebox_000"
     assert json.dumps(snap, default=float)  # serializable
+
+
+def test_regenerate_cli_report_has_effective_config(tmp_path, monkeypatch) -> None:
+    """R9 smoke: a real (short) CLI run writes the effective-config record, the
+    freeze block, the drift check and the schema-2 cost view into its report."""
+    import regenerate_teachers
+
+    out = tmp_path / "run"
+    argv = ["regenerate_teachers.py", "--demos", "sub10_largebox_000",
+            "--frames", "2", "--mode", "standard", "--validation-mode", "strict",
+            "--output-dir", str(out), "--note", "smoke"]
+    monkeypatch.setattr(sys, "argv", argv)
+    regenerate_teachers.main()
+    report = json.loads((out / "standard_report_diagnosis6_strict.json").read_text())
+    assert report["schema"] == 2
+    eff = report["effective"]
+    assert eff["argv"] == argv
+    assert eff["mode"] == "standard"
+    assert eff["effective_repair_config"]["regen_mode"] is False
+    assert eff["frames"] == 2
+    assert eff["demos"] == ["sub10_largebox_000"]
+    assert eff["effective_config_sha256"]
+    # standard mode leaves the repair config at its defaults -- recorded as a
+    # default, never as a modified "effective" value
+    assert eff["is_default_repair_config"] is True
+    assert eff["default_repair_config"] == eff["effective_repair_config"]
+    assert report["freeze"]["assets"] and report["freeze"]["uv_lock_sha256"]
+    assert "thread_env" in report["freeze"]
+    assert report["end"]["config_unchanged"] is True
+    assert report["end"]["code_changed_during_run"] is False
+    row = report["rows"][0]
+    assert row["T"] == 2
+    assert row["cost"]["schema"] == 2
+    assert row["cost"]["input_frames"] == 2
+    assert row["cost"]["attempts"] >= 0
+    assert row["cost"]["passes"][0]["trajectory_pass"] == 0
+    for key in ("preprocess_s", "screening_s", "output_s", "segment_wall_s",
+                "solve_frames_s", "final_validation_s"):
+        assert key in row, key
+    # nesting (within the coarser rounding of the legacy wall field):
+    # total_s (repair call) <= wall_s <= segment_wall_s
+    assert row["wall_s"] + 5e-3 >= row["total_s"]
+    assert row["segment_wall_s"] + 5e-3 >= row["wall_s"]
+    # the report echoes the frozen inputs it actually consumed
+    assert report["inputs"][0]["demo"] == "sub10_largebox_000"
+    assert report["field_notes"]["schema"].startswith("2")
