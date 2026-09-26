@@ -624,7 +624,8 @@ class RepairPipeline:
         retry.diagnostics["suffix_retry_from"] = start
         retry.diagnostics["suffix_retries"] = 1
         retry.diagnostics["failed_checks"] = {
-            k: {"location": v.location, "first_failure_frame": v.first_failure_frame}
+            k: {"location": v.location, "first_failure_frame": v.first_failure_frame,
+                "evidence": v.evidence}
             for k, v in final.checks.items() if not v.passed
         }
         # the first pass's cost is reported VERBATIM whichever way the retry
@@ -655,7 +656,8 @@ class RepairPipeline:
             }
             return self._finish(retry, passes, T, accepted_pass=1)
         retry.diagnostics["final_retry_failed_checks"] = {
-            k: {"location": v.location, "first_failure_frame": v.first_failure_frame}
+            k: {"location": v.location, "first_failure_frame": v.first_failure_frame,
+                "evidence": v.evidence}
             for k, v in final2.checks.items() if not v.passed
         }
         self._final_rejection(retry, retry.diagnostics["final_retry_failed_checks"])

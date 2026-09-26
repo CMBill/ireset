@@ -112,6 +112,15 @@ class CheckResult:
     #: THIS field, never the human-readable ``location`` string (which keeps
     #: the worst-frame position for display).
     first_failure_frame: int | None = None
+    #: structured UNROUNDED first-exceedance evidence for the failing
+    #: families (label-quality plan section 2.2): actual value, limit,
+    #: exceedance, the two DIFFERENCE frames and, for the joint family, the
+    #: zero-based index inside the 29-dim joint array. ``location`` stays a
+    #: rounded display string -- evidence, not location, is what reports
+    #: must rely on (sub7: 12.00 rad/s displayed, 12.000000401362618 actual,
+    #: exceedance 4.0e-7 rad/s -- a frame-level-tolerance-size violation the
+    #: strict check still rejects). None when the check passed.
+    evidence: dict | None = None
 
 
 def _first_exceed(arr: np.ndarray, limit: float) -> int | None:
@@ -257,7 +266,8 @@ class IndependentValidator:
         T = q.shape[0]
         if T < 2:
             return CheckResult(True, 0.0, 0.0, "T<2")
-        dq = np.abs(np.diff(q[:, 7:36], axis=0)).max() / dt
+        dq_all = np.abs(np.diff(q[:, 7:36], axis=0))            # [T-1, 29]
+        dq = dq_all.max() / dt
         dpos = np.linalg.norm(np.diff(q[:, 0:3], axis=0), axis=1).max() / dt
         # world-frame angular increment via retract-style finite difference
         from ireset.kinematics.rotation_adapter import quat_to_mat_wxyz
@@ -268,18 +278,39 @@ class IndependentValidator:
         w = ang.max() / dt
         worst = max(dq / cfg.joint_velocity_limit_radps, dpos / cfg.base_lin_velocity_limit_mps,
                     w / cfg.base_ang_velocity_limit_radps)
-        # per-family first exceedance, attributed to the POST-difference frame
-        firsts = [
-            _first_exceed(np.abs(np.diff(q[:, 7:36], axis=0)).max(1) / dt,
-                          cfg.joint_velocity_limit_radps),
-            _first_exceed(np.linalg.norm(np.diff(q[:, 0:3], axis=0), axis=1) / dt,
-                          cfg.base_lin_velocity_limit_mps),
-            _first_exceed(ang / dt, cfg.base_ang_velocity_limit_radps),
-        ]
-        firsts = [f + 1 for f in firsts if f is not None]
+        # per-family first exceedance, attributed to the POST-difference frame;
+        # the structured evidence keeps the UNROUNDED actual value, the limit,
+        # the exceedance, the two diff frames and (joint family) the zero-based
+        # index inside the 29-dim joint array -- the location string rounds to
+        # 2 decimals and cannot distinguish a 4e-7 rad/s exceedance from zero
+        families = (
+            ("joint", dq_all.max(1) / dt, cfg.joint_velocity_limit_radps),
+            ("base_lin", np.linalg.norm(np.diff(q[:, 0:3], axis=0), axis=1) / dt,
+             cfg.base_lin_velocity_limit_mps),
+            ("base_ang", ang / dt, cfg.base_ang_velocity_limit_radps),
+        )
+        firsts = []
+        exceedances = []
+        for name, series, limit in families:
+            f = _first_exceed(series, limit)
+            if f is None:
+                continue
+            firsts.append(f + 1)
+            rec = {
+                "family": name,
+                "frame": int(f + 1),
+                "diff_frames": [int(f), int(f + 1)],
+                "value": float(series[f]),
+                "limit": float(limit),
+                "exceedance": float(series[f] - limit),
+                "joint_index": (int(np.argmax(dq_all[f])) if name == "joint" else None),
+            }
+            exceedances.append(rec)
         return CheckResult(worst <= 1.0, worst, 1.0,
                            f"joint={dq:.2f}rad/s pos={dpos:.2f}m/s ang={w:.2f}rad/s",
-                           first_failure_frame=min(firsts) if firsts else None)
+                           first_failure_frame=min(firsts) if firsts else None,
+                           evidence=({"velocity_exceedances": exceedances}
+                                     if exceedances else None))
 
     def _all_site_xpos(self, qp: np.ndarray, d: mujoco.MjData) -> np.ndarray:
         d.qpos = qp

@@ -9,10 +9,18 @@ per side, inside the reference grasp window AND over the full clip:
   inside the reference grasp window,
 - task MPJPE p50/p95/max and its growth (first vs last quintile).
 
-Reusable for the frozen v3 artifacts and any new run: the input is a teacher
-NPZ (same layout as the regenerated outputs) plus the source clip for the
-reference schedule. The independent validator is the arbiter; this script
-only quantifies what ``keep`` hides.
+Label-quality plan section 2.2 (2026-09-26): every coverage number is
+generated from the PER-FRAME series and the four certification notions are
+listed separately -- certified total, certified-and-in-reference
+intersection, the longest continuous intersection run, both hands
+simultaneously -- never substituted for one another (sub10 left reported
+"3" from the certified total while the intersection was 0). Proximity
+counts use the keep criterion's strict ``distance < hand_enter_m``; the
++2mm/+5mm counts are diagnostics and never relax admission; threshold
+crossings are counted only between adjacent frames inside the SAME
+reference interval. Frame 0 carries no differential speed (NaN, not a
+placeholder zero); zero reference frames is UNDEFINED (None) for ratios,
+zero certification is an explicit 0.
 
 Run: uv run --locked python scripts/segment_quality_report.py \
         --npz derived/.../sub10_largebox_000.npz --demo sub10_largebox_000
@@ -30,6 +38,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import numpy as np
 
+from ireset.data.labels import (
+    both_hands_metrics,
+    continuous_runs,
+    crossings_within_intervals,
+    longest_detachment_run,
+    longest_run_frames,
+)
 from ireset.embodied.contact_sites import infer_reference_schedule
 from ireset.data.teacher import load_teacher_npz
 from ireset.paths import PROJECT_ROOT, TEACHER_TRAJ_DIR
@@ -43,6 +58,7 @@ from ireset.repair.pipeline import KPT_IDX
 
 def _series_stats(v: np.ndarray) -> dict:
     v = np.asarray(v, dtype=float)
+    v = v[np.isfinite(v)]          # frame 0's undefined differential speed stays out
     if v.size == 0:
         return {"n": 0}
     return {"n": int(v.size), "mean": round(float(v.mean()), 4),
@@ -52,40 +68,55 @@ def _series_stats(v: np.ndarray) -> dict:
 
 
 def side_metrics(vcfg, traj: np.ndarray, cond: ReferenceCondition,
-                 validator: IndependentValidator, side: str) -> dict:
-    """Speed / drift / gap metrics for one hand side."""
+                 validator: IndependentValidator, side: str, rep) -> dict:
+    """Speed / drift / gap / certification metrics for one hand side.
+
+    ``rep`` is the single independent-validation report of this trajectory
+    (schedule + cached per-frame series); recomputing it per side would only
+    re-run a deterministic function.
+    """
     T = traj.shape[0]
     cache = validator._cache
     local = cache["hand_local"][side]                  # [T, 3, 3] box frame
     dist = cache["hand_dist"][side]                    # [T]
     dt = 1.0 / vcfg.fps
-    speed = np.zeros(T)
+    # box-frame speed of the three sites; frame 0 has NO differential speed
+    speed = np.full(T, np.nan)
     if T > 1:
         speed[1:] = np.linalg.norm(np.diff(local, axis=0), axis=2).max(1) / dt
 
-    ref = np.zeros(T, dtype=bool)
     eff = "left_hand" if side == "l" else "right_hand"
-    for iv in cond.ref_schedule.intervals:
-        if iv.effector == eff:
-            ref[iv.start:iv.end] = True
-    ivs = [(iv.start, iv.end) for iv in validator.validate(
-        traj, exclude=("box_ground",)).schedule.intervals
-        if iv.effector == eff and iv.support == "object"]
+    ref_intervals = [(iv.start, iv.end) for iv in cond.ref_schedule.intervals
+                     if iv.effector == eff]
+    ref = np.zeros(T, dtype=bool)
+    for a, b in ref_intervals:
+        ref[a:b] = True
+    ivs = [(iv.start, iv.end) for iv in rep.schedule.intervals
+           if iv.effector == eff and iv.support == "object"]
     cert = np.zeros(T, dtype=bool)
     drift = []
     for a, b in ivs:
         cert[a:b] = True
         anchor = local[a]
         drift.append(float(np.linalg.norm(local[a:b] - anchor, axis=-1).max()))
-    gap_ref = dist[ref] if ref.any() else np.array([])
+    sup = cert & ref
+    inter_runs = continuous_runs(sup)
     enter = float(vcfg.hand_enter_m)
-    within = (gap_ref <= enter) if gap_ref.size else np.array([], dtype=bool)
+    # keep criterion's operator: distance < hand_enter_m (strict)
+    within = ref & (dist < enter)
+    gap_ref = dist[ref] if ref.any() else np.array([])
     return {
         "ref_frames": int(ref.sum()),
+        "ref_intervals": [[int(a), int(b)] for a, b in ref_intervals],
+        # certification notions listed separately, never substituted:
+        # total / in-reference intersection / longest continuous intersection
         "certified_frames": int(cert.sum()),
-        "certified_in_ref_frames": int((cert & ref).sum()),
+        "certified_in_ref_frames": int(sup.sum()),
+        "intersection_intervals": [[int(a), int(b)] for a, b in inter_runs],
+        "intersection_longest_run_frames": max(
+            (b - a for a, b in inter_runs), default=0),
         "intervals": [[int(a), int(b)] for a, b in ivs],
-        "speed_ref_mps": _series_stats(speed[ref]) if ref.any() else {"n": 0},
+        "speed_ref_mps": _series_stats(speed[ref]),
         "speed_all_mps": _series_stats(speed),
         "anchor_drift_certified_m": (
             {"n": len(drift), "max": round(max(drift), 4)} if drift else {"n": 0}),
@@ -96,21 +127,25 @@ def side_metrics(vcfg, traj: np.ndarray, cond: ReferenceCondition,
              "p95": round(float(np.percentile(gap_ref, 95)) * 1e3, 3),
              "p99": round(float(np.percentile(gap_ref, 99)) * 1e3, 3),
              "max": round(float(gap_ref.max()) * 1e3, 3)} if gap_ref.size else {"n": 0}),
+        "max_detachment_ref_m": (round(float(gap_ref.max()), 6)
+                                 if gap_ref.size else None),
         # proximity-coverage robustness: the keep criterion counts frames
-        # inside the enter threshold, so report the counts at the threshold
-        # and in a small band above it, plus the number of threshold
-        # crossings -- a coverage dip with near-identical percentiles and
-        # many crossings is inference chatter, not lost proximity
+        # strictly inside the enter threshold; the +2mm/+5mm bands are
+        # diagnostics only and never relax admission
         "enter_mm": round(enter * 1e3, 3),
-        "frames_within_enter": int(within.sum()) if within.size else 0,
+        "frames_within_enter": int(within.sum()),
         "frames_within_enter_p2mm": int(
-            (gap_ref <= enter + 0.002).sum()) if gap_ref.size else 0,
+            (gap_ref < enter + 0.002).sum()) if gap_ref.size else 0,
         "frames_within_enter_p5mm": int(
-            (gap_ref <= enter + 0.005).sum()) if gap_ref.size else 0,
-        "enter_threshold_crossings": int(
-            np.count_nonzero(np.diff(within.astype(int)))) if within.size else 0,
-        "missing_contact_ref_frames": int(
-            (~within).sum()) if gap_ref.size else 0,
+            (gap_ref < enter + 0.005).sum()) if gap_ref.size else 0,
+        # crossings counted ONLY between adjacent frames of the SAME
+        # reference interval -- a gap between intervals is not a crossing
+        "enter_threshold_crossings": crossings_within_intervals(
+            within, ref_intervals),
+        "missing_contact_ref_frames": int((ref & ~within).sum()),
+        "longest_detachment_run_frames": longest_detachment_run(
+            within, ref_intervals),
+        "proximity_recall": (float(within.sum() / ref.sum()) if ref.any() else None),
         "gap_all_mm": {"min": round(float(dist.min()) * 1e3, 3),
                        "p95": round(float(np.percentile(dist, 95)) * 1e3, 3)},
     }
@@ -153,6 +188,17 @@ def quality_for(npz: str | Path, demo: str,
     # task MPJPE needs the robot evaluator on the LOCKED scene model
     ev = FrameEvaluator(validator.spec, validator.pairs, rcfg)
     rep = validator.validate(traj, exclude=("box_ground",))
+    sides = {s: side_metrics(vcfg, traj, cond, validator, s, rep)
+             for s in ("l", "r")}
+    per_side_arrays = {}
+    for s, m in sides.items():
+        sup = np.zeros(traj.shape[0], dtype=bool)
+        for a, b in m["intersection_intervals"]:
+            sup[a:b] = True
+        cert = np.zeros(traj.shape[0], dtype=bool)
+        for a, b in m["intervals"]:
+            cert[a:b] = True
+        per_side_arrays[s] = {"certified": cert, "supervision": sup}
 
     return {
         "demo": demo,
@@ -161,14 +207,17 @@ def quality_for(npz: str | Path, demo: str,
         "validation_mode": validation_mode,
         "validator_passed": bool(rep.passed),
         "validator_failed": {k: {"location": c.location,
-                                 "first_failure_frame": c.first_failure_frame}
+                                 "first_failure_frame": c.first_failure_frame,
+                                 "evidence": c.evidence}
                              for k, c in rep.checks.items() if not c.passed},
         "max_check_interval_m": rep.max_check_interval_m,
         "hand": hand_recall(validator, traj, cond),
         "task_mpjpe": task_mpjpe_stats(ev, traj, cond),
         "mpjpe_growth": mpjpe_growth(ev, traj, cond),
-        "sides": {s: side_metrics(vcfg, traj, cond, validator, s)
-                  for s in ("l", "r")},
+        "sides": sides,
+        # simultaneous two-hand certification, listed separately from the
+        # per-side numbers (never their sum or product)
+        "hands": both_hands_metrics(per_side_arrays),
     }
 
 
@@ -189,11 +238,14 @@ def main() -> None:
     for s in ("l", "r"):
         m = out["sides"][s]
         print(f"[{s}] ref={m['ref_frames']} cert={m['certified_frames']} "
-              f"(in-ref {m['certified_in_ref_frames']}) "
+              f"(in-ref {m['certified_in_ref_frames']}, "
+              f"longest-inter {m['intersection_longest_run_frames']}) "
+              f"within={m['frames_within_enter']} "
               f"speed_ref p95={m['speed_ref_mps'].get('p95')} "
               f"drift_max={m['anchor_drift_certified_m']} "
               f"gap_ref {m['gap_ref_mm']}")
-    print(f"validator_passed={out['validator_passed']} "
+    print(f"hands={out['hands']} "
+          f"validator_passed={out['validator_passed']} "
           f"task={out['task_mpjpe']} growth={out['mpjpe_growth']['growth']}")
 
 

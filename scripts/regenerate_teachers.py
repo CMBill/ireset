@@ -249,6 +249,10 @@ def main() -> None:
                          "measurement with regen_mode OFF (regression check "
                          "for the stage gate; no NPZ is written)")
     ap.add_argument("--task-gate-yaml", type=str, default=None)
+    ap.add_argument("--assert-task-gate", type=float, default=None,
+                    help="refuse to start unless the EFFECTIVE task gate equals "
+                         "this value (label-quality plan section 4.1: runs must "
+                         "not silently pick up a recalibrated gate)")
     ap.add_argument("--min-hand-recall", type=float, default=0.5,
                     help="screening threshold per grasping side")
     ap.add_argument("--min-ref-frames", type=int, default=10,
@@ -274,6 +278,14 @@ def main() -> None:
         rcfg.task_mpjpe_tol_m = float(
             _yaml.safe_load(Path(args.task_gate_yaml).read_text())
             ["task_quality_gates"]["mpjpe_tol_m"])
+    if args.assert_task_gate is not None and \
+            abs(rcfg.task_mpjpe_tol_m - args.assert_task_gate) > 1e-12:
+        # startup guard: refuse to run under a different effective gate than
+        # the one the run was planned for (the yaml override above and any
+        # loader default are both covered)
+        raise ValueError(
+            f"effective task gate {rcfg.task_mpjpe_tol_m} != asserted "
+            f"{args.assert_task_gate}")
     # regen objective tracks the REFERENCE (mesh/keypoints + temporal +
     # regularization), not the old teacher's joints: the teacher's hand
     # drifts in box frame (p90 18cm) and a prediction-tracking objective

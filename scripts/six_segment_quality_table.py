@@ -31,8 +31,11 @@ def summarize(q: dict) -> dict:
     for s, m in q["sides"].items():
         sides[s] = {
             "ref_frames": m["ref_frames"],
+            "ref_intervals": m["ref_intervals"],
             "certified_frames": m["certified_frames"],
             "certified_in_ref_frames": m["certified_in_ref_frames"],
+            "intersection_intervals": m["intersection_intervals"],
+            "intersection_longest_run_frames": m["intersection_longest_run_frames"],
             "n_intervals": len(m["intervals"]),
             "interval_bounds": m["intervals"],
             "contact_recall": q["hand"].get(f"{'left' if s == 'l' else 'right'}"
@@ -43,11 +46,14 @@ def summarize(q: dict) -> dict:
             "speed_all_p95_mps": m["speed_all_mps"].get("p95"),
             "drift_certified_max_m": m["anchor_drift_certified_m"].get("max"),
             "gap_ref_mm": m["gap_ref_mm"],
+            "max_detachment_ref_m": m["max_detachment_ref_m"],
             "enter_mm": m.get("enter_mm"),
             "frames_within_enter": m.get("frames_within_enter"),
             "frames_within_enter_p2mm": m.get("frames_within_enter_p2mm"),
             "frames_within_enter_p5mm": m.get("frames_within_enter_p5mm"),
             "enter_threshold_crossings": m.get("enter_threshold_crossings"),
+            "longest_detachment_run_frames": m.get("longest_detachment_run_frames"),
+            "proximity_recall": m.get("proximity_recall"),
             "missing_contact_ref_frames": m["missing_contact_ref_frames"],
         }
     return {
@@ -61,6 +67,7 @@ def summarize(q: dict) -> dict:
         "q1_mean": q["mpjpe_growth"]["q1_mean"],
         "q5_mean": q["mpjpe_growth"]["q5_mean"],
         "sides": sides,
+        "hands": q.get("hands"),
     }
 
 

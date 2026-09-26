@@ -1,0 +1,75 @@
+# Graded teacher-label protocol v1 (frozen 2026-09-26).
+# Source plan: docs/plans/m2_m3_label_quality_train24_plan.md sections 2-3.
+#
+# This file FREEZES the label protocol as an independent version: usage
+# classes, formulas, threshold comparison operators and the known
+# deviations of the current unified solver version. It does NOT modify any
+# strict/keep/task-gate threshold -- configs/eval/protocol.yaml and
+# configs/repair/qp_default.yaml stay the acceptance record. The old
+# per-side quality gate ("certified intersection >= v3") remains FAILED and
+# is only bypassed by this protocol's usage restrictions (plan section 1.1:
+# restricted transition, never a retroactive pass).
+
+label_protocol: graded_labels_v1
+frozen: 2026-09-26
+code_constant: ireset.data.labels.LABEL_PROTOCOL_VERSION   # must equal label_protocol
+
+usage_classes:
+  motion_fk_supervision:
+    admission: "full trajectory passes strict validation + task gate 0.40 m + keep rule"
+    permitted: [state reconstruction, root rotation, FK keypoint, general velocity]
+  hand_proximity_marks:
+    admission: "kept trajectory, frame in a reference grasp interval AND closest
+      hand-geom/box distance < hand_enter_m (strict '<', the keep criterion's
+      operator)"
+    permitted: [proximity-of-fact marking]
+    forbidden: ["deriving sustained grasp", "three-site surface conformity"]
+  hand_contact_supervision:
+    admission: "kept trajectory, frame in BOTH a reference grasp interval AND a
+      validator-certified robot interval (intersection)"
+    permitted: [contact auxiliary loss on exactly these frames]
+    forbidden: ["load-bearing grasp claims", "masking motion/FK/velocity labels"]
+  rejected:
+    admission: "any failed admission condition"
+    permitted: [diagnostics only]
+
+formulas:
+  hand_proximity_mask: "ref_contact(t) AND (min_hand_geom_box_dist(t) < hand_enter_m)"
+  hand_contact_supervision_mask: "ref_contact(t) AND certified(t)"
+  hand_supervision_interval_id: >
+    continuous pieces of the supervision intersection, numbered across
+    (certified interval, continuous piece) pairs; -1 outside; a new id starts
+    at every reference gap AND every certified-interval boundary, so
+    adjacent frames form a grasp-timing pair only when both are valid with
+    equal ids (half-open [start, end) everywhere)
+  thresholds:
+    hand_enter_m: 0.01          # reference copy of contact_inference.hand_enter_m;
+                                # the validator config remains the runtime source
+  comparison_operators:
+    proximity: "<"              # strict, identical to the keep criterion
+    certification: "schedule inclusion (validator quasi-static entry gates)"
+
+reporting_rules:
+  - certification notions are listed separately and never substituted:
+    certified total / certified-in-reference intersection / longest
+    continuous intersection run / both hands simultaneously
+  - proximity counts use the strict '<' operator; +2mm/+5mm band counts are
+    diagnostics and never relax admission
+  - threshold crossings are counted only between adjacent frames inside the
+    SAME reference interval
+  - frame 0 has no differential speed (undefined, never a placeholder zero);
+    ratios over zero reference frames are undefined; zero certification is 0
+
+known_deviations_unified_version:   # vs frozen v3, reviewfix_20260924 evidence
+  - "sub10 left certified-and-reference intersection 0 frames (v3: 3; certified
+    total stays 3 but lies outside the reference grasp window)"
+  - "sub10 right proximity coverage 63/74 (v3: 67/74, -5.4pp)"
+  - "sub8 right proximity coverage 78/80 (v3: 79/80, -1.25pp)"
+  - "stab-weight conclusion is limited to: tested weights 0/0.1/1.0 did not
+    restore the proximity coverage; no impossibility claim"
+
+old_quality_gate_status:
+  certified_intersection_ge_v3: failed   # not retroactively passed by this protocol
+  proximity_coverage_ge_v3: failed       # same two side deviations as the 10th round
+  restricted_transition_gate: "quantity >= 4/6 + sub10/sub8 kept + all kept strict +
+    mask/report contracts (plan section 4.1 step 3)"
