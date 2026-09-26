@@ -545,6 +545,8 @@ T_total = T_reference_processing + T_generation + T_stitch
 
 > **阶段门实现审阅与修复计划(2026-09-23,2026-09-24 实施完成)**:对 `736f676^..cb8e4c0` 的审阅确认 9 项缺陷:探测距离截断值误入 QP、接触法向反号、回流缓存未失效、MPJPE 增长未逐帧 FK、最后失败归因错配、重试成本漏导出、探测违反行偏移错误、尝试事件过早定稿及有效配置记录错误。按[实现审阅修复方案](m2_m3_stage_gate_review_fix_plan.md)先修诊断/报告并验证行为一致(D 对照:5/5 保留 NPZ 与冻结最终版逐字节相同),再修数值/缓存并重测六段。**统一版本结果(MuJoCo/OSQP 与容差零改动)**:R1-R9 分项提交(`c8d266f`/`b9fc080`/`a22e775`/`c991f6b`/`12c5741`/`9658b02`),165 项测试;Nq/Nv regen 5/6 keep(sub12 速度终检问题消除并接受、sub7 出现可复现的 @t=101 速度终检拒绝,两轮同因)、Ns 标准模式 6/6 与旧标准逐段一致(3 段 QP 迭代数因探测行纠正变化)、“每侧几何接近覆盖不低于 v3”仍有 2 项偏差(sub10 右 −5.4 pp、sub8 右 −1.25 pp,S01/S10 证明与稳定权重无关);历史 `mpjpe_growth`/q1/q5 已逐帧重算(旧“误差随段显著下降”解读作废),旧 5/6、6/6 仅作历史对照。strict/keep/任务工作门 0.40 不变,**不自动转 train24**。详见[修复验证记录](../verification/m2_m3_stage_gate_review_fix_verification.md)。
 
+> **标签分级与 train24 受限验证(2026-09-26,`docs/plans/m2_m3_label_quality_train24_plan.md` + `docs/verification/m2_m3_label_quality_train24_verification.md`)**:教师数据质量准入与小规模验证。证据订正:统一版本相对 v3 为 **3 项**退化(上段"2 项偏差"中的 sub10 左认证交集实为 **0 帧**——认证总数 3 落在参考窗口外;"不可能由稳定权重恢复"撤回;sub7 拒绝的结构化速度证据:帧 101、关节 26、超限 4.0136e-7 rad/s,两轮一致)。落地分级标签协议 v1(`configs/labels/graded_labels_v1.yaml`:动作/FK、几何接近标记、认证交集监督、拒绝四类用途,旧质量门继续未通过)与消费接口(`export_label_manifest.py` 清单+掩码、`TeacherWindowDataset(label_manifest=…)`、损失分级监督;186 项测试)。六段回归与冻结基线逐段一致后,train24(`calibration24_train_v1`,三次运行字节一致)结果:**13/24 keep < 18/24 预注册数量门未达标**——失败分类为终检速度微超限 3 段(3e-9~4e-7 rad/s)、regen 手带行不可行 6 段、接触召回不足 2 段;六受试者均有可用窗口(40 窗/60.3 s)、局部认证监督左/右 50/90 帧。**按预注册规则停止规模扩展:312 originals 重生成与干净标签重训不启动**,待失败类别最小修复后重新冻结重跑。
+
 ### M0:数据与 G1 资产审计(约 1-2 周)
 
 - [x] 检查本机 CPU/内存/GPU/存储,固定 Python 3.12 与 uv 最小项目环境。
