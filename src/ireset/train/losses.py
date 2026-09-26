@@ -123,7 +123,15 @@ class LossAssembler:
             ).view(B, F, -1, 3)                                                     # [B,F,6,3]
             p_geom = self.hand_points_box_geom(hand_p, batch)                           # [B,F,6,3]
             sdf = point_box_sdf_torch(p_geom)                                            # [B,F,6]
-            contact = batch["contact"][..., 0:2]                                         # [B,F,2]
+            if "hand_contact_supervision_mask" in batch:
+                # graded supervision (label protocol v1): contact loss ONLY on
+                # certified-and-in-reference frames, normalized by valid frames;
+                # an empty mask contributes zero loss and zero contact gradient
+                # (clamp_min keeps the denominator defined) and never masks the
+                # motion/FK/velocity terms above
+                contact = batch["hand_contact_supervision_mask"].to(sdf.dtype)          # [B,F,2]
+            else:
+                contact = batch["contact"][..., 0:2]                                    # [B,F,2]
             left = sdf[..., 0:3] * contact[..., 0:1]
             right = sdf[..., 3:6] * contact[..., 1:2]
             parts["contact_m2"] = (left ** 2).sum() / contact[..., 0].sum().clamp_min(1.0) / 3.0 \
