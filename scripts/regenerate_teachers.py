@@ -381,6 +381,10 @@ def main() -> None:
                "final_stage": res.diagnostics.get("final_stage"),
                "fallbacks": res.diagnostics.get("fallbacks"),
                "slack_frames": res.diagnostics.get("slack_frames"),
+               # V1: candidate normalization accounting (checks / changed /
+               # budget failures / max delta / modified output frames) --
+               # facts about candidates, never a gate
+               "velocity_projection": res.diagnostics.get("velocity_projection"),
                # R6: the run-level TOTAL view (schema 2, every trajectory pass)
                # plus the per-pass event paths. The flat fields below describe
                # the FINAL pass only -- a reader must not add them to `cost`.

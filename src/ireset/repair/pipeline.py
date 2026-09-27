@@ -80,6 +80,69 @@ class TrajectoryResult:
     diagnostics: dict = field(default_factory=dict)
 
 
+def strict_joint_speeds(z: np.ndarray, z_prev: np.ndarray, cfg) -> np.ndarray:
+    """Per-joint speeds in the EXACT float64 form of the independent final
+    validator (``abs(diff(q)) / (1/fps)``, strict ``>`` against the limit).
+
+    V1: the pipeline's own adoption gate re-uses this formula bit-for-bit, so
+    a state accepted frame-by-frame cannot fail the final check on the joint
+    family -- no epsilon, no rounding, and no algebraically-equivalent-but-
+    floatingly-different rewrite (``* fps`` is NOT the same computation).
+    """
+    return np.abs(np.asarray(z[7:36], dtype=float)
+                  - np.asarray(z_prev[7:36], dtype=float)) / (1.0 / cfg.fps)
+
+
+def normalize_joint_velocity(z_cand: np.ndarray, z_prev: np.ndarray, cfg) -> dict:
+    """Bounded candidate normalization against the adopted previous state
+    (train24fix plan section 4.1). Pure: returns a NEW state, input untouched.
+
+    Joints that already pass the strict same-formula check are copied
+    bit-for-bit. A violating joint is moved to ``q_prev +/- dt*limit``; when
+    the same-formula recheck of that boundary still exceeds (float: e.g.
+    ``q_prev=0.8`` gives ``0.8+0.4 = 1.2000000000000002`` -> 12.000000000000004
+    rad/s), it shrinks inward with ``np.nextafter`` (max 8 steps). The total
+    per-candidate budget is fixed at ``dt*limit*1e-6`` (4e-7 rad at 30 fps):
+    one joint needing more fails the WHOLE normalization (no partial
+    projection) -- the caller then treats the candidate as unusable, it never
+    widens the budget to fit an observed failure.
+    """
+    dt = 1.0 / cfg.fps
+    lim = float(cfg.joint_velocity_limit_radps)
+    budget = dt * lim * 1e-6
+    q = np.asarray(z_cand[7:36], dtype=float)
+    qp = np.asarray(z_prev[7:36], dtype=float)
+    new = q.copy()
+    changed: list[tuple[int, float]] = []
+    for j in range(q.size):
+        if abs(new[j] - qp[j]) / dt <= lim:
+            continue
+        original = new[j]
+        target = qp[j] + dt * lim if new[j] > qp[j] else qp[j] - dt * lim
+        for _ in range(8):
+            if abs(target - qp[j]) / dt <= lim:
+                break
+            target = np.nextafter(target, qp[j])
+        else:
+            return {"ok": False, "reason": "boundary_convergence",
+                    "joint": int(j),
+                    "needed_rad": float(abs(target - original))}
+        if abs(target - original) > budget:
+            return {"ok": False, "reason": "velocity_projection_budget",
+                    "joint": int(j),
+                    "needed_rad": float(abs(target - original))}
+        changed.append((int(j), float(abs(target - original))))
+        new[j] = target
+    speeds = np.abs(new - qp) / dt
+    if float(speeds.max()) > lim:
+        return {"ok": False, "reason": "postcheck_exceedance"}
+    z_out = np.array(z_cand, copy=True)
+    z_out[7:36] = new
+    return {"ok": True, "z": z_out, "n_changed": len(changed),
+            "max_delta_rad": max((d for _, d in changed), default=0.0),
+            "changed": changed}
+
+
 @dataclass
 class PassRecord:
     """One trajectory pass's OWN accounting (R6).
@@ -250,10 +313,32 @@ class RepairPipeline:
         #: diagnostics replays only. ``data`` values are live references
         #: (arrays/contexts); the callback owns copying what it keeps.
         self.snapshot = None
+        #: V1 velocity-normalization accounting (reset per repair call;
+        #: reported verbatim in diagnostics -- never a decision input)
+        self._vel_proj = {"checks": 0, "normalized": 0, "budget_failures": 0,
+                          "max_delta_rad": 0.0, "output_frames_modified": 0}
 
     def _snap(self, kind: str, **data) -> None:
         if self.snapshot is not None:
             self.snapshot(kind, data)
+
+    def _normalize_candidate(self, z_cand: np.ndarray, ctx) -> dict:
+        """V1: normalize ONE adoption candidate against ``ctx.z_prev`` (the
+        actually adopted previous state) and account it. ``t=0`` candidates
+        pass through unchanged -- the final check has no differential there."""
+        if ctx.z_prev is None:
+            return {"ok": True, "z": z_cand, "n_changed": 0,
+                    "max_delta_rad": 0.0, "changed": []}
+        info = normalize_joint_velocity(z_cand, ctx.z_prev, self.cfg)
+        self._vel_proj["checks"] += 1
+        if info["ok"]:
+            if info["n_changed"]:
+                self._vel_proj["normalized"] += 1
+                self._vel_proj["max_delta_rad"] = max(
+                    self._vel_proj["max_delta_rad"], info["max_delta_rad"])
+        else:
+            self._vel_proj["budget_failures"] += 1
+        return info
 
     # -- interaction mesh precompute -------------------------------------------
 
@@ -436,6 +521,22 @@ class RepairPipeline:
                         chk.discovered.append(ids[k])
             chk.reason = "state_constraints"
             return chk
+        # V1 independent strict joint-velocity gate: same float64 formula as
+        # the final validator, checked at EVERY candidate. The normalized
+        # violation sum above (1e-6 on a 0.4 rad row scale) would absorb an
+        # eps-scale exceedance of this exact linear row (sub7: 3.3e-8 passed
+        # the sum, 12.000000401 rad/s failed the final check).
+        if ctx.z_prev is not None:
+            speeds = strict_joint_speeds(z, ctx.z_prev, self.cfg)
+            jmax = int(np.argmax(speeds))
+            if float(speeds[jmax]) > self.cfg.joint_velocity_limit_radps:
+                chk.ok = False
+                chk.reason = "state_constraints"
+                chk.rows.append({
+                    "row": f"joint_vel[j{jmax + 7}]",
+                    "val": float(speeds[jmax]),
+                    "hi": float(self.cfg.joint_velocity_limit_radps)})
+                return chk
         # interpolated probes between the previous accepted scene and the
         # candidate: the final validator interpolates FULL scenes (robot +
         # box), so the sequential loop must pre-check the same transitions
@@ -568,9 +669,14 @@ class RepairPipeline:
         validations (the timing callers must report)."""
         t0 = time.perf_counter()
         self.solver.probe_cfg = self.validator.cfg
+        self._vel_proj = {"checks": 0, "normalized": 0, "budget_failures": 0,
+                          "max_delta_rad": 0.0, "output_frames_modified": 0}
         if self.verbose:
             self.frame_log = []
         result = self._repair_trajectory(prediction, condition)
+        # V1 accounting covers every pass (first + suffix retry); the
+        # numbers are facts about candidates, never re-used as gates
+        result.diagnostics.setdefault("velocity_projection", dict(self._vel_proj))
         result.diagnostics.setdefault("total_s", round(time.perf_counter() - t0, 3))
         return result
 
@@ -775,6 +881,28 @@ class RepairPipeline:
         rec = self._begin_attempt(res, source, t, attempt_id)
         attempts.append(rec)
         frame_recs.append(rec)
+        # V1: normalize the solve candidate before ANY acceptance check (the
+        # ``_begin_attempt`` fields above describe the solver's raw return;
+        # the normalization is recorded separately). An over-budget failure
+        # makes the candidate unusable: the caller's existing failure/restart
+        # flow handles it -- no partial projection, no widened budget.
+        norm = self._normalize_candidate(res.z, ctx)
+        if not norm["ok"]:
+            rec["velocity_normalization"] = {
+                "ok": False, "reason": norm["reason"],
+                "joint": norm.get("joint"), "needed_rad": norm.get("needed_rad")}
+            chk = FrameCheck(ok=False, reason=norm["reason"])
+            self._note_check(checks, chk, source, t, attempt_id)
+            self._finalize_attempt(rec, res, chk,
+                                   {"probed": [], "adopted": None})
+            return res, chk, None, {"probed": [], "adopted": None}, rec
+        if norm["n_changed"]:
+            res.z = norm["z"]
+            res.frame_check = None          # the cached check is stale (plan 4.1)
+            res.diagnostics["velocity_normalized"] = True
+            rec["velocity_normalization"] = {
+                "ok": True, "n_changed": norm["n_changed"],
+                "max_delta_rad": norm["max_delta_rad"]}
         res, bt, bt_info = self._transition_backtrack(
             res, ctx, z_prev, source=source, attempt_id=attempt_id,
             backtrack=not force_slack)
@@ -851,6 +979,7 @@ class RepairPipeline:
         for t in range(T):
             t0 = time.perf_counter()
             visits.append(t)
+            frame_modified = False        # V1: did adoption change the state?
             # stage 1: discovered-pair carry-over is a WITHIN-FRAME mechanism
             # (attempt N learns what attempt N-1's checks caught); a new
             # frame is a new state and starts from a clean candidate set
@@ -891,11 +1020,21 @@ class RepairPipeline:
             self._snap("frame", t=t, pass_index=pass_index, ctx=ctx,
                        z_pred=z_pred, z_prev=z_prev, box=box, prediction=prediction)
 
-            chk = self.frame_valid(z_pred, ctx)
+            # V1: normalize the skip candidate against the adopted previous
+            # state BEFORE checking it -- the checked state must be the
+            # adopted state. A normalization failure (over budget) denies the
+            # skip and falls through to the normal solve escalation; the raw
+            # prediction stays untouched as the solve input/objective.
+            skip_norm = self._normalize_candidate(z_pred, ctx)
+            if skip_norm["ok"]:
+                chk = self.frame_valid(skip_norm["z"], ctx)
+            else:
+                chk = FrameCheck(ok=False, reason=skip_norm["reason"])
             self._note_check(checks, chk, "skip", t, None)
             self._log_check(chk, t, "skip", None)
             if chk.ok:
-                z = z_pred
+                z = skip_norm["z"]
+                frame_modified = skip_norm["n_changed"] > 0
                 frame_status.append("skipped")
                 adopted_iterations.append(0)
                 adopted_qp.append(0)
@@ -1003,6 +1142,7 @@ class RepairPipeline:
                 # path NAME, but the flag travels with the result object
                 # (P0-fix F4, 2026-09-14)
                 slack_flags.append(bool(res.slack_used))
+                frame_modified = bool(res.diagnostics.get("velocity_normalized"))
 
             # commit contact transitions from the accepted state only:
             # anchors lock from the geometry that just passed all checks
@@ -1015,10 +1155,13 @@ class RepairPipeline:
             prev_sole = {"l": self.ev.site_positions(self.ev.sole_sites["l"]),
                          "r": self.ev.site_positions(self.ev.sole_sites["r"])}
             accepted.append(z)
+            if frame_modified:
+                self._vel_proj["output_frames_modified"] += 1
             self._snap("adopted", t=t, pass_index=pass_index, z=z.copy(),
                        status=frame_status[-1], slack=bool(slack_flags[-1]),
                        qp_calls=int(qp_calls_hist[-1]),
-                       iterations=int(adopted_iterations[-1]))
+                       iterations=int(adopted_iterations[-1]),
+                       velocity_modified=bool(frame_modified))
             timings.append(time.perf_counter() - t0)
 
         trajectory = np.zeros((T, 43))
@@ -1072,6 +1215,13 @@ class RepairPipeline:
         for alpha in (0.75, 0.5, 0.25):
             cand = retract_batch(self.ev.model, z_prev[None], (alpha * xi)[None])[0]
             probed.append(float(alpha))
+            # V1: a backtracking candidate is an adoption candidate too --
+            # normalize before its check; an over-budget candidate is simply
+            # not usable at this alpha (the next alpha is tried)
+            norm = self._normalize_candidate(cand, ctx)
+            if not norm["ok"]:
+                continue
+            cand = norm["z"]
             chk_bt = self._frame_valid(cand, ctx)
             if checks is not None:
                 self._note_check(checks, chk_bt, f"backtrack_{alpha}", ctx.t, attempt_id)
@@ -1079,6 +1229,8 @@ class RepairPipeline:
             if chk_bt.ok:
                 res.z = cand
                 res.frame_check = chk_bt
+                if norm["n_changed"]:
+                    res.diagnostics["velocity_normalized"] = True
                 return res, "repaired_bt", {"probed": probed, "adopted": float(alpha)}
             self.carry_discovered(chk_bt)
         return res, None, {"probed": probed, "adopted": None}
