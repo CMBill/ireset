@@ -531,7 +531,7 @@ class FrameSolver:
         ev.forward(z, ctx.box_pose)
         pre = self._fixed_pre_rows(z, ctx, trust)
         rows = self._collision_rows(ctx, band_margin_m, probe_mode=probe_mode,
-                                    need_jacobian=False)
+                                    need_jacobian=False, mode=mode)
         self._last_rows = rows
         block = self._collision_block(rows, mode)
         post = self._fixed_post_rows(z, ctx)
@@ -554,7 +554,8 @@ class FrameSolver:
         ev.forward(z, ctx.box_pose)
         pre = self._fixed_pre_rows(z, ctx, self.cfg.trust_radius_max)
         rows = self._collision_rows(ctx, band_margin_m, probe_mode=probe_mode,
-                                    budget=False, need_jacobian=False)
+                                    budget=False, need_jacobian=False,
+                                    mode="accept")
         self._last_rows = rows
         names, ids = list(self.last_row_pairs), list(self.last_row_ids)
         block = self._collision_block(rows, "accept")
@@ -879,18 +880,23 @@ class FrameSolver:
                         band_margin_m: float | None = None,
                         probe_mode: bool = False,
                         budget: bool = True,
-                        need_jacobian: bool = True) -> list[tuple[float, np.ndarray, float, float]]:
+                        need_jacobian: bool = True,
+                        mode: str = "repair") -> list[tuple[float, np.ndarray, float, float]]:
         """Active collision rows with contact-band classification.
 
         Hand geoms during hold and sole geoms during support are CONTACT
         pairs (band [-2mm, upper]); everything else keeps the positive
         non-contact clearance. A support foot touching the ground is the
-        intended state, not a violation. ``band_margin_m`` overrides the
-        regeneration interior margin (None -> cfg default; 0.0 gives the
-        validator-grade floor for transition probes). ``probe_mode=True``
-        marks an INTERPOLATED mid-state evaluation: regen corridor rows
-        keep only their anti-penetration floor there (the closing target
-        is a frame-end bound; see the stage 2 comment below).
+        intended state, not a violation. ``band_margin_m`` explicitly
+        overrides the band floor (transition probes pass 0.0 -> the
+        validator-grade -2mm); ``None`` selects by ``mode``: the QP DRIVING
+        floor keeps the regen interior margin (-1.5mm), while
+        ``mode="accept"`` uses the acceptance-grade floor -- in regen mode
+        ``cfg_noncontact`` (-1.8mm, train24fix F1: the single changed cell of
+        the section-2.4 matrix; standard mode keeps the historical -2mm).
+        ``probe_mode=True`` marks an INTERPOLATED mid-state evaluation: regen
+        corridor rows keep only their anti-penetration floor there (the
+        closing target is a frame-end bound; see the stage 2 comment below).
 
         ``budget=False`` skips the QP row cap: the check path evaluates
         EVERY candidate pair (F1 -- a successful return may not hide a
@@ -973,12 +979,23 @@ class FrameSolver:
                 self.last_corridor[side] = sel
         # regen mode keeps an interior margin above the -2 mm validator
         # floor on every band row: solutions sit on constraint boundaries
-        # by construction, and boundary-sitting states would graze past
-        # the gate at the transition probes' interpolated states. Probes
+        # by construction, and boundary-sitting states would graze past the
+        # gate at the transition probes' interpolated states. Probes
         # override this to the validator grade via ``band_margin_m=0``.
-        band_lo = -cfg.contact_band_pen_m + (
-            band_margin_m if band_margin_m is not None
-            else (0.0005 if cfg.regen_mode else 0.0))
+        # ACCEPT-mode verdicts (frame feasibility / merit / check_rows) use
+        # the acceptance floor instead (train24fix F1): in regen mode
+        # cfg_noncontact (-1.8mm, validator gate + the 0.2mm probe margin
+        # the non-contact rows already carry) -- the driving floor stays
+        # -1.5mm so the QP still keeps solutions away from the probes. The
+        # independent validator's -2mm and every explicit/probe floor are
+        # untouched. Standard mode is unchanged in every path.
+        if band_margin_m is not None:
+            band_lo = -cfg.contact_band_pen_m + band_margin_m
+        elif mode == "accept" and cfg.regen_mode:
+            band_lo = cfg_noncontact(cfg)
+        else:
+            band_lo = -cfg.contact_band_pen_m + (
+                0.0005 if cfg.regen_mode else 0.0)
         added_regens: set = set()
         # Stage 2 (2026-09-16): the corridor upper bound is an END-OF-FRAME
         # closing target -- one full dt of closing from the previous accepted
