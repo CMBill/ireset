@@ -272,6 +272,30 @@ class FrameSolver:
 
     # -- pair identity -------------------------------------------------------
 
+    def _registry_nearest_hand(self, geoms: set[int], distmax_start: float = 1.0):
+        """Nearest ``(dist, ga, gb, fromto)`` over the registry's robot_box
+        pairs for ``geoms``, bypassing the activation-gated candidate set.
+
+        R2 (train24fix): starts at a 1 m query range and escalates once; only
+        ``dist < distmax`` hits count (MuJoCo returns exactly ``distmax`` with
+        a zero ``fromto`` on a miss -- that is a truncated sentinel, never a
+        distance). Returns ``None`` when no real hit exists at either range.
+        """
+        ev = self.ev
+        for distmax in (distmax_start, 10.0):
+            best = None
+            for ga, gb, kind in ev.pairs:
+                if kind != "robot_box" or (ga not in geoms and gb not in geoms):
+                    continue
+                d, ft = ev.geom_distance(ga, gb, distmax=distmax)
+                if d >= distmax:
+                    continue
+                if best is None or d < best[0]:
+                    best = (d, ga, gb, ft)
+            if best is not None:
+                return best
+        return None
+
     def pair_identity(self, ga: int, gb: int) -> tuple[int, int, str]:
         """Registry-normalized ``(ga, gb, kind)`` for a pair identity.
 
@@ -949,7 +973,35 @@ class FrameSolver:
                 for dist, ga, gb, kind, ft in scored:
                     if kind == "robot_box" and ga in geoms and (best is None or dist < best[0]):
                         best = (dist, ga, gb, ft)
+                selection_source = "candidate"
                 if best is None:
+                    # R2 (train24fix): the activation-gated candidate set
+                    # cannot see a hovering hand -- D-R measured 5.7-11.8 cm
+                    # during active reference grasps, so no corridor row
+                    # existed and neither the pull nor the corridor contract
+                    # ever engaged (107 deciding-check frames on sub10_001).
+                    # Select the nearest hand geom from the FULL registry;
+                    # only a real hit (dist < distmax, never the truncated
+                    # return) is a usable distance.
+                    best = self._registry_nearest_hand(geoms)
+                    selection_source = "registry"
+                if best is None:
+                    # query failure is EXPLICIT: a synthetic always-violating
+                    # row rejects the candidate instead of silently dropping
+                    # the side's active row (the value is the query bound,
+                    # not a measured distance)
+                    prev = ctx.prev_hand_dist.get(side)
+                    margin = solver_band_margin(ctx, cfg)
+                    upper = cfg.regen_hand_contact_gap_m if prev is None else max(
+                        cfg.regen_hand_contact_gap_m,
+                        prev - cfg.regen_closing_rate_mps * self.dt - margin)
+                    rows.append((10.0, np.zeros((1, N_TANGENT)), -INF, 0.0))
+                    row_names.append(f"regen_query_failed[{side}]:regen")
+                    row_ids.append(None)
+                    row_roles.append("regen")
+                    self.last_corridor[side] = {
+                        "dist_m": None, "upper_m": upper, "geom": None,
+                        "query_failed": True}
                     continue
                 # approach corridor: the bound must be reachable within one
                 # frame from the previous accepted distance; once inside the
@@ -968,7 +1020,8 @@ class FrameSolver:
                     prev - cfg.regen_closing_rate_mps * self.dt - margin)
                 regen_active[(best[1], best[2])] = (best[0], best[3], upper)
                 sel = {"dist_m": best[0], "upper_m": upper,
-                       "geom": ev.geom_name(best[1])}
+                       "geom": ev.geom_name(best[1]),
+                       "source": selection_source}
                 prev_sel = self._last_regen_geom.get(side)
                 if prev_sel is not None and prev_sel != sel["geom"]:
                     # a REAL state change re-selected the nearest hand geom;

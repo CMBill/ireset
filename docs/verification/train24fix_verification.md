@@ -47,11 +47,17 @@
 
 V1 ✅、F1 ✅(band_floor_only×2)、R2 ✅;R1 为契约验证(经 R2 行,不另建距离门)。
 
-## 2. V1:有界候选规范化(状态:待实施)
+## 2. V1:有界候选规范化(已实施,提交 `8a3ac9a`)
 
-## 3. F1:regen 端点带行验收界分离(状态:待实施)
+`normalize_joint_velocity` + `strict_joint_speeds`(与终检逐位同式 `abs(diff)/(1/fps)`):已过关节逐位不动;越限关节取 `q_prev ± dt·limit` 边界、同式复算仍超则 `np.nextafter` 内收(≤8 次);总预算 `dt·limit·1e-6 = 4e-7 rad`,超预算**不部分投影**(skip 转正常求解、求解候选按既有失败/重启流程、回溯候选跳过该 alpha)。覆盖 skip/prediction/prev_accepted/slack/回溯/后缀重试全部采纳入口,规范化先于完整接受检查(检查的状态=采纳的状态);修改 `res.z` 即失效 `frame_check`。`_frame_valid` 新增独立严格关节速度门(反例=审阅浮点例 0.8+0.4→12.000000000000004,naive clip 严格不过)。`velocity_projection` 计数(检查/修正/预算失败/最大幅度/输出被修正帧数)入诊断与报告行。11 项测试(浮点反例、sub7 冻结值 12.000000401362618→严格通过、预算边界/超限/多关节全或无、负方向、严格门、skip 端到端、skip 拒绝转求解、求解候选不可用、缓存失效、回溯 alpha)。全量 196 passed。
 
-## 4. R2/R1:主动行覆盖与走廊接受契约(状态:待实施)
+## 3. F1:regen 端点带行验收界分离(已实施,提交 `b97f63e`;D-F 证据启用:band_floor_only×2)
+
+`_collision_rows` 增加 `mode` 参数(accept 角色显式传递,不再凭上界/margin 猜):**唯一改动格** = regen+端点+accept+有限上界普通接触带与主动行,下界 −1.5→−1.8 mm(`cfg_noncontact`)。QP 驱动(−2+动态 m(ctx):0.02/0.1/0.16 m 运动 → −1.5/+1/+4 mm)、显式 margin/probe(−2)、标准模式 accept(−2)、探测态主动行有效界(−1.8,来自上界无穷的 accept 覆盖)、独立 probe 块(−1.8)全部不动;独立终检 −2 mm 不动。7 项测试覆盖全矩阵终装配界 + −1.6 mm 新接受(旧界算术 0.05 归一化违反复现旧拒)、−1.9 mm 仍拒、限位/脚速反例仍拒、终检不变。
+
+## 4. R2/R1:主动行覆盖与走廊接受契约(已实施,提交见 git log)
+
+**R2**:`_registry_nearest_hand`——ref_hold 侧的最近手 geom/箱 pair 从注册表全量查询(1 m 起步、10 m 升级),绕过 ~5 cm 激活门;仅 `dist < distmax` 的真实命中可用(截断哨兵不作距离);无命中显式失败:合成常违反行 `regen_query_failed[side]:regen`(值=查询界,非测量距离)+ `query_failed` 走廊记录,候选被拒且不进回流(无 pair 身份)。候选路径命中时保持 `source="candidate"` 且同 pair 仅一行(去重)。**R1**:R2 行就位后由既有检查链承担(skip 检查、`solve_frame` 可行性/提前返回、`success_review`、pipeline 采纳全部经 `check_rows` 看到主动行与动态上界),不另建距离门——与 D-R 结论一致(R1 未独立触发)。6 项测试:注册表远距选行+停滞悬空诚实违反、查询失败显式拒绝且回流安全、近距去重、标准模式无主动行、**零 QP 反例新形态**(停滞悬空不再 0 QP 原样接受;合法闭合期 0 QP 通过是正确行为)、采纳检查全路径走廊契约(30→24 mm 合法接近通过、6 mm 其余合法时 skip 允许)。全量 209 passed + 1 skipped。
 
 ## 5. 六段回归与重新冻结(状态:待实施)
 

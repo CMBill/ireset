@@ -517,7 +517,9 @@ class RepairPipeline:
                                      "val_m": float(v), "lo_m": float(l_),
                                      "hi_m": float(h_)})
                     chk.carried.append(names[k] if k < len(names) else "?")
-                    if k < len(ids):
+                    if k < len(ids) and ids[k] is not None:
+                        # synthetic rows (R2 query failure) carry no pair
+                        # identity and cannot be carried back
                         chk.discovered.append(ids[k])
             chk.reason = "state_constraints"
             return chk
