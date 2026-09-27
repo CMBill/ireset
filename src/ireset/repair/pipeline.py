@@ -243,6 +243,17 @@ class RepairPipeline:
         self.frame_log: list[dict] = []
         #: trajectory pass currently running (check ids are scoped by it)
         self._pass_index: int = 0
+        #: READ-ONLY forensic hook (train24fix D stage). When set, it is
+        #: called with ``(kind, data)`` at frame/adoption/failure events.
+        #: It runs OUTSIDE every decision path: the pipeline never reads
+        #: anything back from it, so its presence cannot change behaviour --
+        #: diagnostics replays only. ``data`` values are live references
+        #: (arrays/contexts); the callback owns copying what it keeps.
+        self.snapshot = None
+
+    def _snap(self, kind: str, **data) -> None:
+        if self.snapshot is not None:
+            self.snapshot(kind, data)
 
     # -- interaction mesh precompute -------------------------------------------
 
@@ -613,6 +624,8 @@ class RepairPipeline:
         # segment -- retrying only the tail would silently keep whatever
         # the missing location hides (P0-fix F3, 2026-09-14)
         f_frame = self._first_failure_frame(final)
+        self._snap("final_fail", pass_index=0, trajectory=result.trajectory.copy(),
+                   final=final, first_failure_frame=f_frame)
         start = 0 if f_frame is None else max(0, f_frame - self.cfg.suffix_retry_window)
         retry_pred = np.vstack([result.trajectory[:start], prediction[start:]])
         retry = self._run_sequential(retry_pred, condition, pass_index=1)
@@ -660,6 +673,9 @@ class RepairPipeline:
                 "evidence": v.evidence}
             for k, v in final2.checks.items() if not v.passed
         }
+        self._snap("final_fail", pass_index=1, trajectory=retry.trajectory.copy(),
+                   final=final2, first_failure_frame=self._first_failure_frame(final2),
+                   first_attempt_final=final)
         self._final_rejection(retry, retry.diagnostics["final_retry_failed_checks"])
         return self._finish(TrajectoryResult(False, "rejected_final", diagnostics={
             **retry.diagnostics, "final_retry": final2.summary(),
@@ -872,6 +888,8 @@ class RepairPipeline:
                             if float(np.linalg.norm(hl - anchor, axis=-1).max()) > self.cfg.hand_anchor_tol_m:
                                 contacts.release(name)
             ctx = self._frame_ctx(t, prediction, condition, contacts, prev_local, prev_sole, z_prev)
+            self._snap("frame", t=t, pass_index=pass_index, ctx=ctx,
+                       z_pred=z_pred, z_prev=z_prev, box=box, prediction=prediction)
 
             chk = self.frame_valid(z_pred, ctx)
             self._note_check(checks, chk, "skip", t, None)
@@ -939,6 +957,11 @@ class RepairPipeline:
                     # attempt failed on a transition), and the initial
                     # skip_reason describes only the raw prediction (R5).
                     last_rec = frame_recs[-1]
+                    self._snap("fail", t=t, pass_index=pass_index, ctx=ctx,
+                               last_res=res, last_chk=last_chk,
+                               last_rec=last_rec, z_pred=z_pred, z_prev=z_prev,
+                               accepted=[a.copy() for a in accepted],
+                               prediction=prediction)
                     timings.append(time.perf_counter() - t0)
                     rec_pass = self._pass_record(
                         prediction, pass_index, "rejected_frame", len(accepted),
@@ -992,6 +1015,10 @@ class RepairPipeline:
             prev_sole = {"l": self.ev.site_positions(self.ev.sole_sites["l"]),
                          "r": self.ev.site_positions(self.ev.sole_sites["r"])}
             accepted.append(z)
+            self._snap("adopted", t=t, pass_index=pass_index, z=z.copy(),
+                       status=frame_status[-1], slack=bool(slack_flags[-1]),
+                       qp_calls=int(qp_calls_hist[-1]),
+                       iterations=int(adopted_iterations[-1]))
             timings.append(time.perf_counter() - t0)
 
         trajectory = np.zeros((T, 43))
