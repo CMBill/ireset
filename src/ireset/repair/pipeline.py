@@ -916,8 +916,15 @@ class RepairPipeline:
         res, bt, bt_info = self._transition_backtrack(
             res, ctx, z_prev, source=source, attempt_id=attempt_id,
             backtrack=not force_slack)
-        chk = self.check_result(res, ctx, source)
+        # note the check id BEFORE serializing it (review round 2): the log
+        # record is a snapshot, and an empty-id check record could never be
+        # correlated back to its attempt -- the deciding check of every
+        # solve-adopted frame was unfindable in verbose logs
+        if res.frame_check is None:
+            res.frame_check = self._frame_valid(res.z, ctx)
+        chk = res.frame_check
         self._note_check(checks, chk, source, t, attempt_id)
+        self._log_check(chk, ctx.t, source, res)
         self._finalize_attempt(rec, res, chk, bt_info)
         return res, chk, bt, bt_info, rec
 

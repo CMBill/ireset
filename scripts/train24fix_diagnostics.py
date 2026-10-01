@@ -394,19 +394,24 @@ def cmd_dr(demos: list[str], out: Path, zero_qp_frames: dict[str, list[int]]) ->
         adopted = {(a["pass_index"], a["t"]): a for a in col.adopted}
         # the check record that DECIDED each frame's adoption: the skip check
         # for skipped frames, otherwise the adopted attempt's own check id
-        # (attempt records carry check_id + adopted after finalization)
+        # (attempt records carry check_id + adopted after finalization).
+        # Records logged before their id was assigned (backtrack checks and
+        # pre-fix logs) fall back to ORDER-based pass segmentation: pass 1
+        # records all follow the first "p1:" id in the sequential log.
         checks_by_id = {r.get("check_id"): r for r in pipe.frame_log
-                        if r.get("kind") == "check"}
+                        if r.get("kind") == "check" and r.get("check_id")}
         checks_at: dict[tuple[int, int], list[dict]] = {}
         attempts_at: dict[tuple[int, int], list[dict]] = {}
+        running_pass = 0
         for r in pipe.frame_log:
             cid = r.get("check_id") or ""
-            pass_idx = int(cid.split(":")[0][1:]) if cid.startswith("p") else None
-            if r.get("kind") == "check" and pass_idx is not None:
+            if cid.startswith("p") and ":" in cid:
+                running_pass = max(running_pass, int(cid.split(":")[0][1:]))
+            pass_idx = (int(cid.split(":")[0][1:])
+                        if cid.startswith("p") and ":" in cid else running_pass)
+            if r.get("kind") == "check":
                 checks_at.setdefault((pass_idx, r["t"]), []).append(r)
             elif r.get("kind") == "attempt":
-                cid = r.get("check_id") or ""
-                pass_idx = int(cid.split(":")[0][1:]) if cid.startswith("p") else 0
                 attempts_at.setdefault((pass_idx, r["t"]), []).append(r)
 
         def deciding_check(p: int, t: int) -> dict:
@@ -415,8 +420,17 @@ def cmd_dr(demos: list[str], out: Path, zero_qp_frames: dict[str, list[int]]) ->
             if a is not None and a["status"] == "skipped":
                 return next((r for r in recs if r.get("caller") == "skip"), {})
             atts = attempts_at.get((p, t), [])
-            cid = next((r.get("check_id") for r in atts if r.get("adopted")), None)
-            return checks_by_id.get(cid, {})
+            adopted_att = next((r for r in atts if r.get("adopted")), None)
+            if adopted_att is None:
+                return {}
+            rec = checks_by_id.get(adopted_att.get("check_id"))
+            if rec:
+                return rec
+            # fallback for records serialized before id assignment: the
+            # attempt's own source names its check's caller uniquely
+            src = adopted_att.get("source")
+            cands = [r for r in recs if r.get("caller") == src]
+            return cands[-1] if cands else {}
 
         table, r2_ev, r1_ev = [], [], []
         for (p, t), fr in sorted(frames_by_key.items()):
