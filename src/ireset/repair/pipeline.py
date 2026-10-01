@@ -30,7 +30,13 @@ from ireset.imesh.delaunay import build_frame_mesh, laplacian_coordinates
 from ireset.geometry.distance_adapter import world_to_box_geom
 from ireset.kinematics.mujoco_adapter import retract_batch
 from ireset.repair.constraints import FrameEvaluator, tangent_error
-from ireset.repair.context import EFFECTORS, ContactStateMachine, ReferenceCondition, RepairConfig
+from ireset.repair.context import (
+    C2HandSpeedState,
+    EFFECTORS,
+    ContactStateMachine,
+    ReferenceCondition,
+    RepairConfig,
+)
 from ireset.repair.scp import FrameCheck, FrameContext, FrameSolver, solver_band_margin
 from ireset.repair.validation import IndependentValidator
 
@@ -317,6 +323,11 @@ class RepairPipeline:
         #: reported verbatim in diagnostics -- never a decision input)
         self._vel_proj = {"checks": 0, "normalized": 0, "budget_failures": 0,
                           "max_delta_rad": 0.0, "output_frames_modified": 0}
+        #: C2 hand-speed-row accounting (train24fix2 section 4.3; reset per
+        #: repair call, cumulative over passes; facts, never a gate)
+        self._c2_diag = {"frames_on": {"l": 0, "r": 0},
+                         "enable_events": [], "release_events": [],
+                         "query_miss": []}
 
     def _snap(self, kind: str, **data) -> None:
         if self.snapshot is not None:
@@ -407,7 +418,40 @@ class RepairPipeline:
                 out["foot"][name] = pts
         return out
 
-    def _frame_ctx(self, t, prediction, condition, contacts, prev_local, prev_sole, z_prev):
+    def _collect_prev_scene_dist(self, t: int) -> dict:
+        """C2 previous-frame input: min hand-geom/box distance of the
+        previous accepted FULL SCENE (robot AND box pose), read in the SAME
+        forwarded state as the ``prev_local`` collection right above it --
+        never re-projected against the current box pose (that projected
+        field is the approach corridor's).  Real-hit criterion
+        ``dist < distmax``: a miss (hand beyond the 1.0 m scan cap) keeps
+        the rows off and is recorded -- never filled with zero and never
+        silently replaced by the projected field.
+
+        The ONLY call site is behind ``regen_mode and
+        regen_hand_speed_mps > 0`` (section 4.2 implementation trap): the
+        collection point itself is on an unconditional path that standard
+        mode also executes, so an ungated query here would change the
+        standard-mode call/count behaviour."""
+        out = {}
+        for side in ("l", "r"):
+            dmin, hit = np.inf, False
+            for g in self.ev._hand_geoms[side]:
+                d = self.ev.geom_distance(g, self.ev.box_geom)[0]
+                if d < 1.0:
+                    hit = True
+                    dmin = min(dmin, d)
+            if hit:
+                out[side] = float(dmin)
+            else:
+                out[side] = None
+                self._c2_diag["query_miss"].append(
+                    {"t": t, "side": side,
+                     "note": "hand beyond the 1.0 m scan cap; rows stay off"})
+        return out
+
+    def _frame_ctx(self, t, prediction, condition, contacts, prev_local, prev_sole, z_prev,
+                   prev_scene_dist=None, c2_enable=None, c2_reason=None):
         # Only anchors already LOCKED from accepted states constrain the solve
         # (plan 8.4): a first hold frame solves freely and its accepted state
         # provides the anchor afterwards.
@@ -459,6 +503,9 @@ class RepairPipeline:
                     np.r_[z_prev, prediction[t - 1, 36:43]],
                     np.r_[prediction[t, 0:36], prediction[t, 36:43]])
                 if z_prev is not None else 0.0),
+            c2_hand_enabled=dict(c2_enable or {}),
+            c2_hand_reason=dict(c2_reason or {}),
+            prev_hand_scene_dist=dict(prev_scene_dist or {}),
         )
 
     # -- frame-level checks (skip logic, plan 8.4) ---------------------------------
@@ -509,6 +556,14 @@ class RepairPipeline:
         )
         chk.hand_prev = {s: float(v) for s, v in ctx.prev_hand_dist.items()}
         chk.hand_cand = self._hand_gaps()
+        if ctx.c2_hand_enabled or ctx.c2_hand_reason:
+            # C2 evidence copied from the endpoint row assembly (state that
+            # already exists -- the log never recomputes or re-forwards)
+            chk.c2 = {}
+            for s in ("l", "r"):
+                rec = dict(self.solver.last_hand_speed.get(s, {}))
+                rec["prev_scene_dist_m"] = ctx.prev_hand_scene_dist.get(s)
+                chk.c2[s] = rec
         if ep_viol > 1e-6:
             for k in range(len(names)):
                 v, l_, h_ = val[99 + k], lo[99 + k], hi[99 + k]
@@ -655,6 +710,8 @@ class RepairPipeline:
                "hand_r_prev_m": float(chk.hand_prev.get("r", float("nan"))),
                "hand_r_cand_m": float(chk.hand_cand.get("r", float("nan"))),
                "corridor": chk.corridor, "band_margin_m": chk.band_margin}
+        if chk.c2:
+            rec["c2"] = chk.c2
         if chk.rows:
             rec["rows"] = chk.rows
             rec["carried"] = chk.carried
@@ -673,12 +730,21 @@ class RepairPipeline:
         self.solver.probe_cfg = self.validator.cfg
         self._vel_proj = {"checks": 0, "normalized": 0, "budget_failures": 0,
                           "max_delta_rad": 0.0, "output_frames_modified": 0}
+        self._c2_diag = {"frames_on": {"l": 0, "r": 0},
+                         "enable_events": [], "release_events": [],
+                         "query_miss": []}
         if self.verbose:
             self.frame_log = []
         result = self._repair_trajectory(prediction, condition)
         # V1 accounting covers every pass (first + suffix retry); the
         # numbers are facts about candidates, never re-used as gates
         result.diagnostics.setdefault("velocity_projection", dict(self._vel_proj))
+        result.diagnostics.setdefault(
+            "c2_hand_speed",
+            {"frames_on": dict(self._c2_diag["frames_on"]),
+             "enable_events": list(self._c2_diag["enable_events"]),
+             "release_events": list(self._c2_diag["release_events"]),
+             "query_miss": list(self._c2_diag["query_miss"])})
         result.diagnostics.setdefault("total_s", round(time.perf_counter() - t0, 3))
         return result
 
@@ -992,6 +1058,16 @@ class RepairPipeline:
         checks: list[dict] = []         # every acceptance check, always recorded
         visits: list[int] = []          # processed-frame visits in this pass
         skip_reasons: dict[int, str] = {}
+        # C2 (train24fix2 section 4.2): the hand-speed-row enable state is a
+        # pure function of the accepted prefix + the INPUT reference schedule;
+        # one instance PER PASS (a suffix retry rebuilds it from the retry's
+        # own accepted prefix). Standard mode / parameter 0 build NO state and
+        # issue NO extra distance queries (ns count-identity gate).
+        c2 = (C2HandSpeedState(condition.ref_schedule, T,
+                               self.cfg.regen_hand_contact_gap_m)
+              if self.cfg.regen_mode and self.cfg.regen_hand_speed_mps > 0.0
+              else None)
+        prev_scene_dist: dict = {}
 
         for t in range(T):
             t0 = time.perf_counter()
@@ -1033,7 +1109,29 @@ class RepairPipeline:
                             hl = self.ev.hand_local(side)
                             if float(np.linalg.norm(hl - anchor, axis=-1).max()) > self.cfg.hand_anchor_tol_m:
                                 contacts.release(name)
-            ctx = self._frame_ctx(t, prediction, condition, contacts, prev_local, prev_sole, z_prev)
+            # C2 frame state: judged ONCE per frame from the accepted prefix
+            # and the reference input, BEFORE any candidate is checked -- all
+            # candidates of this frame (skip / solve / backtrack / retry) see
+            # the same rows. A failed candidate cannot alter it.
+            c2_enable, c2_reason = {}, {}
+            if c2 is not None:
+                for side, eff in (("l", "left_hand"), ("r", "right_hand")):
+                    was_on = c2.enabled[eff]
+                    on, why = c2.step(eff, t,
+                                      contacts.reference_wants_hold(eff, t),
+                                      prev_scene_dist.get(side))
+                    c2_enable[side], c2_reason[side] = on, why
+                    if on:
+                        self._c2_diag["frames_on"][side] += 1
+                        if why == "enable":
+                            self._c2_diag["enable_events"].append(
+                                {"t": t, "side": side})
+                    elif was_on:
+                        self._c2_diag["release_events"].append(
+                            {"t": t, "side": side, "reason": why})
+            ctx = self._frame_ctx(t, prediction, condition, contacts, prev_local,
+                                  prev_sole, z_prev, prev_scene_dist=prev_scene_dist,
+                                  c2_enable=c2_enable, c2_reason=c2_reason)
             self._snap("frame", t=t, pass_index=pass_index, ctx=ctx,
                        z_pred=z_pred, z_prev=z_prev, box=box, prediction=prediction)
 
@@ -1179,6 +1277,10 @@ class RepairPipeline:
             prev_local = {"l": self.ev.hand_local("l"), "r": self.ev.hand_local("r")}
             prev_sole = {"l": self.ev.site_positions(self.ev.sole_sites["l"]),
                          "r": self.ev.site_positions(self.ev.sole_sites["r"])}
+            if c2 is not None:
+                # C2 previous-frame input: the previous accepted FULL SCENE
+                # (robot AND box pose of frame t); see _collect_prev_scene_dist
+                prev_scene_dist = self._collect_prev_scene_dist(t)
             accepted.append(z)
             if frame_modified:
                 self._vel_proj["output_frames_modified"] += 1

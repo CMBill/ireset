@@ -385,6 +385,9 @@ def main() -> None:
                # budget failures / max delta / modified output frames) --
                # facts about candidates, never a gate
                "velocity_projection": res.diagnostics.get("velocity_projection"),
+               # C2 (train24fix2): hand-speed-row enable/release/query facts,
+               # cumulative over passes -- evidence, never a gate
+               "c2_hand_speed": res.diagnostics.get("c2_hand_speed"),
                # R6: the run-level TOTAL view (schema 2, every trajectory pass)
                # plus the per-pass event paths. The flat fields below describe
                # the FINAL pass only -- a reader must not add them to `cost`.

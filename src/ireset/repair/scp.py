@@ -122,6 +122,28 @@ class FrameContext:
     #: the solver's interpolation-dip margin (dip grows ~ quadratically
     #: with the per-frame step)
     frame_motion_m: float = 0.0
+    #: C2 (train24fix2 section 4.2): per-side enable state of the regen hand
+    #: box-frame speed rows at THIS frame, the reason for it, and the previous
+    #: accepted FULL-SCENE hand/box distance it was derived from.  Empty or
+    #: missing keys keep the rows OFF (standard mode, legacy contexts) -- the
+    #: projected ``prev_hand_dist`` above belongs to the approach corridor
+    #: alone and is never a C2 input.
+    c2_hand_enabled: dict = field(default_factory=dict)
+    c2_hand_reason: dict = field(default_factory=dict)
+    prev_hand_scene_dist: dict = field(default_factory=dict)
+
+
+def hand_speed_rows_active(cfg, ctx: FrameContext, side: str) -> bool:
+    """THE shared enable criterion of the regen hand box-frame speed rows
+    (train24fix2 section 4.2).  The value path (``_fixed_post_rows``) and
+    the QP mirror (``linearize``) must answer it identically: regen mode, a
+    positive bound parameter, the previous box-frame site array, and the
+    frame's reference-interval enable state over the previous FULL-SCENE
+    distance.  The old criterion (projected ``prev_hand_dist`` at 6mm) is
+    NOT part of C2 -- it missed five of the ten frozen speed spikes."""
+    return (cfg.regen_mode and cfg.regen_hand_speed_mps > 0.0
+            and ctx.prev_hand_local.get(side) is not None
+            and bool(ctx.c2_hand_enabled.get(side, False)))
 
 
 @dataclass
@@ -189,6 +211,10 @@ class FrameCheck:
     hand_prev: dict = field(default_factory=dict)
     hand_cand: dict = field(default_factory=dict)
     corridor: dict = field(default_factory=dict)
+    #: C2 evidence (train24fix2 section 4.3): per-side enable/reason and, when
+    #: enabled, the row values' absmax / bound / true norm speed -- copied
+    #: from the endpoint check's row assembly, never recomputed for the log
+    c2: dict = field(default_factory=dict)
     band_margin: float = 0.0
     motion_m: float = 0.0
     truncated_rows: list[str] = field(default_factory=list)
@@ -231,6 +257,11 @@ class FrameSolver:
         #: bound geom distance + active upper at the LAST linearization);
         #: read by the pipeline's verbose frame log, not by the solver
         self.last_corridor: dict[str, dict] = {}
+        #: C2 hand-speed row evidence at the LAST row assembly (per side:
+        #: enabled/reason and, when on, row absmax/bound/true norm speed);
+        #: populated by ``_fixed_post_rows`` from the already-forwarded
+        #: evaluator state -- the log never recomputes
+        self.last_hand_speed: dict[str, dict] = {}
         #: last selected nearest hand geom per side (re-selection evidence)
         self._last_regen_geom: dict[str, str] = {}
         #: geom-pair names parallel to the rows returned by the last
@@ -494,27 +525,43 @@ class FrameSolver:
                 u[base_s : base_s + 15] = lim_f
                 scale[base_s : base_s + 15] = lim_f
 
-        # regen-mode hand box-frame speed rows: once a hand is IN the
-        # contact band, its per-frame box-frame motion is hard-bounded
-        # (the per-frame QP otherwise chatters a few mm inside the band
-        # slack and the validator's quasi-static entry gate sees 2-3x the
-        # reference hand speed). Bounds: +-dt * regen_hand_speed_mps,
-        # measured exactly like the validator (hand_local vs previous
-        # accepted hand_local). Approach frames (outside the band) are
-        # exempt -- the corridor needs mm-scale closing steps.
+        # regen-mode hand box-frame speed rows (C2, train24fix2 section 4):
+        # once ENABLED for the current reference hold interval (the shared
+        # criterion in hand_speed_rows_active -- previous accepted FULL-SCENE
+        # distance <= regen_hand_contact_gap_m, see C2HandSpeedState), the
+        # per-frame box-frame motion of every hand site axis is hard-bounded.
+        # Bounds: +-dt * regen_hand_speed_mps, measured exactly like the
+        # validator (hand_local vs previous accepted hand_local); the
+        # certification entry gate (0.05) admits sqrt(3) * the bound, so a
+        # row-satisfying candidate is never speed-gated out.  Approach frames
+        # (interval not yet enabled) are exempt -- the corridor needs mm-scale
+        # closing steps; interval end releases the rows unconditionally.
+        self.last_hand_speed = {}
         if cfg.regen_mode and cfg.regen_hand_speed_mps > 0.0:
             lim_h = self.dt * cfg.regen_hand_speed_mps
             for si, side in enumerate(("l", "r")):
-                prev_local = ctx.prev_hand_local.get(side)
-                prev_dist = ctx.prev_hand_dist.get(side)
-                if (prev_local is None or prev_dist is None
-                        or prev_dist > 0.006):
-                    continue
-                base = N_HAND_ROWS + N_FOOT_ROWS + N_FOOT_SPEED + si * 9
-                val[base : base + 9] = (ev.hand_local(side) - prev_local).reshape(-1)
-                l[base : base + 9] = -lim_h
-                u[base : base + 9] = lim_h
-                scale[base : base + 9] = lim_h
+                active = hand_speed_rows_active(cfg, ctx, side)
+                if active:
+                    prev_local = ctx.prev_hand_local[side]
+                    vals = (ev.hand_local(side) - prev_local).reshape(-1)
+                    base = N_HAND_ROWS + N_FOOT_ROWS + N_FOOT_SPEED + si * 9
+                    val[base : base + 9] = vals
+                    l[base : base + 9] = -lim_h
+                    u[base : base + 9] = lim_h
+                    scale[base : base + 9] = lim_h
+                    self.last_hand_speed[side] = {
+                        "enabled": True,
+                        "reason": ctx.c2_hand_reason.get(side),
+                        "row_absmax_m": float(np.abs(vals).max()),
+                        "bound_abs_m": float(lim_h),
+                        "norm_speed_mps": float(
+                            np.linalg.norm(vals.reshape(3, 3), axis=1).max()
+                            / self.dt),
+                    }
+                else:
+                    self.last_hand_speed[side] = {
+                        "enabled": False,
+                        "reason": ctx.c2_hand_reason.get(side)}
         return val, l, u, scale
 
     def _collision_block(self, rows: list, mode: str):
@@ -1355,18 +1402,17 @@ class FrameSolver:
                 A_rows.append(np.zeros((15, N_TANGENT)))
                 l_rows.append(np.full(15, -INF)); u_rows.append(np.full(15, INF))
 
-        # regen-mode hand box-frame speed rows (mirror of constraint_rows)
+        # regen-mode hand box-frame speed rows (mirror of constraint_rows;
+        # SAME shared criterion -- hand_speed_rows_active, C2 section 4.2)
         if cfg.regen_mode and cfg.regen_hand_speed_mps > 0.0:
             lim_h = self.dt * cfg.regen_hand_speed_mps
             for side in ("l", "r"):
-                prev_local = ctx.prev_hand_local.get(side)
-                prev_dist = ctx.prev_hand_dist.get(side)
-                Jh = ev.hand_local_jac(side).reshape(9, N_TANGENT)
-                if (prev_local is None or prev_dist is None
-                        or prev_dist > 0.006):
+                if not hand_speed_rows_active(cfg, ctx, side):
                     A_rows.append(np.zeros((9, N_TANGENT)))
                     l_rows.append(np.full(9, -INF)); u_rows.append(np.full(9, INF))
                 else:
+                    prev_local = ctx.prev_hand_local[side]
+                    Jh = ev.hand_local_jac(side).reshape(9, N_TANGENT)
                     cur = ev.hand_local(side)
                     A_rows.append(Jh)
                     l_rows.append((-lim_h - (cur - prev_local)).reshape(-1))

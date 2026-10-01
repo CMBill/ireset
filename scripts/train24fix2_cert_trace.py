@@ -460,7 +460,11 @@ class ChainReplay:
 
     def __init__(self, cond: ReferenceCondition, src_scene: np.ndarray,
                  rq_traj: np.ndarray, rcfg, vcfg):
-        self.cfg = replace(rcfg, regen_mode=True)
+        # regen_hand_speed_mps is pinned to 0.0 HERE on purpose: the frozen
+        # rq chain and this counterfactual's "current check" are the PRE-C2
+        # algorithm; the proposed rows are added on top by ``c2_rows_of``
+        # with the trace's own enable criterion (never the deployed code).
+        self.cfg = replace(rcfg, regen_mode=True, regen_hand_speed_mps=0.0)
         assert self.cfg.regen_hand_speed_mps == 0.0            # noqa: S101
         self.pipe = RepairPipeline(cfg=self.cfg)
         self.pipe.validator.cfg = vcfg

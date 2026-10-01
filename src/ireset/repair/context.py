@@ -144,12 +144,21 @@ class RepairConfig:
     # Pre-registered weight comparison: off (0.0) / 0.1 / 1.0.
     regen_hand_stab_weight: float = 0.0
     regen_hand_stab_scale_m: float = 0.01
-    # hard box-frame speed rows for in-band hands: DISABLED (0.0) after
-    # a negative result -- any bound tight enough to kill the per-frame
-    # QP chatter (~1 mm/frame) also forbids following the reference's own
-    # grip adjustments (p90 15 mm/frame), and distance-gated activation
-    # flaps at its threshold; certification stays the validator's job
-    regen_hand_speed_mps: float = 0.0
+    # hard box-frame speed rows for in-band hands (C2, train24fix2 section 4):
+    # per-axis bound dt * this value on the box-frame displacement of the 3
+    # hand sites (3 sites x 3 axes = 9 rows per side). sqrt(3) * 0.02598 =
+    # 0.04499868 < hand_entry_speed_mps 0.05, so a candidate that exactly
+    # satisfies the rows cannot be speed-gated out of certification.
+    # Re-enabled (was 0.0 after the 2026-09-15 negative result) with a NEW
+    # enable criterion: the rows turn on only inside a reference hold
+    # interval once the previous accepted FULL-SCENE hand/box distance is
+    # within regen_hand_contact_gap_m, stay on for the whole interval and
+    # release at interval end (C2HandSpeedState) -- the two 2026-09-15
+    # failure modes were the PROJECTED prev_hand_dist 6mm gate flapping at
+    # its threshold and a bound that forbade the reference's own grip
+    # changes during approach; the interval-scoped enable exempts pull-in
+    # and the certification-compatible bound addresses the chatter.
+    regen_hand_speed_mps: float = 0.02598
     # regeneration does NOT lock hand point anchors: a +-10mm box-frame
     # anchor under box rotation is repeatedly tipped out by the
     # hover-tracking objective (marginal 0.1-1mm infeasibilities). Contact
@@ -161,6 +170,65 @@ class RepairConfig:
 
 #: effectors tracked by the state machine
 EFFECTORS = ("left_hand", "right_hand", "left_foot", "right_foot")
+
+
+class C2HandSpeedState:
+    """Per-side enable/release state of the regen hand box-frame speed rows
+    (train24fix2 plan section 4.2).
+
+    The state is a pure function of the ACCEPTED prefix and the INPUT
+    reference schedule -- never of the candidate being checked, and never of
+    the independent validator's own intervals (feeding supervision back as an
+    input condition is what the plan forbids).  One instance per trajectory
+    pass: a suffix retry or a new segment builds a new one, so cross-pass
+    leakage is impossible by construction.
+
+    Per side and frame (section 4.2 table):
+
+    - t=0 or no valid previous full scene  -> rows off, no state inheritance;
+    - reference does not want hold         -> rows off, state released;
+    - interval identity changed            -> old state cleared, re-judged;
+    - enabled earlier in the SAME interval -> rows on (holds through 6-8mm
+      fluctuations and boundary-rounding residue by construction);
+    - not yet enabled, prev full-scene distance <= gap -> enable now;
+    - not yet enabled, distance > gap      -> pull-in exemption, corridor
+      drives the approach.
+    """
+
+    SIDES = (("l", "left_hand"), ("r", "right_hand"))
+
+    def __init__(self, ref_schedule: ContactSchedule, T: int, gap_m: float) -> None:
+        self.gap_m = float(gap_m)
+        self._frame_iv: dict[str, list] = {}
+        for _side, eff in self.SIDES:
+            ids = [None] * T
+            ivs = [iv for iv in ref_schedule.intervals if iv.effector == eff]
+            for i, iv in enumerate(ivs):
+                for t in range(iv.start, iv.end):
+                    ids[t] = i
+            self._frame_iv[eff] = ids
+        self.enabled = {eff: False for _side, eff in self.SIDES}
+        self._interval = {eff: None for _side, eff in self.SIDES}
+
+    def step(self, eff: str, t: int, ref_hold: bool,
+             prev_scene_dist: float | None) -> tuple[bool, str]:
+        """Enable decision for frame ``t``; commits the state (safe: it
+        depends only on the accepted prefix and the reference input)."""
+        iv = self._frame_iv[eff][t]
+        if t == 0 or prev_scene_dist is None:
+            self.enabled[eff], self._interval[eff] = False, None
+            return False, "off_t0_or_no_prev"
+        if not ref_hold:
+            self.enabled[eff], self._interval[eff] = False, None
+            return False, "off_no_ref_released"
+        if self.enabled[eff] and self._interval[eff] != iv:
+            self.enabled[eff], self._interval[eff] = False, None
+        if self.enabled[eff]:
+            return True, "hold"
+        if prev_scene_dist <= self.gap_m:
+            self.enabled[eff], self._interval[eff] = True, iv
+            return True, "enable"
+        return False, "pull_in_exempt"
 
 
 class ContactStateMachine:
