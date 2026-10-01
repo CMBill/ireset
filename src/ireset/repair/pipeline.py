@@ -16,9 +16,11 @@ rejected ones carry diagnostics only (never an exportable trajectory).
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field, replace
 
+import mujoco
 import numpy as np
 import trimesh
 
@@ -43,6 +45,58 @@ from ireset.repair.validation import IndependentValidator
 KPT_IDX = [SMPLH_INDEX[v] for v in KPT_TO_SMPLH.values()]
 N_SURF = 12   # object surface samples for the interaction mesh
 N_GROUND = 8  # world-fixed ground points
+
+C2_QUERY_DISTMAX = 1.0
+
+
+def classify_distance_query(d: float, distmax: float) -> str:
+    """Return contract of one MuJoCo distance query (review R2, 2026-10-01).
+
+    ``hit`` (finite, ``d < distmax`` -- negative and zero kept: real contact)
+    / ``truncated`` (finite, ``d == distmax`` exactly: the documented
+    out-of-range sentinel) / an anomaly kind (``nan`` / ``pos_inf`` /
+    ``neg_inf`` / ``out_of_range`` for finite values beyond the query range,
+    which the API contract excludes).  The caller turns anomaly kinds into
+    explicit run rejections -- they must never be read as "far away"."""
+    if math.isnan(d):
+        return "nan"
+    if d == math.inf:
+        return "pos_inf"
+    if d == -math.inf:
+        return "neg_inf"
+    if d > distmax:
+        return "out_of_range"
+    return "hit" if d < distmax else "truncated"
+
+
+class C2DistanceQueryError(RuntimeError):
+    """A C2 post-adoption hand/box distance query went anomalous (review
+    R2): NaN/±Inf/out-of-API-range value, or the query raised.  Raised at
+    the collection point and converted by ``_run_sequential`` into an
+    explicit trajectory rejection -- the run can never end ACCEPTED with an
+    anomalous collection, and the error record keeps the full query
+    identity (frame, side, geom, distmax, raw value/exception, stage)."""
+
+    def __init__(self, t: int, side: str, geom: str, distmax: float,
+                 value_kind: str, raw,
+                 stage: str = "post_adoption_collection") -> None:
+        self.t = int(t)
+        self.side = side
+        self.geom = geom
+        self.distmax = float(distmax)
+        self.value_kind = value_kind
+        self.raw = raw
+        self.stage = stage
+        super().__init__(
+            f"t={t} side={side} geom={geom} distmax={distmax} "
+            f"kind={value_kind} raw={raw!r} stage={stage}")
+
+    def record(self) -> dict:
+        """JSON-safe evidence (never NaN/Inf literals; the raw value is
+        carried as a readable string per the product contract)."""
+        return {"t": self.t, "side": self.side, "geom": self.geom,
+                "distmax": self.distmax, "value_kind": self.value_kind,
+                "raw_repr": repr(self.raw), "stage": self.stage}
 
 
 def _surface_target(p: np.ndarray, box_pose: np.ndarray,
@@ -327,7 +381,7 @@ class RepairPipeline:
         #: repair call, cumulative over passes; facts, never a gate)
         self._c2_diag = {"frames_on": {"l": 0, "r": 0},
                          "enable_events": [], "release_events": [],
-                         "query_miss": []}
+                         "query_miss": [], "query_errors": []}
 
     def _snap(self, kind: str, **data) -> None:
         if self.snapshot is not None:
@@ -423,10 +477,17 @@ class RepairPipeline:
         previous accepted FULL SCENE (robot AND box pose), read in the SAME
         forwarded state as the ``prev_local`` collection right above it --
         never re-projected against the current box pose (that projected
-        field is the approach corridor's).  Real-hit criterion
-        ``dist < distmax``: a miss (hand beyond the 1.0 m scan cap) keeps
-        the rows off and is recorded -- never filled with zero and never
-        silently replaced by the projected field.
+        field is the approach corridor's).
+
+        Return contract (review R2, 2026-10-01): per geom, a finite value
+        below ``distmax`` is a real hit (negative/zero kept); a finite value
+        exactly ``distmax`` is the documented normal truncation (miss); any
+        NaN/±Inf/out-of-range value or a raised exception is a QUERY
+        ANOMALY and aborts the collection with :class:`C2DistanceQueryError`
+        -- one anomalous geom poisons its side even when other geoms hit
+        (the failing geom may be the truly nearest one).  An anomaly must
+        never be recorded as "hand beyond the scan cap" (the pre-fix NaN
+        path did exactly that and the run could still be accepted).
 
         The ONLY call site is behind ``regen_mode and
         regen_hand_speed_mps > 0`` (section 4.2 implementation trap): the
@@ -435,18 +496,46 @@ class RepairPipeline:
         standard-mode call/count behaviour."""
         out = {}
         for side in ("l", "r"):
-            dmin, hit = np.inf, False
+            dmin, n_hit, n_miss = np.inf, 0, 0
             for g in self.ev._hand_geoms[side]:
-                d = self.ev.geom_distance(g, self.ev.box_geom)[0]
-                if d < 1.0:
-                    hit = True
+                gname = mujoco.mj_id2name(
+                    self.ev.model, mujoco.mjtObj.mjOBJ_GEOM, g) or str(g)
+                try:
+                    d = self.ev.geom_distance(
+                        g, self.ev.box_geom, distmax=C2_QUERY_DISTMAX)[0]
+                except C2DistanceQueryError:
+                    raise
+                except Exception as exc:                     # noqa: BLE001
+                    self._c2_diag["query_errors"].append(
+                        {"t": t, "side": side, "geom": gname,
+                         "distmax": C2_QUERY_DISTMAX,
+                         "value_kind": "exception", "raw_repr": repr(exc)})
+                    raise C2DistanceQueryError(
+                        t, side, gname, C2_QUERY_DISTMAX, "exception", exc) from exc
+                kind = classify_distance_query(d, C2_QUERY_DISTMAX)
+                if kind == "hit":
+                    n_hit += 1
                     dmin = min(dmin, d)
-            if hit:
+                elif kind == "truncated":
+                    n_miss += 1
+                else:
+                    err = C2DistanceQueryError(
+                        t, side, gname, C2_QUERY_DISTMAX, kind, d)
+                    self._c2_diag["query_errors"].append(err.record())
+                    raise err
+            if n_hit:
                 out[side] = float(dmin)
+                if n_miss:
+                    self._c2_diag["query_miss"].append(
+                        {"t": t, "side": side, "scope": "side_partial_miss",
+                         "n_hit": n_hit, "n_miss": n_miss,
+                         "note": "some hand geoms beyond the 1.0 m scan cap; "
+                                 "rows bound by the nearest real hit"})
             else:
                 out[side] = None
                 self._c2_diag["query_miss"].append(
-                    {"t": t, "side": side,
+                    {"t": t, "side": side, "scope": "side_all_miss",
+                     "n_hit": 0, "n_miss": n_miss,
                      "note": "hand beyond the 1.0 m scan cap; rows stay off"})
         return out
 
@@ -732,7 +821,7 @@ class RepairPipeline:
                           "max_delta_rad": 0.0, "output_frames_modified": 0}
         self._c2_diag = {"frames_on": {"l": 0, "r": 0},
                          "enable_events": [], "release_events": [],
-                         "query_miss": []}
+                         "query_miss": [], "query_errors": []}
         if self.verbose:
             self.frame_log = []
         result = self._repair_trajectory(prediction, condition)
@@ -744,7 +833,8 @@ class RepairPipeline:
             {"frames_on": dict(self._c2_diag["frames_on"]),
              "enable_events": list(self._c2_diag["enable_events"]),
              "release_events": list(self._c2_diag["release_events"]),
-             "query_miss": list(self._c2_diag["query_miss"])})
+             "query_miss": list(self._c2_diag["query_miss"]),
+             "query_errors": list(self._c2_diag["query_errors"])})
         result.diagnostics.setdefault("total_s", round(time.perf_counter() - t0, 3))
         return result
 
@@ -911,6 +1001,11 @@ class RepairPipeline:
             "slack_used": bool(res.slack_used), "trust": float(res.trust),
             "last_viol": float(res.last_viol),
             "last_qp_status": str(res.last_qp_status),
+            # verbatim loop-exit cause + the budget it ran under (review R4);
+            # "infeasible" above is a historical label, never proof of
+            # structural joint infeasibility by itself
+            "term_reason": str(res.term_reason),
+            "iter_budget": int(res.iter_budget),
             "violated_rows": list(res.violated_rows),
             "truncated_rows": list(res.truncated_rows),
             "probe_rows": list(res.probe_rows),
@@ -1236,6 +1331,7 @@ class RepairPipeline:
                         "final_stage": last_chk.reason,
                         "reason_source": "last_solve_attempt",
                         "last_attempt": last_rec,
+                        "last_term_reason": last_rec.get("term_reason"),
                         "last_attempt_id": [pass_index, t, last_rec["attempt_id"]],
                         "last_check_id": last_rec["check_id"],
                         "evidence_states": {
@@ -1279,8 +1375,38 @@ class RepairPipeline:
                          "r": self.ev.site_positions(self.ev.sole_sites["r"])}
             if c2 is not None:
                 # C2 previous-frame input: the previous accepted FULL SCENE
-                # (robot AND box pose of frame t); see _collect_prev_scene_dist
-                prev_scene_dist = self._collect_prev_scene_dist(t)
+                # (robot AND box pose of frame t); see _collect_prev_scene_dist.
+                # A query anomaly REJECTS the run here (review R2): the frame
+                # itself is already adopted (all its checks passed), so the
+                # error is booked as a post-adoption collection failure --
+                # never silently downgraded to "rows off", never retried as a
+                # suffix, and every cost fact of the pass is preserved.
+                try:
+                    prev_scene_dist = self._collect_prev_scene_dist(t)
+                except C2DistanceQueryError as err:
+                    accepted.append(z)
+                    timings.append(time.perf_counter() - t0)
+                    rec_pass = self._pass_record(
+                        prediction, pass_index, "rejected_frame",
+                        len(accepted), sum(1 for st in frame_status if st == "skipped"),
+                        int(sum(slack_flags)), attempts, checks, visits,
+                        timings, backtracks, backtrack_probes, t_fail=t)
+                    return TrajectoryResult(False, "rejected_frame", diagnostics={
+                        "t_fail": t,
+                        "reason": "c2_distance_query_anomaly",
+                        "final_stage": "c2_distance_query_failed",
+                        "reason_source": "post_adoption_collection",
+                        "c2_query_error": err.record(),
+                        "accepted_frames": len(accepted),
+                        "frame_status": frame_status,
+                        "iterations": adopted_iterations, "timings_s": timings,
+                        "qp_calls": qp_calls_hist, "fallbacks": fallbacks,
+                        "slack_frames": int(sum(slack_flags)),
+                        "skipped": sum(1 for st in frame_status if st == "skipped"),
+                        "timing_stats": self._timing_stats(timings),
+                        "_pass_record": rec_pass,
+                        **self._aggregate(rec_pass),
+                    })
             accepted.append(z)
             if frame_modified:
                 self._vel_proj["output_frames_modified"] += 1
