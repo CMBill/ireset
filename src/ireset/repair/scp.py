@@ -172,6 +172,18 @@ class FrameResult:
     truncated_rows: list = field(default_factory=list)
     #: OSQP exit status of this attempt's LAST QP solve (F0 evidence)
     last_qp_status: str = ""
+    #: ACTUAL loop-exit cause of this attempt (review R4, 2026-10-01):
+    #: converged / restoration_qp_failed_trust_min / no_merit_step_trust_min
+    #: / budget_exhausted.  ``status`` keeps its historical vocabulary
+    #: (infeasible/max_iters/...) -- it is a compatibility label, and
+    #: "infeasible" must NOT be read back as proof of structural joint
+    #: infeasibility: budget_exhausted/trust-collapse exits only show the
+    #: search did not converge within the fixed budget.
+    term_reason: str = ""
+    #: the iteration budget this attempt ran under (base scp_max_iters, +
+    #: restoration extras on forced slack) -- separates "hit the budget"
+    #: from "collapsed below trust_radius_min"
+    iter_budget: int = 0
     #: probe-row names active at the last linearization (F4 evidence)
     probe_rows: list = field(default_factory=list)
     probe_truncated: list = field(default_factory=list)
@@ -1644,6 +1656,10 @@ class FrameSolver:
         self._frame_pairs = None
         self._refresh_counter = 0
         self._probe_cache = None
+        # review R4: the loop-exit cause is recorded verbatim; it separates
+        # "no acceptable step / trust collapsed below trust_radius_min" from
+        # "budget exhausted" -- the historical status label cannot
+        term_reason = ""
         for it in range(max_iters):
             it_done = it + 1
             res = self.evaluate(z, ctx)
@@ -1680,7 +1696,9 @@ class FrameSolver:
                 if ok:
                     return self._result(True, z, it_done, used_slack, merit,
                                         qp_calls, trust, last_viol, last_names,
-                                        qp_status=last_qp_status)
+                                        qp_status=last_qp_status,
+                                        term_reason="converged",
+                                        iter_budget=max_iters)
                 if best_z is not None and np.array_equal(best_z, z):
                     best_z, best_merit, best_feasible = None, float("inf"), False
 
@@ -1691,6 +1709,7 @@ class FrameSolver:
                 if x_s is None:
                     trust *= cfg.shrink_factor
                     if trust < cfg.trust_radius_min:
+                        term_reason = "restoration_qp_failed_trust_min"
                         break
                     continue
                 used_slack = True
@@ -1727,6 +1746,7 @@ class FrameSolver:
             if not accepted_step:
                 trust *= cfg.shrink_factor
                 if trust < cfg.trust_radius_min:
+                    term_reason = "no_merit_step_trust_min"
                     break
 
         # budget exhausted / trust collapsed: report the ACTUAL iteration
@@ -1735,31 +1755,39 @@ class FrameSolver:
         # stage 0, 2026-09-16). The historical best gets the SAME review as
         # the early return (F1): if the fresh scan exposes a violation, it is
         # explicitly rejected instead of being handed back unchecked.
+        term_reason = term_reason or "budget_exhausted"
         if best_feasible:
             res = self.evaluate(best_z, ctx)
             if res["mpjpe"] > cfg.task_mpjpe_tol_m:
                 return self._result(False, best_z, it_done, used_slack, best_merit,
                                     qp_calls, trust, last_viol, last_names,
-                                    status="task_quality", qp_status=last_qp_status)
+                                    status="task_quality", qp_status=last_qp_status,
+                                    term_reason=term_reason, iter_budget=max_iters)
             ok, info = self.success_review(best_z, ctx)
             review = info
             if not ok:
                 return self._result(False, best_z, it_done, used_slack, best_merit,
                                     qp_calls, trust, last_viol, last_names,
                                     status="review_failed", review=info,
-                                    qp_status=last_qp_status)
+                                    qp_status=last_qp_status,
+                                    term_reason=term_reason, iter_budget=max_iters)
             return self._result(True, best_z, it_done, used_slack, best_merit,
                                 qp_calls, trust, last_viol, last_names,
-                                qp_status=last_qp_status)
+                                qp_status=last_qp_status,
+                                term_reason=term_reason, iter_budget=max_iters)
         return self._result(False, z, it_done, used_slack, float("inf"), qp_calls,
                             trust, last_viol, last_names, status="infeasible",
-                            review=review, qp_status=last_qp_status)
+                            review=review, qp_status=last_qp_status,
+                            term_reason=term_reason, iter_budget=max_iters)
 
     def _result(self, accepted, z, it_done, used_slack, merit, qp_calls, trust,
                 last_viol, last_names, status=None, review=None,
-                qp_status: str = "") -> FrameResult:
+                qp_status: str = "", term_reason: str = "",
+                iter_budget: int = 0) -> FrameResult:
         """FrameResult with the exit evidence F0 requires (trust, last
-        constraint, QP exit status, budget truncation, review outcome)."""
+        constraint, QP exit status, budget truncation, review outcome) and
+        the verbatim loop-exit cause (review R4 -- the status label stays
+        historical)."""
         res = FrameResult(
             accepted, z, it_done, slack_used=used_slack,
             status=status or ("solved" if accepted else "max_iters"),
@@ -1768,7 +1796,8 @@ class FrameSolver:
             truncated_rows=list(self.last_truncated_names),
             probe_rows=list(self.last_probe_rows),
             probe_truncated=list(self.last_probe_truncated),
-            last_qp_status=str(qp_status))
+            last_qp_status=str(qp_status), term_reason=str(term_reason),
+            iter_budget=int(iter_budget))
         if review:
             res.diagnostics["review"] = review
         if self.last_truncated_ids:
