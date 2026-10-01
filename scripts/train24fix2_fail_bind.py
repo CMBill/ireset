@@ -1,35 +1,35 @@
 """Bind the failing candidates of the train24fix2 six-segment regression and
-classify the joint infeasibility with full-constraint counterfactuals
-(train24fix2 plan section 9, risk row 2 -- the pre-registered action when
-the six-segment run falls below 6/6: PAUSE, bind the failing candidates,
-classify; any strategy change requires a new plan).
+classify them with FULL-constraint counterfactuals (train24fix2 plan section
+9 risk row 2; REVIEW-FIX round rewrite, plan train24fix2_review_fix_plan.md
+sections 2-4).
 
-For every REJECTED segment of ``train24fix2_20260927_sixseg/rq`` the segment
-is re-run deterministically (same code revision, same inputs) with the
-read-only snapshot hook capturing, at the ``fail`` event, the LAST executed
-attempt's candidate state, the failing check, the frame context (C2 enable
-state, previous full-scene distances, previous box-frame hand arrays), the
-accepted prefix, and the contact state.
+Review defects this rewrite removes (2026-10-01):
 
-Classification per segment (all rows uncapped, unrounded):
+- R1 (P1): the context used to be REBUILT with the evaluator's current
+  robot FK as ``ref_kpts_world``, dropping the human reference, the hand
+  targets/deltas and the frame motion -- sub12@12/sub3@14 task errors
+  collapsed to 0.  Now the ``fail`` snapshot FREEZES the run's own
+  FrameContext field-completely (``train24fix2_audit.freeze_context``) and
+  every counterfactual restores THAT context, toggling only the C2 fields.
+- R3: the C2-off counterfactual checked endpoint rows only.  Now each
+  branch gets the full audit (endpoint rows / every interpolation point /
+  strict velocities / task under the human reference / PREFIX independent
+  final validation) and the section-4.2 classification vocabulary.
+- The single-frame re-solve now replays the production escalation (V1
+  skip check with reflux -> prediction -> prev_accepted -> slack) instead
+  of three bare ``_solve_attempt`` calls.
 
-1. FULL row dump of the last candidate -- every violating row with its
-   family (pre / collision / post, post split into anchors, foot speed,
-   C2 hand speed), not just the collision-family evidence the verbose log
-   carries.
-2. Counterfactual "candidate without C2": the SAME candidate checked with
-   the C2 rows disabled -- does it violate anything else?
-3. Counterfactual "frame solved without C2": the same frame, same accepted
-   prefix, same discovered-pair-free start, escalated exactly like the run
-   (prediction -> prev_accepted -> slack) with the C2 rows off -- feasible
-   and accepted would attribute the infeasibility to the C2 joint
-   interaction.
+Outputs (versioned JSON + NPZ, overwrite refused) go to
+``derived/data/teachers_regenerated/train24fix2_reviewfix_20261001/diag/``
+by default -- NEVER the frozen ``train24fix2_20260927_diag/``.
 
-Run: uv run --locked python scripts/train24fix2_fail_bind.py
+Run: uv run --locked python scripts/train24fix2_fail_bind.py [--rq-dir DIR]
+                                                      [--out DIR] [--replay]
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 import time
@@ -41,76 +41,42 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import numpy as np
 
+from closed_loop_metrics import git_rev
+from experiment_provenance import asset_hashes, git_state
 from ireset.data.teacher import load_teacher_npz
 from ireset.embodied.contact_sites import infer_reference_schedule
 from ireset.paths import DERIVED_DATA_DIR, TEACHER_TRAJ_DIR
 from ireset.repair.config_io import load_mode_configs
 from ireset.repair.context import ReferenceCondition
 from ireset.repair.pipeline import RepairPipeline
+from train24fix2_audit import (
+    AUDIT_FORMAT,
+    assert_snapshot_matches_live,
+    classify_branches,
+    context_arrays,
+    context_from,
+    context_meta,
+    context_scalar_leaves,
+    escalate_frame,
+    freeze_context,
+    full_candidate_audit,
+    load_products,
+    write_products,
+)
 
 REGEN = DERIVED_DATA_DIR / "teachers_regenerated"
-RQ_DIR = REGEN / "train24fix2_20260927_sixseg" / "rq"
-OUT_DIR = REGEN / "train24fix2_20260927_diag"
-INF = 1e9
-
-
-def row_families(solver, val, lo, hi, scl, names) -> list[dict]:
-    """Every violating row with family + descriptor (uncapped, unrounded)."""
-    viol = np.maximum(np.maximum(lo - val, val - hi), 0.0) / scl
-    out = []
-    n_coll = len(names)
-    for i in np.nonzero(viol > 0)[0]:
-        if i < 99:
-            if i < 29:
-                d = f"pre.joint_limit[j{i + 7}]"
-            elif i < 58:
-                d = f"pre.joint_vel[j{i - 29 + 7}]"
-            elif i in (58, 61):
-                d = f"pre.root_vel[{i}]"
-            else:
-                d = f"pre.trust[{i - 64}]"
-            fam = "pre"
-        elif i < 99 + n_coll:
-            d, fam = f"coll[{names[i - 99]}]", "collision"
-        else:
-            j = i - 99 - n_coll
-            fam = ("post.hand_anchor" if j < 18 else
-                   "post.foot_anchor" if j < 48 else
-                   "post.foot_speed" if j < 78 else "post.hand_speed")
-            d = f"{fam}[{j}]"
-        out.append({"family": fam, "row": d, "val": float(val[i]),
-                    "lo": float(lo[i]), "hi": float(hi[i]),
-                    "viol_norm": float(viol[i])})
-    return out
+DEFAULT_RQ = REGEN / "train24fix2_20260927_sixseg" / "rq"
+DEFAULT_OUT = REGEN / "train24fix2_reviewfix_20261001" / "diag"
 
 
 def c2_off_ctx(ctx):
-    """Same frame context with ONLY the C2 rows disabled."""
-    return replace(ctx, c2_hand_enabled={}, c2_hand_reason={})
+    """Same frozen context with ONLY the C2 row-enable state cleared (the
+    bound parameter stays 0.02598 in the config -- the rows turn off
+    through the context, never by replacing the whole config)."""
+    return replace(freeze_context(ctx), c2_hand_enabled={}, c2_hand_reason={})
 
 
-def solve_frame_escalated(pipe, ctx, t, z_pred, z_prev):
-    """The pipeline's own escalation for ONE frame (fresh pair state)."""
-    pipe.solver.clear_discovered_pairs()
-    pipe.solver.clear_probe_pairs()
-    attempts, checks, frame_recs = [], [], []
-    res, chk, _bt, _bti, _rec = pipe._solve_attempt(
-        z_pred, "cf_prediction", ctx, t, z_prev, 0, attempts, checks, frame_recs)
-    if not chk.ok and z_prev is not None:
-        res2, chk2, _b2, _t2, _r2 = pipe._solve_attempt(
-            z_prev, "cf_prev_accepted", ctx, t, z_prev,
-            len(frame_recs), attempts, checks, frame_recs)
-        if not chk2.ok:
-            res3, chk3, _b3, _t3, _r3 = pipe._solve_attempt(
-                z_prev, "cf_slack_fallback", ctx, t, z_prev,
-                len(frame_recs), attempts, checks, frame_recs,
-                force_slack=True)
-            return res3, chk3, attempts
-        return res2, chk2, attempts
-    return res, chk, attempts
-
-
-def bind(demo: str) -> dict:
+def bind(demo: str, rq_dir: Path, out: Path) -> dict:
     scene, human, fps = load_teacher_npz(TEACHER_TRAJ_DIR / f"{demo}_original.npz")
     cond = ReferenceCondition(human, scene[:, 36:43],
                               infer_reference_schedule(human, scene[:, 36:43]))
@@ -124,37 +90,34 @@ def bind(demo: str) -> dict:
     def snap(kind, data):
         if kind != "fail":
             return
-        ctx = data["ctx"]
-        res = data["last_res"]
-        chk = data["last_chk"]
+        # R1: freeze the run's own context FIELD-COMPLETELY (deep copy,
+        # verified against the live object on every field), plus the last
+        # executed attempt's candidate/check/record and the accepted prefix
+        ctx_frozen = freeze_context(data["ctx"])
+        assert_snapshot_matches_live(ctx_frozen, data["ctx"])
         captured["t"] = data["t"]
-        captured["z_cand"] = np.asarray(res.z).copy()
-        captured["status"] = res.status
+        captured["pass_index"] = data["pass_index"]
+        captured["ctx"] = ctx_frozen
+        captured["z_cand"] = np.asarray(data["last_res"].z).copy()
+        captured["res_fields"] = {
+            "status": data["last_res"].status,
+            "term_reason": data["last_res"].term_reason,
+            "iter_budget": data["last_res"].iter_budget,
+            "iterations": data["last_res"].iterations,
+            "qp_calls": data["last_res"].qp_calls,
+            "slack_used": bool(data["last_res"].slack_used),
+            "trust": float(data["last_res"].trust),
+            "last_qp_status": data["last_res"].last_qp_status,
+            "last_viol": float(data["last_res"].last_viol)}
+        chk = data["last_chk"]
         captured["chk"] = {"ok": chk.ok, "reason": chk.reason,
                            "viol": float(chk.viol), "rows": chk.rows,
-                           "c2": {s: dict(v) for s, v in chk.c2.items()}}
-        captured["ctx_fields"] = {
-            "t": ctx.t,
-            "c2_enabled": dict(ctx.c2_hand_enabled),
-            "c2_reason": dict(ctx.c2_hand_reason),
-            "prev_scene_dist": dict(ctx.prev_hand_scene_dist),
-            "prev_hand_dist": dict(ctx.prev_hand_dist),
-            "z_prev": None if ctx.z_prev is None else ctx.z_prev.copy(),
-            "z_pred": ctx.z_pred.copy(),
-            "box_pose": ctx.box_pose.copy(),
-            "box_pose_prev": (None if ctx.box_pose_prev is None
-                              else ctx.box_pose_prev.copy()),
-            "prev_hand_local": {s: (None if v is None else v.copy())
-                                for s, v in ctx.prev_hand_local.items()},
-            "prev_sole_world": {s: (None if v is None else v.copy())
-                                for s, v in ctx.prev_sole_world.items()},
-            "hand_anchor": {s: (None if v is None else v.copy())
-                            for s, v in ctx.hand_anchor.items()},
-            "foot_anchor": {s: (None if v is None else v.copy())
-                            for s, v in ctx.foot_anchor.items()},
-            "ref_hold": dict(ctx.ref_hold),
-        }
-        captured["accepted_prefix"] = [a.copy() for a in data["accepted"]]
+                           "c2": {s: dict(v) for s, v in chk.c2.items()},
+                           "check_id": chk.check_id}
+        captured["last_rec"] = dict(data["last_rec"])
+        captured["last_attempt_id"] = list(data["last_attempt_id"])
+        captured["accepted"] = [a.copy() for a in data["accepted"]]
+        captured["prediction"] = data["prediction"].copy()
         captured["c2_diag"] = {
             k: (dict(v) if isinstance(v, dict) else list(v))
             for k, v in pipe._c2_diag.items()}
@@ -167,80 +130,202 @@ def bind(demo: str) -> dict:
                 "note": "no fail event captured"}
 
     t = captured["t"]
-    rec = {"demo": demo, "t_fail": t, "run_status": res.status,
-           "wall_s": round(wall, 2),
-           "frame_status": list(res.diagnostics.get("frame_status") or []),
-           "c2_diag": captured["c2_diag"],
-           "last_attempt": {"status": captured["status"],
-                            "chk": captured["chk"]}}
-    cf = captured["ctx_fields"]
-
-    # rebuild a ctx object for the row dumps / counterfactual solves
-    from ireset.repair.scp import FrameContext
-    ctx_on = FrameContext(
-        t=cf["t"], box_pose=cf["box_pose"], z_pred=cf["z_pred"],
-        z_prev=cf["z_prev"], ref_kpts_world=pipe.ev.site_positions(pipe.ev.kpt_ids),
-        mesh_L=None, delta_ref=None, mesh_fixed=None,
-        hand_anchor=cf["hand_anchor"], foot_anchor=cf["foot_anchor"],
-        prev_hand_local=cf["prev_hand_local"], prev_sole_world=cf["prev_sole_world"],
-        box_pose_prev=cf["box_pose_prev"], ref_hold=cf["ref_hold"],
-        prev_hand_dist=cf["prev_hand_dist"],
-        c2_hand_enabled=cf["c2_enabled"], c2_hand_reason=cf["c2_reason"],
-        prev_hand_scene_dist=cf["prev_scene_dist"])
-    # the original ctx carried the run's mesh terms; rebuild them exactly
-    L, delta, fixed = pipe._frame_mesh(cond, t)
-    ctx_on.mesh_L, ctx_on.delta_ref, ctx_on.mesh_fixed = L, delta, fixed
+    ctx = captured["ctx"]
     z_cand = captured["z_cand"]
+    prefix = captured["accepted"]
+    box_poses = captured["prediction"][:, 36:43]
 
-    # (1) full row dump of the last candidate (C2 on -- the run's condition)
-    val, lo, hi, scl, names, _ids = pipe.solver.check_rows(z_cand, ctx_on)
-    rec["candidate_rows_on"] = row_families(pipe.solver, val, lo, hi, scl, names)
+    # -- identity cross-check against the formal run's own report (R1
+    # section 2.3): a mismatch stops the binding, never "a similar failure"
+    rec: dict = {
+        "demo": demo, "t_fail": t, "pass_index": captured["pass_index"],
+        "run_status": res.status,
+        "run_t_fail": res.diagnostics.get("t_fail"),
+        "run_final_stage": res.diagnostics.get("final_stage"),
+        "run_reason": res.diagnostics.get("reason"),
+        "identity_match": {
+            "t_fail": res.diagnostics.get("t_fail") == t,
+            "last_attempt_id": (res.diagnostics.get("last_attempt_id")
+                                == captured["last_attempt_id"]),
+            "last_check_id": (res.diagnostics.get("last_check_id")
+                              == captured["chk"]["check_id"]),
+            "status": (res.diagnostics.get("last_attempt", {}).get("status")
+                       == captured["res_fields"]["status"])},
+        "wall_s": round(wall, 2),
+        "frame_status": list(res.diagnostics.get("frame_status") or []),
+        "c2_diag": captured["c2_diag"],
+        "last_attempt": {"solver_fields": captured["res_fields"],
+                         "chk": captured["chk"],
+                         "attempt_id": captured["last_attempt_id"]},
+    }
+    if not all(rec["identity_match"].values()):
+        rec["verdict"] = "IDENTITY_MISMATCH"
+        write_products(out, f"fail_bind2_{demo}", rec,
+                       {"z_cand": z_cand, "prefix": np.stack(prefix),
+                        "box_poses": box_poses,
+                        **context_arrays(ctx)})
+        return rec
 
-    # (2) the SAME candidate with C2 disabled
-    val2, lo2, hi2, scl2, names2, _i2 = pipe.solver.check_rows(z_cand, c2_off_ctx(ctx_on))
-    rows_off = row_families(pipe.solver, val2, lo2, hi2, scl2, names2)
-    rec["candidate_rows_c2off"] = rows_off
-    rec["candidate_passes_without_c2"] = bool(
-        pipe.solver.violation(val2, lo2, hi2, scl2) <= 1e-6)
+    # -- full audits: (a) the frozen candidate with C2 ON (the run's
+    # condition), (b) the SAME candidate with C2 off
+    audits: dict = {}
+    arrays: dict = {"z_cand": z_cand,
+                    "prefix": np.stack(prefix), "box_poses": box_poses,
+                    **context_arrays(ctx)}
+    for label, actx in (("c2_on", ctx), ("c2_off", c2_off_ctx(ctx))):
+        arec, aarr = full_candidate_audit(
+            pipe.spec, cfg, vcfg, actx, z_cand,
+            prefix=prefix, box_poses=box_poses, label=label)
+        audits[label] = arec
+        arrays.update(aarr)
 
-    # (3) the frame re-solved with C2 disabled, same prefix escalation
-    res3, chk3, attempts3 = solve_frame_escalated(
-        pipe, c2_off_ctx(ctx_on), t, cf["z_pred"], cf["z_prev"])
-    rec["frame_solved_without_c2"] = {
-        "accepted": bool(chk3.ok), "status": res3.status,
-        "reason": chk3.reason, "viol": float(chk3.viol),
-        "qp_calls": int(res3.qp_calls),
-        "attempts": [{"source": a.get("source"),
-                      "status": a.get("status"),
+    # -- (c) the frame re-solved without C2: production escalation on a
+    # FRESH pipeline (independent evaluator/solver, frozen context)
+    pipe_off = RepairPipeline(spec=pipe.spec, cfg=cfg)
+    pipe_off.validator.cfg = vcfg
+    esc = escalate_frame(pipe_off, c2_off_ctx(ctx), t, ctx.z_pred, ctx.z_prev)
+    rec["resolve_without_c2"] = {
+        "skipped": esc["skipped"], "adopted": esc["adopted"],
+        "adopted_source": esc["adopted_source"],
+        "adopted_status": esc["adopted_status"],
+        "last_status": esc["last_status"],
+        "last_term_reason": esc["last_term_reason"],
+        "last_check_reason": esc["last_check_reason"],
+        "attempts": [{"source": a.get("source"), "status": a.get("status"),
+                      "term_reason": a.get("term_reason"),
                       "slack": a.get("slack_used"),
-                      "qp": a.get("qp_calls")} for a in attempts3]}
+                      "qp": a.get("qp_calls"),
+                      "iters": a.get("iterations"),
+                      "check_id": a.get("check_id")}
+                     for a in esc["attempts"]],
+        "skip": esc["skip"]}
+    if esc["adopted"] and not esc["skipped"]:
+        # the re-solved candidate gets its own full audit under its own
+        # identity -- never mixed with the frozen original
+        rrec, rarr = full_candidate_audit(
+            pipe.spec, cfg, vcfg, c2_off_ctx(ctx), esc["adopted_z"],
+            prefix=prefix, box_poses=box_poses, label="resolve_c2_off")
+        audits["resolve_c2_off"] = rrec
+        arrays.update(rarr)
+        arrays["resolve_adopted_z"] = esc["adopted_z"]
+    rec["audits"] = audits
+
+    # -- classification (section 4.2): the two same-candidate branches
+    # decide the frozen-candidate verdict; the re-solve is a SEPARATE
+    # conclusion, never "the segment is recovered"
+    rec["classification"] = classify_branches(
+        audits.get("c2_off"), audits.get("c2_on"))
+    # convention note: classify_branches(current=no-C2 branch, plus=C2)
+    rec["classification_basis"] = {
+        "no_c2_branch_pass": audits["c2_off"].get("branch_pass"),
+        "plus_c2_branch_pass": audits["c2_on"].get("branch_pass")}
+    rec["conclusion_strength"] = {
+        "frozen_candidate": (
+            "rejected_by_c2_rows" if (
+                rec["classification"] == "C2_ONLY")
+            else rec["classification"]),
+        "resolve": ("c2_addition_failed_the_frame_under_fixed_flow"
+                    if not esc["adopted"] else "frame_solved_without_c2"),
+        "note": ("neither statement is a whole-segment recovery; the "
+                 "original 1/6 pause verdict stands until a full rerun"),
+    }
+    rec["provenance"] = {
+        "git": git_state(), "git_rev": git_rev(),
+        "assets": asset_hashes(),
+        "effective_configs": {"strict_repair": vars(cfg),
+                              "strict_validation": vars(vcfg)},
+        "fps": fps, "format": AUDIT_FORMAT,
+        "context_meta": {**context_meta(ctx),
+                         "ctx_scalars": context_scalar_leaves(ctx)},
+    }
+    write_products(out, f"fail_bind2_{demo}", rec, arrays)
     return rec
 
 
+def replay(out: Path) -> dict:
+    """Recompute the same-candidate branches from the frozen files (no
+    trajectory re-solve, no re-search) and compare with the saved verdicts
+    (plan section 4.3: replay never substitutes a re-found candidate)."""
+    rcfg, vcfg = load_mode_configs("strict")
+    cfg = replace(rcfg, regen_mode=True)
+    results = {}
+    for jpath in sorted(out.glob("fail_bind2_*.json")):
+        record, arrays = load_products(out, jpath.stem)
+        if "audits" not in record:
+            results[jpath.stem] = {"replayed": False,
+                                   "reason": "identity mismatch record"}
+            continue
+        spec = RepairPipeline(cfg=cfg).spec
+        ctx = context_from(arrays, record["provenance"]["context_meta"])
+        z_cand = arrays["z_cand"]
+        prefix = [arrays["prefix"][i] for i in range(arrays["prefix"].shape[0])]
+        box_poses = arrays["box_poses"]
+        rep: dict = {"replayed": True}
+        fresh: dict = {}
+        for label, actx in (("c2_on", ctx), ("c2_off", c2_off_ctx(ctx))):
+            arec, _a = full_candidate_audit(
+                spec, cfg, vcfg, actx, z_cand,
+                prefix=prefix, box_poses=box_poses, label=label)
+            fresh[label] = arec
+            saved = record["audits"][label]
+            same = (
+                arec.get("branch_pass") == saved.get("branch_pass")
+                and arec["endpoint"]["viol_sum"] == saved["endpoint"]["viol_sum"]
+                and arec["task"]["mpjpe_m"] == saved["task"]["mpjpe_m"]
+                and arec["interpolation"]["pass"] == saved["interpolation"]["pass"]
+                and arec["prefix_validation"]["passed"]
+                == saved["prefix_validation"]["passed"])
+            rep[label] = {"matches_saved": bool(same),
+                          "branch_pass": arec.get("branch_pass"),
+                          "viol_sum": arec["endpoint"]["viol_sum"],
+                          "task_mpjpe": arec["task"]["mpjpe_m"]}
+        rep["classification_recomputed"] = classify_branches(
+            fresh["c2_off"], fresh["c2_on"])
+        rep["classification_matches"] = (
+            rep["classification_recomputed"] == record["classification"])
+        results[jpath.stem] = rep
+    (out / "fail_bind2_replay.json").write_text(
+        json.dumps(results, indent=1, default=float))
+    return results
+
+
 def main() -> None:
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    report = json.loads((RQ_DIR / "regen_report_diagnosis6_strict.json").read_text())
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--rq-dir", default=str(DEFAULT_RQ),
+                    help="formal six-segment rq report dir (read-only)")
+    ap.add_argument("--out", default=str(DEFAULT_OUT),
+                    help="output diag dir (default: the reviewfix 20261001 "
+                         "dir, never the frozen 20260927 one)")
+    ap.add_argument("--demos", nargs="*", default=None)
+    ap.add_argument("--replay", action="store_true",
+                    help="recompute same-candidate branches from the frozen "
+                         "files and compare (no re-solve)")
+    args = ap.parse_args()
+    out = Path(args.out)
+    rq_dir = Path(args.rq_dir)
+    if args.replay:
+        res = replay(out)
+        ok = all(v.get("replayed") and
+                 all(b.get("matches_saved") for b in v.values()
+                     if isinstance(b, dict) and "matches_saved" in b)
+                 for v in res.values())
+        print(f"[replay] {'ALL MATCH' if ok else 'MISMATCH'} -> "
+              f"{out / 'fail_bind2_replay.json'}")
+        return
+    report = json.loads((rq_dir / "regen_report_diagnosis6_strict.json").read_text())
     failed = [r["demo"] for r in report["rows"] if not r["accepted"]]
-    print(f"binding {len(failed)} rejected segments: {failed}")
-    out = []
-    for demo in failed:
-        rec = bind(demo)
-        (OUT_DIR / f"fail_bind_{demo}.json").write_text(json.dumps(rec, indent=1))
-        out.append(rec)
-        print(f"[{demo}] t_fail={rec.get('t_fail')} "
-              f"last_status={rec.get('last_attempt', {}).get('status')} "
-              f"cand_passes_without_c2={rec.get('candidate_passes_without_c2')} "
-              f"frame_solves_without_c2={rec.get('frame_solved_without_c2', {}).get('accepted')}")
-        fams = {}
-        for r in rec.get("candidate_rows_on", []):
-            fams[r["family"]] = fams.get(r["family"], 0) + 1
-        print(f"   violating families (c2 on): {fams}")
-        fams2 = {}
-        for r in rec.get("candidate_rows_c2off", []):
-            fams2[r["family"]] = fams2.get(r["family"], 0) + 1
-        print(f"   violating families (c2 off): {fams2}")
-    (OUT_DIR / "fail_bind_summary.json").write_text(json.dumps(out, indent=1))
-    print(f"-> {OUT_DIR}")
+    demos = args.demos or failed
+    print(f"binding {len(demos)} rejected segments: {demos}")
+    out.mkdir(parents=True, exist_ok=True)
+    for demo in demos:
+        rec = bind(demo, rq_dir, out)
+        cls = rec.get("classification", rec.get("verdict", "n/a"))
+        esc = rec.get("resolve_without_c2", {})
+        print(f"[{demo}] t_fail={rec.get('t_fail')} class={cls} "
+              f"last={rec.get('last_attempt', {}).get('solver_fields', {}).get('status')}"
+              f"/{rec.get('last_attempt', {}).get('solver_fields', {}).get('term_reason')} "
+              f"resolve_adopted={esc.get('adopted')}")
+    print(f"-> {out}")
 
 
 if __name__ == "__main__":

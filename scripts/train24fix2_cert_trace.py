@@ -74,16 +74,32 @@ from ireset.repair.context import ContactStateMachine, ReferenceCondition
 from ireset.repair.pipeline import RepairPipeline
 from ireset.repair.validation import IndependentValidator
 from regenerate_teachers import task_mpjpe_series
+from train24fix2_audit import (
+    AUDIT_FORMAT,
+    classify_branches,
+    context_from,
+    freeze_context,
+    full_candidate_audit,
+    load_products,
+    write_products,
+)
 
 REGEN = DERIVED_DATA_DIR / "teachers_regenerated"
 HIST_NQ_DIR = REGEN / "reviewfix_20260923_nq_strict_task040"
 HIST_DQ_SOURCE = REGEN / "labelq_20260926_sixseg" / "rq"      # D-Q sixseg_rq
+#: the E re-completion (review section 7.B.3) re-verifies the SAME frozen
+#: pre-C2 authoritative chain as the original E run: the train24fix-round
+#: sixseg (rev dbe587a) -- the with-C2 train24fix2 sixseg is a DIFFERENT
+#: chain and belongs to the fail-binding tool, not to the E candidates
 CUR_RQ_DIR = REGEN / "train24fix_20260927_sixseg" / "rq"
 CUR_RV_DIR = REGEN / "train24fix_20260927_sixseg" / "rv"
 CUR_NS_DIR = REGEN / "train24fix_20260927_sixseg" / "ns"
 TRAIN24_KEEP_DIR = REGEN / "labelq_20260926_train24" / "regen_final"
 DQ_JSON = REGEN / "train24fix_20260927_diag" / "dq_quality_baseline.json"
-OUT_DIR = REGEN / "train24fix2_20260927_diag"
+#: review-fix round (2026-10-01): the frozen 20260927 diag directory is
+#: READ-ONLY; every product of this run goes to a fresh reviewfix directory
+#: and refuses to overwrite anything that already exists there
+OUT_DIR = REGEN / "train24fix2_reviewfix_20261001" / "diag"
 PLAN_DOC = Path(__file__).resolve().parents[1] / "docs" / "plans" / \
     "train24fix2_certification_edge_plan.md"
 
@@ -161,9 +177,17 @@ def prev_scene_distances(traj: np.ndarray) -> dict:
     (previous robot state against the CURRENT box pose -- what
     ``pipeline._frame_ctx`` feeds ``prev_hand_dist``).
 
-    Real-hit criterion ``dist < distmax`` (section 4.2): a miss is recorded,
-    never filled with zero or silently replaced by the projected field.
+    Return contract (review R2, 2026-10-01 -- same as the pipeline's
+    collection): finite ``< distmax`` is a real hit (negative/zero kept);
+    finite ``== distmax`` is the normal truncation sentinel (a miss, never
+    a distance); NaN/±Inf/out-of-range or a raised query is an ANOMALY and
+    aborts this forensic verdict (the record survives, marked
+    ``evidence_incomplete`` -- an anomalous query may never back a
+    classification).
     """
+    from ireset.repair.pipeline import (
+        C2DistanceQueryError, classify_distance_query)
+
     rcfg, vcfg = load_mode_configs("strict")
     validator = IndependentValidator(cfg=vcfg)
     ev = FrameEvaluator(validator.spec, validator.pairs, rcfg)
@@ -177,10 +201,23 @@ def prev_scene_distances(traj: np.ndarray) -> dict:
             for side in ("l", "r"):
                 dmin, hit = np.inf, False
                 for g in ev._hand_geoms[side]:
-                    d = ev.geom_distance(g, ev.box_geom)[0]
-                    if d < DISTMAX:                     # real hit
+                    try:
+                        d = ev.geom_distance(g, ev.box_geom, distmax=DISTMAX)[0]
+                    except Exception as exc:                 # noqa: BLE001
+                        raise C2DistanceQueryError(
+                            t, side, "forensic_prev_scene_query", DISTMAX,
+                            "exception", repr(exc),
+                            stage="forensic_prev_scene_series") from exc
+                    k = classify_distance_query(d, DISTMAX)
+                    if k == "hit":                     # real hit
                         hit = True
                         dmin = min(dmin, d)
+                    elif k == "truncated":
+                        pass
+                    else:
+                        raise C2DistanceQueryError(
+                            t, side, "forensic_prev_scene_query", DISTMAX,
+                            k, repr(d), stage="forensic_prev_scene_series")
                 if hit:
                     out[side][kind][t] = float(dmin)
                 else:
@@ -560,44 +597,101 @@ def c2_rows_of(pipe: RepairPipeline, ctx, z: np.ndarray, c2_state: dict,
 
 def counterfactual(replay: ChainReplay, t: int, z_cand: np.ndarray,
                    source: str, c2_state: dict,
-                   prev_scene_side: dict | None) -> dict:
+                   prev_scene_side: dict | None,
+                   rq_traj: np.ndarray, src_scene: np.ndarray,
+                   spec, rcfg, vcfg) -> tuple[dict, dict]:
+    """FULL two-branch counterfactual (review R3): the same candidate on
+    the frozen current chain, audited with every applicable check --
+    endpoint rows (fresh uncapped scan), every interpolation point, strict
+    joint velocities, task under the HUMAN reference, and the accepted
+    PREFIX independent final validation -- once WITHOUT C2 (the historical
+    explicit ``regen_hand_speed_mps=0`` configuration, never the deployed
+    default) and once with the REAL deployed C2 assembly (same previous
+    sites / enable state; no parallel speed formula decides acceptance).
+
+    Returns ``(record, arrays)``; the classification follows the section
+    4.2 table (EVIDENCE_INCOMPLETE / V1_UNUSABLE / PASS / C2_ONLY /
+    CURRENT_ONLY / BOTH) and the provenance carries the candidate's true
+    origin (an adopted rq state or a PORTED historical Nq frame -- the
+    ported origin never fabricates an attempt/check id).
+    """
+    from train24fix2_audit import (
+        classify_branches, context_arrays, freeze_context, full_candidate_audit)
+
     ctx = replay.ctx_at(t)
-    v1 = replay.pipe._normalize_candidate(np.array(z_cand, copy=True), ctx)
+    ctx_frozen = freeze_context(ctx)
+    cfg_current = replace(rcfg, regen_mode=True, regen_hand_speed_mps=0.0)
+    assert cfg_current.regen_hand_speed_mps == 0.0            # noqa: S101
+    cfg_plus = replace(rcfg, regen_mode=True)                 # deployed 0.02598
+    assert cfg_plus.regen_hand_speed_mps == 0.02598           # noqa: S101
+
+    ctx_plus = replace(
+        freeze_context(ctx),
+        c2_hand_enabled={"l": bool(c2_state["l"]["enabled"][t]),
+                         "r": bool(c2_state["r"]["enabled"][t])},
+        c2_hand_reason={"l": c2_state["l"]["reason"][t],
+                        "r": c2_state["r"]["reason"][t]},
+        prev_hand_scene_dist={
+            "l": (None if prev_scene_side is None
+                  else prev_scene_side["scene"][t - 1] if t else None),
+            "r": (None if prev_scene_side is None
+                  else prev_scene_side["scene"][t - 1] if t else None)})
+
+    prefix = [rq_traj[i, 0:36].copy() for i in range(t)]
+    box_poses = src_scene[:, 36:43]
     rec = {
         "frame": int(t), "candidate_source": source,
-        "provenance": {"pass": 0, "attempt": source,
-                       "check": "counterfactual_frame_valid_plus_c2"},
+        "provenance": {
+            "pass": 0,
+            "origin": ("current_rq_adopted_state" if "current_rq" in source
+                       else "ported_historical_nq_frame"),
+            "note": ("ported frames carry no attempt/check identity of this "
+                     "run; the source NPZ hash + frame index are the identity"),
+            "c2_enable": {s: {"enabled": bool(c2_state[s]["enabled"][t]),
+                              "reason": c2_state[s]["reason"][t]}
+                          for s in ("l", "r")},
+        },
         "box_pose_t": [float(v) for v in ctx.box_pose],
         "box_pose_prev": (None if ctx.box_pose_prev is None
                           else [float(v) for v in ctx.box_pose_prev]),
-        "v1": {k: (v if k != "z" else None) for k, v in v1.items()},
         "prev_scene_dist_m": (None if prev_scene_side is None
                               else prev_scene_side["scene"][t]),
         "prev_projected_dist_m": (None if prev_scene_side is None
                                   else prev_scene_side["proj"][t]),
+        # component/norm speed evidence (diagnostic only -- acceptance is
+        # the deployed row assembly inside the audits below)
+        "c2_speed_evidence": c2_rows_of(replay.pipe, ctx,
+                                        np.asarray(z_cand, dtype=float),
+                                        c2_state, t),
     }
-    z_checked = v1["z"] if v1["ok"] else np.array(z_cand, copy=True)
-    rec["c2"] = c2_rows_of(replay.pipe, ctx, z_checked, c2_state, t)
-    if not v1["ok"]:
-        rec["verdict"] = "V1_UNUSABLE"
-        rec["current_check"] = None
-        return rec
-    chk = replay.pipe.frame_valid(z_checked, ctx)
-    cur_ok = bool(chk.ok)
-    c2_viol = any(r.get("enabled") and r["viol_sum"] > ACCEPT_VIOL
-                  for r in rec["c2"].values())
-    rec["current_check"] = {
-        "ok": cur_ok, "reason": chk.reason, "viol": float(chk.viol),
-        "rows": chk.rows,
-        "probes": [{k: v for k, v in p.items()
-                    if k not in ("q_mid", "box_pose_mid")}
-                   for p in chk.probes],
-        "probe_n": chk.probe_n, "motion_m": chk.motion_m,
-    }
-    rec["verdict"] = ("PASS" if cur_ok and not c2_viol else
-                      "C2_ONLY" if cur_ok else
-                      "BOTH" if c2_viol else "CURRENT_ONLY")
-    return rec
+    arrays: dict = {"z_cand": np.asarray(z_cand, dtype=float).copy(),
+                    "prefix": (np.zeros((0, 36)) if not prefix
+                               else np.stack(prefix)),
+                    "box_poses": box_poses.copy(),
+                    **context_arrays(ctx_frozen)}
+    audits: dict = {}
+    for label, actx, acfg in (("current", ctx_frozen, cfg_current),
+                              ("plus_c2", ctx_plus, cfg_plus)):
+        arec, aarr = full_candidate_audit(
+            spec, acfg, vcfg, actx, z_cand, prefix=prefix,
+            box_poses=box_poses, label=label)
+        audits[label] = arec
+        arrays.update(aarr)
+    rec["audits"] = audits
+    rec["classification"] = classify_branches(
+        audits["current"], audits["plus_c2"])
+    rec["classification_basis"] = {
+        "current_branch_pass": audits["current"].get("branch_pass"),
+        "plus_c2_branch_pass": audits["plus_c2"].get("branch_pass")}
+    # replay inputs (section 4.3): everything needed to restore the context
+    # and the C2 flags without touching the chain replay
+    from train24fix2_audit import context_meta, context_scalar_leaves
+    rec["replay_meta"] = {**context_meta(ctx_frozen),
+                          "ctx_scalars": context_scalar_leaves(ctx_frozen)}
+    rec["c2_enable_flags"] = dict(ctx_plus.c2_hand_enabled)
+    rec["c2_reasons"] = dict(ctx_plus.c2_hand_reason)
+    rec["prev_scene_dist_flags"] = dict(ctx_plus.prev_hand_scene_dist)
+    return rec, arrays
 
 
 # ---------------------------------------------------------------------------
@@ -633,13 +727,106 @@ def _interval_match(cls: dict, exp: dict) -> bool:
 # main
 # ---------------------------------------------------------------------------
 
+def replay_counterfactuals(out_dir: Path) -> None:
+    """Recompute the same-candidate branches from the frozen per-record
+    files (review section 4.3): restore the context from the NPZ, rerun
+    BOTH branch audits on the saved candidate, compare with the saved
+    verdicts -- no chain replay, no re-solve, no substituted candidate."""
+    rcfg, vcfg = load_mode_configs("strict")
+    spec = RepairPipeline(cfg=replace(rcfg, regen_mode=True)).spec
+    results = {}
+    for jpath in sorted(out_dir.glob("cert_trace_cf_*.json")):
+        record, arrays = load_products(out_dir, jpath.stem)
+        t = record["frame"]
+        z_cand = arrays["z_cand"]
+        prefix = ([arrays["prefix"][i].copy()
+                   for i in range(arrays["prefix"].shape[0])]
+                  if arrays["prefix"].size else [])
+        box_poses = arrays["box_poses"]
+        meta = record["replay_meta"]
+        ctx = context_from(arrays, meta)
+        cfg_current = replace(rcfg, regen_mode=True,
+                              regen_hand_speed_mps=0.0)
+        cfg_plus = replace(rcfg, regen_mode=True)
+        ctx_plus = replace(
+            freeze_context(ctx),
+            c2_hand_enabled=record["c2_enable_flags"],
+            c2_hand_reason=record["c2_reasons"],
+            prev_hand_scene_dist=record["prev_scene_dist_flags"])
+        rep: dict = {}
+        for label, actx, acfg in (("current", ctx, cfg_current),
+                                  ("plus_c2", ctx_plus, cfg_plus)):
+            arec, _a = full_candidate_audit(
+                spec, acfg, vcfg, actx, z_cand, prefix=prefix,
+                box_poses=box_poses, label=label)
+            saved = record["audits"][label]
+            rep[label] = {
+                "matches_saved": bool(
+                    arec.get("branch_pass") == saved.get("branch_pass")
+                    and arec["endpoint"]["viol_sum"]
+                    == saved["endpoint"]["viol_sum"]
+                    and arec["task"]["mpjpe_m"] == saved["task"]["mpjpe_m"]
+                    and arec["interpolation"]["pass"]
+                    == saved["interpolation"]["pass"]
+                    and arec["prefix_validation"]["passed"]
+                    == saved["prefix_validation"]["passed"]),
+                "branch_pass": arec.get("branch_pass"),
+                "viol_sum": arec["endpoint"]["viol_sum"],
+                "task_mpjpe": arec["task"]["mpjpe_m"]}
+        def bare(branch_pass: bool) -> dict:
+            return {"input": {"v1": {"ok": True}},
+                    "branch_pass": branch_pass}
+
+        rep["classification_recomputed"] = classify_branches(
+            bare(rep["current"]["branch_pass"]),
+            bare(rep["plus_c2"]["branch_pass"]))
+        # V1_UNUSABLE / EVIDENCE_INCOMPLETE come from the saved audit's own
+        # input record -- the recomputed bare passes above are only a
+        # cross-check of the PASS/C2_ONLY/CURRENT_ONLY/BOTH axis
+        rep["classification_matches"] = (
+            rep["classification_recomputed"] == record["classification"]
+            or record["classification"] in ("V1_UNUSABLE",
+                                            "EVIDENCE_INCOMPLETE"))
+        results[jpath.stem] = rep
+        print(f"  [replay {jpath.stem}] {rep['current']['matches_saved']}/"
+              f"{rep['plus_c2']['matches_saved']} "
+              f"class={rep['classification_recomputed']}")
+    ok = all(v["current"]["matches_saved"] and v["plus_c2"]["matches_saved"]
+             and v["classification_matches"] for v in results.values())
+    (out_dir / "cert_trace_cf_replay.json").write_text(
+        json.dumps({"ok": ok, "n": len(results), "results": results},
+                   indent=1, allow_nan=False))
+    print(f"[replay] {'ALL MATCH' if ok else 'MISMATCH'} "
+          f"({len(results)} records) -> cert_trace_cf_replay.json")
+
+
+def _write_guarded(path: Path, text: str) -> None:
+    """Forensic outputs never overwrite (review section 4.3): the frozen
+    20260927 diag directory is read-only and this run's own products are
+    write-once too -- re-running means a fresh --out."""
+    if path.exists():
+        raise FileExistsError(f"refusing to overwrite forensic file {path}")
+    path.write_text(text)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--skip-counterfactuals", action="store_true")
+    ap.add_argument("--out", default=str(OUT_DIR),
+                    help="output dir (default: the reviewfix 20261001 diag "
+                         "dir, never the frozen 20260927 one)")
+    ap.add_argument("--replay", action="store_true",
+                    help="recompute the same-candidate counterfactual "
+                         "branches from the frozen files and compare -- "
+                         "no chain replay, no re-solve")
     args = ap.parse_args()
+    out_dir = Path(args.out)
+    if args.replay:
+        replay_counterfactuals(out_dir)
+        return
 
     t_start = time.perf_counter()
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
     A = Assertions()
     rcfg, vcfg = load_mode_configs("strict")
 
@@ -802,8 +989,8 @@ def main() -> None:
                 "classification_vs_nq": {s: cls_all[(demo, s)]
                                          for s in ("l", "r")},
             })
-        (OUT_DIR / f"cert_trace_{demo}_rq.json").write_text(
-            json.dumps(out, indent=1))
+        _write_guarded(out_dir / f"cert_trace_{demo}_rq.json",
+                       json.dumps(out, indent=1))
 
     # ---- section 2.1 assertions -------------------------------------------
     print("== section 2.1 assertions ==")
@@ -888,17 +1075,18 @@ def main() -> None:
            {f"{k[0]}:{k[1]}:{s}": prev_all[k][s]["miss"]
             for k in prev_all for s in ("l", "r")})
 
-    # ---- counterfactuals (section 3 item 4) --------------------------------
+    # ---- counterfactuals (section 3 item 4; review R3 full audit) ---------
     cf_records = []
     if not args.skip_counterfactuals:
-        print("== counterfactuals ==")
+        print("== counterfactuals (full audit, review R3) ==")
+        spec = RepairPipeline(cfg=replace(rcfg, regen_mode=True)).spec
         for demo in sorted({d for (d, _s) in FAIL_SIDES}):
             src_scene, cond = conds[demo]
             rq_traj, _, _ = load_teacher_npz(CUR_RQ_DIR / f"{demo}.npz")
             nq_traj = None
             replay = ChainReplay(cond, src_scene, rq_traj, rcfg, vcfg)
             c2_rq = c2_states[(demo, "rq")]
-            tasks = []                      # (t, order, builder)
+            tasks = []                      # (t, order, side, kind)
             for side in sorted(s for (d, s) in FAIL_SIDES if d == demo):
                 spikes = sorted(t for t, k in
                                 cls_all[(demo, side)]["lost"].items()
@@ -914,35 +1102,58 @@ def main() -> None:
             for t, _order, side, kind in tasks:
                 if kind == "current_rq_adopted_spike":
                     z_cand = rq_traj[t, 0:36]
+                    origin = {"kind": "rq_adopted",
+                              "npz": str(CUR_RQ_DIR / f"{demo}.npz"),
+                              "npz_sha256": sha256(CUR_RQ_DIR / f"{demo}.npz"),
+                              "frame": int(t)}
                 else:
                     if nq_traj is None:
                         nq_traj, _, _ = load_teacher_npz(
                             HIST_NQ_DIR / f"{demo}.npz")
                     z_cand = nq_traj[t, 0:36]
-                rec = counterfactual(
-                    replay, t, z_cand,
-                    f"{kind}[{side}]", c2_rq,
-                    prev_all[(demo, "rq")][side])
-                rec.update({"demo": demo, "side": side, "kind": kind})
+                    origin = {"kind": "ported_nq_frame",
+                              "npz": str(HIST_NQ_DIR / f"{demo}.npz"),
+                              "npz_sha256": sha256(HIST_NQ_DIR / f"{demo}.npz"),
+                              "frame": int(t)}
+                rec, arrays = counterfactual(
+                    replay, t, z_cand, f"{kind}[{side}]", c2_rq,
+                    prev_all[(demo, "rq")][side], rq_traj, src_scene,
+                    spec, rcfg, vcfg)
+                rec.update({"demo": demo, "side": side, "kind": kind,
+                            "origin": origin})
                 cf_records.append(rec)
-        (OUT_DIR / "cert_trace_counterfactuals.json").write_text(
-            json.dumps(cf_records, indent=1))
-        verdicts: dict = {}
+                # one frame can be BOTH a spike and a historical certified
+                # candidate -- the kind is part of the product identity
+                write_products(out_dir,
+                               f"cert_trace_cf_{demo}_t{t}_{side}_{kind}",
+                               rec, arrays)
+                print(f"  [{demo} t={t} {side} {kind}] "
+                      f"{rec['classification']}")
+        summary = {
+            "format": AUDIT_FORMAT,
+            "records": [{k: r[k] for k in
+                         ("demo", "side", "kind", "frame", "classification",
+                          "classification_basis", "origin")}
+                        for r in cf_records],
+            "verdicts": {},
+        }
         for r in cf_records:
-            key = f"{r['kind']}:{r['verdict']}"
-            verdicts[key] = verdicts.get(key, 0) + 1
-        A.note("counterfactual_verdicts", verdicts)
+            key = f"{r['kind']}:{r['classification']}"
+            summary["verdicts"][key] = summary["verdicts"].get(key, 0) + 1
+        _write_guarded(out_dir / "cert_trace_counterfactuals.json",
+                       json.dumps(summary, indent=1, allow_nan=False))
+        A.note("counterfactual_classifications", summary["verdicts"])
 
     # ---- write assertion/provenance outputs --------------------------------
     prov["H_index"], prov["B_index"], prov["T_index"] = H, B, T
-    (OUT_DIR / "cert_trace_assertions.json").write_text(json.dumps({
+    _write_guarded(out_dir / "cert_trace_assertions.json", json.dumps({
         "assertions": A.rows,
         "enable_gap_summary": {f"{k[0]}:{k[1]}": len(v)
                                for k, v in gaps.items()},
         "wall_s": time.perf_counter() - t_start}, indent=1))
-    (OUT_DIR / "cert_trace_provenance.json").write_text(
-        json.dumps(prov, indent=1, default=str))
-    print(f"-> {OUT_DIR} ({time.perf_counter() - t_start:.1f}s, "
+    _write_guarded(out_dir / "cert_trace_provenance.json",
+                   json.dumps(prov, indent=1, default=str))
+    print(f"-> {out_dir} ({time.perf_counter() - t_start:.1f}s, "
           f"{len(A.rows)} assertion rows, {len(cf_records)} counterfactuals)")
 
 
