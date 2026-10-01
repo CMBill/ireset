@@ -190,19 +190,32 @@ def test_verbose_attempt_log_reflects_adoption() -> None:
 
 
 def test_probe_audit_rescans_per_point() -> None:
-    """Endpoint pair cache must not serve the interpolation audit: a box far
-    at BOTH endpoints that sweeps through the robot at the midpoint gets no
-    robot_box rows from the endpoint scan -- the audit must rescan and fail."""
+    """Endpoint pair cache must not serve the interpolation audit.  The
+    trap is only live when the cache is ESTABLISHED first: the audit runs a
+    ``check_rows`` at a definite endpoint state (populating ``_frame_pairs``
+    with no robot_box candidate -- the box is far there), then the box
+    sweeps through the robot ONLY at an interior subdivision state.  The
+    per-point rescan must reject and report the middle pair/alpha; the
+    pre-fix audit (no per-point reset) reused the endpoint set and passed.
+
+    Review R5 (2026-10-01): the original test never built the endpoint
+    cache, so the FIRST interior point scanned anyway on the fresh solver
+    and the pre-fix variant still passed -- verified by replaying the
+    pre-fix ``_probe_audit`` against this scenario (recorded in
+    train24fix2_review_fix_verification.md section 2)."""
     from train24fix_diagnostics import _probe_audit
     from ireset.repair.scp import FrameSolver
 
     pipe = RepairPipeline(cfg=REGEN)
     z = standing_scene(1)[0, 0:36].copy()
-    torso = pipe.ev.data.geom_xpos[pipe.ev.box_geom] * 0  # placeholder
     pipe.ev.forward(z, np.array([5.0, 0.0, 0.25, 1.0, 0, 0, 0]))
     root = pipe.ev.data.geom_xpos[pipe.ev._hand_geoms["l"][0]]
-    box_a = np.array([root[0] - 0.5, root[1], root[2], 1.0, 0, 0, 0])
-    box_b = np.array([root[0] + 0.5, root[1], root[2], 1.0, 0, 0, 0])
+    # subdivision is capped at max_subdivisions=2 -> interior points sit
+    # exactly at alpha=1/3 and 2/3; place the box ON the hand at alpha=1/3
+    # and far at BOTH endpoints (30 cm / 60 cm -- beyond the ~6 cm
+    # activation margin including the box half-extent)
+    box_a = np.array([root[0] - 0.30, root[1], root[2], 1.0, 0, 0, 0])
+    box_b = np.array([root[0] + 0.60, root[1], root[2], 1.0, 0, 0, 0])
     ctx = FrameContext(
         t=1, box_pose=box_b, z_pred=z.copy(), z_prev=z.copy(),
         ref_kpts_world=pipe.ev.site_positions(pipe.ev.kpt_ids).copy(),
@@ -212,8 +225,21 @@ def test_probe_audit_rescans_per_point() -> None:
         frame_motion_m=0.5)
     s2 = FrameSolver(pipe.ev, REGEN)
     s2.probe_cfg = pipe.validator.cfg
+    # ESTABLISH the endpoint pair cache exactly like a real endpoint check
+    # would (this is the state the pre-fix audit kept reusing): no robot_box
+    # candidate at the candidate endpoint, and the cache is a live list --
+    # not None -- afterwards
+    s2.check_rows(z, ctx)
+    assert s2._frame_pairs is not None
+    assert not any(ga in set(pipe.ev._hand_geoms["l"]) | set(pipe.ev._hand_geoms["r"])
+                   and gb == pipe.ev.box_geom
+                   for ga, gb, _k in s2._frame_pairs), \
+        "scenario broken: endpoint scan already sees the box pair"
     audit = _probe_audit(pipe, s2, ctx, z, z.copy(), pipe.validator.cfg)
     assert audit["checked"] and audit["n_sub"] > 1
     assert audit["pass"] is False, "mid-state sweep must be caught by rescan"
     all_rows = [row for pt in audit["points"] for row in pt["rows"]]
     assert all_rows and any("largebox" in r["pair"] for r in all_rows)
+    # the rejection localizes to an interior alpha with the sweeping pair
+    bad = [pt for pt in audit["points"] if pt["rows"]]
+    assert bad and all(0.0 < pt["alpha"] < 1.0 for pt in bad)
