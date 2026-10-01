@@ -1,5 +1,15 @@
 # train24fix 第二轮(认证边缘碎裂)验证记录
 
+> ## 0. 审阅订正(2026-10-01,[train24fix2 实现审阅修复方案](train24fix2_review_fix_plan.md) §5;优先于下文)
+>
+> 实现审阅(基点 `0500b4a`)确认 5 项问题,本记录与取证结论按下表订正;运行状态与裁决不受影响:
+>
+> 1. **§1.5/§3.2 反事实的上下文缺陷(R1,P1)**:失败绑定的上下文重建以**当前机器人 FK 关键点替代人体参考**(`ref_kpts_world=ev.site_positions(…)`),漏掉 `ref_hand_kpts`/`ref_hand_delta`/`frame_motion_m`——sub12@12、sub3@14 的任务 MPJPE 本应为 **0.114154/0.131966 m**,缺陷版本记为 0。§3.2 表"同帧同前缀关 C2 重解全部接受"与"归因唯一"**整体作废待重验**;审阅者用正确上下文重放的两个样本中,同候选关 C2 的完整帧检查与前缀终检均通过(支持继续取证,不等于五段结论成立)。
+> 2. **§1.4 "无任何异常查询失效"撤回(R2)**:`_collect_prev_scene_dist` 把 NaN 返回与正常截断未命中同类处理(均记"1 m 外远离、行关闭"),三帧场景可复现"NaN 被当远离且整段 accepted"。sub16 的 0.98–1.28 m 远离结论经 5 m distmax 复核,仍然成立;该条"无失效"断言降级为"未检出",以修复后重跑为准。
+> 3. **§3.2/§3.4 "联合不可行已证实"措辞过强(R4)**:五段最后 QP 均为 `maximum iterations reached` 且信赖域已低于最小值——这是"数值/搜索未收敛或未找到可接受解",结构性冲突只是待检验解释。允许的结论强度见修复方案 §5 表;"该冻结候选被 C2 行拒绝"仍是 §3.2 行级证据支持的(端点行 dump 不依赖被 R1 污染的上下文字段),但"重解接受"与"联合不可行"归因均待完整重验。
+> 4. **§1.5 的 E 反事实分类(10 C2_ONLY、13 PASS/90 C2_ONLY)保留为历史结果**:其审计缺前缀独立终检与完整行 dump(修复方案 R3),补齐后允许订正;不要求新工具强行复现旧分类。
+> 5. rq **1/6** 与**暂停转段**裁决、H/B/T 冻结、`train24fix2_20260927_*` 只读保护均不变;重验产物写入 `train24fix2_reviewfix_20261001/`,结论以[审阅修复验证记录](train24fix2_review_fix_verification.md)为准。
+
 日期:2026-10-01 起。对象:[train24fix2 认证边缘最小修复方案](../plans/train24fix2_certification_edge_plan.md)(审阅修订+复核批注版)。本记录随各阶段实施递增;未完成的节标注状态。取证产物目录:`derived/data/teachers_regenerated/train24fix2_20260927_diag/`(未舍入;`cert_trace_provenance.json` / `cert_trace_{demo}_rq.json` / `cert_trace_counterfactuals.json` / `cert_trace_assertions.json`)。
 
 ## 1. E 阶段:取证固化(已完成)
