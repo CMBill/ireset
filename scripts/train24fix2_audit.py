@@ -268,8 +268,14 @@ def escalate_frame(pipe: RepairPipeline, ctx: FrameContext, t: int,
                 "check_id": chk0.check_id,
                 "velocity_normalized": bool(skip_norm.get("n_changed"))}
     if chk0.ok:
+        # the skip return carries the SAME key set as the solve path (the
+        # caller reads one shape; a missing key crashed the first formal
+        # fail-bind of this round on a frame whose C2-off skip passes)
         return {"skipped": True, "skip": skip_rec, "adopted": True,
                 "adopted_source": "skip", "adopted_z": skip_norm["z"].copy(),
+                "adopted_status": "skipped",
+                "last_status": "skipped", "last_term_reason": "",
+                "last_check_reason": chk0.reason,
                 "attempts": attempts, "checks": checks, "frame_recs": frame_recs}
     # a denied skip feeds the prediction's violations into the solve
     pipe.carry_discovered(chk0)

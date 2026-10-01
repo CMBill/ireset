@@ -199,9 +199,10 @@ def bind(demo: str, rq_dir: Path, out: Path) -> dict:
                       "check_id": a.get("check_id")}
                      for a in esc["attempts"]],
         "skip": esc["skip"]}
-    if esc["adopted"] and not esc["skipped"]:
-        # the re-solved candidate gets its own full audit under its own
-        # identity -- never mixed with the frozen original
+    if esc["adopted"]:
+        # the adopted candidate gets its own full audit under its own
+        # identity -- never mixed with the frozen original; this covers
+        # BOTH adoption shapes (skip pass-through and solved candidate)
         rrec, rarr = full_candidate_audit(
             pipe.spec, cfg, vcfg, c2_off_ctx(ctx), esc["adopted_z"],
             prefix=prefix, box_poses=box_poses, label="resolve_c2_off")
