@@ -1,8 +1,10 @@
 # train24 失败类别最小修复验证记录
 
-日期:2026-09-27 起。对象:[train24 失败类别最小修复方案](../plans/train24_failure_fix_plan.md)(修订版)。本记录随各阶段实施递增;未完成的节标注状态。取证产物目录:`derived/data/teachers_regenerated/train24fix_20260927_diag/`(完整结论 JSON:`D_CONCLUSIONS.json`)。
+日期:2026-09-27 起。对象:[train24 失败类别最小修复方案](../plans/train24_failure_fix_plan.md)(修订版)。本记录随各阶段实施递增;未完成的节标注状态。取证产物目录:`derived/data/teachers_regenerated/train24fix_20260927_diag/`(完整结论 JSON:`D_CONCLUSIONS.json`,含 2026-09-27 审阅二轮订正块)。
 
-## 1. D 阶段:只读取证(已完成)
+> **2026-09-27 审阅二轮订正(优先于下文首轮记录)**:四项缺陷(P1 截断距离可绑定走廊、P2a 失败快照混尝试、P2b 离线插值未逐点重扫、P2c verbose 日志 adopted 冻结为 None)已修复并分项提交(`66343e1`/`dbe587a`,全量 **213 passed + 1 skipped**)。**订正一(D-F 分类)**:以修复前代码(68ba62b worktree+P2a 外科补丁)经修正工具重推导,sub7_029 由 foot_speed **改判 band_floor_only**(脚速违反属于第一次尝试的候选;最后执行尝试的候选仅违反手带行 1.66e-5 m)——修正后 band_floor_only **×3**(sub3_001/sub8_002/sub7_029)、mixed_joint_limit(sub12_004)、deep(sub16_012)、foot_speed(sub10_075),F1 启用证据增强并经身份绑定+逐点重扫+前缀终检三重前置严格复现。**订正二(D-R 计数)**:原 r2_decide=107/91 被日志 adopted 冻结污染,作废;r2_any(skip 检查口径,107)与零 QP 反例仍为有效 R2 触发证据;修正工具在当前代码上 r2_decide/r2_any/r1 全 0(R2 完全闭合)。**订正三(六段重跑)**:首轮六段(P1 缺陷在场)归档为 `train24fix_20260927_sixseg_v1_superseded/`;修复后重跑逐项复现同一判决(见 §5),结论现为干净证据下的权威版本。
+
+## 1. D 阶段:只读取证(已完成;分类经审阅二轮订正)
 
 提交:`<D>`。改动:pipeline 新增**默认关闭**的只读快照钩子(`RepairPipeline.snapshot`/`_snap`,采纳/失败/终检失败事件;186 项测试全过,无行为改动)+ 取证脚本 `scripts/train24fix_diagnostics.py`(dv/df/dr/dq)。重放均以独立 evaluator/solver 复算,不触正式运行缓存。
 
@@ -22,16 +24,16 @@
 
 在冻结失败候选上仅替换 §2.4 指定格(regen 端点 accept 带行下界 −1.5→−1.8 mm),其余行与全部探测界不动:
 
-| 段 | t | 分类 | 依据 |
+| 段 | t | 分类(订正后) | 依据 |
 |---|---|---|---|
 | sub3_001 | 111 | **band_floor_only** | 仅带行 µm 级越界(7.35e-6/3.56e-6 m);反事实通过端点+探测+速度+任务门;前缀终检通过 |
 | sub8_002 | 62 | **band_floor_only** | 仅 ankle 行 2.5e-7 m 越界;反事实全过 |
+| sub7_029 | 18 | **band_floor_only**(由 foot_speed 改判) | 最后执行尝试候选仅违反手带行 1.66e-5 m;脚速违反属第一次尝试候选(快照身份订正后绑定最后尝试) |
 | sub12_004 | 0 | mixed_joint_limit | `joint_limit[j16]` 骑界 2.76e-7 rad + 四条带行 µm 级;非指定格的行仍挡(反事实不过) |
 | sub16_012 | 40 | deep_penetration | 手带行 −3.5~−4.0 mm,超终检门 |
-| sub7_029 | 18 | foot_speed | 支撑脚速度 post 行 2e-8~1.1e-7 m/frame 越界与带行 3.1e-6 m 并存;反事实仍被脚速行挡 |
 | sub10_075 | 69 | foot_speed | sole2:z 越界 9.4e-4 m/frame(实质性,非 eps 类) |
 
-**F1 启用条件成立**(2 个真实 band_floor_only 反例)。残留类别(脚速 2 段、关节限位骑界 1 段、深穿透 1 段)本轮不设专属策略(方案 §8),如实入账。帧级反事实通过≠整段恢复,以六段回归与 train24 重跑裁决。注:独立 evaluator 复算的部分末候选行值与冻结报告在 µm 级有差(进程内求解器状态),分类不受影响。
+**F1 启用条件成立且经修正工具在修复前代码上严格重验**(band_floor_only ×3,身份绑定+逐点重扫+前缀终检全部通过)。残留类别(脚速 1 段、关节限位骑界 1 段、深穿透 1 段)本轮不设专属策略(方案 §8),如实入账。帧级反事实通过≠整段恢复,以六段回归与 train24 重跑裁决。注:独立 evaluator 复算的部分末候选行值与冻结报告在 µm 级有差(进程内求解器状态),分类不受影响。另:在**当前修复版本**上 df 重放,6 段中 5 段直接 accepted(仅 sub16_012 深穿透仍拒)——F 类失败在组合修复下整体消失,band_floor_only 归因仅存于修复前状态。
 
 ### 1.3 D-R:走廊/全入口审计与零 QP 反例
 
@@ -59,9 +61,9 @@ V1 ✅、F1 ✅(band_floor_only×2)、R2 ✅;R1 为契约验证(经 R2 行,不�
 
 **R2**:`_registry_nearest_hand`——ref_hold 侧的最近手 geom/箱 pair 从注册表全量查询(1 m 起步、10 m 升级),绕过 ~5 cm 激活门;仅 `dist < distmax` 的真实命中可用(截断哨兵不作距离);无命中显式失败:合成常违反行 `regen_query_failed[side]:regen`(值=查询界,非测量距离)+ `query_failed` 走廊记录,候选被拒且不进回流(无 pair 身份)。候选路径命中时保持 `source="candidate"` 且同 pair 仅一行(去重)。**R1**:R2 行就位后由既有检查链承担(skip 检查、`solve_frame` 可行性/提前返回、`success_review`、pipeline 采纳全部经 `check_rows` 看到主动行与动态上界),不另建距离门——与 D-R 结论一致(R1 未独立触发)。6 项测试:注册表远距选行+停滞悬空诚实违反、查询失败显式拒绝且回流安全、近距去重、标准模式无主动行、**零 QP 反例新形态**(停滞悬空不再 0 QP 原样接受;合法闭合期 0 QP 通过是正确行为)、采纳检查全路径走廊契约(30→24 mm 合法接近通过、6 mm 其余合法时 skip 允许)。全量 209 passed + 1 skipped。
 
-## 5. 六段回归(已执行;基础门通过、D-Q 质量回归门 4 侧未过 → 按方案 §5 暂停自动转段)
+## 5. 六段回归(已执行两轮;首轮被 P1 缺陷污染归档为 v1_superseded,修复后重跑为权威版本——两轮判决逐项一致)
 
-运行:`train24fix_20260927_sixseg/{rq,rv,ns}`(统一冻结版本 `767a19d`+方案修订 `9d77135`,单进程串行、线程环境 8、`--assert-task-gate 0.40`、运行期仓库零写入,三次运行 `code_changed_during_run=False`)。
+运行:`train24fix_20260927_sixseg/{rq,rv,ns}`(修复后版本 `dbe587a`,单进程串行、线程环境 8、`--assert-task-gate 0.40`、运行期仓库零写入,三次运行 `code_changed_during_run=False`)。首轮(`767a19d`+`9d77135`,P1 截断距离缺陷在场)结果归档于 `train24fix_20260927_sixseg_v1_superseded/`;重跑逐段比较:sub8 的 NPZ 哈希与首轮相同、其余段哈希变化但**状态/计数/召回/质量逐项一致**,且 rq V1 计数(checks/normalized/budget/out)六段完全相同——P1 未在六段集上触发,经重跑证实而非假设。以下数字为修复后权威版本(两轮同值):
 
 ### 5.1 regen quiet/verbose(rq/rv)
 
@@ -99,4 +101,16 @@ V1 ✅、F1 ✅(band_floor_only×2)、R2 ✅;R1 为契约验证(经 R2 行,不�
 
 ## 6. train24 重跑(未执行:§5 质量回归门未过,按预注册规则暂停)
 
-方案 §6 的重跑条件未满足;不按六段结果追补策略、不重标阈值、不混合变体。失败分类交付(供下一轮另立方案):认证交集退化 4 侧,机理为走廊拉入下的进入认证边缘碎裂/移位,近接无退化;sub16_012 深穿透、脚速类(sub7_029/sub10_075)、关节限位骑界(sub12_004)为 D-F 已立案的残留类别,本轮未触及。
+方案 §6 的重跑条件未满足;不按六段结果追补策略、不重标阈值、不混合变体。失败分类交付(供下一轮另立方案):认证交集退化 4 侧,机理为走廊拉入下的进入认证边缘碎裂/移位,近接无退化;sub16_012 深穿透、脚速类(sub10_075)、关节限位骑界(sub12_004)为 D-F(订正后)残留类别,本轮未触及。
+
+## 7. 审阅二轮修复(2026-09-27,提交 `66343e1`/`dbe587a`)
+
+| 编号 | 缺陷与复现 | 修复 | 反例测试 |
+|---|---|---|---|
+| P1 | 回流远距手部 pair 进入 `scored` 后,截断返回(真距 ~100 mm 记 60 mm)被选为 regen 行 best,走廊上界 94.5 mm 下 frame_valid 由拒翻转为过 | 候选路径要求 `dist < activation+0.01` 真实命中,截断落入注册表升级查询 | `_place_box` 构造真距 100 mm + 回流 pair:判定仍拒、corridor dist=真实距离 |
+| P2a | 失败快照 `last_res=res` 为第一次尝试对象,与 last_chk/last_rec(最后尝试)不同源 | 新增 `last_exec_res` 三尝试点各自更新,快照带 `last_attempt_id` | 三次失败尝试候选各异:快照候选=第三次状态,身份字段与 last_rec 一致 |
+| P2c | `_finalize_attempt` 以 spread 拷贝入 verbose 日志,`adopted` 冻结 None(sub10 日志 67/67 全 None),求解采纳帧决定性检查不可定位 | 改引用入日志,采纳裁决同步 | 求解采纳帧日志中恰一条 `adopted=True` |
+| P2b | `_probe_audit` 沿用端点 pair 缓存,中间态进入范围的 pair 无行(两端远、中间穿机器人:离线 pass=True,正式 transition_interpolated) | 每个插值点重置 `_frame_pairs` 重扫;band_floor_only 加前缀终检前置 | 两端远+中点穿体:审计 fail 且行含碰撞对 |
+| 追加 | solve 尝试 check 记录在 id 赋值前序列化,按 id 关联落空 | `_note_check` 先于 `_log_check`(纯记录顺序) | dr 决定性检查按采纳尝试 source 匹配回退;r2_decide 修正后为 0 |
+
+修复后全量 **213 passed + 1 skipped**。F1 启用证据、D-R 结论、六段判决均按上文订正块重验;六段权威判决不变(基础门过、D-Q 质量门 4 侧未过、暂停转段)。
