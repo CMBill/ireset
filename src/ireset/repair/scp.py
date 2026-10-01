@@ -970,8 +970,15 @@ class FrameSolver:
                     continue
                 geoms = set(ev._hand_geoms[side])
                 best = None
+                # a candidate distance is usable ONLY below the query range:
+                # a miss returns exactly distmax with a zero fromto, and a
+                # carried-back far hand pair (review P1) would otherwise
+                # enter the corridor row with the truncated 60 mm "distance"
+                # and pass an upper the true ~100 mm distance violates
+                gate = cfg.activation_margin_m + 0.01
                 for dist, ga, gb, kind, ft in scored:
-                    if kind == "robot_box" and ga in geoms and (best is None or dist < best[0]):
+                    if (kind == "robot_box" and ga in geoms and dist < gate
+                            and (best is None or dist < best[0])):
                         best = (dist, ga, gb, ft)
                 selection_source = "candidate"
                 if best is None:

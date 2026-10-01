@@ -245,6 +245,12 @@ def _probe_audit(pipe, s2, ctx, z, z_prev, vcfg) -> dict:
     for i in range(1, n_sub):
         mid = pipe.validator._interpolate(scene_a, scene_b, i / n_sub)
         ctx_mid = replace(ctx, box_pose=mid[36:43].copy())
+        # rescan per probe like the formal _frame_valid: the endpoint's
+        # candidate set cannot see pairs that come into range only at
+        # interior states (review P2 -- a box sweeping through the robot
+        # mid-frame must not audit as "pass" because the endpoint had no
+        # robot_box candidate at all)
+        s2._frame_pairs = None
         vm, lm, hm, sm, nm, _im = s2.check_rows(
             mid[0:36], ctx_mid, band_margin_m=0.0, probe_mode=True)
         n_coll = 99 + len(nm)
@@ -325,7 +331,13 @@ def cmd_df(demos: list[str], out: Path) -> None:
                 cls = "endpoint_already_passing_offline"
             elif probes.get("pass") is False:
                 cls = "interpolated"
-            elif dec_cf and probes.get("pass") is True and vel_ok and task_ok:
+            elif dec_cf and probes.get("pass") is True and vel_ok and task_ok \
+                    and prep.passed:
+                # the frame is freed by the floor change ONLY when every
+                # applicable check passes -- including the recomputed
+                # independent validation of the accepted prefix + candidate
+                # (review P2: a prefix-level failure must not hide behind a
+                # frame-level counterfactual)
                 cls = "band_floor_only"
             elif deep:
                 cls = "deep_penetration"

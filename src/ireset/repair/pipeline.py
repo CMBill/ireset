@@ -857,8 +857,16 @@ class RepairPipeline:
 
     def _finalize_attempt(self, rec: dict, res, chk: FrameCheck,
                           bt_info: dict) -> None:
-        """Finalize an attempt event after its check and backtracking."""
+        """Finalize an attempt event after its check and backtracking.
+
+        The verbose log stores the record ITSELF (by reference), so the
+        adoption verdict set later by the caller (``a["adopted"]``) is
+        reflected in the log -- a spread copy would freeze ``adopted=None``
+        and no consumer could locate the deciding check of a solve-adopted
+        frame (review P2, 2026-09-27).
+        """
         rec.update({
+            "kind": "attempt",
             "check_id": chk.check_id or None,
             "frame_valid": bool(chk.ok),
             "frame_valid_reason": chk.reason,
@@ -868,7 +876,7 @@ class RepairPipeline:
                           "state": "candidate_along_prev_accepted"},
         })
         if self.verbose:
-            self.frame_log.append({"kind": "attempt", **rec})
+            self.frame_log.append(rec)
 
     def _solve_attempt(self, z_start, source: str, ctx: FrameContext, t: int,
                        z_prev, attempt_id: int, attempts: list, checks: list,
@@ -1053,6 +1061,11 @@ class RepairPipeline:
                 res, chk2, bt, _bti, rec = self._solve_attempt(
                     z_pred, "prediction", ctx, t, z_prev, 0, attempts, checks,
                     frame_recs)
+                # the LAST EXECUTED attempt's own result object: ``res`` keeps
+                # the FIRST attempt when later attempts fail, so the failure
+                # snapshot must not read its state (review P2 -- the recorded
+                # last check/rec belong to a different attempt)
+                last_exec_res = res
                 path = bt or ("repaired_slack" if res.slack_used else "repaired")
                 backtracks += 1 if bt else 0
                 backtrack_probes += len(_bti["probed"])
@@ -1067,6 +1080,7 @@ class RepairPipeline:
                         res_alt, chk_alt, bt2, bti2, rec_alt = self._solve_attempt(
                             z_prev, "prev_accepted", ctx, t, z_prev,
                             len(frame_recs), attempts, checks, frame_recs)
+                        last_exec_res = res_alt
                         backtracks += 1 if bt2 else 0
                         backtrack_probes += len(bti2["probed"])
                         adopted_rec = rec_alt if chk_alt.ok else None
@@ -1081,6 +1095,7 @@ class RepairPipeline:
                             "slack_fallback", ctx, t, z_prev,
                             len(frame_recs), attempts, checks, frame_recs,
                             force_slack=True)
+                        last_exec_res = res2
                         adopted_rec = rec_sl if chk_sl.ok else None
                         last_chk = chk_sl
                         if chk_sl.ok:
@@ -1099,8 +1114,9 @@ class RepairPipeline:
                     # skip_reason describes only the raw prediction (R5).
                     last_rec = frame_recs[-1]
                     self._snap("fail", t=t, pass_index=pass_index, ctx=ctx,
-                               last_res=res, last_chk=last_chk,
+                               last_res=last_exec_res, last_chk=last_chk,
                                last_rec=last_rec, z_pred=z_pred, z_prev=z_prev,
+                               last_attempt_id=[pass_index, t, last_rec["attempt_id"]],
                                accepted=[a.copy() for a in accepted],
                                prediction=prediction)
                     timings.append(time.perf_counter() - t0)
