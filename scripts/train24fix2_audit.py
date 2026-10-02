@@ -25,29 +25,52 @@ Three pieces both forensic tools consume:
 Nothing here is a decision path of the repair pipeline; the tools call it
 on copies.  Products are versioned JSON manifests + NPZ arrays; the replay
 verifier recomputes same-candidate branches from the frozen files.
+
+Second review round (2026-10-02, reviewfix2) hardening:
+
+- products carry their OWN integrity chain: the sha256 of the NPZ bundle,
+  the effective (frozen) configs the audits ran under, and sha256 of every
+  code/config/asset file that computed them -- ``load_products`` refuses a
+  tampered NPZ and the replay restores the FROZEN configs instead of
+  reloading the current YAML (D4);
+- candidate discovery for replays is INDEX-driven (``load_index``): a
+  replay's own summary file can no longer masquerade as a candidate, an
+  empty/missing index is an explicit failure, and replay OUTPUT goes to a
+  separate directory (D5);
+- ``deep_diff``/``arrays_diff`` give the replays a COMPLETE evidence
+  comparison (every row descriptor, interpolation point, strict-velocity
+  exceedance, prefix worst value, re-solve audit, classification) instead
+  of five summary values (D2).
 """
 
 from __future__ import annotations
 
 import dataclasses
+import functools
 import json
 import math
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import numpy as np
 from scipy.sparse import csr_matrix, issparse
 
+from experiment_provenance import asset_hashes
+from ireset.paths import PROJECT_ROOT
 from ireset.repair.constraints import FrameEvaluator
+from ireset.repair.context import RepairConfig
 from ireset.repair.pipeline import RepairPipeline, strict_joint_speeds
 from ireset.repair.scp import FrameCheck, FrameContext, FrameSolver
-from ireset.repair.validation import IndependentValidator
+from ireset.repair.validation import IndependentValidator, ValidationConfig
 
 #: product format version (bump when the layout changes; replay refuses
-#: mismatches)
-AUDIT_FORMAT = "train24fix2_reviewfix_audit_v1"
+#: mismatches -- v2 adds npz_sha256 / effective / integrity, and the v1
+#: products of the first review round are superseded, not silently loaded)
+AUDIT_FORMAT = "train24fix2_reviewfix_audit_v2"
 #: acceptance: ONE normalized violation sum over all finite-bound rows
 ACCEPT_VIOL = 1e-6
 
@@ -525,7 +548,9 @@ def write_products(out_dir: Path, stem: str, record: dict,
                    arrays: dict) -> tuple[Path, Path]:
     """Write ``{stem}.json`` + ``{stem}.npz``; REFUSE to overwrite existing
     forensic files (the old tool's default path silently clobbered the
-    frozen diag directory)."""
+    frozen diag directory).  The NPZ is written FIRST and its sha256 goes
+    into the JSON manifest -- a later tampered NPZ is refused by
+    :func:`load_products` (reviewfix2 D4)."""
     out_dir.mkdir(parents=True, exist_ok=True)
     jpath, npath = out_dir / f"{stem}.json", out_dir / f"{stem}.npz"
     for p in (jpath, npath):
@@ -533,12 +558,14 @@ def write_products(out_dir: Path, stem: str, record: dict,
             raise FileExistsError(
                 f"refusing to overwrite existing forensic file {p} "
                 f"(old products are read-only; choose a new --out)")
+    np.savez_compressed(npath, **arrays)
+    import hashlib
     record = dict(record)
     record["format"] = AUDIT_FORMAT
     record["npz"] = npath.name
+    record["npz_sha256"] = hashlib.sha256(npath.read_bytes()).hexdigest()
     jpath.write_text(json.dumps(record, indent=1, allow_nan=False,
                                 default=_json_default))
-    np.savez_compressed(npath, **arrays)
     return jpath, npath
 
 
@@ -558,12 +585,25 @@ def _json_default(o):
 
 
 def load_products(out_dir: Path, stem: str) -> tuple[dict, dict]:
+    """Load + VERIFY a product bundle: format version AND the sha256 of the
+    NPZ against the manifest (a rewritten array file is refused -- the old
+    loader only checked the format string)."""
+    import hashlib
     jpath = out_dir / f"{stem}.json"
     record = json.loads(jpath.read_text())
     if record.get("format") != AUDIT_FORMAT:
         raise ValueError(f"{jpath}: format {record.get('format')!r} != "
                          f"{AUDIT_FORMAT!r}")
-    with np.load(out_dir / record["npz"]) as z:
+    npath = out_dir / record["npz"]
+    digest = hashlib.sha256(npath.read_bytes()).hexdigest()
+    if "npz_sha256" not in record:
+        raise ValueError(f"{jpath}: no npz_sha256 in manifest (pre-v2 "
+                         f"product; regenerate with the current tool)")
+    if digest != record["npz_sha256"]:
+        raise ValueError(f"{npath}: sha256 {digest} != manifest "
+                         f"{record['npz_sha256']} -- tampered or corrupted "
+                         f"NPZ, refusing to load")
+    with np.load(npath) as z:
         arrays = {k: z[k] for k in z.files}
     return record, arrays
 
@@ -573,3 +613,170 @@ def json_safe(obj) -> str:
     the exact saved values; NaN/Inf literals are rejected upstream)."""
     return json.dumps(obj, sort_keys=True, allow_nan=False,
                       default=_json_default)
+
+
+# ---------------------------------------------------------------------------
+# reviewfix2: frozen effective configs + integrity manifest (D4)
+# ---------------------------------------------------------------------------
+
+def _forensic_scripts() -> list[Path]:
+    root = PROJECT_ROOT
+    files = sorted((root / "src" / "ireset" / "repair").glob("*.py"))
+    files += [root / "scripts" / f"train24fix2_{n}.py"
+              for n in ("audit", "fail_bind", "cert_trace")]
+    files += [root / "configs" / "repair" / "qp_default.yaml",
+              root / "configs" / "eval" / "protocol.yaml"]
+    return [p for p in files if p.exists()]
+
+
+@functools.lru_cache(maxsize=1)
+def integrity_manifest() -> dict[str, str]:
+    """sha256 of every code/config file that computes the audits plus the
+    locked robot/scene assets -- cached per process (the manifest is embedded
+    into every product; a replay recomputes it and REFUSES on drift)."""
+    import hashlib
+    out = {str(p.relative_to(PROJECT_ROOT)):
+           hashlib.sha256(p.read_bytes()).hexdigest()
+           for p in _forensic_scripts()}
+    out.update(asset_hashes())
+    return out
+
+
+def attach_integrity(record: dict, cfg, vcfg) -> None:
+    """Embed the FROZEN effective configs and the integrity manifest into a
+    product record (in place).  A replay reconstructs its configs from these
+    values -- never from the current YAML files -- and verifies the manifest
+    against the live tree."""
+    record["effective"] = dict(record.get("effective") or {})
+    record["effective"]["repair"] = asdict(cfg)
+    record["effective"]["validation"] = asdict(vcfg)
+    record["integrity"] = {"files": integrity_manifest()}
+
+
+def configs_from_record(record: dict, *, key: str = "repair"):
+    """Rebuild the (frozen) effective configs stored in a product -- the
+    replay's ONLY config source.  ``key`` selects an extra stored repair
+    variant (e.g. ``repair_no_c2``) when present, defaulting to ``repair``."""
+    eff = record["effective"]
+    payload = json.loads(json.dumps(eff[key]))
+    vpayload = json.loads(json.dumps(eff["validation"]))
+    cfg, vcfg = RepairConfig(**payload), ValidationConfig(**vpayload)
+    if json.loads(json.dumps(asdict(cfg))) != payload or \
+            json.loads(json.dumps(asdict(vcfg))) != vpayload:
+        raise ValueError("frozen effective config does not round-trip")
+    return cfg, vcfg
+
+
+def verify_integrity(record: dict) -> list[str]:
+    """Drift of ANY hashed code/config/asset file between generation and
+    replay, as explicit messages (empty list = intact).  Integrity failure
+    means the recomputation below runs DIFFERENT code than the one that
+    produced the evidence -- the replay then reports, never passes."""
+    saved = (record.get("integrity") or {}).get("files") or {}
+    if not saved:
+        return ["record carries no integrity manifest"]
+    live = integrity_manifest()
+    out = []
+    for k in sorted(set(saved) | set(live)):
+        if k not in live:
+            out.append(f"file vanished since generation: {k}")
+        elif k not in saved:
+            out.append(f"file appeared since generation: {k}")
+        elif saved[k] != live[k]:
+            out.append(f"file changed since generation: {k}")
+    return out
+
+
+# ---------------------------------------------------------------------------
+# reviewfix2: complete-evidence comparison (D2)
+# ---------------------------------------------------------------------------
+
+def deep_diff(saved, fresh, path: str = "") -> list[str]:
+    """Every differing leaf path between two JSON-safe structures (exact
+    scalar equality; dict key sets and list lengths checked).  The replays
+    feed it COMPLETE records -- five summary values are not a comparison."""
+    if isinstance(saved, dict) and isinstance(fresh, dict):
+        out = []
+        for k in sorted(set(saved) | set(fresh), key=str):
+            p = f"{path}.{k}" if path else str(k)
+            if k not in saved:
+                out.append(f"{p}: only in recomputed")
+            elif k not in fresh:
+                out.append(f"{p}: only in saved")
+            else:
+                out.extend(deep_diff(saved[k], fresh[k], p))
+        return out
+    if isinstance(saved, list) and isinstance(fresh, list):
+        if len(saved) != len(fresh):
+            return [f"{path}: length saved={len(saved)} "
+                    f"recomputed={len(fresh)}"]
+        out = []
+        for i, (x, y) in enumerate(zip(saved, fresh)):
+            out.extend(deep_diff(x, y, f"{path}[{i}]"))
+        return out
+    num = (lambda v: isinstance(v, (int, float))
+           and not isinstance(v, bool))
+    if num(saved) and num(fresh):
+        return [] if saved == fresh else \
+            [f"{path}: saved={saved!r} recomputed={fresh!r}"]
+    if type(saved) is not type(fresh):
+        return [f"{path}: type saved={type(saved).__name__} "
+                f"recomputed={type(fresh).__name__}"]
+    return [] if saved == fresh else \
+        [f"{path}: saved={saved!r} recomputed={fresh!r}"]
+
+
+def arrays_diff(saved_arrays: dict, fresh_arrays: dict) -> list[str]:
+    """Bitwise array comparison (key set + dtype + shape + bytes)."""
+    out = []
+    for k in sorted(set(saved_arrays) | set(fresh_arrays)):
+        if k not in saved_arrays:
+            out.append(f"{k}: only in recomputed")
+        elif k not in fresh_arrays:
+            out.append(f"{k}: only in saved")
+        else:
+            a, b = np.asarray(saved_arrays[k]), np.asarray(fresh_arrays[k])
+            if a.dtype != b.dtype or a.shape != b.shape:
+                out.append(f"{k}: dtype/shape saved={a.dtype}{a.shape} "
+                           f"recomputed={b.dtype}{b.shape}")
+            elif not np.array_equal(a, b, equal_nan=True):
+                out.append(f"{k}: values differ")
+    return out
+
+
+# ---------------------------------------------------------------------------
+# reviewfix2: index-driven candidate discovery (D5)
+# ---------------------------------------------------------------------------
+
+def write_index(out_dir: Path, name: str, payload: dict) -> Path:
+    """Write ``{name}.json`` (guarded): the EXPECTED candidate list a replay
+    must find -- discovery never globs the directory again, so a replay's
+    own summary file cannot re-enter as a candidate."""
+    path = out_dir / f"{name}.json"
+    if path.exists():
+        raise FileExistsError(f"refusing to overwrite forensic index {path}")
+    body = {"format": AUDIT_FORMAT, **payload}
+    path.write_text(json.dumps(body, indent=1, allow_nan=False,
+                               default=_json_default))
+    return path
+
+
+def load_index(out_dir: Path, name: str) -> dict:
+    """Load the generation-time candidate index; missing/foreign-format/
+    EMPTY indexes are explicit errors -- an empty candidate set was judged
+    'ALL MATCH' by the glob-based replay (reviewfix2 D5)."""
+    path = out_dir / f"{name}.json"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path}: candidate index missing -- the products were written "
+            f"by a pre-index tool or into the wrong directory; refusing to "
+            f"replay (an empty glob must never read as ALL MATCH)")
+    idx = json.loads(path.read_text())
+    if idx.get("format") != AUDIT_FORMAT:
+        raise ValueError(f"{path}: index format {idx.get('format')!r} != "
+                         f"{AUDIT_FORMAT!r}")
+    stems = idx.get("stems")
+    if not isinstance(stems, list) or not stems:
+        raise ValueError(f"{path}: index lists no candidates -- refusing to "
+                         f"replay an empty candidate set")
+    return idx

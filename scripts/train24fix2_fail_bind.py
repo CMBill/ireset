@@ -20,8 +20,23 @@ Review defects this rewrite removes (2026-10-01):
   of three bare ``_solve_attempt`` calls.
 
 Outputs (versioned JSON + NPZ, overwrite refused) go to
-``derived/data/teachers_regenerated/train24fix2_reviewfix_20261001/diag/``
-by default -- NEVER the frozen ``train24fix2_20260927_diag/``.
+``derived/data/teachers_regenerated/train24fix2_reviewfix2_20261002/diag/``
+by default -- NEVER the frozen ``train24fix2_20260927_diag/`` nor the
+superseded ``train24fix2_reviewfix_20261001/diag/``.
+
+Reviewfix2 (2026-10-02) hardening of THIS tool:
+
+- D1: the identity check compares the re-run against the ORIGINAL formal
+  report of ``--rq-dir`` (t_fail / last_attempt_id / last_check_id /
+  last-attempt status, item by item); any mismatch STOPS the binding.  The
+  previous check compared the re-run against its OWN snapshot -- circular,
+  a doctored report changed nothing.
+- D2/D4/D5: the replay is index-driven, restores the FROZEN effective
+  configs from each product, verifies the NPZ sha256 + code/config/asset
+  integrity manifest, recomputes the re-solve escalation AND its adopted
+  candidate's audit, and compares the COMPLETE records (all rows,
+  interpolation points, strict velocities, prefix worst values,
+  classification) -- its summary goes to a SEPARATE replay directory.
 
 Run: uv run --locked python scripts/train24fix2_fail_bind.py [--rq-dir DIR]
                                                       [--out DIR] [--replay]
@@ -51,22 +66,30 @@ from ireset.repair.context import ReferenceCondition
 from ireset.repair.pipeline import RepairPipeline
 from train24fix2_audit import (
     AUDIT_FORMAT,
+    arrays_diff,
     assert_snapshot_matches_live,
+    attach_integrity,
     classify_branches,
+    configs_from_record,
     context_arrays,
     context_from,
     context_meta,
     context_scalar_leaves,
+    deep_diff,
     escalate_frame,
     freeze_context,
     full_candidate_audit,
+    load_index,
     load_products,
+    verify_integrity,
+    write_index,
     write_products,
 )
 
 REGEN = DERIVED_DATA_DIR / "teachers_regenerated"
 DEFAULT_RQ = REGEN / "train24fix2_20260927_sixseg" / "rq"
-DEFAULT_OUT = REGEN / "train24fix2_reviewfix_20261001" / "diag"
+DEFAULT_OUT = REGEN / "train24fix2_reviewfix2_20261002" / "diag"
+INDEX_NAME = "fail_bind2_index"
 
 
 def c2_off_ctx(ctx):
@@ -76,10 +99,51 @@ def c2_off_ctx(ctx):
     return replace(freeze_context(ctx), c2_hand_enabled={}, c2_hand_reason={})
 
 
-def bind(demo: str, rq_dir: Path, out: Path) -> dict:
-    scene, human, fps = load_teacher_npz(TEACHER_TRAJ_DIR / f"{demo}_original.npz")
-    cond = ReferenceCondition(human, scene[:, 36:43],
-                              infer_reference_schedule(human, scene[:, 36:43]))
+def load_report_rows(rq_dir: Path) -> dict[str, dict]:
+    """demo -> row of the ORIGINAL formal report (the frozen rq run's own
+    ``regen_report_diagnosis6_strict.json``)."""
+    report = json.loads(
+        (rq_dir / "regen_report_diagnosis6_strict.json").read_text())
+    return {r["demo"]: r for r in report["rows"]}
+
+
+def identity_vs_report(report_row: dict, captured: dict) -> dict:
+    """D1: item-by-item comparison of THIS re-run's failure against the
+    ORIGINAL formal report row -- the binding target.  Any False stops the
+    binding (never bind 'a similar failure').  The four items mirror what
+    the report's ``rejection`` block freezes: failure frame, last attempt
+    id, last check id, last-attempt solver status."""
+    rej = report_row.get("rejection") or {}
+    last_att = rej.get("last_attempt") or {}
+    got_attempt = captured["last_attempt_id"]
+    got_check = captured["chk"]["check_id"]
+    exp = {
+        "t_fail": report_row.get("t_fail"),
+        "last_attempt_id": rej.get("last_attempt_id"),
+        "last_check_id": rej.get("last_check_id"),
+        "last_attempt_status": last_att.get("status"),
+    }
+    got = {
+        "t_fail": captured["t"],
+        "last_attempt_id": list(got_attempt),
+        "last_check_id": got_check,
+        "last_attempt_status": captured["res_fields"]["status"],
+    }
+    return {"match": {k: exp[k] == got[k] for k in exp},
+            "report": exp, "this_run": got}
+
+
+def bind(demo: str, rq_dir: Path, out: Path,
+         *, report_row: dict | None = None,
+         scene: np.ndarray | None = None,
+         cond: ReferenceCondition | None = None) -> dict:
+    if scene is None or cond is None:
+        _scene, human, _fps = load_teacher_npz(
+            TEACHER_TRAJ_DIR / f"{demo}_original.npz")
+        scene = _scene
+        cond = ReferenceCondition(human, scene[:, 36:43],
+                                  infer_reference_schedule(human,
+                                                           scene[:, 36:43]))
     rcfg, vcfg = load_mode_configs("strict")
     cfg = replace(rcfg, regen_mode=True)
     assert cfg.regen_hand_speed_mps == 0.02598          # noqa: S101
@@ -135,8 +199,20 @@ def bind(demo: str, rq_dir: Path, out: Path) -> dict:
     prefix = captured["accepted"]
     box_poses = captured["prediction"][:, 36:43]
 
-    # -- identity cross-check against the formal run's own report (R1
-    # section 2.3): a mismatch stops the binding, never "a similar failure"
+    # -- D1: identity against the ORIGINAL formal report first; a mismatch
+    # stops the binding outright (the run-internal circularity check below
+    # can never catch a doctored or diverged report)
+    if report_row is None:
+        report_row = load_report_rows(rq_dir).get(demo)
+    if report_row is None:
+        raise KeyError(f"{demo}: no row in the formal report of {rq_dir}")
+    if report_row.get("accepted"):
+        raise ValueError(f"{demo}: formal report row is accepted -- only "
+                         f"rejected segments can be bound")
+    vs_report = identity_vs_report(report_row, captured)
+
+    # -- run-internal consistency (R1 section 2.3): the final diagnostics
+    # must be the snapshot's own failure
     rec: dict = {
         "demo": demo, "t_fail": t, "pass_index": captured["pass_index"],
         "run_status": res.status,
@@ -151,6 +227,7 @@ def bind(demo: str, rq_dir: Path, out: Path) -> dict:
                               == captured["chk"]["check_id"]),
             "status": (res.diagnostics.get("last_attempt", {}).get("status")
                        == captured["res_fields"]["status"])},
+        "identity_vs_report": vs_report,
         "wall_s": round(wall, 2),
         "frame_status": list(res.diagnostics.get("frame_status") or []),
         "c2_diag": captured["c2_diag"],
@@ -158,8 +235,13 @@ def bind(demo: str, rq_dir: Path, out: Path) -> dict:
                          "chk": captured["chk"],
                          "attempt_id": captured["last_attempt_id"]},
     }
-    if not all(rec["identity_match"].values()):
+    if not all(vs_report["match"].values()) or \
+            not all(rec["identity_match"].values()):
         rec["verdict"] = "IDENTITY_MISMATCH"
+        failed = ([k for k, v in vs_report["match"].items() if not v]
+                  + [f"run_internal:{k}" for k, v in
+                     rec["identity_match"].items() if not v])
+        rec["identity_failed_items"] = failed
         write_products(out, f"fail_bind2_{demo}", rec,
                        {"z_cand": z_cand, "prefix": np.stack(prefix),
                         "box_poses": box_poses,
@@ -233,61 +315,145 @@ def bind(demo: str, rq_dir: Path, out: Path) -> dict:
     rec["provenance"] = {
         "git": git_state(), "git_rev": git_rev(),
         "assets": asset_hashes(),
-        "effective_configs": {"strict_repair": vars(cfg),
-                              "strict_validation": vars(vcfg)},
-        "fps": fps, "format": AUDIT_FORMAT,
+        "fps": cfg.fps, "format": AUDIT_FORMAT,
         "context_meta": {**context_meta(ctx),
                          "ctx_scalars": context_scalar_leaves(ctx)},
     }
+    attach_integrity(rec, cfg, vcfg)
     write_products(out, f"fail_bind2_{demo}", rec, arrays)
     return rec
 
 
-def replay(out: Path) -> dict:
-    """Recompute the same-candidate branches from the frozen files (no
-    trajectory re-solve, no re-search) and compare with the saved verdicts
-    (plan section 4.3: replay never substitutes a re-found candidate)."""
-    rcfg, vcfg = load_mode_configs("strict")
-    cfg = replace(rcfg, regen_mode=True)
-    results = {}
-    for jpath in sorted(out.glob("fail_bind2_*.json")):
-        record, arrays = load_products(out, jpath.stem)
+def _escalation_summary(esc: dict) -> dict:
+    """JSON-safe projection of an escalation result (same shape bind()
+    freezes into ``resolve_without_c2``)."""
+    return {
+        "skipped": esc["skipped"], "adopted": esc["adopted"],
+        "adopted_source": esc["adopted_source"],
+        "adopted_status": esc["adopted_status"],
+        "last_status": esc["last_status"],
+        "last_term_reason": esc["last_term_reason"],
+        "last_check_reason": esc["last_check_reason"],
+        "attempts": [{"source": a.get("source"), "status": a.get("status"),
+                      "term_reason": a.get("term_reason"),
+                      "slack": a.get("slack_used"),
+                      "qp": a.get("qp_calls"),
+                      "iters": a.get("iterations"),
+                      "check_id": a.get("check_id")}
+                     for a in esc["attempts"]],
+        "skip": esc["skip"],
+    }
+
+
+def replay(out: Path, replay_dir: Path) -> dict:
+    """Strict replay (reviewfix2 D2/D4/D5): candidates come ONLY from the
+    generation-time index; every product is loaded with its NPZ sha256 and
+    integrity manifest verified; the audits run under the FROZEN effective
+    configs restored from the product (never the current YAML); the
+    re-solve escalation AND its adopted candidate's audit are recomputed;
+    and the comparison covers the COMPLETE records (all row descriptors and
+    values, every interpolation point, strict velocities, task, prefix
+    checks, classification) plus the arrays BITWISE.  The summary goes to
+    ``replay_dir`` -- never the products directory."""
+    idx = load_index(out, INDEX_NAME)
+    replay_dir.mkdir(parents=True, exist_ok=True)
+    results: dict = {}
+    ok = True
+    for stem in idx["stems"]:
+        record, arrays = load_products(out, stem)
+        entry: dict = {"stem": stem}
+        results[stem] = entry
+        integrity = verify_integrity(record)
+        entry["integrity_ok"] = not integrity
+        entry["integrity_mismatches"] = integrity[:20]
         if "audits" not in record:
-            results[jpath.stem] = {"replayed": False,
-                                   "reason": "identity mismatch record"}
+            entry["replayed"] = False
+            entry["reason"] = "identity mismatch record (no audits frozen)"
+            ok = False
             continue
+        cfg, vcfg = configs_from_record(record)
         spec = RepairPipeline(cfg=cfg).spec
         ctx = context_from(arrays, record["provenance"]["context_meta"])
         z_cand = arrays["z_cand"]
         prefix = [arrays["prefix"][i] for i in range(arrays["prefix"].shape[0])]
         box_poses = arrays["box_poses"]
-        rep: dict = {"replayed": True}
+        t = record["t_fail"]
         fresh: dict = {}
+        fresh_arrays: dict = {}
         for label, actx in (("c2_on", ctx), ("c2_off", c2_off_ctx(ctx))):
-            arec, _a = full_candidate_audit(
+            arec, aarr = full_candidate_audit(
                 spec, cfg, vcfg, actx, z_cand,
                 prefix=prefix, box_poses=box_poses, label=label)
             fresh[label] = arec
-            saved = record["audits"][label]
-            same = (
-                arec.get("branch_pass") == saved.get("branch_pass")
-                and arec["endpoint"]["viol_sum"] == saved["endpoint"]["viol_sum"]
-                and arec["task"]["mpjpe_m"] == saved["task"]["mpjpe_m"]
-                and arec["interpolation"]["pass"] == saved["interpolation"]["pass"]
-                and arec["prefix_validation"]["passed"]
-                == saved["prefix_validation"]["passed"])
-            rep[label] = {"matches_saved": bool(same),
-                          "branch_pass": arec.get("branch_pass"),
-                          "viol_sum": arec["endpoint"]["viol_sum"],
-                          "task_mpjpe": arec["task"]["mpjpe_m"]}
-        rep["classification_recomputed"] = classify_branches(
-            fresh["c2_off"], fresh["c2_on"])
-        rep["classification_matches"] = (
-            rep["classification_recomputed"] == record["classification"])
-        results[jpath.stem] = rep
-    (out / "fail_bind2_replay.json").write_text(
-        json.dumps(results, indent=1, default=float))
-    return results
+            fresh_arrays.update(aarr)
+        # the re-solve itself: production escalation on a fresh pipeline
+        pipe_off = RepairPipeline(spec=spec, cfg=cfg)
+        pipe_off.validator.cfg = vcfg
+        esc = escalate_frame(pipe_off, c2_off_ctx(ctx), t,
+                             ctx.z_pred, ctx.z_prev)
+        resolve_rec = _escalation_summary(esc)
+        if esc["adopted"]:
+            rrec, rarr = full_candidate_audit(
+                spec, cfg, vcfg, c2_off_ctx(ctx), esc["adopted_z"],
+                prefix=prefix, box_poses=box_poses, label="resolve_c2_off")
+            fresh["resolve_c2_off"] = rrec
+            fresh_arrays.update(rarr)
+            fresh_arrays["resolve_adopted_z"] = esc["adopted_z"]
+        classification = classify_branches(fresh["c2_off"], fresh["c2_on"])
+        fresh_record = {
+            "audits": fresh,
+            "classification": classification,
+            "classification_basis": {
+                "no_c2_branch_pass": fresh["c2_off"].get("branch_pass"),
+                "plus_c2_branch_pass": fresh["c2_on"].get("branch_pass")},
+            "resolve_without_c2": resolve_rec,
+            "conclusion_strength": {
+                "frozen_candidate": (
+                    "rejected_by_c2_rows"
+                    if classification == "C2_ONLY" else classification),
+                "resolve": ("c2_addition_failed_the_frame_under_fixed_flow"
+                            if not esc["adopted"]
+                            else "frame_solved_without_c2"),
+                "note": ("neither statement is a whole-segment recovery; "
+                         "the original 1/6 pause verdict stands until a "
+                         "full rerun")},
+        }
+        # complete-record comparison over everything the replay recomputes
+        diffs = deep_diff({k: record.get(k) for k in fresh_record},
+                          fresh_record)
+        # arrays: compare ONLY the recomputable subset (row values/bounds/
+        # scales/viols + candidates); ctx/prefix/box_poses are replay INPUTS
+        recomp = {k: arrays[k] for k in fresh_arrays if k in arrays}
+        arr_diffs = arrays_diff(recomp, fresh_arrays)
+        arr_diffs += [f"{k}: recomputed array absent from saved bundle"
+                      for k in sorted(fresh_arrays) if k not in arrays]
+        entry.update({
+            "replayed": True,
+            "record_diff_paths": diffs[:40],
+            "n_record_diffs": len(diffs),
+            "array_diffs": arr_diffs[:40],
+            "classification_recomputed": classification,
+            "classification_matches": classification
+            == record.get("classification"),
+            "matches": not diffs and not arr_diffs,
+        })
+        entry["ok"] = (entry["matches"]
+                       and entry["classification_matches"]
+                       and entry["integrity_ok"])
+        ok = ok and entry["ok"]
+    summary = {"ok": ok, "n": len(results),
+               "expected": len(idx["stems"]),
+               "recompute_scope": ("audits (all rows/interpolation points/"
+                                   "strict velocity/task/prefix), resolve "
+                                   "escalation + adopted-candidate audit, "
+                                   "classification; arrays bitwise; run-level "
+                                   "fields (frame_status/c2_diag/last_attempt)"
+                                   " are generation-time inputs, not "
+                                   "recomputed"),
+               "results": results}
+    (replay_dir / "fail_bind2_replay.json").write_text(
+        json.dumps(summary, indent=1, default=float))
+    return summary
 
 
 def main() -> None:
@@ -295,38 +461,53 @@ def main() -> None:
     ap.add_argument("--rq-dir", default=str(DEFAULT_RQ),
                     help="formal six-segment rq report dir (read-only)")
     ap.add_argument("--out", default=str(DEFAULT_OUT),
-                    help="output diag dir (default: the reviewfix 20261001 "
-                         "dir, never the frozen 20260927 one)")
+                    help="output diag dir (default: the reviewfix2 20261002 "
+                         "dir; never the frozen or superseded earlier ones)")
     ap.add_argument("--demos", nargs="*", default=None)
     ap.add_argument("--replay", action="store_true",
-                    help="recompute same-candidate branches from the frozen "
-                         "files and compare (no re-solve)")
+                    help="strict replay from the index into a SEPARATE "
+                         "directory (default: <out>_replay)")
     args = ap.parse_args()
     out = Path(args.out)
     rq_dir = Path(args.rq_dir)
     if args.replay:
-        res = replay(out)
-        ok = all(v.get("replayed") and
-                 all(b.get("matches_saved") for b in v.values()
-                     if isinstance(b, dict) and "matches_saved" in b)
-                 for v in res.values())
-        print(f"[replay] {'ALL MATCH' if ok else 'MISMATCH'} -> "
-              f"{out / 'fail_bind2_replay.json'}")
+        replay_dir = out.parent / f"{out.name}_replay"
+        summary = replay(out, replay_dir)
+        print(f"[replay] {'ALL MATCH' if summary['ok'] else 'MISMATCH'} "
+              f"({summary['n']} records) -> "
+              f"{replay_dir / 'fail_bind2_replay.json'}")
         return
-    report = json.loads((rq_dir / "regen_report_diagnosis6_strict.json").read_text())
-    failed = [r["demo"] for r in report["rows"] if not r["accepted"]]
+    report_rows = load_report_rows(rq_dir)
+    failed = [d for d, r in report_rows.items() if not r["accepted"]]
     demos = args.demos or failed
     print(f"binding {len(demos)} rejected segments: {demos}")
     out.mkdir(parents=True, exist_ok=True)
+    stems = []
     for demo in demos:
-        rec = bind(demo, rq_dir, out)
+        rec = bind(demo, rq_dir, out, report_row=report_rows[demo])
+        if "t_fail" in rec:
+            stems.append(f"fail_bind2_{demo}")
         cls = rec.get("classification", rec.get("verdict", "n/a"))
         esc = rec.get("resolve_without_c2", {})
+        idr = rec.get("identity_vs_report", {}).get("match", {})
         print(f"[{demo}] t_fail={rec.get('t_fail')} class={cls} "
+              f"id_vs_report={all(idr.values()) if idr else None} "
               f"last={rec.get('last_attempt', {}).get('solver_fields', {}).get('status')}"
               f"/{rec.get('last_attempt', {}).get('solver_fields', {}).get('term_reason')} "
               f"resolve_adopted={esc.get('adopted')}")
+    if stems:
+        write_index(out, INDEX_NAME,
+                    {"demos": demos, "stems": stems,
+                     "rq_dir": str(rq_dir),
+                     "report_sha256": _report_sha(rq_dir)})
     print(f"-> {out}")
+
+
+def _report_sha(rq_dir: Path) -> str:
+    import hashlib
+    return hashlib.sha256(
+        (rq_dir / "regen_report_diagnosis6_strict.json").read_bytes()
+    ).hexdigest()
 
 
 if __name__ == "__main__":

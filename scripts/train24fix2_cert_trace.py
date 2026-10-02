@@ -36,10 +36,12 @@ gate, certified-frame component-bound statistics) BITWISE where the plan
 gives full precision; any mismatch aborts the freeze.
 
 Outputs (new files only) -> derived/data/teachers_regenerated/
-train24fix2_20260927_diag/:
+train24fix2_reviewfix2_20261002/diag/ (the frozen 20260927 diag and the
+superseded reviewfix 20261001 diag are read-only):
   cert_trace_provenance.json      revision/configs/assets/inputs/H-B-T index
   cert_trace_{demo}_rq.json       per-frame series + C2 state + classification
   cert_trace_counterfactuals.json full-constraint counterfactual records
+  cert_trace_cf_index.json        EXPECTED candidate list for the replay (D5)
   cert_trace_assertions.json      every assertion + the section 2 tables
 
 Run: uv run --locked python scripts/train24fix2_cert_trace.py
@@ -76,11 +78,18 @@ from ireset.repair.validation import IndependentValidator
 from regenerate_teachers import task_mpjpe_series
 from train24fix2_audit import (
     AUDIT_FORMAT,
+    arrays_diff,
+    attach_integrity,
     classify_branches,
+    configs_from_record,
     context_from,
+    deep_diff,
     freeze_context,
     full_candidate_audit,
+    load_index,
     load_products,
+    verify_integrity,
+    write_index,
     write_products,
 )
 
@@ -98,8 +107,12 @@ TRAIN24_KEEP_DIR = REGEN / "labelq_20260926_train24" / "regen_final"
 DQ_JSON = REGEN / "train24fix_20260927_diag" / "dq_quality_baseline.json"
 #: review-fix round (2026-10-01): the frozen 20260927 diag directory is
 #: READ-ONLY; every product of this run goes to a fresh reviewfix directory
-#: and refuses to overwrite anything that already exists there
-OUT_DIR = REGEN / "train24fix2_reviewfix_20261001" / "diag"
+#: and refuses to overwrite anything that already exists there.
+#: Reviewfix2 (2026-10-02): the 20261001 diag products carry the D3
+#: misaligned prev-scene field and the D2/D4/D5 weak replay contract -- they
+#: are SUPERSEDED by this round's directory, never overwritten
+OUT_DIR = REGEN / "train24fix2_reviewfix2_20261002" / "diag"
+INDEX_NAME = "cert_trace_cf_index"
 PLAN_DOC = Path(__file__).resolve().parents[1] / "docs" / "plans" / \
     "train24fix2_certification_edge_plan.md"
 
@@ -595,9 +608,57 @@ def c2_rows_of(pipe: RepairPipeline, ctx, z: np.ndarray, c2_state: dict,
     return out
 
 
+def prev_scene_flags(prev_scene: dict | None, t: int) -> dict:
+    """D3 (reviewfix2): per-side previous-FULL-scene distance at frame t.
+    The series' ``[t]`` entry ALREADY IS the previous scene (``traj[t-1]``
+    robot AND box -- see :func:`prev_scene_distances`); reading ``[t-1]``
+    shifts one more frame, and one side's value must never be written into
+    both sides.  ``None`` series (no rq source) keeps both sides None."""
+    if prev_scene is None:
+        return {"l": None, "r": None}
+    return {s: prev_scene[s]["scene"][t] for s in ("l", "r")}
+
+
+def prev_scene_distances_at(traj: np.ndarray, t: int) -> dict:
+    """Both sides' previous-FULL-scene hand/box distance for ONE frame,
+    same query contract as :func:`prev_scene_distances` (anomaly raises
+    ``C2DistanceQueryError``) -- the replay cross-check that the frozen
+    per-record fields really are ``[side]["scene"][t]``."""
+    from ireset.repair.pipeline import (
+        C2DistanceQueryError, classify_distance_query)
+
+    rcfg, vcfg = load_mode_configs("strict")
+    validator = IndependentValidator(cfg=vcfg)
+    ev = FrameEvaluator(validator.spec, validator.pairs, rcfg)
+    ev.forward(traj[t - 1, 0:36], traj[t - 1, 36:43])
+    out = {}
+    for side in ("l", "r"):
+        dmin, hit = np.inf, False
+        for g in ev._hand_geoms[side]:
+            try:
+                d = ev.geom_distance(g, ev.box_geom, distmax=DISTMAX)[0]
+            except Exception as exc:                     # noqa: BLE001
+                raise C2DistanceQueryError(
+                    t, side, "forensic_prev_scene_query", DISTMAX,
+                    "exception", repr(exc),
+                    stage="replay_prev_scene_at") from exc
+            k = classify_distance_query(d, DISTMAX)
+            if k == "hit":
+                hit = True
+                dmin = min(dmin, d)
+            elif k == "truncated":
+                pass
+            else:
+                raise C2DistanceQueryError(
+                    t, side, "forensic_prev_scene_query", DISTMAX, k,
+                    repr(d), stage="replay_prev_scene_at")
+        out[side] = float(dmin) if hit else None
+    return out
+
+
 def counterfactual(replay: ChainReplay, t: int, z_cand: np.ndarray,
-                   source: str, c2_state: dict,
-                   prev_scene_side: dict | None,
+                   source: str, c2_state: dict, side: str,
+                   prev_scene: dict | None, prev_source: dict | None,
                    rq_traj: np.ndarray, src_scene: np.ndarray,
                    spec, rcfg, vcfg) -> tuple[dict, dict]:
     """FULL two-branch counterfactual (review R3): the same candidate on
@@ -631,16 +692,13 @@ def counterfactual(replay: ChainReplay, t: int, z_cand: np.ndarray,
                          "r": bool(c2_state["r"]["enabled"][t])},
         c2_hand_reason={"l": c2_state["l"]["reason"][t],
                         "r": c2_state["r"]["reason"][t]},
-        prev_hand_scene_dist={
-            "l": (None if prev_scene_side is None
-                  else prev_scene_side["scene"][t - 1] if t else None),
-            "r": (None if prev_scene_side is None
-                  else prev_scene_side["scene"][t - 1] if t else None)})
+        prev_hand_scene_dist=prev_scene_flags(prev_scene, t))
 
     prefix = [rq_traj[i, 0:36].copy() for i in range(t)]
     box_poses = src_scene[:, 36:43]
+    side_flags = prev_scene_flags(prev_scene, t)
     rec = {
-        "frame": int(t), "candidate_source": source,
+        "frame": int(t), "candidate_source": source, "side": side,
         "provenance": {
             "pass": 0,
             "origin": ("current_rq_adopted_state" if "current_rq" in source
@@ -654,10 +712,15 @@ def counterfactual(replay: ChainReplay, t: int, z_cand: np.ndarray,
         "box_pose_t": [float(v) for v in ctx.box_pose],
         "box_pose_prev": (None if ctx.box_pose_prev is None
                           else [float(v) for v in ctx.box_pose_prev]),
-        "prev_scene_dist_m": (None if prev_scene_side is None
-                              else prev_scene_side["scene"][t]),
-        "prev_projected_dist_m": (None if prev_scene_side is None
-                                  else prev_scene_side["proj"][t]),
+        # per-side previous-FULL-scene distance AT t (reviewfix2 D3: both
+        # sides recorded separately, index [t] -- the series' [t] already
+        # IS the previous scene; the selected side's value is kept under
+        # prev_scene_dist_m for continuity with the first review round)
+        "prev_scene_dist_both_m": dict(side_flags),
+        "prev_scene_dist_m": side_flags[side],
+        "prev_projected_dist_m": (None if prev_scene is None
+                                  else prev_scene[side]["proj"][t]),
+        "prev_scene_source": prev_source,
         # component/norm speed evidence (diagnostic only -- acceptance is
         # the deployed row assembly inside the audits below)
         "c2_speed_evidence": c2_rows_of(replay.pipe, ctx,
@@ -691,6 +754,10 @@ def counterfactual(replay: ChainReplay, t: int, z_cand: np.ndarray,
     rec["c2_enable_flags"] = dict(ctx_plus.c2_hand_enabled)
     rec["c2_reasons"] = dict(ctx_plus.c2_hand_reason)
     rec["prev_scene_dist_flags"] = dict(ctx_plus.prev_hand_scene_dist)
+    # reviewfix2 D4: frozen effective configs of BOTH branches + the
+    # integrity manifest -- the replay restores these, never the YAML
+    attach_integrity(rec, cfg_plus, vcfg)
+    rec["effective"]["repair_no_c2"] = asdict(cfg_current)
     return rec, arrays
 
 
@@ -727,17 +794,36 @@ def _interval_match(cls: dict, exp: dict) -> bool:
 # main
 # ---------------------------------------------------------------------------
 
-def replay_counterfactuals(out_dir: Path) -> None:
-    """Recompute the same-candidate branches from the frozen per-record
-    files (review section 4.3): restore the context from the NPZ, rerun
-    BOTH branch audits on the saved candidate, compare with the saved
-    verdicts -- no chain replay, no re-solve, no substituted candidate."""
-    rcfg, vcfg = load_mode_configs("strict")
-    spec = RepairPipeline(cfg=replace(rcfg, regen_mode=True)).spec
-    results = {}
-    for jpath in sorted(out_dir.glob("cert_trace_cf_*.json")):
-        record, arrays = load_products(out_dir, jpath.stem)
+def replay_counterfactuals(out_dir: Path, replay_dir: Path) -> None:
+    """Strict replay (reviewfix2 D2/D3/D4/D5): candidates come ONLY from the
+    generation-time index (a replay summary can never re-enter as one, and
+    an empty/missing index is an explicit failure); each product is loaded
+    with its NPZ sha256 verified; the audits run under the FROZEN effective
+    configs restored from the record (never the current YAML); the previous
+    full-scene distance fields are CROSS-CHECKED against a fresh query of
+    the hash-verified source NPZ (the D3 class -- per-side, index [t]);
+    and the comparison covers the COMPLETE records (all rows, every
+    interpolation point, strict velocities, task, prefix checks, c2 speed
+    evidence, classification) plus the arrays BITWISE.  The summary goes to
+    ``replay_dir`` -- never the products directory."""
+    idx = load_index(out_dir, INDEX_NAME)
+    replay_dir.mkdir(parents=True, exist_ok=True)
+    by_stem = {r["stem"]: r for r in idx["records"]}
+    results: dict = {}
+    ok = True
+    for stem in by_stem:
+        record, arrays = load_products(out_dir, stem)
+        entry: dict = {"stem": stem}
+        results[stem] = entry
+        integrity = verify_integrity(record)
+        entry["integrity_ok"] = not integrity
+        entry["integrity_mismatches"] = integrity[:20]
         t = record["frame"]
+        cfg_plus, vcfg = configs_from_record(record)
+        cfg_current, _ = configs_from_record(record, key="repair_no_c2")
+        assert cfg_current.regen_hand_speed_mps == 0.0    # noqa: S101
+        assert cfg_plus.regen_hand_speed_mps == 0.02598   # noqa: S101
+        spec = RepairPipeline(cfg=cfg_plus).spec
         z_cand = arrays["z_cand"]
         prefix = ([arrays["prefix"][i].copy()
                    for i in range(arrays["prefix"].shape[0])]
@@ -745,59 +831,87 @@ def replay_counterfactuals(out_dir: Path) -> None:
         box_poses = arrays["box_poses"]
         meta = record["replay_meta"]
         ctx = context_from(arrays, meta)
-        cfg_current = replace(rcfg, regen_mode=True,
-                              regen_hand_speed_mps=0.0)
-        cfg_plus = replace(rcfg, regen_mode=True)
         ctx_plus = replace(
             freeze_context(ctx),
             c2_hand_enabled=record["c2_enable_flags"],
             c2_hand_reason=record["c2_reasons"],
             prev_hand_scene_dist=record["prev_scene_dist_flags"])
-        rep: dict = {}
+
+        # D3 cross-check: the frozen per-side fields must equal a FRESH
+        # distance query of the previous full scene of the source NPZ
+        prev_checks: dict = {}
+        src = record.get("prev_scene_source")
+        if src is not None and t > 0:
+            npz_path = Path(src["npz"])
+            digest = sha256(npz_path)
+            if digest != src["sha256"]:
+                prev_checks["source_npz"] = (
+                    f"sha256 {digest} != recorded {src['sha256']}")
+            else:
+                traj, _h, _f = load_teacher_npz(npz_path)
+                fresh_at = prev_scene_distances_at(traj, t)
+                for s in ("l", "r"):
+                    if record["prev_scene_dist_both_m"][s] != fresh_at[s]:
+                        prev_checks[s] = (f"saved "
+                                          f"{record['prev_scene_dist_both_m'][s]!r}"
+                                          f" != fresh {fresh_at[s]!r}")
+        entry["prev_scene_check"] = prev_checks or "ok"
+
+        audits: dict = {}
+        fresh_arrays: dict = {}
         for label, actx, acfg in (("current", ctx, cfg_current),
                                   ("plus_c2", ctx_plus, cfg_plus)):
-            arec, _a = full_candidate_audit(
+            arec, aarr = full_candidate_audit(
                 spec, acfg, vcfg, actx, z_cand, prefix=prefix,
                 box_poses=box_poses, label=label)
-            saved = record["audits"][label]
-            rep[label] = {
-                "matches_saved": bool(
-                    arec.get("branch_pass") == saved.get("branch_pass")
-                    and arec["endpoint"]["viol_sum"]
-                    == saved["endpoint"]["viol_sum"]
-                    and arec["task"]["mpjpe_m"] == saved["task"]["mpjpe_m"]
-                    and arec["interpolation"]["pass"]
-                    == saved["interpolation"]["pass"]
-                    and arec["prefix_validation"]["passed"]
-                    == saved["prefix_validation"]["passed"]),
-                "branch_pass": arec.get("branch_pass"),
-                "viol_sum": arec["endpoint"]["viol_sum"],
-                "task_mpjpe": arec["task"]["mpjpe_m"]}
-        def bare(branch_pass: bool) -> dict:
-            return {"input": {"v1": {"ok": True}},
-                    "branch_pass": branch_pass}
-
-        rep["classification_recomputed"] = classify_branches(
-            bare(rep["current"]["branch_pass"]),
-            bare(rep["plus_c2"]["branch_pass"]))
-        # V1_UNUSABLE / EVIDENCE_INCOMPLETE come from the saved audit's own
-        # input record -- the recomputed bare passes above are only a
-        # cross-check of the PASS/C2_ONLY/CURRENT_ONLY/BOTH axis
-        rep["classification_matches"] = (
-            rep["classification_recomputed"] == record["classification"]
-            or record["classification"] in ("V1_UNUSABLE",
-                                            "EVIDENCE_INCOMPLETE"))
-        results[jpath.stem] = rep
-        print(f"  [replay {jpath.stem}] {rep['current']['matches_saved']}/"
-              f"{rep['plus_c2']['matches_saved']} "
-              f"class={rep['classification_recomputed']}")
-    ok = all(v["current"]["matches_saved"] and v["plus_c2"]["matches_saved"]
-             and v["classification_matches"] for v in results.values())
-    (out_dir / "cert_trace_cf_replay.json").write_text(
-        json.dumps({"ok": ok, "n": len(results), "results": results},
-                   indent=1, allow_nan=False))
+            audits[label] = arec
+            fresh_arrays.update(aarr)
+        # diagnostic speed evidence recomputed from the frozen flags (the
+        # same c2_rows_of the generation ran, state rebuilt at frame t)
+        c2_state_r = {s: {"enabled": [False] * t
+                          + [record["c2_enable_flags"][s]],
+                          "reason": [""] * t + [record["c2_reasons"][s]]}
+                      for s in ("l", "r")}
+        ev_pipe = RepairPipeline(spec=spec, cfg=cfg_plus)
+        speed_evidence = c2_rows_of(ev_pipe, ctx, z_cand, c2_state_r, t)
+        classification = classify_branches(audits["current"], audits["plus_c2"])
+        fresh_record = {
+            "audits": audits,
+            "classification": classification,
+            "classification_basis": {
+                "current_branch_pass": audits["current"].get("branch_pass"),
+                "plus_c2_branch_pass": audits["plus_c2"].get("branch_pass")},
+            "c2_speed_evidence": speed_evidence,
+        }
+        diffs = deep_diff({k: record.get(k) for k in fresh_record},
+                          fresh_record)
+        recomp = {k: arrays[k] for k in fresh_arrays if k in arrays}
+        arr_diffs = arrays_diff(recomp, fresh_arrays)
+        arr_diffs += [f"{k}: recomputed array absent from saved bundle"
+                      for k in sorted(fresh_arrays) if k not in arrays]
+        entry.update({
+            "record_diff_paths": diffs[:40],
+            "n_record_diffs": len(diffs),
+            "array_diffs": arr_diffs[:40],
+            "classification_recomputed": classification,
+            "classification_matches": classification
+            == record.get("classification"),
+            "matches": not diffs and not arr_diffs,
+        })
+        entry["ok"] = (entry["matches"] and entry["classification_matches"]
+                       and entry["integrity_ok"]
+                       and prev_checks == {})
+        ok = ok and entry["ok"]
+        print(f"  [replay {stem}] match={entry['matches']} "
+              f"class={classification} prev={entry['prev_scene_check']}")
+    (replay_dir / "cert_trace_cf_replay.json").write_text(
+        json.dumps({"ok": ok, "n": len(results),
+                    "expected": len(idx["records"]),
+                    "results": results}, indent=1, allow_nan=False,
+                   default=float))
     print(f"[replay] {'ALL MATCH' if ok else 'MISMATCH'} "
-          f"({len(results)} records) -> cert_trace_cf_replay.json")
+          f"({len(results)} records) -> "
+          f"{replay_dir / 'cert_trace_cf_replay.json'}")
 
 
 def _write_guarded(path: Path, text: str) -> None:
@@ -813,8 +927,9 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--skip-counterfactuals", action="store_true")
     ap.add_argument("--out", default=str(OUT_DIR),
-                    help="output dir (default: the reviewfix 20261001 diag "
-                         "dir, never the frozen 20260927 one)")
+                    help="output dir (default: the reviewfix2 20261002 diag "
+                         "dir; the frozen 20260927 and superseded 20261001 "
+                         "ones are read-only)")
     ap.add_argument("--replay", action="store_true",
                     help="recompute the same-candidate counterfactual "
                          "branches from the frozen files and compare -- "
@@ -822,7 +937,8 @@ def main() -> None:
     args = ap.parse_args()
     out_dir = Path(args.out)
     if args.replay:
-        replay_counterfactuals(out_dir)
+        replay_counterfactuals(out_dir,
+                               out_dir.parent / f"{out_dir.name}_replay")
         return
 
     t_start = time.perf_counter()
@@ -1099,12 +1215,14 @@ def main() -> None:
                         tasks.append((t, 1, side,
                                       "historical_certified_candidate"))
             tasks.sort(key=lambda x: (x[0], x[1], x[2]))
+            rq_npz = CUR_RQ_DIR / f"{demo}.npz"
+            prev_source = {"npz": str(rq_npz), "sha256": sha256(rq_npz)}
             for t, _order, side, kind in tasks:
                 if kind == "current_rq_adopted_spike":
                     z_cand = rq_traj[t, 0:36]
                     origin = {"kind": "rq_adopted",
-                              "npz": str(CUR_RQ_DIR / f"{demo}.npz"),
-                              "npz_sha256": sha256(CUR_RQ_DIR / f"{demo}.npz"),
+                              "npz": str(rq_npz),
+                              "npz_sha256": sha256(rq_npz),
                               "frame": int(t)}
                 else:
                     if nq_traj is None:
@@ -1116,10 +1234,10 @@ def main() -> None:
                               "npz_sha256": sha256(HIST_NQ_DIR / f"{demo}.npz"),
                               "frame": int(t)}
                 rec, arrays = counterfactual(
-                    replay, t, z_cand, f"{kind}[{side}]", c2_rq,
-                    prev_all[(demo, "rq")][side], rq_traj, src_scene,
+                    replay, t, z_cand, f"{kind}[{side}]", c2_rq, side,
+                    prev_all[(demo, "rq")], prev_source, rq_traj, src_scene,
                     spec, rcfg, vcfg)
-                rec.update({"demo": demo, "side": side, "kind": kind,
+                rec.update({"demo": demo, "kind": kind,
                             "origin": origin})
                 cf_records.append(rec)
                 # one frame can be BOTH a spike and a historical certified
@@ -1131,9 +1249,12 @@ def main() -> None:
                       f"{rec['classification']}")
         summary = {
             "format": AUDIT_FORMAT,
-            "records": [{k: r[k] for k in
-                         ("demo", "side", "kind", "frame", "classification",
-                          "classification_basis", "origin")}
+            "records": [{**{k: r[k] for k in
+                            ("demo", "side", "kind", "frame",
+                             "classification", "classification_basis",
+                             "origin")},
+                         "stem": f"cert_trace_cf_{r['demo']}_t{r['frame']}_"
+                                 f"{r['side']}_{r['kind']}"}
                         for r in cf_records],
             "verdicts": {},
         }
@@ -1142,6 +1263,12 @@ def main() -> None:
             summary["verdicts"][key] = summary["verdicts"].get(key, 0) + 1
         _write_guarded(out_dir / "cert_trace_counterfactuals.json",
                        json.dumps(summary, indent=1, allow_nan=False))
+        # reviewfix2 D5: the replay's EXPECTED candidate list -- discovery
+        # never globs the products dir again (a replay summary re-entering
+        # as a candidate was the second-run failure)
+        write_index(out_dir, INDEX_NAME, {
+            "records": summary["records"],
+            "stems": [r["stem"] for r in summary["records"]]})
         A.note("counterfactual_classifications", summary["verdicts"])
 
     # ---- write assertion/provenance outputs --------------------------------
