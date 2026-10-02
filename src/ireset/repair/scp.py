@@ -1263,7 +1263,8 @@ class FrameSolver:
             out.append((w, J_r, r))
         return out
 
-    def build_qp(self, z: np.ndarray, ctx: FrameContext, trust: float, slack: bool = False):
+    def build_qp(self, z: np.ndarray, ctx: FrameContext, trust: float,
+                 slack: bool = False, *, mu: float | None = None):
         """Assemble the QP at state z (caller must have forwarded to z)."""
         ev, cfg = self.ev, self.cfg
 
@@ -1398,6 +1399,12 @@ class FrameSolver:
             l_rows.append(np.array([r["lo"] - r["dist"]]))
             u_rows.append(np.array([INF]))
 
+        # train24fix3 (plan 6.1): actual row-count anchor of the post block.
+        # The pre block's length depends on z_prev (99 with, 70 without) --
+        # the C2 block start must come from the REAL assembly, never from
+        # the nominal layout constant, or t=0 rows would be misattributed.
+        anchor_post = sum(r.shape[0] for r in A_rows)
+
         # hand anchors
         for side in ("l", "r"):
             anchor = ctx.hand_anchor.get(side)
@@ -1435,7 +1442,14 @@ class FrameSolver:
                 l_rows.append(np.full(15, -INF)); u_rows.append(np.full(15, INF))
 
         # regen-mode hand box-frame speed rows (mirror of constraint_rows;
-        # SAME shared criterion -- hand_speed_rows_active, C2 section 4.2)
+        # SAME shared criterion -- hand_speed_rows_active, C2 section 4.2).
+        # N2/N3 (train24fix3 plan 6.1): the profile may divide these QP rows
+        # by B = dt * regen_hand_speed_mps -- a pure ROW transformation of
+        # the same linear constraint set. The REAL acceptance rows stay in
+        # metres (val = d, l/u = +-B, scale = B in _fixed_post_rows); the
+        # two paths align via B * l_QP_scaled + d = -B (test-pinned).
+        c2_precond = (self.c2_profile is not None and
+                      self.c2_profile.c2_row_precondition == "divide_by_bound")
         if cfg.regen_mode and cfg.regen_hand_speed_mps > 0.0:
             lim_h = self.dt * cfg.regen_hand_speed_mps
             for side in ("l", "r"):
@@ -1446,9 +1460,15 @@ class FrameSolver:
                     prev_local = ctx.prev_hand_local[side]
                     Jh = ev.hand_local_jac(side).reshape(9, N_TANGENT)
                     cur = ev.hand_local(side)
+                    lo_r = -lim_h - (cur - prev_local)
+                    hi_r = lim_h - (cur - prev_local)
+                    if c2_precond:
+                        Jh = Jh / lim_h
+                        lo_r = lo_r / lim_h
+                        hi_r = hi_r / lim_h
                     A_rows.append(Jh)
-                    l_rows.append((-lim_h - (cur - prev_local)).reshape(-1))
-                    u_rows.append((lim_h - (cur - prev_local)).reshape(-1))
+                    l_rows.append(lo_r.reshape(-1))
+                    u_rows.append(hi_r.reshape(-1))
         else:
             A_rows.append(np.zeros((N_HAND_SPEED, N_TANGENT)))
             l_rows.append(np.full(N_HAND_SPEED, -INF)); u_rows.append(np.full(N_HAND_SPEED, INF))
@@ -1495,13 +1515,37 @@ class FrameSolver:
             lo_new[n_r:n_r + n_s] = lo[idx]  # duplicated rows enforce l + s
             P_new = np.zeros((N_TANGENT + n_s, N_TANGENT + n_s))
             P_new[:N_TANGENT, :N_TANGENT] = P
-            q_new = np.concatenate([q, np.full(n_s, cfg.slack_penalty)])
+            # train24fix3 N2 (plan 6.1): when the C2 rows entered the QP
+            # divided by B, their recovery slacks are DIMENSIONLESS -- the
+            # penalty must change units with them. scaled_10000B keeps the
+            # metre-unit cost exactly: 10000 * B * s_norm == 10000 * s_m
+            # (s_m = B * s_norm). Other families keep the original penalty
+            # and the trust rows stay hard -- nothing else is transformed.
+            penalties = np.full(n_s, float(cfg.slack_penalty))
+            if c2_precond:
+                c2_lo = anchor_post + N_HAND_ROWS + N_FOOT_ROWS + N_FOOT_SPEED
+                c2_hi = c2_lo + N_HAND_SPEED
+                in_c2 = (idx >= c2_lo) & (idx < c2_hi)
+                if self.c2_profile.c2_slack_penalty == "scaled_10000B":
+                    penalties[in_c2] = float(cfg.slack_penalty) * \
+                        (self.dt * cfg.regen_hand_speed_mps)
+                elif self.c2_profile.c2_slack_penalty == "mu":
+                    # N3 (plan 6.1): the dimensionless C2 recovery penalty
+                    # becomes the CURRENT merit weight -- unit-consistent
+                    # with the merit term's mu-per-normalized-violation.
+                    # mu comes from solve_frame (incl. the regen multiplier)
+                    if mu is None:
+                        raise ValueError(
+                            "N3 requires the current merit weight mu -- "
+                            "build_qp must be called with solve_frame's mu")
+                    penalties[in_c2] = float(mu)
+            q_new = np.concatenate([q, penalties])
             if self.trace is not None:
                 # train24fix3 plan 5.1: identities of the relaxed rows and
                 # the penalties actually placed on their slacks (the N2/N3
                 # profiles vary the C2 family). Read out once here -- the
                 # QP rows carry no identifier arrays of their own.
-                names_all = self._qp_row_names(A.shape[0])
+                names_all = self._qp_row_names(A.shape[0], ctx)
                 self.last_slack_rows = {
                     "idx": [int(i) for i in idx],
                     "names": [names_all[i] for i in idx],
@@ -1511,15 +1555,20 @@ class FrameSolver:
 
         return (spa.csc_matrix(P), q, spa.csc_matrix(A), lo, hi), 0
 
-    def _qp_row_names(self, n_rows: int) -> list[str]:
+    def _qp_row_names(self, n_rows: int, ctx: FrameContext | None = None) -> list[str]:
         """Descriptors parallel to the LAST ``build_qp`` row layout (pre /
         collision / probe / post / padding). The QP block ORDER differs
         from the nonlinear value path -- the probe block sits BETWEEN
         collision and post, so the post-block relative offsets are NOT QP
-        row indices (train24fix3 plan 6.1 implementation note). Raises on
+        row indices (train24fix3 plan 6.1 implementation note). The pre
+        block is CONDITIONAL: without ``ctx.z_prev`` the joint-velocity
+        and root-velocity rows do not exist (64 rows, not 99). Raises on
         desync so a silently mislabelled row can never enter the evidence.
         """
-        names = (list(self._pre_row_descriptors())
+        pre = self._pre_row_descriptors()
+        if ctx is not None and ctx.z_prev is None:
+            pre = pre[:29] + pre[64:]     # joint limits + trust only
+        names = (list(pre)
                  + list(self.last_row_pairs)
                  + list(self.last_probe_rows)
                  + list(self._post_row_descriptors()))
@@ -1903,7 +1952,8 @@ class FrameSolver:
                         best_z, best_merit, best_feasible = None, float("inf"), False
 
                 if restoration:
-                    (Ps, qs, As, los, his), _ = self.build_qp(z, ctx, trust, slack=True)
+                    (Ps, qs, As, los, his), _ = self.build_qp(
+                        z, ctx, trust, slack=True, mu=mu)
                     qp_calls += 1
                     x_s, last_qp_status = self.solve_qp(Ps, qs, As, los, his,
                                                         settings=settings)
@@ -1913,7 +1963,7 @@ class FrameSolver:
                         qp_rec["rows_n"] = int(As.shape[0])
                         if "qp_row_names" not in attempt_trace:
                             attempt_trace["qp_row_names"] = self._qp_row_names(
-                                int(As.shape[0]))
+                                int(As.shape[0]), ctx)
                         qp_rec["slack"] = (None if x_s is None else {
                             "values": [float(v) for v in x_s[N_TANGENT:]],
                             "negative": int((np.asarray(x_s[N_TANGENT:]) < 0).sum()),
@@ -1933,7 +1983,8 @@ class FrameSolver:
                     used_slack = True
                     xi = x_s[:N_TANGENT]
                 else:
-                    (P, qv, A, lo_a, hi_a), _ = self.build_qp(z, ctx, trust, slack=False)
+                    (P, qv, A, lo_a, hi_a), _ = self.build_qp(
+                    z, ctx, trust, slack=False, mu=mu)
                     qp_calls += 1
                     xi, last_qp_status = self.solve_qp(P, qv, A, lo_a, hi_a,
                                                        settings=settings)
@@ -1943,7 +1994,7 @@ class FrameSolver:
                         qp_rec["rows_n"] = int(A.shape[0])
                         if "qp_row_names" not in attempt_trace:
                             attempt_trace["qp_row_names"] = self._qp_row_names(
-                                int(A.shape[0]))
+                                int(A.shape[0]), ctx)
                     if xi is None:
                         restoration = True
                         if it_rec is not None:
