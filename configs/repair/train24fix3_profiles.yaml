@@ -1,0 +1,68 @@
+# train24fix3 fixed profile registry (plan sections 6.1 and 7.1).
+#
+# The ONLY pre-registered candidates of this round.  Strict configs still
+# come from the RepairConfig/ValidationConfig dataclasses (config_io); a
+# profile contributes (a) OSQP settings applied ONLY to frames whose C2 rows
+# are active and (b) the C2 row-handling knobs.  The registry is validated
+# against a closed field set -- unknown keys are rejected at load time.
+# Editing this RECORD file does not change a run: the driver/scripts load it
+# explicitly and freeze the resolved values + this file's sha256 into the
+# effective record.
+
+schema: train24fix3_profiles_v1
+
+profiles:
+  N0:
+    description: >-
+      Frozen baseline: the historical hard-coded solve_qp settings and the
+      original metre-unit C2 rows with the legacy slack penalty. Used for the
+      trace stage and as the no-change arm of every comparison.
+    solver: {polish: false, eps_abs: 3.0e-5, eps_rel: 3.0e-5, max_iter: 2500, scaling: 10}
+    c2_mode: axis
+    c2_row_precondition: none
+    c2_slack_penalty: legacy
+
+  N1:
+    description: >-
+      Inner accuracy/iteration check (plan 6.1): polish on, eps 1e-9,
+      20000 iterations. C2 row handling identical to N0.
+    solver: {polish: true, eps_abs: 1.0e-9, eps_rel: 1.0e-9, max_iter: 20000, scaling: 10}
+    c2_mode: axis
+    c2_row_precondition: none
+    c2_slack_penalty: legacy
+
+  N2:
+    description: >-
+      N1 settings + cost-preserving row preconditioning: the C2 QP rows and
+      their recovery slack are divided by B = dt * regen_hand_speed_mps; the
+      dimensionless C2 slack penalty is 10000 * B (mathematically the same
+      cost as N0/N1's metre-unit penalty). Real acceptance rows stay in
+      metres with l/u = +-B and scale = B.
+    base: N1
+    c2_row_precondition: divide_by_bound
+    c2_slack_penalty: scaled_10000B
+
+  N3:
+    description: >-
+      N2 with the dimensionless C2 recovery-slack penalty set to the CURRENT
+      merit weight mu (unit-consistent with the merit term; plan 2.2 item 2).
+    base: N2
+    c2_slack_penalty: mu
+
+  S1:
+    description: >-
+      Norm branch, first candidate (plan 7.1): per-site REAL norm speed bound
+      0.045 m/s (approximately the old axis-mode maximum norm, freedom only
+      in direction allocation). N3 solver settings + unit-consistent
+      recovery.
+    base: N3
+    c2_mode: norm_cut
+    c2_norm_speed_mps: 0.045
+
+  S2:
+    description: >-
+      Norm branch, second candidate: per-site real norm speed bound 0.049
+      m/s (~1 mm/s margin under the validator's 0.05 entry gate).
+    base: S1
+    c2_mode: norm_cut
+    c2_norm_speed_mps: 0.049

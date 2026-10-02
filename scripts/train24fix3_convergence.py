@@ -262,33 +262,295 @@ def stage_baseline(root: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# stage B: trace (plan section 5) -- implemented with the trace hook commit
+# stage B: trace (plan section 5)
 # ---------------------------------------------------------------------------
 
+def _thread_env() -> dict:
+    env = dict(os.environ)
+    env.update({k: "8" for k in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                                 "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS",
+                                 "VECLIB_MAXIMUM_THREADS")})
+    return env
+
+
+def _trace_jsonable(trace: dict) -> dict:
+    """Trace minus the heavy arrays (those go to the NPZ bundle)."""
+    out = {"n_attempts": len(trace.get("attempts", []))}
+    atts = []
+    for att in trace.get("attempts", []):
+        a = {k: v for k, v in att.items() if k != "qp_arrays"}
+        iters = [{k: v for k, v in it.items()
+                  if k not in ("z", "z_next", "xi_raw", "xi_clipped")}
+                 for it in att.get("iterations", [])]
+        a["iterations"] = iters
+        atts.append(a)
+    out["attempts"] = atts
+    return out
+
+
+def _trace_arrays(trace: dict) -> dict:
+    import numpy as np
+
+    arr: dict = {}
+    for ai, att in enumerate(trace.get("attempts", [])):
+        for ii, it in enumerate(att.get("iterations", [])):
+            for key in ("z", "z_next", "xi_raw", "xi_clipped"):
+                v = it.get(key)
+                if v is not None:
+                    arr[f"a{ai}_it{ii}_{key}"] = np.asarray(v, dtype=float)
+        for qi, qa in enumerate(att.get("qp_arrays", [])):
+            for key in ("P", "q", "A", "lo", "hi"):
+                arr[f"a{ai}_qp{qi}_{key}"] = np.asarray(qa[key], dtype=float)
+    return arr
+
+
 def stage_trace(root: Path) -> None:
+    """Plan section 5: the five frozen frames' full escalation chains under
+    the N0 behaviour, with the complete per-iteration trace.  Identity
+    reproduction (same failure, same exit) is the gate; the trace itself
+    is the deliverable."""
+    import numpy as np
+    from ireset.repair.pipeline import RepairPipeline
+    from train24fix2_audit import (
+        configs_from_record,
+        context_from,
+        escalate_frame,
+        load_products,
+    )
+
     load_stage_summary(root, "baseline")
-    raise SystemExit(
-        "stage trace requires the trace-hook implementation commit "
-        "(plan section 5); not yet available in this revision")
+    out = root / "trace"
+    gate = Gate()
+    diag = F_ROOT / "diag"
+    idx = load_index(diag, "fail_bind2_index")
+    summary_rows = []
+    for stem in idx["stems"]:
+        record, arrays = load_products(diag, stem)
+        cfg, vcfg = configs_from_record(record)
+        spec = RepairPipeline(cfg=cfg).spec
+        ctx = context_from(arrays, record["provenance"]["context_meta"])
+        t = record["t_fail"]
+        pipe = RepairPipeline(spec=spec, cfg=cfg)
+        pipe.validator.cfg = vcfg
+        pipe.solver.trace = {"attempts": []}
+        t0 = time.perf_counter()
+        esc = escalate_frame(pipe, ctx, t, ctx.z_pred, ctx.z_prev)
+        wall = time.perf_counter() - t0
+        trace = pipe.solver.trace
+        frozen = record["last_attempt"]["solver_fields"]
+        atts = trace.get("attempts", [])
+        ident = {
+            "t_fail": t,
+            "skipped": bool(esc["skipped"]),
+            "adopted": bool(esc["adopted"]),
+            "esc_last_status": esc["last_status"],
+            "esc_last_term": esc["last_term_reason"],
+            "frozen_status": frozen["status"],
+            "frozen_term": frozen["term_reason"],
+            "frozen_iterations": frozen["iterations"],
+            "frozen_qp_calls": frozen["qp_calls"],
+            "replay_last_iterations": (atts[-1]["exit"]["it_done"]
+                                       if atts and atts[-1].get("exit")
+                                       else None),
+            "replay_last_qp_calls": (atts[-1]["exit"]["qp_calls"]
+                                     if atts and atts[-1].get("exit")
+                                     else None),
+        }
+        matches = (not esc["skipped"] and not esc["adopted"]
+                   and esc["last_status"] == frozen["status"]
+                   and esc["last_term_reason"] == frozen["term_reason"]
+                   and ident["replay_last_iterations"] == frozen["iterations"]
+                   and ident["replay_last_qp_calls"] == frozen["qp_calls"])
+        gate.check(f"identity_{stem}", matches, ident)
+        write_guarded(out / f"trace_{stem}.json", json.dumps(
+            {"stem": stem, "demo": record["demo"], "wall_s": round(wall, 2),
+             "identity": ident, "identity_matches": matches,
+             "trace": _trace_jsonable(trace)}, indent=1, default=float))
+        np.savez(out / f"trace_{stem}.npz", **_trace_arrays(trace))
+        summary_rows.append(
+            {"stem": stem, "demo": record["demo"], "t": t,
+             "identity_matches": matches, "n_attempts": len(atts),
+             "n_iterations_total": sum(len(a["iterations"]) for a in atts),
+             "n_qp_total": sum(len(a["qp"]) for a in atts),
+             "wall_s": round(wall, 2)})
+        print(f"[trace] {stem}: identity={matches} "
+              f"attempts={len(atts)} qp={summary_rows[-1]['n_qp_total']}")
+    summary = {"stage": "trace", "ok": gate.ok,
+               "generated": time.strftime("%Y-%m-%d %H:%M:%S"),
+               "rows": summary_rows, "checks": gate.checks,
+               "next": "numeric (N1 -> N2 -> N3, plan section 6)"}
+    write_guarded(stage_summary_path(root, "trace"),
+                  json.dumps(summary, indent=1, default=float))
+    print(f"trace -> {'PASS' if gate.ok else 'FAIL'} "
+          f"({stage_summary_path(root, 'trace')})")
+
+
+# ---------------------------------------------------------------------------
+# stage C: numeric candidates (plan section 6)
+# ---------------------------------------------------------------------------
+
+def _profile_frozen_frames(prof, diag: Path) -> dict:
+    """Five frozen frames under ONE profile: the full escalation; an
+    adopted candidate additionally gets the complete C2-on audit (plan
+    6.2 item 1 -- legal-solve / failure / timeout / insufficient evidence
+    are listed separately, never merged)."""
+    from ireset.repair.pipeline import RepairPipeline
+    from train24fix2_audit import (
+        configs_from_record,
+        context_from,
+        escalate_frame,
+        full_candidate_audit,
+        load_products,
+    )
+
+    idx = load_index(diag, "fail_bind2_index")
+    rows = []
+    audits = {}
+    for stem in idx["stems"]:
+        record, arrays = load_products(diag, stem)
+        cfg, vcfg = configs_from_record(record)
+        spec = RepairPipeline(cfg=cfg).spec
+        ctx = context_from(arrays, record["provenance"]["context_meta"])
+        t = record["t_fail"]
+        pipe = RepairPipeline(spec=spec, cfg=cfg, c2_profile=prof)
+        pipe.validator.cfg = vcfg
+        t0 = time.perf_counter()
+        esc = escalate_frame(pipe, ctx, t, ctx.z_pred, ctx.z_prev)
+        wall = time.perf_counter() - t0
+        row = {"stem": stem, "demo": record["demo"], "t": t,
+               "skipped": bool(esc["skipped"]),
+               "adopted": bool(esc["adopted"]),
+               "adopted_source": esc["adopted_source"],
+               "last_status": esc["last_status"],
+               "last_term_reason": esc["last_term_reason"],
+               "n_attempts": len(esc["attempts"]),
+               "wall_s": round(wall, 2)}
+        if esc["adopted"]:
+            prefix = ([arrays["prefix"][i].copy()
+                       for i in range(arrays["prefix"].shape[0])]
+                      if arrays["prefix"].size else [])
+            arec, _aarr = full_candidate_audit(
+                spec, cfg, vcfg, ctx, esc["adopted_z"],
+                prefix=prefix, box_poses=arrays["box_poses"],
+                label="profile_adopted")
+            audits[stem] = arec
+            row["adopted_audit_branch_pass"] = arec.get("branch_pass")
+        rows.append(row)
+        print(f"  [{prof.name}] {stem}: adopted={row['adopted']} "
+              f"term={row['last_term_reason']} ({row['wall_s']}s)")
+    return {"rows": rows,
+            "n_adopted": sum(1 for r in rows if r["adopted"]),
+            "audits": audits}
+
+
+def _run_sixseg(profile_name: str, rq: Path) -> dict:
+    """One full diagnosis6 quiet run under the profile (plan 6.2 item 2)."""
+    import subprocess
+
+    rq.mkdir(parents=True, exist_ok=True)
+    cmd = ["uv", "run", "--locked", "python",
+           "scripts/regenerate_teachers.py",
+           "--set", "diagnosis6", "--mode", "regen",
+           "--validation-mode", "strict", "--profile", profile_name,
+           "--assert-task-gate", "0.40",
+           "--output-dir", str(rq),
+           "--report", str(rq / "regen_report_diagnosis6_strict.json"),
+           "--note", f"train24fix3 numeric candidate {profile_name}"]
+    t0 = time.perf_counter()
+    proc = subprocess.run(cmd, cwd=PROJECT_ROOT, env=_thread_env())
+    wall = time.perf_counter() - t0
+    if proc.returncode != 0:
+        raise RuntimeError(f"sixseg subprocess failed for {profile_name}")
+    report = json.loads(
+        (rq / "regen_report_diagnosis6_strict.json").read_text())
+    return {"rq_dir": str(rq), "wall_s": round(wall, 1),
+            "n_demos": report["n_demos"], "n_kept": report["n_kept"],
+            "kept": [r["demo"] for r in report["rows"] if r["accepted"]],
+            "code_changed_during_run":
+                report.get("end", {}).get("code_changed_during_run"),
+            "argv": report.get("effective", {}).get("argv"),
+            "profile": report.get("profile")}
 
 
 def stage_numeric(root: Path) -> None:
+    """Plan section 6: N1 -> N2 -> N3 in order; the FIRST profile meeting
+    the full six-segment development gates is selected and the remaining
+    candidates are recorded as not-needed-to-execute (a started comparison
+    always completes its full sixseg)."""
+    from ireset.repair.profiles import load_profiles
+    from train24fix3_quality_gate import gate_report
+
     load_stage_summary(root, "baseline")
     load_stage_summary(root, "trace")
-    raise SystemExit(
-        "stage numeric requires the N1/N2/N3 implementation commits "
-        "(plan section 6); not yet available in this revision")
+    out = root / "numeric"
+    diag = F_ROOT / "diag"
+    gate = Gate()
+    profiles = load_profiles()
+    winner = None
+    comparisons: dict[str, dict] = {}
+    not_executed: list[str] = []
+    for name in ("N1", "N2", "N3"):
+        if winner is not None:
+            not_executed.append(name)
+            continue
+        prof = profiles[name]
+        pdir = out / name
+        ff = _profile_frozen_frames(prof, diag)
+        six = _run_sixseg(name, pdir / "sixseg" / "rq")
+        qg = gate_report(Path(six["rq_dir"]))
+        base_ok = (six["n_kept"] == six["n_demos"]
+                   and six["code_changed_during_run"] is False)
+        cand_ok = base_ok and qg["ok"]
+        comparisons[name] = {
+            "profile": prof.as_record(),
+            "frozen_frames": {k: ff[k] for k in ("rows", "n_adopted")},
+            "frozen_frame_adopted_audits": ff["audits"],
+            "sixseg": {k: six[k] for k in
+                       ("rq_dir", "wall_s", "n_demos", "n_kept", "kept",
+                        "code_changed_during_run", "profile")},
+            "quality_gate": {"verdicts": qg["verdicts"], "rows": qg["rows"]},
+            "base_gate_ok": base_ok, "quality_gate_ok": qg["ok"],
+            "selected": bool(cand_ok)}
+        write_guarded(pdir / "profile_summary.json", json.dumps(
+            comparisons[name], indent=1, default=float))
+        gate.check(f"{name}_base_gate", base_ok,
+                   f"keep {six['n_kept']}/{six['n_demos']}, "
+                   f"r9={six['code_changed_during_run']}")
+        gate.check(f"{name}_quality_gate", qg["ok"], qg["verdicts"])
+        if cand_ok:
+            winner = name
+    # the stage COMPLETED even without a winner; the winner field decides
+    # the next branch (plan 6.2 exit) -- ok is never massaged to pass
+    summary = {"stage": "numeric", "ok": True,
+               "generated": time.strftime("%Y-%m-%d %H:%M:%S"),
+               "winner": winner, "not_executed": not_executed,
+               "comparisons": {k: {kk: vv for kk, vv in v.items()
+                                   if kk != "frozen_frame_adopted_audits"}
+                               for k, v in comparisons.items()},
+               "checks": gate.checks,
+               "next": ("sixseg (formal stage E, selected profile)"
+                        if winner else "norm (S1 -> S2, plan section 7)")}
+    write_guarded(stage_summary_path(root, "numeric"),
+                  json.dumps(summary, indent=1, default=float))
+    print(f"numeric -> winner={winner} "
+          f"({stage_summary_path(root, 'numeric')})")
+
+
+# ---------------------------------------------------------------------------
+# later stages (plan sections 7/8/9)
+# ---------------------------------------------------------------------------
 
 
 def stage_norm(root: Path) -> None:
     numeric = load_stage_summary(root, "numeric")
     if numeric.get("winner"):
         raise SystemExit(
-            "stage norm is NOT to run: a numeric profile satisfied the full "
-            "six-segment development gates (plan section 6 exit)")
+            "stage norm is NOT to run: a numeric profile satisfied the "
+            "development gates (plan section 6 exit -- norm is the branch "
+            "for 'no numeric winner' only)")
     raise SystemExit(
-        "stage norm requires the norm_cut implementation commit "
-        "(plan section 7); not yet available in this revision")
+        "stage norm requires the norm_cut implementation (plan section 7); "
+        "not yet available in this revision")
 
 
 def stage_sixseg(root: Path) -> None:

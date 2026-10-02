@@ -30,7 +30,7 @@ Correctness contracts added 2026-09-22 (m2_m3_stage_gate_fix_plan F1/F2):
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 import numpy as np
 import osqp
@@ -44,6 +44,7 @@ from ireset.kinematics.rotation_adapter import (
     so3_left_jacobian_np,
     so3_log_np,
 )
+from ireset.repair.profiles import OsqpSettings
 from ireset.repair.constraints import (
     FrameEvaluator,
     KPT_NAMES,
@@ -312,6 +313,25 @@ class FrameSolver:
         #: layouts; built once, R7)
         self._pre_desc: list[str] | None = None
         self._post_desc: list[str] | None = None
+        # -- train24fix3 (plan sections 4.1/5/6.1) --------------------------
+        #: the attached C2 profile (None = plain config behaviour). Its
+        #: solver settings apply ONLY to frames with active C2 rows
+        #: (``_frame_qp_settings``); its C2 row knobs drive build_qp (the
+        #: N2/N3 preconditioning and recovery-slack penalty).
+        self.c2_profile = None
+        #: OFF by default (None). When a dict, ``solve_frame`` records the
+        #: full per-iteration evidence of every attempt into
+        #: ``self.trace["attempts"]`` (plan section 5.1) and ``solve_qp``
+        #: appends per-solve records to ``self.qp_trace`` (arrays to
+        #: ``self.qp_trace_arrays``). Pure read-out: every guard copies
+        #: what was already computed, nothing feeds back, no extra solves;
+        #: with it None the control flow is identical to N0.
+        self.trace: dict | None = None
+        self.qp_trace: list | None = None
+        self.qp_trace_arrays: list | None = None
+        #: slack bookkeeping of the last ``build_qp(slack=True)`` call
+        #: (trace-only; identities of the relaxed rows + their penalties)
+        self.last_slack_rows: dict | None = None
 
     # -- pair identity -------------------------------------------------------
 
@@ -1476,9 +1496,40 @@ class FrameSolver:
             P_new = np.zeros((N_TANGENT + n_s, N_TANGENT + n_s))
             P_new[:N_TANGENT, :N_TANGENT] = P
             q_new = np.concatenate([q, np.full(n_s, cfg.slack_penalty)])
+            if self.trace is not None:
+                # train24fix3 plan 5.1: identities of the relaxed rows and
+                # the penalties actually placed on their slacks (the N2/N3
+                # profiles vary the C2 family). Read out once here -- the
+                # QP rows carry no identifier arrays of their own.
+                names_all = self._qp_row_names(A.shape[0])
+                self.last_slack_rows = {
+                    "idx": [int(i) for i in idx],
+                    "names": [names_all[i] for i in idx],
+                    "penalty": [float(v) for v in q_new[N_TANGENT:]],
+                    "n_s": int(n_s)}
             return (spa.csc_matrix(P_new), q_new, spa.csc_matrix(A_new), lo_new, hi_new), n_s
 
         return (spa.csc_matrix(P), q, spa.csc_matrix(A), lo, hi), 0
+
+    def _qp_row_names(self, n_rows: int) -> list[str]:
+        """Descriptors parallel to the LAST ``build_qp`` row layout (pre /
+        collision / probe / post / padding). The QP block ORDER differs
+        from the nonlinear value path -- the probe block sits BETWEEN
+        collision and post, so the post-block relative offsets are NOT QP
+        row indices (train24fix3 plan 6.1 implementation note). Raises on
+        desync so a silently mislabelled row can never enter the evidence.
+        """
+        names = (list(self._pre_row_descriptors())
+                 + list(self.last_row_pairs)
+                 + list(self.last_probe_rows)
+                 + list(self._post_row_descriptors()))
+        n_missing = n_rows - len(names)
+        if n_missing < 0:
+            raise RuntimeError(
+                f"QP row-name reconstruction desync: {len(names)} names "
+                f"for {n_rows} rows")
+        names += [f"pad[{i}]" for i in range(n_missing)]
+        return names
 
     def _mesh_jacobian(self, L, J_kpt) -> np.ndarray:
         """Mesh residual Jacobian: only the first 15 points vary.
@@ -1489,20 +1540,112 @@ class FrameSolver:
         Lk = np.asarray(L[:, :15].todense()) if hasattr(L, "todense") else np.asarray(L)[:, :15]
         return np.kron(Lk, np.eye(3)) @ J_kpt.reshape(15 * 3, N_TANGENT)
 
-    def solve_qp(self, P, q, A, lo, hi):
+    def solve_qp(self, P, q, A, lo, hi, settings: OsqpSettings | None = None):
+        """Solve one assembled QP.
+
+        ``settings`` overrides the OSQP setup for THIS solve only; ``None``
+        keeps the ``RepairConfig.osqp_*`` values (the frozen N0 settings --
+        these defaults are exactly the values this method used to
+        hard-code). The train24fix3 per-frame profile gating happens in
+        ``solve_frame`` (``_frame_qp_settings``), which owns the frame
+        context this method deliberately does not.
+        """
         prob = self._osqp
+        if settings is None:
+            settings = OsqpSettings.from_config(self.cfg)
         lo = np.where(lo <= -INF / 2, -np.inf, lo)
         hi = np.where(hi >= INF / 2, np.inf, hi)
         prob.setup(P=P, q=q, A=A, l=lo, u=hi, verbose=False,
-                   polish=False, eps_abs=3e-5, eps_rel=3e-5, max_iter=2500,
-                   scaling=10)
+                   polish=bool(settings.polish),
+                   eps_abs=float(settings.eps_abs),
+                   eps_rel=float(settings.eps_rel),
+                   max_iter=int(settings.max_iter),
+                   scaling=int(settings.scaling))
         res = prob.solve()
         status = str(res.info.status)
         x = np.asarray(res.x) if res.x is not None else None
+        if self.qp_trace is not None:
+            # train24fix3 plan 5.1: read-only evidence of THIS solve. No
+            # extra solve, no behavioural branch; the OSQP 1.1.3 info
+            # fields (iter/prim_res/dual_res/obj_val/status_polish) are
+            # copied as returned -- the historical pri_res/dua_res names
+            # do not exist in this build.
+            info = res.info
+            self.qp_trace.append({
+                "settings": asdict(settings),
+                "status": status,
+                "iter": int(info.iter),
+                "prim_res": float(info.prim_res),
+                "dual_res": float(info.dual_res),
+                "obj_val": float(info.obj_val),
+                "status_polish": int(info.status_polish),
+                "x_returned": x is not None,
+                "x_absmax": (float(np.abs(x).max())
+                             if x is not None else None),
+            })
+            if self.qp_trace_arrays is not None:
+                self.qp_trace_arrays.append({
+                    "P": (np.asarray(P.todense()) if spa.issparse(P)
+                          else np.array(P)),
+                    "q": np.array(q),
+                    "A": (np.asarray(A.todense()) if spa.issparse(A)
+                          else np.array(A)),
+                    "lo": np.array(lo), "hi": np.array(hi)})
         # OSQP returns garbage (huge) x on infeasibility: never trust it
         if x is None or not np.isfinite(x).all() or np.abs(x).max() > 1e6 or "infeasible" in status:
             return None, status
         return x, status
+
+    def _frame_qp_settings(self, ctx: FrameContext) -> OsqpSettings | None:
+        """Solver settings for THIS frame's QPs (train24fix3 plan 6.1).
+
+        ``None`` keeps the ``RepairConfig.osqp_*`` defaults (N0). The
+        attached profile's settings apply ONLY when the run is regen with
+        C2 armed AND at least one side's rows are active at this frame;
+        every other frame (standard mode, approach/pull-in, C2 disabled)
+        solves under the N0 settings. The decision reads the frame's
+        enable state ONLY -- never a failed candidate -- so it cannot
+        update C2 state.
+        """
+        prof = self.c2_profile
+        if prof is None or not self.cfg.regen_mode \
+                or self.cfg.regen_hand_speed_mps <= 0.0:
+            return None
+        if any(hand_speed_rows_active(self.cfg, ctx, side) for side in ("l", "r")):
+            return prof.solver
+        return None
+
+    @staticmethod
+    def _trace_objective_parts(res: dict) -> dict:
+        def _sq(r):
+            if r is None:
+                return None
+            r = np.asarray(r)
+            return float((r ** 2).sum()) if r.size else 0.0
+
+        return {"pred_sq": _sq(res["r_pred"]), "temp_sq": _sq(res["r_temp"]),
+                "mesh_sq": _sq(res["r_mesh"]), "hand_sq": _sq(res["r_hand"]),
+                "stab_sq": _sq(res["r_stab"]), "mpjpe": float(res["mpjpe"])}
+
+    def _trace_viol_blocks(self, val, lo, hi, scl) -> dict:
+        """Normalized violation sum per layout block (pre / collision /
+        post / probe) -- the same per-row formula as :meth:`violation`,
+        split so the trace shows which family carries the residual."""
+        val, lo, hi, scl = (np.asarray(a, dtype=float)
+                            for a in (val, lo, hi, scl))
+        n = len(val)
+        n_probe = len(self.last_probe_rows)
+        n_col = n - N_FIXED - N_POST_ROWS - n_probe
+        v = np.maximum(np.maximum(lo - val, val - hi), 0.0) / scl
+        finite = (np.abs(lo) < INF / 2) | (np.abs(hi) < INF / 2)
+        v = np.where(finite, v, 0.0)
+        c0 = N_FIXED + max(n_col, 0)
+        return {"pre": float(v[:N_FIXED].sum()),
+                "collision": float(v[N_FIXED:c0].sum()),
+                "post": float(v[c0:c0 + N_POST_ROWS].sum()),
+                "probe": float(v[c0 + N_POST_ROWS:].sum()),
+                "n_rows": [int(N_FIXED), int(max(n_col, 0)), int(N_POST_ROWS),
+                           int(n_probe)]}
 
     # -- success review ------------------------------------------------------
 
@@ -1642,143 +1785,272 @@ class FrameSolver:
         last_viol, last_names = 0.0, []
         last_qp_status = ""
         review = {}
+        # train24fix3 (plan 6.1): THIS frame's OSQP settings -- the attached
+        # profile's only when the frame carries active C2 rows, else None
+        # (= the RepairConfig osqp_* defaults, the frozen N0 behaviour)
+        settings = self._frame_qp_settings(ctx)
+        # train24fix3 (plan 5.1): OFF by default. When self.trace is a dict,
+        # every attempt of this frame appends a full record (iterations,
+        # QP solves, line search, exit evidence); solve_qp appends to
+        # self.qp_trace, which points at the CURRENT attempt's list. Pure
+        # read-out: with self.trace None the control flow is unchanged.
+        attempt_trace: dict | None = None
+        it_rec: dict | None = None
+        if self.trace is not None:
+            attempt_trace = {
+                "force_slack": bool(force_slack),
+                "used_settings": (None if settings is None
+                                  else asdict(settings)),
+                "c2_sides": [s for s in ("l", "r")
+                             if hand_speed_rows_active(cfg, ctx, s)],
+                "mu": float(mu), "iter_budget": 0,
+                "iterations": [], "qp": [], "qp_arrays": [],
+                "exit": None}
+            self.trace.setdefault("attempts", []).append(attempt_trace)
+            self.qp_trace = attempt_trace["qp"]
+            self.qp_trace_arrays = attempt_trace["qp_arrays"]
+        try:
+            # once the tight QP proves infeasible for this frame, stay in
+            # restoration mode (re-trying the tight solve each iteration doubles
+            # the cost without new information)
+            restoration = force_slack
+            max_iters = cfg.scp_max_iters + (cfg.scp_extra_restoration_iters if force_slack else 0)
+            if attempt_trace is not None:
+                attempt_trace["iter_budget"] = int(max_iters)
+            # full registry scan for this frame's first linearization; carried
+            # extras from previous attempts (``_extra_pairs``) are merged in. The
+            # probe cache of the PREVIOUS attempt belongs to a different
+            # linearization program and is dropped too (R3); the frame switch
+            # drops it via ``clear_probe_pairs``.
+            self._frame_pairs = None
+            self._refresh_counter = 0
+            self._probe_cache = None
+            # review R4: the loop-exit cause is recorded verbatim; it separates
+            # "no acceptable step / trust collapsed below trust_radius_min" from
+            # "budget exhausted" -- the historical status label cannot
+            term_reason = ""
+            for it in range(max_iters):
+                it_done = it + 1
+                res = self.evaluate(z, ctx)
+                # feasibility/merit are judged against ACCEPTANCE bounds; the
+                # proactive +2mm clearance lives only inside the QP rows
+                val, lo, hi, scl = self.constraint_rows(z, ctx, trust, mode="accept")
+                viol = self.violation(val, lo, hi, scl)
+                last_viol = viol
+                if viol <= 1e-6:
+                    last_names = []
+                else:
+                    # descriptors are parallel to the FULL nonlinear value array
+                    # (pre + collision + post + probe); the old extraction skipped
+                    # the 96 post rows, mislabelling every probe row and losing
+                    # the real probe violations (R7)
+                    names_all, ids_all = self.row_descriptors()
+                    if len(names_all) != len(val):
+                        raise RuntimeError(
+                            f"row descriptors out of sync with the value array "
+                            f"({len(names_all)} vs {len(val)})")
+                    last_names, _ids, _recs = self._violating(val, lo, hi, names_all, ids_all)
+                merit = self.objective(res) + mu * viol
+                feasible = viol <= 1e-6
+                if feasible and merit < best_merit:
+                    best_z, best_merit, best_feasible = z.copy(), merit, True
+                if attempt_trace is not None:
+                    it_rec = {
+                        "it": it, "trust": float(trust),
+                        "restoration": bool(restoration),
+                        "z": z.copy(),
+                        "merit": float(merit), "viol": float(viol),
+                        "objective": self._trace_objective_parts(res),
+                        "viol_blocks": self._trace_viol_blocks(val, lo, hi, scl),
+                        "violated_rows": list(last_names),
+                        "hand_speed": {s: dict(v) for s, v in
+                                       self.last_hand_speed.items()},
+                        "feasible": bool(feasible),
+                        "best_merit": (float(best_merit)
+                                       if best_feasible else None),
+                        "qp_from": len(attempt_trace["qp"]),
+                        "line_search": [], "trust_after": None,
+                        "early_exit": None}
+                    attempt_trace["iterations"].append(it_rec)
+                if feasible and res["mpjpe"] <= cfg.task_mpjpe_tol_m and self._stationary(z, ctx):
+                    # stage 1 + F1: a candidate could satisfy the budgeted rows
+                    # while violating a pair they could not carry. EVERY success
+                    # exit runs the uncapped full-registry review; a failure does
+                    # NOT return -- it invalidates this best and feeds the
+                    # discovered pairs into the next linearization.
+                    ok, info = self.success_review(z, ctx)
+                    review = info
+                    if ok:
+                        if it_rec is not None:
+                            it_rec["early_exit"] = "converged_review_passed"
+                            it_rec["trust_after"] = float(trust)
+                        if attempt_trace is not None:
+                            attempt_trace["exit"] = {
+                                "accepted": True, "status": "solved",
+                                "term_reason": "converged",
+                                "it_done": int(it_done),
+                                "qp_calls": int(qp_calls),
+                                "trust": float(trust),
+                                "used_slack": bool(used_slack)}
+                        return self._result(True, z, it_done, used_slack, merit,
+                                            qp_calls, trust, last_viol, last_names,
+                                            qp_status=last_qp_status,
+                                            term_reason="converged",
+                                            iter_budget=max_iters)
+                    if it_rec is not None:
+                        it_rec["early_exit"] = "review_failed_candidate_invalidated"
+                    if best_z is not None and np.array_equal(best_z, z):
+                        best_z, best_merit, best_feasible = None, float("inf"), False
 
-        # once the tight QP proves infeasible for this frame, stay in
-        # restoration mode (re-trying the tight solve each iteration doubles
-        # the cost without new information)
-        restoration = force_slack
-        max_iters = cfg.scp_max_iters + (cfg.scp_extra_restoration_iters if force_slack else 0)
-        # full registry scan for this frame's first linearization; carried
-        # extras from previous attempts (``_extra_pairs``) are merged in. The
-        # probe cache of the PREVIOUS attempt belongs to a different
-        # linearization program and is dropped too (R3); the frame switch
-        # drops it via ``clear_probe_pairs``.
-        self._frame_pairs = None
-        self._refresh_counter = 0
-        self._probe_cache = None
-        # review R4: the loop-exit cause is recorded verbatim; it separates
-        # "no acceptable step / trust collapsed below trust_radius_min" from
-        # "budget exhausted" -- the historical status label cannot
-        term_reason = ""
-        for it in range(max_iters):
-            it_done = it + 1
-            res = self.evaluate(z, ctx)
-            # feasibility/merit are judged against ACCEPTANCE bounds; the
-            # proactive +2mm clearance lives only inside the QP rows
-            val, lo, hi, scl = self.constraint_rows(z, ctx, trust, mode="accept")
-            viol = self.violation(val, lo, hi, scl)
-            last_viol = viol
-            if viol <= 1e-6:
-                last_names = []
-            else:
-                # descriptors are parallel to the FULL nonlinear value array
-                # (pre + collision + post + probe); the old extraction skipped
-                # the 96 post rows, mislabelling every probe row and losing
-                # the real probe violations (R7)
-                names_all, ids_all = self.row_descriptors()
-                if len(names_all) != len(val):
-                    raise RuntimeError(
-                        f"row descriptors out of sync with the value array "
-                        f"({len(names_all)} vs {len(val)})")
-                last_names, _ids, _recs = self._violating(val, lo, hi, names_all, ids_all)
-            merit = self.objective(res) + mu * viol
-            feasible = viol <= 1e-6
-            if feasible and merit < best_merit:
-                best_z, best_merit, best_feasible = z.copy(), merit, True
-            if feasible and res["mpjpe"] <= cfg.task_mpjpe_tol_m and self._stationary(z, ctx):
-                # stage 1 + F1: a candidate could satisfy the budgeted rows
-                # while violating a pair they could not carry. EVERY success
-                # exit runs the uncapped full-registry review; a failure does
-                # NOT return -- it invalidates this best and feeds the
-                # discovered pairs into the next linearization.
-                ok, info = self.success_review(z, ctx)
-                review = info
-                if ok:
-                    return self._result(True, z, it_done, used_slack, merit,
-                                        qp_calls, trust, last_viol, last_names,
-                                        qp_status=last_qp_status,
-                                        term_reason="converged",
-                                        iter_budget=max_iters)
-                if best_z is not None and np.array_equal(best_z, z):
-                    best_z, best_merit, best_feasible = None, float("inf"), False
+                if restoration:
+                    (Ps, qs, As, los, his), _ = self.build_qp(z, ctx, trust, slack=True)
+                    qp_calls += 1
+                    x_s, last_qp_status = self.solve_qp(Ps, qs, As, los, his,
+                                                        settings=settings)
+                    if attempt_trace is not None and len(attempt_trace["qp"]):
+                        qp_rec = attempt_trace["qp"][-1]
+                        qp_rec["branch"] = "restoration"
+                        qp_rec["rows_n"] = int(As.shape[0])
+                        if "qp_row_names" not in attempt_trace:
+                            attempt_trace["qp_row_names"] = self._qp_row_names(
+                                int(As.shape[0]))
+                        qp_rec["slack"] = (None if x_s is None else {
+                            "values": [float(v) for v in x_s[N_TANGENT:]],
+                            "negative": int((np.asarray(x_s[N_TANGENT:]) < 0).sum()),
+                            "nonfinite": int((~np.isfinite(
+                                np.asarray(x_s[N_TANGENT:]))).sum()),
+                            "rows": (dict(self.last_slack_rows)
+                                     if self.last_slack_rows else None)})
+                    if x_s is None:
+                        trust *= cfg.shrink_factor
+                        if it_rec is not None:
+                            it_rec["trust_after"] = float(trust)
+                            it_rec["qp_failed"] = True
+                        if trust < cfg.trust_radius_min:
+                            term_reason = "restoration_qp_failed_trust_min"
+                            break
+                        continue
+                    used_slack = True
+                    xi = x_s[:N_TANGENT]
+                else:
+                    (P, qv, A, lo_a, hi_a), _ = self.build_qp(z, ctx, trust, slack=False)
+                    qp_calls += 1
+                    xi, last_qp_status = self.solve_qp(P, qv, A, lo_a, hi_a,
+                                                       settings=settings)
+                    if attempt_trace is not None and len(attempt_trace["qp"]):
+                        qp_rec = attempt_trace["qp"][-1]
+                        qp_rec["branch"] = "tight"
+                        qp_rec["rows_n"] = int(A.shape[0])
+                        if "qp_row_names" not in attempt_trace:
+                            attempt_trace["qp_row_names"] = self._qp_row_names(
+                                int(A.shape[0]))
+                    if xi is None:
+                        restoration = True
+                        if it_rec is not None:
+                            it_rec["qp_failed"] = True
+                            it_rec["restoration_switch"] = True
+                        continue
+                xi_raw = xi
+                xi = np.clip(xi, -trust * self.D, trust * self.D)
+                if it_rec is not None:
+                    it_rec["xi_raw"] = xi_raw.copy()
+                    it_rec["xi_clipped"] = xi.copy()
 
-            if restoration:
-                (Ps, qs, As, los, his), _ = self.build_qp(z, ctx, trust, slack=True)
-                qp_calls += 1
-                x_s, last_qp_status = self.solve_qp(Ps, qs, As, los, his)
-                if x_s is None:
-                    trust *= cfg.shrink_factor
-                    if trust < cfg.trust_radius_min:
-                        term_reason = "restoration_qp_failed_trust_min"
+                # backtracking line search: deep-penetration linearizations can
+                # mispredict, and a full step may increase the true violation
+                accepted_step = False
+                for step_scale in (1.0, 0.5, 0.25, 0.125):
+                    cand = retract_batch(self.ev.model, z[None], (step_scale * xi)[None])[0]
+                    res_c = self.evaluate(cand, ctx)
+                    val_c, lo_c, hi_c, scl_c = self.constraint_rows(cand, ctx, trust, mode="accept")
+                    merit_c = self.objective(res_c) + mu * self.violation(val_c, lo_c, hi_c, scl_c)
+                    if it_rec is not None:
+                        it_rec["line_search"].append(
+                            {"scale": float(step_scale),
+                             "merit_c": float(merit_c),
+                             "viol_c": float(self.violation(val_c, lo_c, hi_c, scl_c)),
+                             "mpjpe_c": float(res_c["mpjpe"]),
+                             "accepted": False})
+                    if merit_c < merit:
+                        z = cand
+                        accepted_step = True
+                        if it_rec is not None:
+                            it_rec["line_search"][-1]["accepted"] = True
+                        # stage 1: the step may have carried the state near pairs
+                        # outside the frozen candidate set; schedule a partial
+                        # refresh (fast families + carried extras) so later
+                        # linearizations see them. The uncapped success review
+                        # remains the correctness gate.
+                        self._refresh_counter += 1
+                        if merit_c < 0.5 * merit:
+                            trust = min(cfg.trust_radius_max, trust * cfg.expand_factor)
                         break
-                    continue
-                used_slack = True
-                xi = x_s[:N_TANGENT]
-            else:
-                (P, qv, A, lo_a, hi_a), _ = self.build_qp(z, ctx, trust, slack=False)
-                qp_calls += 1
-                xi, last_qp_status = self.solve_qp(P, qv, A, lo_a, hi_a)
-                if xi is None:
-                    restoration = True
-                    continue
-            xi = np.clip(xi, -trust * self.D, trust * self.D)
+                if it_rec is not None:
+                    it_rec["trust_after"] = float(trust)
+                    it_rec["z_next"] = z.copy()
+                if not accepted_step:
+                    trust *= cfg.shrink_factor
+                    if it_rec is not None:
+                        it_rec["trust_after"] = float(trust)
+                        it_rec["step_rejected"] = True
+                    if trust < cfg.trust_radius_min:
+                        term_reason = "no_merit_step_trust_min"
+                        break
 
-            # backtracking line search: deep-penetration linearizations can
-            # mispredict, and a full step may increase the true violation
-            accepted_step = False
-            for step_scale in (1.0, 0.5, 0.25, 0.125):
-                cand = retract_batch(self.ev.model, z[None], (step_scale * xi)[None])[0]
-                res_c = self.evaluate(cand, ctx)
-                val_c, lo_c, hi_c, scl_c = self.constraint_rows(cand, ctx, trust, mode="accept")
-                merit_c = self.objective(res_c) + mu * self.violation(val_c, lo_c, hi_c, scl_c)
-                if merit_c < merit:
-                    z = cand
-                    accepted_step = True
-                    # stage 1: the step may have carried the state near pairs
-                    # outside the frozen candidate set; schedule a partial
-                    # refresh (fast families + carried extras) so later
-                    # linearizations see them. The uncapped success review
-                    # remains the correctness gate.
-                    self._refresh_counter += 1
-                    if merit_c < 0.5 * merit:
-                        trust = min(cfg.trust_radius_max, trust * cfg.expand_factor)
-                    break
-            if not accepted_step:
-                trust *= cfg.shrink_factor
-                if trust < cfg.trust_radius_min:
-                    term_reason = "no_merit_step_trust_min"
-                    break
-
-        # budget exhausted / trust collapsed: report the ACTUAL iteration
-        # count and slack usage (the old hardcoded ``scp_max_iters`` hid
-        # early-exit branches and misreported slack on restoration exits;
-        # stage 0, 2026-09-16). The historical best gets the SAME review as
-        # the early return (F1): if the fresh scan exposes a violation, it is
-        # explicitly rejected instead of being handed back unchecked.
-        term_reason = term_reason or "budget_exhausted"
-        if best_feasible:
-            res = self.evaluate(best_z, ctx)
-            if res["mpjpe"] > cfg.task_mpjpe_tol_m:
-                return self._result(False, best_z, it_done, used_slack, best_merit,
+            # budget exhausted / trust collapsed: report the ACTUAL iteration
+            # count and slack usage (the old hardcoded ``scp_max_iters`` hid
+            # early-exit branches and misreported slack on restoration exits;
+            # stage 0, 2026-09-16). The historical best gets the SAME review as
+            # the early return (F1): if the fresh scan exposes a violation, it is
+            # explicitly rejected instead of being handed back unchecked.
+            term_reason = term_reason or "budget_exhausted"
+            if attempt_trace is not None:
+                attempt_trace["exit"] = {
+                    "accepted": None, "term_reason": term_reason,
+                    "it_done": int(it_done), "qp_calls": int(qp_calls),
+                    "trust": float(trust), "used_slack": bool(used_slack)}
+            if best_feasible:
+                res = self.evaluate(best_z, ctx)
+                if res["mpjpe"] > cfg.task_mpjpe_tol_m:
+                    if attempt_trace is not None:
+                        attempt_trace["exit"].update(
+                            {"accepted": False, "status": "task_quality"})
+                    return self._result(False, best_z, it_done, used_slack, best_merit,
+                                        qp_calls, trust, last_viol, last_names,
+                                        status="task_quality", qp_status=last_qp_status,
+                                        term_reason=term_reason, iter_budget=max_iters)
+                ok, info = self.success_review(best_z, ctx)
+                review = info
+                if not ok:
+                    if attempt_trace is not None:
+                        attempt_trace["exit"].update(
+                            {"accepted": False, "status": "review_failed"})
+                    return self._result(False, best_z, it_done, used_slack, best_merit,
+                                        qp_calls, trust, last_viol, last_names,
+                                        status="review_failed", review=info,
+                                        qp_status=last_qp_status,
+                                        term_reason=term_reason, iter_budget=max_iters)
+                if attempt_trace is not None:
+                    attempt_trace["exit"].update(
+                        {"accepted": True, "status": "solved"})
+                return self._result(True, best_z, it_done, used_slack, best_merit,
                                     qp_calls, trust, last_viol, last_names,
-                                    status="task_quality", qp_status=last_qp_status,
-                                    term_reason=term_reason, iter_budget=max_iters)
-            ok, info = self.success_review(best_z, ctx)
-            review = info
-            if not ok:
-                return self._result(False, best_z, it_done, used_slack, best_merit,
-                                    qp_calls, trust, last_viol, last_names,
-                                    status="review_failed", review=info,
                                     qp_status=last_qp_status,
                                     term_reason=term_reason, iter_budget=max_iters)
-            return self._result(True, best_z, it_done, used_slack, best_merit,
-                                qp_calls, trust, last_viol, last_names,
-                                qp_status=last_qp_status,
+            if attempt_trace is not None:
+                attempt_trace["exit"].update(
+                    {"accepted": False, "status": "infeasible"})
+            return self._result(False, z, it_done, used_slack, float("inf"), qp_calls,
+                                trust, last_viol, last_names, status="infeasible",
+                                review=review, qp_status=last_qp_status,
                                 term_reason=term_reason, iter_budget=max_iters)
-        return self._result(False, z, it_done, used_slack, float("inf"), qp_calls,
-                            trust, last_viol, last_names, status="infeasible",
-                            review=review, qp_status=last_qp_status,
-                            term_reason=term_reason, iter_budget=max_iters)
+        finally:
+            if attempt_trace is not None:
+                # the trace pointers belong to THIS attempt only; a later
+                # standalone solve_qp must not write into a finished record
+                self.qp_trace = None
+                self.qp_trace_arrays = None
+                self.last_slack_rows = None
 
     def _result(self, accepted, z, it_done, used_slack, merit, qp_calls, trust,
                 last_viol, last_names, status=None, review=None,

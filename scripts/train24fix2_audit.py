@@ -673,15 +673,37 @@ def attach_integrity(record: dict, cfg, vcfg) -> None:
     record["integrity"] = {"files": integrity_manifest()}
 
 
+#: solver fields added by train24fix3 (plan 4.1 task 3). v2 products
+#: predate them, so the ONLY legal backfill is the registered N0 defaults
+#: -- never the currently selected profile's values (plan section 7.2).
+_SOLVER_FIELDS_N0 = {"osqp_polish": False, "osqp_eps_abs": 3e-5,
+                     "osqp_eps_rel": 3e-5, "osqp_max_iter": 2500,
+                     "osqp_scaling": 10}
+
+
 def configs_from_record(record: dict, *, key: str = "repair"):
     """Rebuild the (frozen) effective configs stored in a product -- the
     replay's ONLY config source.  ``key`` selects an extra stored repair
-    variant (e.g. ``repair_no_c2``) when present, defaulting to ``repair``."""
+    variant (e.g. ``repair_no_c2``) when present, defaulting to ``repair``.
+
+    v2 records predate the train24fix3 solver fields: missing keys are
+    backfilled with the REGISTERED N0 defaults for the round-trip check
+    (the frozen payload itself stays verbatim and its old fields must
+    match exactly); a v2 record whose new fields carry anything but the
+    N0 values is rejected -- v2 code cannot have produced profile values.
+    """
     eff = record["effective"]
     payload = json.loads(json.dumps(eff[key]))
     vpayload = json.loads(json.dumps(eff["validation"]))
+    carried = {k: payload[k] for k in _SOLVER_FIELDS_N0 if k in payload}
+    if record.get("format") == AUDIT_FORMAT and any(
+            carried[k] != _SOLVER_FIELDS_N0[k] for k in carried):
+        raise ValueError(
+            "v2 record carries non-N0 train24fix3 solver fields -- not "
+            "producible by v2 code; refusing to interpret")
+    extra = {k: v for k, v in _SOLVER_FIELDS_N0.items() if k not in payload}
     cfg, vcfg = RepairConfig(**payload), ValidationConfig(**vpayload)
-    if json.loads(json.dumps(asdict(cfg))) != payload or \
+    if json.loads(json.dumps(asdict(cfg))) != {**extra, **payload} or \
             json.loads(json.dumps(asdict(vcfg))) != vpayload:
         raise ValueError("frozen effective config does not round-trip")
     return cfg, vcfg

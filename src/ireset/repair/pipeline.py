@@ -350,12 +350,17 @@ def cost_view(passes: list[PassRecord], input_frames: int, *,
 
 
 class RepairPipeline:
-    def __init__(self, spec: G1Spec | None = None, cfg: RepairConfig | None = None) -> None:
+    def __init__(self, spec: G1Spec | None = None, cfg: RepairConfig | None = None,
+                 c2_profile=None) -> None:
         self.cfg = cfg or RepairConfig()
         self.spec = spec or G1Spec()
         self.pairs = build_collision_pairs(self.spec, scene=True)
         self.ev = FrameEvaluator(self.spec, self.pairs, self.cfg)
         self.solver = FrameSolver(self.ev, self.cfg)
+        # train24fix3 (plan 4.1 task 3): a C2 profile, when attached, gates
+        # the solver settings of C2-ACTIVE frames and the C2 row handling
+        # inside build_qp. None everywhere = the frozen N0 behaviour.
+        self.solver.c2_profile = c2_profile
         self.validator = IndependentValidator(spec=self.spec)
         self._surf_pts: np.ndarray | None = None
         self._ground_pts: np.ndarray | None = None

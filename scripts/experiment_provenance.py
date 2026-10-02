@@ -98,13 +98,17 @@ def git_state() -> dict:
 def effective_record(rcfg, vcfg, *, argv, mode: str, validation_mode: str,
                      demos: list[str], frames: int, note: str | None = None,
                      task_gate_yaml: str | None = None,
-                     screening: dict | None = None) -> dict:
+                     screening: dict | None = None,
+                     profile: dict | None = None) -> dict:
     """Effective configuration of ONE run instance, after every override.
 
     Round-trips both configs through JSON before exporting them, records the
     task-gate YAML path AND hash, and keeps the default dataclasses under
     explicit ``default_*`` keys plus an ``is_default_*`` flag -- a default
     value must never be presented as the instance's effective parameter (R9).
+    ``profile`` (train24fix3) freezes the resolved profile and the registry
+    hash alongside the argv, so a run's solver-behaviour changes are
+    attributable to an exact registry revision.
     """
     config_roundtrip(rcfg)
     config_roundtrip(vcfg)
@@ -128,6 +132,7 @@ def effective_record(rcfg, vcfg, *, argv, mode: str, validation_mode: str,
         "default_validation_config": asdict(ValidationConfig()),
         "is_default_repair_config": RepairConfig() == rcfg,
         "is_default_validation_config": ValidationConfig() == vcfg,
+        "profile": profile,
     }
     return rec
 

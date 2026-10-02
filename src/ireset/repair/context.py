@@ -159,6 +159,18 @@ class RepairConfig:
     # changes during approach; the interval-scoped enable exempts pull-in
     # and the certification-compatible bound addresses the chatter.
     regen_hand_speed_mps: float = 0.02598
+    # OSQP setup (train24fix3 plan section 4.1 task 3): the values
+    # ``FrameSolver.solve_qp`` historically hard-coded in ``prob.setup``,
+    # now configurable. The defaults ARE the frozen N0 behaviour (polish
+    # off, eps 3e-5, 2500 iterations, internal scaling 10); a train24fix3
+    # profile may override them ONLY on frames whose C2 rows are active
+    # (``FrameSolver._frame_qp_settings``) -- standard mode, approach
+    # frames and C2-off runs always solve under these defaults.
+    osqp_polish: bool = False
+    osqp_eps_abs: float = 3e-5
+    osqp_eps_rel: float = 3e-5
+    osqp_max_iter: int = 2500
+    osqp_scaling: int = 10
     # regeneration does NOT lock hand point anchors: a +-10mm box-frame
     # anchor under box rotation is repeatedly tipped out by the
     # hover-tracking objective (marginal 0.1-1mm infeasibilities). Contact

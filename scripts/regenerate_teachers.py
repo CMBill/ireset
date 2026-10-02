@@ -266,6 +266,14 @@ def main() -> None:
                     help="grasp-stability soft-target weight (F4 section 7.2); "
                          "pre-registered comparison: 0 / 0.1 / 1.0. Default: "
                          "the config value (0.0)")
+    ap.add_argument("--profile", type=str, default=None,
+                    help="train24fix3 profile name (configs/repair/"
+                         "train24fix3_profiles.yaml: N0-N3 numeric / S1-S2 "
+                         "norm candidates). Regenerates the resolved profile "
+                         "and registry hash into the effective record; the "
+                         "solver settings apply ONLY to C2-active frames "
+                         "(plan section 6.1). regen mode only -- standard "
+                         "mode must stay profile-free")
     ap.add_argument("--verbose", action="store_true",
                     help="per-frame hand_dist / corridor_upper / probe details "
                          "(printed summary + full frame_log in the report rows)")
@@ -297,7 +305,32 @@ def main() -> None:
     regen_cfg = replace(rcfg, regen_mode=(args.mode == "regen"))
     if args.stab_weight is not None:
         regen_cfg = replace(regen_cfg, regen_hand_stab_weight=args.stab_weight)
-    pipe = RepairPipeline(cfg=regen_cfg)
+    profile = None
+    profile_record = None
+    if args.profile:
+        if args.mode != "regen":
+            raise ValueError(
+                "--profile applies to regen mode only: the standard-mode "
+                "regression check must stay profile-free (plan section 3.1)")
+        from ireset.repair.profiles import (
+            get_profile,
+            profiles_yaml_sha256,
+        )
+
+        profile = get_profile(args.profile)
+        profile_record = {
+            "name": profile.name,
+            "registry_sha256": profiles_yaml_sha256(),
+            "resolved": profile.as_record(),
+            "note": "solver settings apply only to C2-active frames; the "
+                    "registry file is content-hashed into this record",
+        }
+        print(f"[profile] {profile.name}: solver={profile.solver}, "
+              f"c2_mode={profile.c2_mode}, "
+              f"precondition={profile.c2_row_precondition}, "
+              f"slack_penalty={profile.c2_slack_penalty}, "
+              f"norm={profile.c2_norm_speed_mps}")
+    pipe = RepairPipeline(cfg=regen_cfg, c2_profile=profile)
     pipe.validator.cfg = vcfg
     pipe.verbose = args.verbose
     validator = IndependentValidator(cfg=vcfg)
@@ -318,6 +351,7 @@ def main() -> None:
         pipe.cfg, pipe.validator.cfg, argv=sys.argv, mode=args.mode,
         validation_mode=args.validation_mode, demos=demos, frames=args.frames,
         note=args.note, task_gate_yaml=args.task_gate_yaml,
+        profile=profile_record,
         screening={"min_hand_recall": args.min_hand_recall,
                    "min_ref_frames": args.min_ref_frames,
                    "verbose": bool(args.verbose)})
@@ -490,6 +524,7 @@ def main() -> None:
         "set": args.set, "n_demos": len(demos), "n_kept": n_keep,
         "mode": args.mode,
         "validation_mode": args.validation_mode,
+        "profile": profile_record,
         "min_hand_recall": args.min_hand_recall,
         "min_ref_frames": args.min_ref_frames,
         "regen_config": reg_cfg_pub,
