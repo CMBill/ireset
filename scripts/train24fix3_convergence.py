@@ -559,6 +559,7 @@ def _write_norm_products(pdir: Path, stem: str, record: dict,
     current YAML."""
     import numpy as np
 
+    pdir.mkdir(parents=True, exist_ok=True)
     jpath, npath = pdir / f"cf_{stem}.json", pdir / f"cf_{stem}.npz"
     if jpath.exists() or npath.exists():
         raise FileExistsError(f"refusing to overwrite {jpath}")
