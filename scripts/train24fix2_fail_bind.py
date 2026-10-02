@@ -20,9 +20,9 @@ Review defects this rewrite removes (2026-10-01):
   of three bare ``_solve_attempt`` calls.
 
 Outputs (versioned JSON + NPZ, overwrite refused) go to
-``derived/data/teachers_regenerated/train24fix2_reviewfix2_20261002/diag/``
+``derived/data/teachers_regenerated/train24fix2_reviewfix3_20261002/diag/``
 by default -- NEVER the frozen ``train24fix2_20260927_diag/`` nor the
-superseded ``train24fix2_reviewfix_20261001/diag/``.
+superseded ``train24fix2_reviewfix_20261001`` / ``..._20261002`` trees.
 
 Reviewfix2 (2026-10-02) hardening of THIS tool:
 
@@ -79,6 +79,7 @@ from train24fix2_audit import (
     escalate_frame,
     freeze_context,
     full_candidate_audit,
+    integrity_manifest,
     load_index,
     load_products,
     verify_integrity,
@@ -88,7 +89,7 @@ from train24fix2_audit import (
 
 REGEN = DERIVED_DATA_DIR / "teachers_regenerated"
 DEFAULT_RQ = REGEN / "train24fix2_20260927_sixseg" / "rq"
-DEFAULT_OUT = REGEN / "train24fix2_reviewfix2_20261002" / "diag"
+DEFAULT_OUT = REGEN / "train24fix2_reviewfix3_20261002" / "diag"
 INDEX_NAME = "fail_bind2_index"
 
 
@@ -357,13 +358,14 @@ def replay(out: Path, replay_dir: Path) -> dict:
     ``replay_dir`` -- never the products directory."""
     idx = load_index(out, INDEX_NAME)
     replay_dir.mkdir(parents=True, exist_ok=True)
+    live_manifest = integrity_manifest()      # fresh, re-read from disk (G4)
     results: dict = {}
     ok = True
     for stem in idx["stems"]:
         record, arrays = load_products(out, stem)
         entry: dict = {"stem": stem}
         results[stem] = entry
-        integrity = verify_integrity(record)
+        integrity = verify_integrity(record, live_manifest=live_manifest)
         entry["integrity_ok"] = not integrity
         entry["integrity_mismatches"] = integrity[:20]
         if "audits" not in record:
@@ -441,6 +443,10 @@ def replay(out: Path, replay_dir: Path) -> dict:
                        and entry["classification_matches"]
                        and entry["integrity_ok"])
         ok = ok and entry["ok"]
+    # G1: the processed count is part of the verdict -- an index/product
+    # mismatch can never shrink the replay to "0 records ALL MATCH"
+    if len(results) != len(idx["stems"]):
+        ok = False
     summary = {"ok": ok, "n": len(results),
                "expected": len(idx["stems"]),
                "recompute_scope": ("audits (all rows/interpolation points/"
@@ -461,8 +467,9 @@ def main() -> None:
     ap.add_argument("--rq-dir", default=str(DEFAULT_RQ),
                     help="formal six-segment rq report dir (read-only)")
     ap.add_argument("--out", default=str(DEFAULT_OUT),
-                    help="output diag dir (default: the reviewfix2 20261002 "
-                         "dir; never the frozen or superseded earlier ones)")
+                    help="output diag dir (default: the reviewfix3 20261002 "
+                         "dir; the frozen and superseded earlier ones are "
+                         "read-only)")
     ap.add_argument("--demos", nargs="*", default=None)
     ap.add_argument("--replay", action="store_true",
                     help="strict replay from the index into a SEPARATE "

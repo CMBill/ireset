@@ -371,14 +371,13 @@ def test_prev_scene_flags_per_side_at_t() -> None:
     assert prev_scene_flags(None, 3) == {"l": None, "r": None}
 
 
-def test_counterfactual_per_side_freeze_and_replay_crosscheck(tmp_path) -> None:
-    """End-to-end D3: a real counterfactual on a tiny accepted chain
-    freezes BOTH sides' ``[t]`` distances; the strict replay reproduces
-    everything from the frozen product (ALL MATCH), and tampering the
-    per-side distance field is caught by the fresh-query cross-check
-    against the hash-verified source NPZ."""
+def _build_cf_product(tmp_path: Path) -> tuple[Path, str, dict]:
+    """Tiny counterfactual product + index (shared by the reviewfix2 D3 and
+    the reviewfix3 G2 replay tests): a 3-frame pre-C2 chain with the box
+    9.5 mm from the left hand, one cf record at t=1 with a teacher-layout
+    source NPZ, written under ``tmp_path/cf``."""
     from test_band_floor_separation import _place_box
-    from train24fix2_audit import load_products, write_products
+    from train24fix2_audit import write_products
     import train24fix2_cert_trace as ct
 
     rcfg, vcfg = load_mode_configs("strict")
@@ -394,11 +393,6 @@ def test_counterfactual_per_side_freeze_and_replay_crosscheck(tmp_path) -> None:
 
     prev = ct.prev_scene_distances(rq_traj)
     t = 1
-    assert prev["l"]["scene"][t] is not None
-    # the per-frame helper agrees with the full-series computation
-    at = ct.prev_scene_distances_at(rq_traj, t)
-    assert at == {s: prev[s]["scene"][t] for s in ("l", "r")}
-
     chain = ct.ChainReplay(cond, scene, rq_traj, rcfg, vcfg)
     c2_state = {s: {"enabled": [False, True], "reason": ["off", "enable"]}
                 for s in ("l", "r")}
@@ -419,18 +413,35 @@ def test_counterfactual_per_side_freeze_and_replay_crosscheck(tmp_path) -> None:
         chain, t, rq_traj[t, 0:36].copy(), "current_rq_adopted_spike[l]",
         c2_state, "l", prev, prev_source, rq_traj, scene,
         pipe.spec, rcfg, vcfg)
-    both = rec["prev_scene_dist_both_m"]
-    assert both["l"] == prev["l"]["scene"][t]
-    assert both["r"] == prev["r"]["scene"][t]
-    assert rec["prev_scene_dist_flags"] == both          # ctx flags too
-    assert rec["prev_scene_dist_m"] == both["l"]         # selected side
-
     out = tmp_path / "cf"
     stem = "cert_trace_cf_tiny_t1_l_spike"
     write_products(out, stem, rec, arrays)
     ct.write_index(out, ct.INDEX_NAME, {"records": [
         {"demo": "tiny", "side": "l", "kind": "spike", "frame": t,
          "stem": stem}], "stems": [stem]})
+    return out, stem, {"prev": prev, "t": t, "rec": rec}
+
+
+def test_counterfactual_per_side_freeze_and_replay_crosscheck(tmp_path) -> None:
+    """End-to-end D3: a real counterfactual on a tiny accepted chain
+    freezes BOTH sides' ``[t]`` distances; the strict replay reproduces
+    everything from the frozen product (ALL MATCH), and tampering the
+    per-side distance field is caught by the fresh-query cross-check
+    against the hash-verified source NPZ."""
+    import train24fix2_cert_trace as ct
+
+    out, stem, info = _build_cf_product(tmp_path)
+    prev, t, rec = info["prev"], info["t"], info["rec"]
+    both = rec["prev_scene_dist_both_m"]
+    assert prev["l"]["scene"][t] is not None
+    # the per-frame helper agrees with the full-series computation
+    assert ct.prev_scene_distances_at(_load_src_traj(rec), t) == \
+        {s: prev[s]["scene"][t] for s in ("l", "r")}
+    assert both["l"] == prev["l"]["scene"][t]
+    assert both["r"] == prev["r"]["scene"][t]
+    assert rec["prev_scene_dist_flags"] == both          # ctx flags too
+    assert rec["prev_scene_dist_m"] == both["l"]         # selected side
+
     replay_dir = tmp_path / "cf_replay"
     ct.replay_counterfactuals(out, replay_dir)
     s1 = json.loads((replay_dir / "cert_trace_cf_replay.json").read_text())
@@ -451,4 +462,11 @@ def test_counterfactual_per_side_freeze_and_replay_crosscheck(tmp_path) -> None:
                     .read_text())
     entry = s2["results"][stem]
     assert s2["ok"] is False
-    assert "l" in entry["prev_scene_check"], entry["prev_scene_check"]
+    assert any(k.endswith(":l") for k in entry["prev_scene_check"]), \
+        entry["prev_scene_check"]
+
+
+def _load_src_traj(rec: dict) -> np.ndarray:
+    from ireset.data.teacher import load_teacher_npz
+    traj, _h, _f = load_teacher_npz(Path(rec["prev_scene_source"]["npz"]))
+    return traj

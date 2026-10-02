@@ -46,7 +46,6 @@ Second review round (2026-10-02, reviewfix2) hardening:
 from __future__ import annotations
 
 import dataclasses
-import functools
 import json
 import math
 import sys
@@ -59,8 +58,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import numpy as np
 from scipy.sparse import csr_matrix, issparse
 
-from experiment_provenance import asset_hashes
-from ireset.paths import PROJECT_ROOT
+from ireset.paths import DERIVED_ROBOTS_DIR, PROJECT_ROOT
 from ireset.repair.constraints import FrameEvaluator
 from ireset.repair.context import RepairConfig
 from ireset.repair.pipeline import RepairPipeline, strict_joint_speeds
@@ -619,27 +617,49 @@ def json_safe(obj) -> str:
 # reviewfix2: frozen effective configs + integrity manifest (D4)
 # ---------------------------------------------------------------------------
 
-def _forensic_scripts() -> list[Path]:
+def _integrity_files() -> list[Path]:
+    """Every file the audits' COMPUTATION depends on: the ireset subpackages
+    the forensic chain actually imports (repair / geometry / kinematics /
+    embodied / data / imesh -- enumerated from the chain's real imports),
+    the forensic + provenance scripts, the mode configs, the locked derived
+    robot/scene assets AND the box collision mesh they reference under
+    resources/robots/largebox (reviewfix3 G3: the mesh IS a collision
+    dependency -- the locked scene XML references it directly)."""
     root = PROJECT_ROOT
-    files = sorted((root / "src" / "ireset" / "repair").glob("*.py"))
-    files += [root / "scripts" / f"train24fix2_{n}.py"
-              for n in ("audit", "fail_bind", "cert_trace")]
+    files: list[Path] = [root / "src" / "ireset" / "__init__.py",
+                         root / "src" / "ireset" / "paths.py"]
+    for sub in ("repair", "geometry", "kinematics", "embodied", "data",
+                "imesh"):
+        files += sorted((root / "src" / "ireset" / sub).glob("*.py"))
+    files += [root / "scripts" / f"{n}.py" for n in (
+        "train24fix2_audit", "train24fix2_fail_bind", "train24fix2_cert_trace",
+        "experiment_provenance", "closed_loop_metrics", "regenerate_teachers")]
     files += [root / "configs" / "repair" / "qp_default.yaml",
               root / "configs" / "eval" / "protocol.yaml"]
-    return [p for p in files if p.exists()]
+    # assets: the same locked set experiment_provenance.asset_hashes covers,
+    # plus the box mesh source directory -- hashed HERE with FULL digests
+    # (asset_hashes truncates to 16 hex; a mixed-length manifest is exactly
+    # the reviewfix3 G3 finding)
+    files += sorted(p for p in DERIVED_ROBOTS_DIR.rglob("*")
+                    if p.is_file() and "/assets/" in str(p))
+    files += [DERIVED_ROBOTS_DIR / n for n in
+              ("g1_29dof_locked.xml", "g1_29dof_locked_w_largebox.xml",
+               "g1_29dof_locked.urdf", "lock_record.json")]
+    files += sorted((root / "resources" / "robots" / "largebox").glob("*"))
+    return sorted({p for p in files if p.is_file()})
 
 
-@functools.lru_cache(maxsize=1)
 def integrity_manifest() -> dict[str, str]:
-    """sha256 of every code/config file that computes the audits plus the
-    locked robot/scene assets -- cached per process (the manifest is embedded
-    into every product; a replay recomputes it and REFUSES on drift)."""
+    """FULL sha256 of every integrity-relevant file -- recomputed from disk
+    on EVERY call (reviewfix3 G4: a process-level cache made verify see the
+    generation-time digests and miss later file changes)."""
     import hashlib
-    out = {str(p.relative_to(PROJECT_ROOT)):
-           hashlib.sha256(p.read_bytes()).hexdigest()
-           for p in _forensic_scripts()}
-    out.update(asset_hashes())
-    return out
+
+    def key(p: Path) -> str:
+        return str(p.relative_to(PROJECT_ROOT) if p.is_relative_to(PROJECT_ROOT)
+                   else p)
+    return {key(p): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in _integrity_files()}
 
 
 def attach_integrity(record: dict, cfg, vcfg) -> None:
@@ -667,15 +687,18 @@ def configs_from_record(record: dict, *, key: str = "repair"):
     return cfg, vcfg
 
 
-def verify_integrity(record: dict) -> list[str]:
+def verify_integrity(record: dict, *,
+                     live_manifest: dict | None = None) -> list[str]:
     """Drift of ANY hashed code/config/asset file between generation and
-    replay, as explicit messages (empty list = intact).  Integrity failure
-    means the recomputation below runs DIFFERENT code than the one that
-    produced the evidence -- the replay then reports, never passes."""
+    replay, as explicit messages (empty list = intact).  The live side is
+    RE-READ from disk (``integrity_manifest`` is uncached); a replay may
+    pass one fresh manifest per run.  Integrity failure means the
+    recomputation below runs DIFFERENT code than the one that produced the
+    evidence -- the replay then reports, never passes."""
     saved = (record.get("integrity") or {}).get("files") or {}
     if not saved:
         return ["record carries no integrity manifest"]
-    live = integrity_manifest()
+    live = integrity_manifest() if live_manifest is None else live_manifest
     out = []
     for k in sorted(set(saved) | set(live)):
         if k not in live:
@@ -764,7 +787,11 @@ def write_index(out_dir: Path, name: str, payload: dict) -> Path:
 def load_index(out_dir: Path, name: str) -> dict:
     """Load the generation-time candidate index; missing/foreign-format/
     EMPTY indexes are explicit errors -- an empty candidate set was judged
-    'ALL MATCH' by the glob-based replay (reviewfix2 D5)."""
+    'ALL MATCH' by the glob-based replay (reviewfix2 D5).  reviewfix3 G1:
+    when the index carries per-record ``records`` TOO, both views must be
+    non-empty, duplicate-free and set-equal -- an index that keeps 113
+    ``stems`` but empties ``records`` made the E replay process NOTHING and
+    still print ALL MATCH (n=0, expected=0)."""
     path = out_dir / f"{name}.json"
     if not path.exists():
         raise FileNotFoundError(
@@ -779,4 +806,24 @@ def load_index(out_dir: Path, name: str) -> dict:
     if not isinstance(stems, list) or not stems:
         raise ValueError(f"{path}: index lists no candidates -- refusing to "
                          f"replay an empty candidate set")
+    if len(set(stems)) != len(stems):
+        raise ValueError(f"{path}: duplicate stems in index "
+                         f"{[s for s in stems if stems.count(s) > 1]}")
+    records = idx.get("records")
+    if records is not None:
+        if not isinstance(records, list) or not records:
+            raise ValueError(f"{path}: index records empty while stems list "
+                             f"{len(stems)} -- the two views disagree, "
+                             f"refusing to replay 0 candidates")
+        rec_stems = [r.get("stem") if isinstance(r, dict) else None
+                     for r in records]
+        if any(s is None for s in rec_stems):
+            raise ValueError(f"{path}: index record without a stem")
+        if len(set(rec_stems)) != len(rec_stems):
+            raise ValueError(f"{path}: duplicate record stems in index")
+        if set(rec_stems) != set(stems):
+            raise ValueError(
+                f"{path}: index records and stems disagree "
+                f"(records-only={sorted(set(rec_stems) - set(stems))}, "
+                f"stems-only={sorted(set(stems) - set(rec_stems))})")
     return idx

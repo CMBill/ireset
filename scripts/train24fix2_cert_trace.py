@@ -36,8 +36,8 @@ gate, certified-frame component-bound statistics) BITWISE where the plan
 gives full precision; any mismatch aborts the freeze.
 
 Outputs (new files only) -> derived/data/teachers_regenerated/
-train24fix2_reviewfix2_20261002/diag/ (the frozen 20260927 diag and the
-superseded reviewfix 20261001 diag are read-only):
+train24fix2_reviewfix3_20261002/diag/ (the frozen 20260927 diag and the
+superseded reviewfix 20261001 / 20261002 trees are read-only):
   cert_trace_provenance.json      revision/configs/assets/inputs/H-B-T index
   cert_trace_{demo}_rq.json       per-frame series + C2 state + classification
   cert_trace_counterfactuals.json full-constraint counterfactual records
@@ -86,6 +86,7 @@ from train24fix2_audit import (
     deep_diff,
     freeze_context,
     full_candidate_audit,
+    integrity_manifest,
     load_index,
     load_products,
     verify_integrity,
@@ -108,10 +109,12 @@ DQ_JSON = REGEN / "train24fix_20260927_diag" / "dq_quality_baseline.json"
 #: review-fix round (2026-10-01): the frozen 20260927 diag directory is
 #: READ-ONLY; every product of this run goes to a fresh reviewfix directory
 #: and refuses to overwrite anything that already exists there.
-#: Reviewfix2 (2026-10-02): the 20261001 diag products carry the D3
-#: misaligned prev-scene field and the D2/D4/D5 weak replay contract -- they
-#: are SUPERSEDED by this round's directory, never overwritten
-OUT_DIR = REGEN / "train24fix2_reviewfix2_20261002" / "diag"
+#: Reviewfix2 (2026-10-02) superseded 20261001 (D3 field misalignment,
+#: D2/D4/D5 weak replay contract); reviewfix3 (same day, gaps G1-G4)
+#: supersedes 20261002 in turn -- its products embed the expanded integrity
+#: manifest (full digests, real dependency set, box mesh) and are replayed
+#: under the index/consistency/count and mandatory-source rules
+OUT_DIR = REGEN / "train24fix2_reviewfix3_20261002" / "diag"
 INDEX_NAME = "cert_trace_cf_index"
 PLAN_DOC = Path(__file__).resolve().parents[1] / "docs" / "plans" / \
     "train24fix2_certification_edge_plan.md"
@@ -795,27 +798,29 @@ def _interval_match(cls: dict, exp: dict) -> bool:
 # ---------------------------------------------------------------------------
 
 def replay_counterfactuals(out_dir: Path, replay_dir: Path) -> None:
-    """Strict replay (reviewfix2 D2/D3/D4/D5): candidates come ONLY from the
-    generation-time index (a replay summary can never re-enter as one, and
-    an empty/missing index is an explicit failure); each product is loaded
-    with its NPZ sha256 verified; the audits run under the FROZEN effective
-    configs restored from the record (never the current YAML); the previous
-    full-scene distance fields are CROSS-CHECKED against a fresh query of
-    the hash-verified source NPZ (the D3 class -- per-side, index [t]);
-    and the comparison covers the COMPLETE records (all rows, every
-    interpolation point, strict velocities, task, prefix checks, c2 speed
-    evidence, classification) plus the arrays BITWISE.  The summary goes to
+    """Strict replay (reviewfix2 D2/D3/D4/D5 + reviewfix3 G1/G2): candidates
+    come ONLY from the generation-time index (validated non-empty, unique,
+    records/stems set-equal; a replay summary can never re-enter as one);
+    each product is loaded with its NPZ sha256 verified; the audits run
+    under the FROZEN effective configs restored from the record (never the
+    current YAML); the previous full-scene distance is cross-checked
+    against a FRESH query of the hash-verified source NPZ over ALL the
+    fields the replay actually uses (the restored ``prev_scene_dist_flags``
+    context field, the per-side display fields, the selected side's value;
+    a missing source is an explicit failure, never a skip); and the
+    comparison covers the COMPLETE records plus the arrays BITWISE.  The
+    processed count is part of the verdict; the summary goes to
     ``replay_dir`` -- never the products directory."""
     idx = load_index(out_dir, INDEX_NAME)
     replay_dir.mkdir(parents=True, exist_ok=True)
-    by_stem = {r["stem"]: r for r in idx["records"]}
+    live_manifest = integrity_manifest()      # fresh, re-read from disk (G4)
     results: dict = {}
     ok = True
-    for stem in by_stem:
+    for stem in idx["stems"]:
         record, arrays = load_products(out_dir, stem)
         entry: dict = {"stem": stem}
         results[stem] = entry
-        integrity = verify_integrity(record)
+        integrity = verify_integrity(record, live_manifest=live_manifest)
         entry["integrity_ok"] = not integrity
         entry["integrity_mismatches"] = integrity[:20]
         t = record["frame"]
@@ -837,11 +842,26 @@ def replay_counterfactuals(out_dir: Path, replay_dir: Path) -> None:
             c2_hand_reason=record["c2_reasons"],
             prev_hand_scene_dist=record["prev_scene_dist_flags"])
 
-        # D3 cross-check: the frozen per-side fields must equal a FRESH
-        # distance query of the previous full scene of the source NPZ
+        # D3+G2 cross-check: EVERY frozen view of the previous full-scene
+        # distance must equal a FRESH query of the source NPZ -- including
+        # the flags the restored context actually carries and the selected
+        # side's value; a missing source is rejected, never skipped
         prev_checks: dict = {}
         src = record.get("prev_scene_source")
-        if src is not None and t > 0:
+        side = record["side"]
+        if t == 0:
+            both = record["prev_scene_dist_both_m"]
+            if any(both[s] is not None for s in ("l", "r")) or \
+                    any(record["prev_scene_dist_flags"][s] is not None
+                        for s in ("l", "r")) or \
+                    record["prev_scene_dist_m"] is not None:
+                prev_checks["t0"] = "t=0 must freeze None distances"
+        elif not isinstance(src, dict) or "npz" not in src or \
+                "sha256" not in src:
+            prev_checks["source_npz"] = (
+                "prev_scene_source missing or incomplete -- the fresh-query "
+                "cross-check is mandatory, never skippable")
+        else:
             npz_path = Path(src["npz"])
             digest = sha256(npz_path)
             if digest != src["sha256"]:
@@ -851,10 +871,16 @@ def replay_counterfactuals(out_dir: Path, replay_dir: Path) -> None:
                 traj, _h, _f = load_teacher_npz(npz_path)
                 fresh_at = prev_scene_distances_at(traj, t)
                 for s in ("l", "r"):
-                    if record["prev_scene_dist_both_m"][s] != fresh_at[s]:
-                        prev_checks[s] = (f"saved "
-                                          f"{record['prev_scene_dist_both_m'][s]!r}"
-                                          f" != fresh {fresh_at[s]!r}")
+                    for view, value in (
+                            ("both_m", record["prev_scene_dist_both_m"][s]),
+                            ("flags", record["prev_scene_dist_flags"][s])):
+                        if value != fresh_at[s]:
+                            prev_checks[f"{view}:{s}"] = (
+                                f"saved {value!r} != fresh {fresh_at[s]!r}")
+                if record["prev_scene_dist_m"] != fresh_at[side]:
+                    prev_checks[f"selected:{side}"] = (
+                        f"saved {record['prev_scene_dist_m']!r} "
+                        f"!= fresh {fresh_at[side]!r}")
         entry["prev_scene_check"] = prev_checks or "ok"
 
         audits: dict = {}
@@ -904,9 +930,13 @@ def replay_counterfactuals(out_dir: Path, replay_dir: Path) -> None:
         ok = ok and entry["ok"]
         print(f"  [replay {stem}] match={entry['matches']} "
               f"class={classification} prev={entry['prev_scene_check']}")
+    # G1: the processed count is part of the verdict (an index/products
+    # disagreement must never shrink the replay to "0 records ALL MATCH")
+    if len(results) != len(idx["stems"]):
+        ok = False
     (replay_dir / "cert_trace_cf_replay.json").write_text(
         json.dumps({"ok": ok, "n": len(results),
-                    "expected": len(idx["records"]),
+                    "expected": len(idx["stems"]),
                     "results": results}, indent=1, allow_nan=False,
                    default=float))
     print(f"[replay] {'ALL MATCH' if ok else 'MISMATCH'} "
@@ -927,9 +957,9 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--skip-counterfactuals", action="store_true")
     ap.add_argument("--out", default=str(OUT_DIR),
-                    help="output dir (default: the reviewfix2 20261002 diag "
-                         "dir; the frozen 20260927 and superseded 20261001 "
-                         "ones are read-only)")
+                    help="output dir (default: the reviewfix3 20261002 diag "
+                         "dir; the frozen 20260927 and superseded 20261001/"
+                         "20261002 ones are read-only)")
     ap.add_argument("--replay", action="store_true",
                     help="recompute the same-candidate counterfactual "
                          "branches from the frozen files and compare -- "
