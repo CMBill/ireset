@@ -2,7 +2,7 @@
 
 日期:2026-10-01。对象:[train24fix2 实现审阅修复方案](../plans/train24fix2_review_fix_plan.md)(R1-R5)。
 
-> **2026-10-02 订正指针:本文 §0-§8 的取证产物(`train24fix2_reviewfix_20261001/diag/`)经第二轮审阅(§9,缺陷 D1-D5)后被 `train24fix2_reviewfix2_20261002/` 取代**——其中 D3 为证据字段错位(完整场景距离双侧同值且退一帧),§6 的全部结论已在修正工具下按 §9.2 复验成立;§7 阶段 C(sixseg)不受影响。审阅基点 `0500b4a`(独立复跑 225 passed + 1 skipped);实施提交 `2aef500`(方案)→ `a0958df`(订正块)→ `a0bf9d5`(R2)→ `fa341e6`(R4)→ `bab948a`(R5)→ `73814d6`(R1+R3)→ `048523d`(skip 键形修复)→ `2158eb2`(对照脚本);全量测试 **248 passed + 1 skipped**。产物目录:`derived/data/teachers_regenerated/train24fix2_reviewfix_20261001/`(`source_manifest.json` + `diag/` + `sixseg/`);冻结参照只读未动。
+> **2026-10-02 订正指针:本文 §0-§8 的取证产物(`train24fix2_reviewfix_20261001/diag/`)经第二轮审阅(§9,缺陷 D1-D5)后被 `train24fix2_reviewfix2_20261002/` 取代,后者再经第三轮审阅(§10,缺口 G1-G4)被 `train24fix2_reviewfix3_20261002/` 取代**——其中 D3 为证据字段错位(完整场景距离双侧同值且退一帧),§6 的全部结论已在修正工具下按 §9.2/§10.2 复验成立;§7 阶段 C(sixseg)不受影响。审阅基点 `0500b4a`(独立复跑 225 passed + 1 skipped);实施提交 `2aef500`(方案)→ `a0958df`(订正块)→ `a0bf9d5`(R2)→ `fa341e6`(R4)→ `bab948a`(R5)→ `73814d6`(R1+R3)→ `048523d`(skip 键形修复)→ `2158eb2`(对照脚本);全量测试 **248 passed + 1 skipped**。产物目录:`derived/data/teachers_regenerated/train24fix2_reviewfix_20261001/`(`source_manifest.json` + `diag/` + `sixseg/`);冻结参照只读未动。
 
 ## 0. 来源冻结与订正入口(方案 §7.A)
 
@@ -119,3 +119,25 @@ sub16 新记录 78 条 = **45 side_all_miss(与冻结轮计数全等)+ 33 side_p
 
 - 仓库工具存在两种 SHA-256 变体:`closed_loop_metrics.sha256` 为 16 位截断(provenance 索引内嵌),`experiment_provenance`/产物清单为完整 64 位——跨工具哈希比对必须同源,否则出现"哈希不符"假阳性(本轮 source_manifest 复核即踩中)。
 - 完整记录级确定性实证:113 候选双分支审计 + 五段单帧升级(含 QP 重解)在同一提交状态下全记录逐叶、数组逐位可复现——此前仅五项汇总值被比对,正是 D2 类缺陷的藏身处。
+
+## 10. 第三轮审阅缺口修复(reviewfix3,2026-10-02)
+
+对 reviewfix2 工具的第三轮审阅确认**正式取证结论已独立复验成立**(全量 257 passed + 1 skipped 复跑、5+113 完整重放双 ALL MATCH、113 双侧距离字段全部正确、249 产物哈希与冻结来源复核一致),但发现 4 项 P2 校验缺口(G1-G4)。审阅基点 `1b4d185`,实施提交 `f76216b`(全量 **262 passed + 1 skipped**,新增 5 项反例 `tests/test_train24fix2_review_fix3.py`;reviewfix2 的 cf 夹具重构为共享助手)。产物目录 `train24fix2_reviewfix3_20261002/`;**reviewfix2_20261002 的 diag 产物自此被取代**(其内嵌完整性清单为旧 16 项形态)。
+
+### 10.1 四项缺口与修复
+
+- **G1 索引双视图不一致仍可 0 条 ALL MATCH**:`load_index` 原只验 `stems` 非空,而 E 重放遍历 `records`——保留 113 stems、清空 records 得 ok=True/n=0/expected=0。现校验两视图**非空、无重复、集合相等**(任一不等即拒绝重放),重放遍历统一走 `stems`,且**实际处理数纳入通过判据**(`n == expected`)。
+- **G2 距离交叉核验未覆盖实际恢复字段**:原核验只比展示字段 `prev_scene_dist_both_m`,恢复上下文用的 `prev_scene_dist_flags` 被篡改(已启用侧 0.0012→0.0112)重放仍 ALL MATCH;删除 `prev_scene_source` 直接跳过核验。现交叉核验覆盖**来源(缺失即显式失败)、双侧展示字段、实际上下文 flags、所选侧字段**四个视图(t=0 要求全 None),任一不符按 `both_m:l`/`flags:r`/`selected:l`/`source_npz` 命名失败。
+- **G3 完整性清单缺真实依赖与碰撞资产**:原清单只含 repair 子包+3 脚本+2 配置+派生资产(其中 4 项为 16 位截断摘要),改 geometry/kinematics/embodied 模块或 `resources/robots/largebox/largebox.obj`(锁定场景 XML 直接引用的碰撞 mesh)不触发告警。现清单为 **42 项全 64 位摘要**:按取证链真实 import 集覆盖 repair/geometry/kinematics/embodied/data/imesh 六子包 + `__init__`/paths + 6 个脚本(含 experiment_provenance/closed_loop_metrics/regenerate_teachers)+ 2 配置 + 派生锁定资产 + largebox 全部资产文件。
+- **G4 实时核验误用进程缓存**:`integrity_manifest` 的 `lru_cache` 使 `verify_integrity` 拿到生成时摘要,入册文件被修改后核验返回零差异。现**每次调用从磁盘重读**(去缓存),`verify_integrity(record, live_manifest=…)` 支持每次重放传入一次新鲜清单;反例:临时依赖文件 v1→v2,旧缓存实现判过、新实现报 "changed since generation"。
+
+### 10.2 正式重生成与严格重放(rev `f76216b`,干净树)
+
+- fail_bind 五段:对照原报告身份四项全配,结论与 reviewfix2 逐字一致(t_fail 44/12/14/32/20、C2_ONLY、`no_merit_step_trust_min`、重解采纳)。
+- cert_trace:305 s、81 断言全过、113 反事实,分类分布不变(13 PASS + 100 C2_ONLY);sub10@44 双侧 `0.0012341966700727114`/`0.0012351612733721542` 在 both_m 与 flags 两视图均正确。
+- 严格重放:**fb 5/5、cf 113/113 双 ALL MATCH 且 n==expected**;113 条 prev_scene_check 全 ok(来源+四视图交叉核验)、42 项完整性清单全过(实时重读);二次重放稳定。
+- `source_manifest.json`:249 产物 + 冻结输入活性复核(与 reviewfix 冻结逐哈希一致、HBT 24 项重验)。
+
+### 10.3 裁决
+
+工具完整性验收四处边界补齐;正式取证结论经独立复验与更严契约重放**不变**。**裁决维持:审阅修复与证据重验完成;六段仍 rq 1/6,原 C2 修复目标未达成,继续暂停转段**;当前证据支持的表述上限仍为"固定流程下未收敛"(信赖域塌缩),非结构性联合不可行。
