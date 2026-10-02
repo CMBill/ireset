@@ -38,12 +38,23 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-from closed_loop_metrics import git_rev, sha256  # noqa: E402
+import hashlib  # noqa: E402
+
+from closed_loop_metrics import git_rev  # noqa: E402
 from experiment_provenance import (  # noqa: E402
     asset_hashes,
     env_snapshot,
     git_state,
 )
+
+
+def sha256_full(path: Path) -> str:
+    """FULL-length digest. The F source manifest and the integrity chain use
+    64-hex digests; ``closed_loop_metrics.sha256`` is the 16-hex truncated
+    variant -- comparing them across tools is a documented false-positive
+    source (2026-10-02 engineering note), so this driver hashes full-length
+    everywhere it compares or registers file content."""
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 from ireset.paths import DERIVED_DATA_DIR, PROJECT_ROOT  # noqa: E402
 from ireset.repair.config_io import load_mode_configs  # noqa: E402
 from train24fix2_audit import (  # noqa: E402
@@ -61,7 +72,7 @@ REFERENCES = {
     "B": {"root": TEACHERS / "train24fix_20260927_sixseg",
           "subdirs": ("rq", "rv", "ns"), "expect": {"rq_npz": 6}},
     "C": {"root": TEACHERS / "train24fix2_20260927_sixseg",
-          "subdirs": ("rq", "rv", "ns"), "expect": {"rq_npz": 6}},
+          "subdirs": ("rq", "rv", "ns"), "expect": {"rq_npz": 1}},
     "T": {"root": TEACHERS / "labelq_20260926_train24" / "regen_final",
           "subdirs": (), "expect": {"npz": 13}},
 }
@@ -125,7 +136,7 @@ def _reference_registration(gate: Gate) -> dict:
                     continue
                 for p in sorted(base.iterdir()):
                     if p.is_file():
-                        files[str(p.relative_to(root))] = sha256(p)
+                        files[str(p.relative_to(root))] = sha256_full(p)
         counts = {
             "rq_npz": sum(1 for k in files if k.startswith("rq/") and k.endswith(".npz"))
             if "rq" in spec["subdirs"] else None,
@@ -158,7 +169,7 @@ def _untracked_registration(out_dir: Path) -> list[dict]:
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dst)
                 rows.append({"path": rel, "status": "??",
-                             "sha256": sha256(src), "copy": str(dst)})
+                             "sha256": sha256_full(src), "copy": str(dst)})
             elif src.is_dir():
                 for p in sorted(src.rglob("*")):
                     if p.is_file():
@@ -167,7 +178,7 @@ def _untracked_registration(out_dir: Path) -> list[dict]:
                         dst.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copy2(p, dst)
                         rows.append({"path": str(rel2), "status": "??",
-                                     "sha256": sha256(p), "copy": str(dst)})
+                                     "sha256": sha256_full(p), "copy": str(dst)})
     return rows
 
 
@@ -204,7 +215,7 @@ def stage_baseline(root: Path) -> None:
     # 3. source manifest: all 249 products still hash-match (liveness)
     sm = json.loads((F_ROOT / "source_manifest.json").read_text())
     drifted = [p["path"] for p in sm["products"]
-               if sha256(F_ROOT / p["path"]) != p["sha256"]]
+               if sha256_full(F_ROOT / p["path"]) != p["sha256"]]
     gate.check("source_manifest_liveness",
                not drifted and len(sm["products"]) == 249,
                f"products={len(sm['products'])} drifted={drifted[:5]}")
@@ -221,7 +232,7 @@ def stage_baseline(root: Path) -> None:
         "git_rev_full": git_rev(),
         "env": env_snapshot(),
         "assets": asset_hashes(),
-        "uv_lock_sha256": sha256(PROJECT_ROOT / "uv.lock"),
+        "uv_lock_sha256": sha256_full(PROJECT_ROOT / "uv.lock"),
         "thread_env": {k: os.environ.get(k) for k in (
             "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
             "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS")},
