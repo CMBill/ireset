@@ -141,10 +141,29 @@ def hand_speed_rows_active(cfg, ctx: FrameContext, side: str) -> bool:
     positive bound parameter, the previous box-frame site array, and the
     frame's reference-interval enable state over the previous FULL-SCENE
     distance.  The old criterion (projected ``prev_hand_dist`` at 6mm) is
-    NOT part of C2 -- it missed five of the ten frozen speed spikes."""
+    NOT part of C2 -- it missed five of the ten frozen speed spikes.
+
+    The criterion is form-agnostic (axis or norm_cut): the BOUND FORM is a
+    profile property, never an enable input (train24fix3 plan section 7:
+    enable/release semantics stay exactly the reference-interval ones)."""
     return (cfg.regen_mode and cfg.regen_hand_speed_mps > 0.0
             and ctx.prev_hand_local.get(side) is not None
             and bool(ctx.c2_hand_enabled.get(side, False)))
+
+
+#: canonical site order of the C2 rows (HAND_SITES is label-keyed; the
+#: row layout is index-based -- one canonical mapping, used everywhere)
+_C2_SITE_LABELS = ("palm", "thumb", "pinky")
+
+
+def _norm_cut_profile(c2_profile):
+    """The attached profile when it defines the norm_cut bound form (else
+    None -- axis rows or no profile).  A single point of truth for the
+    mode switch so the value path, the QP path and the cut loop cannot
+    disagree about which C2 semantics are in force."""
+    if c2_profile is not None and c2_profile.c2_mode == "norm_cut":
+        return c2_profile
+    return None
 
 
 @dataclass
@@ -310,9 +329,11 @@ class FrameSolver:
         #: full probe row records of the last build (name/alpha/dist/J)
         self._probe_rows_detail: list[dict] = []
         #: cached descriptors of the fixed-pre / fixed-post blocks (static
-        #: layouts; built once, R7)
+        #: layouts; built once, R7). The post cache is mode-keyed: norm_cut
+        #: swaps the C2 tail semantics (train24fix3 plan 7.2).
         self._pre_desc: list[str] | None = None
         self._post_desc: list[str] | None = None
+        self._post_desc_norm: bool | None = None
         # -- train24fix3 (plan sections 4.1/5/6.1) --------------------------
         #: the attached C2 profile (None = plain config behaviour). Its
         #: solver settings apply ONLY to frames with active C2 rows
@@ -332,6 +353,23 @@ class FrameSolver:
         #: slack bookkeeping of the last ``build_qp(slack=True)`` call
         #: (trace-only; identities of the relaxed rows + their penalties)
         self.last_slack_rows: dict | None = None
+        # -- train24fix3 norm_cut (plan section 7.2) -------------------------
+        #: cutting planes of the CURRENT linearization only: cleared at
+        #: every solve_frame entry AND at each outer iteration (a new z is a
+        #: new linearization); a stale cut whose side went inactive is
+        #: dropped at assembly
+        self._c2_cuts: list[dict] = []
+        #: per-side C2 linearization (d_j, J_j) filled by the last build_qp
+        #: call on an active side; consumed by the cut loop of the SAME
+        #: iteration
+        self._c2_lin: dict = {}
+        #: cumulative cut-loop accounting of the current solve_frame call
+        #: (plan 7.2 "每轮切面求解、失败…入账"); reported in FrameResult
+        #: diagnostics, never a decision input -- solve_frame resets it
+        self._c2_cut_stats: dict = {
+            "resolves": 0, "directions_added": 0, "per_site_cap_hit": [],
+            "resolve_cap_hit": False, "nonfinite_skipped": 0,
+            "final_pred_norm_max_m": None, "nonclosed": False}
 
     # -- pair identity -------------------------------------------------------
 
@@ -570,25 +608,47 @@ class FrameSolver:
         # closing steps; interval end releases the rows unconditionally.
         self.last_hand_speed = {}
         if cfg.regen_mode and cfg.regen_hand_speed_mps > 0.0:
-            lim_h = self.dt * cfg.regen_hand_speed_mps
+            norm_prof = _norm_cut_profile(self.c2_profile)
+            lim_h = (self.dt * norm_prof.c2_norm_speed_mps if norm_prof
+                     else self.dt * cfg.regen_hand_speed_mps)
             for si, side in enumerate(("l", "r")):
                 active = hand_speed_rows_active(cfg, ctx, side)
                 if active:
                     prev_local = ctx.prev_hand_local[side]
                     vals = (ev.hand_local(side) - prev_local).reshape(-1)
                     base = N_HAND_ROWS + N_FOOT_ROWS + N_FOOT_SPEED + si * 9
-                    val[base : base + 9] = vals
-                    l[base : base + 9] = -lim_h
-                    u[base : base + 9] = lim_h
-                    scale[base : base + 9] = lim_h
+                    if norm_prof is None:
+                        # axis form: all nine rows, +-lim_h per axis
+                        val[base : base + 9] = vals
+                        l[base : base + 9] = -lim_h
+                        u[base : base + 9] = lim_h
+                        scale[base : base + 9] = lim_h
+                        norm_speed = float(
+                            np.linalg.norm(vals.reshape(3, 3), axis=1).max()
+                            / self.dt)
+                    else:
+                        # norm_cut form (train24fix3 plan 7.2): the REAL rows
+                        # are per-site norms max(||d_j|| - B, 0)/B merged into
+                        # the single violation sum. One active slot per site
+                        # (3j), the other two stay inactive placeholders --
+                        # the 18-slot post layout is shared with axis mode so
+                        # every offset consumer keeps working; descriptors
+                        # distinguish the semantics.
+                        d = vals.reshape(3, 3)
+                        for j in range(3):
+                            r = base + 3 * j
+                            val[r] = float(np.linalg.norm(d[j]))
+                            u[r] = lim_h
+                            scale[r] = lim_h
+                        norm_speed = float(val[base : base + 9 : 3].max()
+                                           / self.dt)
                     self.last_hand_speed[side] = {
                         "enabled": True,
                         "reason": ctx.c2_hand_reason.get(side),
+                        "mode": "norm_cut" if norm_prof else "axis",
                         "row_absmax_m": float(np.abs(vals).max()),
                         "bound_abs_m": float(lim_h),
-                        "norm_speed_mps": float(
-                            np.linalg.norm(vals.reshape(3, 3), axis=1).max()
-                            / self.dt),
+                        "norm_speed_mps": norm_speed,
                     }
                 else:
                     self.last_hand_speed[side] = {
@@ -1444,14 +1504,20 @@ class FrameSolver:
         # regen-mode hand box-frame speed rows (mirror of constraint_rows;
         # SAME shared criterion -- hand_speed_rows_active, C2 section 4.2).
         # N2/N3 (train24fix3 plan 6.1): the profile may divide these QP rows
-        # by B = dt * regen_hand_speed_mps -- a pure ROW transformation of
-        # the same linear constraint set. The REAL acceptance rows stay in
-        # metres (val = d, l/u = +-B, scale = B in _fixed_post_rows); the
-        # two paths align via B * l_QP_scaled + d = -B (test-pinned).
+        # by B -- a pure ROW transformation of the same linear constraint
+        # set. The REAL acceptance rows stay in metres (val = d, l/u = +-B,
+        # scale = B in _fixed_post_rows); the two paths align via
+        # B * l_QP_scaled + d = -B (test-pinned).
+        # norm_cut (plan 7.2): the three-axis +-B rows are the INITIAL
+        # NECESSARY condition (ball contains box); cutting planes appended
+        # below tighten toward the true per-site norm ball.
         c2_precond = (self.c2_profile is not None and
                       self.c2_profile.c2_row_precondition == "divide_by_bound")
+        norm_prof = _norm_cut_profile(self.c2_profile)
+        lim_h = (self.dt * norm_prof.c2_norm_speed_mps if norm_prof
+                 else self.dt * cfg.regen_hand_speed_mps)
         if cfg.regen_mode and cfg.regen_hand_speed_mps > 0.0:
-            lim_h = self.dt * cfg.regen_hand_speed_mps
+            self._c2_lin = {}
             for side in ("l", "r"):
                 if not hand_speed_rows_active(cfg, ctx, side):
                     A_rows.append(np.zeros((9, N_TANGENT)))
@@ -1469,18 +1535,53 @@ class FrameSolver:
                     A_rows.append(Jh)
                     l_rows.append(lo_r.reshape(-1))
                     u_rows.append(hi_r.reshape(-1))
+                    if norm_prof is not None:
+                        # the linearization the cut loop consumes (plan 7.2:
+                        # p_j = d_j + J_j xi at THIS state)
+                        self._c2_lin[side] = {
+                            "d": np.asarray(cur - prev_local, dtype=float),
+                            "J": ev.hand_local_jac(side).reshape(9, N_TANGENT)}
         else:
             A_rows.append(np.zeros((N_HAND_SPEED, N_TANGENT)))
             l_rows.append(np.full(N_HAND_SPEED, -INF)); u_rows.append(np.full(N_HAND_SPEED, INF))
+        c2_tail_end = sum(r.shape[0] for r in A_rows)
+
+        # norm_cut cutting planes (plan 7.2): dynamic rows AFTER the frozen
+        # post tail, in their OWN space -- they never displace collision,
+        # probe or endpoint/anchor rows, and the padding target grows by
+        # their count so the fixed layout check cannot fire on them.
+        cut_rows_meta: list[tuple[str, int]] = []
+        if norm_prof is not None and self._c2_cuts:
+            for cut in self._c2_cuts:
+                lin = self._c2_lin.get(cut["side"])
+                if lin is None:
+                    # the side went inactive between the cut's birth and now
+                    # (different ctx/pass): the cut is stale, drop it
+                    continue
+                Jj = lin["J"][3 * cut["site"] : 3 * cut["site"] + 3]
+                dj = lin["d"][cut["site"]]
+                a = cut["n"] @ Jj
+                nd = float(cut["n"] @ dj)
+                if c2_precond:
+                    a = a / lim_h
+                    u_r = 1.0 - nd / lim_h
+                else:
+                    u_r = lim_h - nd
+                A_rows.append(a.reshape(1, -1))
+                l_rows.append(np.array([-INF]))
+                u_rows.append(np.array([u_r]))
+                cut_rows_meta.append((cut["side"], int(cut["site"])))
 
         # pad to the fixed layout length with inactive rows (collision block
         # may have fewer than MAX_PAIRS active pairs). The transition-probe
         # block (F4) has its OWN budgeted layout appended after the frozen
         # endpoint/anchor rows: padding target = N_ROWS + max_probe_rows
+        # (+ the cut rows' own space)
         A = np.vstack(A_rows)
         lo = np.concatenate(l_rows)
         hi = np.concatenate(u_rows)
-        n_missing = N_ROWS + self.cfg.max_probe_rows - A.shape[0]
+        n_missing = (N_ROWS + self.cfg.max_probe_rows + len(cut_rows_meta)
+                     - A.shape[0])
         if n_missing > 0:
             A = np.vstack([A, np.zeros((n_missing, N_TANGENT))])
             lo = np.concatenate([lo, np.full(n_missing, -INF)])
@@ -1496,23 +1597,54 @@ class FrameSolver:
             # the QP returns destructive steps on near-infeasible systems
             # (found via the Path B corridor, 2026-09-15; slack sum was
             # -51 at a frame missing its bound by 0.9 mm).
+            #
+            # train24fix3 norm_cut (plan 7.2): a site's three initial axis
+            # rows and ALL its cutting planes share ONE dimensionless slack
+            # s_j -- plane form n'(d+J xi)/B <= 1 + s_j, priced ONCE per
+            # site (mu * s_j), never per plane. Other families keep the
+            # default one-slack-per-row identity mapping.
             finite = (lo > -INF / 2) | (hi < INF / 2)
             for i in trust_row_ids:  # trust region is never relaxed
                 finite[i] = False
             idx = np.where(finite)[0]
-            n_s = len(idx)
+            c2_lo = c2_tail_end - N_HAND_SPEED
+            site_of_row: dict[int, tuple[str, int]] = {}
+            if norm_prof is not None:
+                for i in range(c2_lo, c2_tail_end):
+                    side = "l" if i < c2_lo + 9 else "r"
+                    base = c2_lo if side == "l" else c2_lo + 9
+                    site_of_row[i] = (side, (i - base) // 3)
+                for k, meta in enumerate(cut_rows_meta):
+                    site_of_row[c2_tail_end + k] = meta
+            row_slack = np.empty(len(idx), dtype=int)
+            group_id: dict[tuple[str, int], int] = {}
+            nxt = 0
+            for k, i in enumerate(idx):
+                g = site_of_row.get(int(i))
+                if g is None:
+                    row_slack[k] = nxt
+                    nxt += 1
+                else:
+                    if g not in group_id:
+                        group_id[g] = nxt
+                        nxt += 1
+                    row_slack[k] = group_id[g]
+            n_s = nxt
+            n_idx = len(idx)
             n_r = A.shape[0]
-            A_new = np.zeros((n_r + 2 * n_s, N_TANGENT + n_s))
+            A_new = np.zeros((n_r + n_idx + n_s, N_TANGENT + n_s))
             A_new[:n_r, :N_TANGENT] = A
-            for j, i in enumerate(idx):
-                A_new[i, N_TANGENT + j] = -1.0
-                A_new[n_r + j, :N_TANGENT] = A[i]
-                A_new[n_r + j, N_TANGENT + j] = 1.0
-                A_new[n_r + n_s + j, N_TANGENT + j] = 1.0      # s_j >= 0
-            lo_new = np.concatenate([lo, np.full(n_s, -INF), np.zeros(n_s)])
-            hi_new = np.concatenate([hi, np.full(n_s, INF), np.full(n_s, INF)])
+            for k, i in enumerate(idx):
+                col = N_TANGENT + row_slack[k]
+                A_new[i, col] = -1.0
+                A_new[n_r + k, :N_TANGENT] = A[i]
+                A_new[n_r + k, col] = 1.0
+            for s in range(n_s):
+                A_new[n_r + n_idx + s, N_TANGENT + s] = 1.0   # s >= 0
+            lo_new = np.concatenate([lo, np.full(n_idx, -INF), np.zeros(n_s)])
+            hi_new = np.concatenate([hi, np.full(n_idx, INF), np.full(n_s, INF)])
             lo_new[idx] = -INF  # upper-side rows keep u, relaxed by -s
-            lo_new[n_r:n_r + n_s] = lo[idx]  # duplicated rows enforce l + s
+            lo_new[n_r:n_r + n_idx] = lo[idx]  # duplicated rows enforce l + s
             P_new = np.zeros((N_TANGENT + n_s, N_TANGENT + n_s))
             P_new[:N_TANGENT, :N_TANGENT] = P
             # train24fix3 N2 (plan 6.1): when the C2 rows entered the QP
@@ -1521,34 +1653,43 @@ class FrameSolver:
             # metre-unit cost exactly: 10000 * B * s_norm == 10000 * s_m
             # (s_m = B * s_norm). Other families keep the original penalty
             # and the trust rows stay hard -- nothing else is transformed.
+            # norm_cut: the shared site slacks carry the profile penalty.
             penalties = np.full(n_s, float(cfg.slack_penalty))
             if c2_precond:
-                c2_lo = anchor_post + N_HAND_ROWS + N_FOOT_ROWS + N_FOOT_SPEED
-                c2_hi = c2_lo + N_HAND_SPEED
-                in_c2 = (idx >= c2_lo) & (idx < c2_hi)
+                def _is_c2_row(i: int) -> bool:
+                    return i in site_of_row or c2_lo <= i < c2_tail_end
                 if self.c2_profile.c2_slack_penalty == "scaled_10000B":
-                    penalties[in_c2] = float(cfg.slack_penalty) * \
-                        (self.dt * cfg.regen_hand_speed_mps)
+                    scale_pen = float(cfg.slack_penalty) * lim_h
+                    for k, i in enumerate(idx):
+                        if _is_c2_row(int(i)):
+                            penalties[row_slack[k]] = scale_pen
                 elif self.c2_profile.c2_slack_penalty == "mu":
-                    # N3 (plan 6.1): the dimensionless C2 recovery penalty
-                    # becomes the CURRENT merit weight -- unit-consistent
-                    # with the merit term's mu-per-normalized-violation.
-                    # mu comes from solve_frame (incl. the regen multiplier)
+                    # N3 (plan 6.1) / S (plan 7.2): the dimensionless C2
+                    # recovery penalty becomes the CURRENT merit weight --
+                    # unit-consistent with the merit term's
+                    # mu-per-normalized-violation. mu comes from solve_frame
+                    # (incl. the regen multiplier)
                     if mu is None:
                         raise ValueError(
-                            "N3 requires the current merit weight mu -- "
-                            "build_qp must be called with solve_frame's mu")
-                    penalties[in_c2] = float(mu)
+                            "mu-penalty profiles require the current merit "
+                            "weight mu -- build_qp must be called with "
+                            "solve_frame's mu")
+                    for k, i in enumerate(idx):
+                        if _is_c2_row(int(i)):
+                            penalties[row_slack[k]] = float(mu)
             q_new = np.concatenate([q, penalties])
             if self.trace is not None:
                 # train24fix3 plan 5.1: identities of the relaxed rows and
-                # the penalties actually placed on their slacks (the N2/N3
+                # the penalties actually placed on their slacks (the N2/N3/S
                 # profiles vary the C2 family). Read out once here -- the
                 # QP rows carry no identifier arrays of their own.
                 names_all = self._qp_row_names(A.shape[0], ctx)
                 self.last_slack_rows = {
                     "idx": [int(i) for i in idx],
                     "names": [names_all[i] for i in idx],
+                    "slack_of_row": [int(s) for s in row_slack],
+                    "shared_groups": {f"{s}:{j}": g for (s, j), g
+                                      in group_id.items()},
                     "penalty": [float(v) for v in q_new[N_TANGENT:]],
                     "n_s": int(n_s)}
             return (spa.csc_matrix(P_new), q_new, spa.csc_matrix(A_new), lo_new, hi_new), n_s
@@ -1557,21 +1698,35 @@ class FrameSolver:
 
     def _qp_row_names(self, n_rows: int, ctx: FrameContext | None = None) -> list[str]:
         """Descriptors parallel to the LAST ``build_qp`` row layout (pre /
-        collision / probe / post / padding). The QP block ORDER differs
-        from the nonlinear value path -- the probe block sits BETWEEN
-        collision and post, so the post-block relative offsets are NOT QP
-        row indices (train24fix3 plan 6.1 implementation note). The pre
-        block is CONDITIONAL: without ``ctx.z_prev`` the joint-velocity
-        and root-velocity rows do not exist (64 rows, not 99). Raises on
-        desync so a silently mislabelled row can never enter the evidence.
+        collision / probe / post / cuts / padding). The QP block ORDER
+        differs from the nonlinear value path -- the probe block sits
+        BETWEEN collision and post, so the post-block relative offsets are
+        NOT QP row indices (train24fix3 plan 6.1 implementation note). The
+        pre block is CONDITIONAL: without ``ctx.z_prev`` the joint-velocity
+        and root-velocity rows do not exist (64 rows, not 99). norm_cut:
+        the 18-slot C2 tail carries the initial three-axis BOX rows (the
+        real check rows are the per-site norms) and the cutting planes
+        follow before the padding. Raises on desync so a silently
+        mislabelled row can never enter the evidence.
         """
         pre = self._pre_row_descriptors()
         if ctx is not None and ctx.z_prev is None:
             pre = pre[:29] + pre[64:]     # joint limits + trust only
+        post = list(self._post_row_descriptors())
+        norm_prof = _norm_cut_profile(self.c2_profile)
+        if norm_prof is not None:
+            tail = [f"hand_norm_box[{side}:{label}:{ax}]"
+                    for side in ("l", "r") for label in HAND_SITES[side]
+                    for ax in _AXES]
+            post = post[:-N_HAND_SPEED] + tail
+            for cut in (self._c2_cuts or []):
+                label = _C2_SITE_LABELS[cut["site"]]
+                post.append(f"hand_norm_cut[{cut['side']}:{label}:"
+                            f"k{cut['k']}]")
         names = (list(pre)
                  + list(self.last_row_pairs)
                  + list(self.last_probe_rows)
-                 + list(self._post_row_descriptors()))
+                 + post)
         n_missing = n_rows - len(names)
         if n_missing < 0:
             raise RuntimeError(
@@ -1645,6 +1800,100 @@ class FrameSolver:
             return None, status
         return x, status
 
+    def _c2_cut_refine(self, x, status, z, ctx, trust, slack, mu, settings):
+        """norm_cut cutting-plane refinement (train24fix3 plan 7.2).
+
+        After the FIRST solve of this iteration's QP, every site whose
+        PREDICTED displacement d_j + J_j xi exceeds B gets one cut
+        n'(d_j + J_j xi) <= B in its unit direction n = p/||p||; the QP is
+        re-solved with the enlarged set. At most 8 re-solves per call and
+        at most 8 directions per site (this linearization). Reaching either
+        budget only RECORDS non-closure -- a cut-exhausted QP can never be
+        read back as a real-norm pass (the nonlinear check rows are the
+        only judge). Returns ``(x, status, n_extra_solves, stats)``;
+        non-norm_cut profiles pass through with zero extra solves.
+        """
+        prof = _norm_cut_profile(self.c2_profile)
+        if prof is None or x is None:
+            return x, status, 0, None
+        B = self.dt * prof.c2_norm_speed_mps
+        tol = B * (1.0 + 1e-9)
+        counts: dict[tuple[str, int], int] = {}
+        stats = {"resolves": 0, "directions_added": 0,
+                 "per_site_cap_hit": [], "resolve_cap_hit": False,
+                 "nonfinite_skipped": 0, "final_pred_norm_max_m": None,
+                 "nonclosed": False}
+        for _round in range(8):
+            xi = x[:N_TANGENT]
+            added = False
+            worst = 0.0
+            for side in ("l", "r"):
+                lin = self._c2_lin.get(side)
+                if lin is None:
+                    continue
+                for j in range(3):
+                    p = lin["d"][j] + lin["J"][3 * j : 3 * j + 3] @ xi
+                    pn = float(np.linalg.norm(p))
+                    worst = max(worst, pn)
+                    if pn <= tol:
+                        continue
+                    key = (side, j)
+                    if counts.get(key, 0) >= 8:
+                        if key not in stats["per_site_cap_hit"]:
+                            stats["per_site_cap_hit"].append(key)
+                        continue
+                    n_hat = p / pn
+                    if not np.isfinite(n_hat).all():
+                        stats["nonfinite_skipped"] += 1
+                        continue
+                    self._c2_cuts.append({"side": side, "site": j,
+                                          "n": n_hat.copy(),
+                                          "k": counts.get(key, 0)})
+                    counts[key] = counts.get(key, 0) + 1
+                    stats["directions_added"] += 1
+                    added = True
+            if worst > tol and not added:
+                stats["nonclosed"] = True
+            if not added:
+                break
+            (P, q, A, lo, hi), _ = self.build_qp(
+                z, ctx, trust, slack=slack, mu=mu)
+            stats["resolves"] += 1
+            x, status = self.solve_qp(P, q, A, lo, hi, settings=settings)
+            if x is None:
+                break
+        else:
+            stats["resolve_cap_hit"] = True
+        if x is not None:
+            xi = x[:N_TANGENT]
+            worst = 0.0
+            for side in ("l", "r"):
+                lin = self._c2_lin.get(side)
+                if lin is None:
+                    continue
+                for j in range(3):
+                    pn = float(np.linalg.norm(
+                        lin["d"][j] + lin["J"][3 * j : 3 * j + 3] @ xi))
+                    worst = max(worst, pn)
+            stats["final_pred_norm_max_m"] = worst
+            stats["nonclosed"] = worst > tol
+        # merge into the frame-level account (plan 7.2: every round's cut
+        # solves / failures / extra directions are accounted, never gated)
+        acc = self._c2_cut_stats
+        acc["resolves"] += stats["resolves"]
+        acc["directions_added"] += stats["directions_added"]
+        acc["nonfinite_skipped"] += stats["nonfinite_skipped"]
+        acc["resolve_cap_hit"] = acc["resolve_cap_hit"] or stats["resolve_cap_hit"]
+        for key in stats["per_site_cap_hit"]:
+            if key not in acc["per_site_cap_hit"]:
+                acc["per_site_cap_hit"].append(key)
+        if stats["final_pred_norm_max_m"] is not None:
+            acc["final_pred_norm_max_m"] = max(
+                acc["final_pred_norm_max_m"] or 0.0,
+                stats["final_pred_norm_max_m"])
+        acc["nonclosed"] = acc["nonclosed"] or stats["nonclosed"]
+        return x, status, stats["resolves"], stats
+
     def _frame_qp_settings(self, ctx: FrameContext) -> OsqpSettings | None:
         """Solver settings for THIS frame's QPs (train24fix3 plan 6.1).
 
@@ -1710,8 +1959,15 @@ class FrameSolver:
         return self._pre_desc
 
     def _post_row_descriptors(self) -> list[str]:
-        """Descriptors of the fixed-post block, parallel to ``_fixed_post_rows``."""
-        if self._post_desc is None:
+        """Descriptors of the fixed-post block, parallel to ``_fixed_post_rows``.
+
+        norm_cut (train24fix3 plan 7.2) uses its OWN real-row semantics in
+        the SAME 18-slot C2 tail: slot ``3j`` of a side carries the per-site
+        NORM row, ``3j+1``/``3j+2`` are inactive placeholders -- the axis
+        layout and all frozen offsets are untouched, the descriptors make
+        the mode difference explicit."""
+        norm_cut = _norm_cut_profile(self.c2_profile) is not None
+        if self._post_desc is None or self._post_desc_norm != norm_cut:
             hand = [f"hand_anchor[{side}:{label}:{ax}]"
                     for side in ("l", "r") for label in HAND_SITES[side]
                     for ax in _AXES]
@@ -1721,10 +1977,19 @@ class FrameSolver:
             foot_s = [f"foot_speed[{side}:sole{i}:{ax}]"
                       for side in ("l", "r") for i in range(1, 6)
                       for ax in _AXES]
-            hand_s = [f"hand_speed[{side}:{label}:{ax}]"
-                      for side in ("l", "r") for label in HAND_SITES[side]
-                      for ax in _AXES]
+            if norm_cut:
+                hand_s = []
+                for side in ("l", "r"):
+                    for j, label in enumerate(HAND_SITES[side]):
+                        hand_s.append(f"hand_norm[{side}:{label}]")
+                        hand_s.append(f"hand_norm_off[{side}:{label}:slot1]")
+                        hand_s.append(f"hand_norm_off[{side}:{label}:slot2]")
+            else:
+                hand_s = [f"hand_speed[{side}:{label}:{ax}]"
+                          for side in ("l", "r") for label in HAND_SITES[side]
+                          for ax in _AXES]
             self._post_desc = hand + foot_a + foot_s + hand_s
+            self._post_desc_norm = norm_cut
         return self._post_desc
 
     def row_descriptors(self) -> tuple[list[str], list]:
@@ -1874,12 +2139,26 @@ class FrameSolver:
             self._frame_pairs = None
             self._refresh_counter = 0
             self._probe_cache = None
+            # train24fix3 norm_cut: cutting planes are per-LINEARIZATION --
+            # a new frame (or a new pass's fresh attempt) never inherits
+            # them; the accounting resets with them
+            self._c2_cuts = []
+            self._c2_lin = {}
+            self._c2_cut_stats = {"resolves": 0, "directions_added": 0,
+                                  "per_site_cap_hit": [], "resolve_cap_hit": False,
+                                  "nonfinite_skipped": 0,
+                                  "final_pred_norm_max_m": None,
+                                  "nonclosed": False}
             # review R4: the loop-exit cause is recorded verbatim; it separates
             # "no acceptable step / trust collapsed below trust_radius_min" from
             # "budget exhausted" -- the historical status label cannot
             term_reason = ""
             for it in range(max_iters):
                 it_done = it + 1
+                # train24fix3 norm_cut: the previous iteration's cuts belong
+                # to a different linearization point (plan 7.2 -- new state
+                # clears the cache)
+                self._c2_cuts = []
                 res = self.evaluate(z, ctx)
                 # feasibility/merit are judged against ACCEPTANCE bounds; the
                 # proactive +2mm clearance lives only inside the QP rows
@@ -1957,10 +2236,15 @@ class FrameSolver:
                     qp_calls += 1
                     x_s, last_qp_status = self.solve_qp(Ps, qs, As, los, his,
                                                         settings=settings)
+                    x_s, last_qp_status, n_cut, _cs = self._c2_cut_refine(
+                        x_s, last_qp_status, z, ctx, trust, True, mu,
+                        settings)
+                    qp_calls += n_cut
                     if attempt_trace is not None and len(attempt_trace["qp"]):
                         qp_rec = attempt_trace["qp"][-1]
                         qp_rec["branch"] = "restoration"
                         qp_rec["rows_n"] = int(As.shape[0])
+                        qp_rec["cut_resolves"] = int(n_cut)
                         if "qp_row_names" not in attempt_trace:
                             attempt_trace["qp_row_names"] = self._qp_row_names(
                                 int(As.shape[0]), ctx)
@@ -1988,10 +2272,15 @@ class FrameSolver:
                     qp_calls += 1
                     xi, last_qp_status = self.solve_qp(P, qv, A, lo_a, hi_a,
                                                        settings=settings)
+                    xi, last_qp_status, n_cut, _cs = self._c2_cut_refine(
+                        xi, last_qp_status, z, ctx, trust, False, mu,
+                        settings)
+                    qp_calls += n_cut
                     if attempt_trace is not None and len(attempt_trace["qp"]):
                         qp_rec = attempt_trace["qp"][-1]
                         qp_rec["branch"] = "tight"
                         qp_rec["rows_n"] = int(A.shape[0])
+                        qp_rec["cut_resolves"] = int(n_cut)
                         if "qp_row_names" not in attempt_trace:
                             attempt_trace["qp_row_names"] = self._qp_row_names(
                                 int(A.shape[0]), ctx)
@@ -2125,6 +2414,11 @@ class FrameSolver:
             res.diagnostics["review"] = review
         if self.last_truncated_ids:
             res.diagnostics["row_budget_truncated_ids"] = list(self.last_truncated_ids)
+        if self._c2_cut_stats.get("resolves") or \
+                self._c2_cut_stats.get("directions_added"):
+            res.diagnostics["c2_cuts"] = {
+                k: (list(v) if isinstance(v, list) else v)
+                for k, v in self._c2_cut_stats.items()}
         return res
 
     def _stationary(self, z: np.ndarray, ctx: FrameContext) -> bool:

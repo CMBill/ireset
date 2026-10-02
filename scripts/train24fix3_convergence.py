@@ -58,8 +58,14 @@ def sha256_full(path: Path) -> str:
 from ireset.paths import DERIVED_DATA_DIR, PROJECT_ROOT  # noqa: E402
 from ireset.repair.config_io import load_mode_configs  # noqa: E402
 from train24fix2_audit import (  # noqa: E402
+    attach_integrity,
+    classify_branches,
+    configs_from_record,
+    context_from,
+    full_candidate_audit,
     integrity_manifest,
     load_index,
+    load_products,
 )
 from dataclasses import asdict  # noqa: E402
 
@@ -537,20 +543,247 @@ def stage_numeric(root: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# later stages (plan sections 7/8/9)
+# stage D: norm candidates (plan section 7)
 # ---------------------------------------------------------------------------
+
+#: product format of the norm-stage counterfactual products (plan 7.2:
+#: new modes use a NEW format; the v2 forensic products stay v2-decoded)
+NORM_FORMAT = "train24fix3_norm_products_v1"
+
+
+def _write_norm_products(pdir: Path, stem: str, record: dict,
+                         arrays: dict) -> None:
+    """Versioned JSON + NPZ, refusing overwrite; the NPZ is hashed INTO the
+    JSON after writing (self-hash), the effective configs + resolved
+    profile + integrity manifest are embedded so a replay never reads the
+    current YAML."""
+    import numpy as np
+
+    jpath, npath = pdir / f"cf_{stem}.json", pdir / f"cf_{stem}.npz"
+    if jpath.exists() or npath.exists():
+        raise FileExistsError(f"refusing to overwrite {jpath}")
+    np.savez(npath, **arrays)
+    record["npz_sha256"] = sha256_full(npath)
+    jpath.write_text(json.dumps(record, indent=1, allow_nan=False,
+                                default=float))
+
+
+def load_norm_products(pdir: Path, stem: str) -> tuple[dict, dict]:
+    """Load one v3 norm product: format checked, NPZ hash verified against
+    the JSON's self-hash, integrity verified against the live tree (v3
+    records REQUIRE the full effective fields -- no backfill)."""
+    import numpy as np
+
+    jpath = pdir / f"cf_{stem}.json"
+    if not jpath.exists():
+        raise FileNotFoundError(f"{jpath}: norm product missing")
+    record = json.loads(jpath.read_text())
+    if record.get("format") != NORM_FORMAT:
+        raise ValueError(f"{jpath}: format {record.get('format')!r} != "
+                         f"{NORM_FORMAT!r} -- old products are decoded by "
+                         f"the v2 path, never this one")
+    npath = pdir / f"cf_{stem}.npz"
+    digest = sha256_full(npath)
+    if digest != record.get("npz_sha256"):
+        raise ValueError(f"{npath}: sha256 {digest} != recorded "
+                         f"{record.get('npz_sha256')}")
+    with np.load(npath) as data:
+        arrays = {k: data[k] for k in data.files}
+    return record, arrays
+
+
+def load_norm_index(pdir: Path) -> dict:
+    """The norm stage's dual-view index under the G1 contract (non-empty,
+    duplicate-free, records/stems set-equal, correct format)."""
+    path = pdir / "cf" / "cf_index.json"
+    if not path.exists():
+        raise FileNotFoundError(f"{path}: norm index missing -- refusing "
+                                f"to replay an empty candidate set")
+    idx = json.loads(path.read_text())
+    if idx.get("format") != NORM_FORMAT:
+        raise ValueError(f"{path}: format {idx.get('format')!r} != "
+                         f"{NORM_FORMAT!r}")
+    stems = idx.get("stems")
+    if not isinstance(stems, list) or not stems:
+        raise ValueError(f"{path}: index lists no candidates")
+    if len(set(stems)) != len(stems):
+        raise ValueError(f"{path}: duplicate stems in index")
+    records = idx.get("records")
+    if not isinstance(records, list) or not records:
+        raise ValueError(f"{path}: index records empty while stems list "
+                          f"{len(stems)}")
+    rec_stems = [r.get("stem") if isinstance(r, dict) else None
+                 for r in records]
+    if any(x is None for x in rec_stems) or \
+            len(set(rec_stems)) != len(rec_stems) or \
+            set(rec_stems) != set(stems):
+        raise ValueError(f"{path}: index records and stems disagree")
+    return idx
+
+
+def _norm_counterfactuals(prof, diag: Path, pdir: Path, gate: Gate) -> dict:
+    """113 existing counterfactuals re-audited under the S profile's REAL
+    norm rows (plan 7.3).  Only the plus-C2 branch is recomputed -- audits
+    solve nothing, so the current (C2-off) branch is profile-independent
+    and the frozen one stands.  The TEN spike candidates must ALL be
+    rejected by the real norm constraint; historical certified candidates
+    are classified as they come (no 13/90 distribution is required)."""
+    from dataclasses import asdict as _asdict
+    from dataclasses import replace as _replace
+
+    from ireset.repair.pipeline import RepairPipeline
+    from train24fix2_audit import freeze_context
+
+    from ireset.repair.profiles import profiles_yaml_sha256
+
+    idx = load_index(diag, "cert_trace_cf_index")
+    out = pdir / "cf"
+    rows = []
+    spikes = []
+    for stem in idx["stems"]:
+        record, arrays = load_products(diag, stem)
+        cfg, vcfg = configs_from_record(record)
+        spec = RepairPipeline(cfg=cfg).spec
+        ctx = context_from(arrays, record["replay_meta"])
+        ctx_plus = _replace(
+            freeze_context(ctx),
+            c2_hand_enabled=record["c2_enable_flags"],
+            c2_hand_reason=record["c2_reasons"],
+            prev_hand_scene_dist=record["prev_scene_dist_flags"])
+        prefix = ([arrays["prefix"][i].copy()
+                   for i in range(arrays["prefix"].shape[0])]
+                  if arrays["prefix"].size else [])
+        arec, aarr = full_candidate_audit(
+            spec, cfg, vcfg, ctx_plus, arrays["z_cand"],
+            prefix=prefix, box_poses=arrays["box_poses"],
+            label="plus_c2_norm", c2_profile=prof)
+        classification = classify_branches(record["audits"]["current"], arec)
+        enabled_modes = {side: (v.get("mode") if v.get("enabled") else None)
+                         for side, v in
+                         (arec.get("endpoint", {}).get("c2_last_hand_speed")
+                          or {}).items()}
+        row = {"stem": stem,
+               "classification": classification,
+               "plus_branch_pass": arec.get("branch_pass"),
+               "frozen_classification": record.get("classification"),
+               "enabled_row_modes": enabled_modes,
+               "violating": (arec.get("endpoint", {}).get("violating") or [])[:6]}
+        rows.append(row)
+        is_spike = "current_rq_adopted_spike" in stem
+        if is_spike:
+            spikes.append({"stem": stem,
+                           "rejected": not arec.get("branch_pass"),
+                           "mode": enabled_modes})
+        prod = {"format": NORM_FORMAT, "stem": stem, "profile": prof.name,
+                "profile_resolved": prof.as_record(),
+                "registry_sha256": profiles_yaml_sha256(),
+                "effective": {"repair": _asdict(cfg),
+                              "validation": _asdict(vcfg)},
+                "audits": {"plus_c2_norm": arec},
+                "classification": classification,
+                "frozen_classification": record.get("classification")}
+        attach_integrity(prod, cfg, vcfg)
+        _write_norm_products(out, stem, prod,
+                             {f"rows__plus_c2_norm__{k}": v
+                              for k, v in aarr.items()})
+        print(f"  [{prof.name}] {stem}: class={classification} "
+              f"pass={arec.get('branch_pass')}")
+    # dual-view index (non-empty, unique, set-equal -- the G1 contract)
+    write_guarded(out / "cf_index.json", json.dumps(
+        {"format": NORM_FORMAT, "stems": [r["stem"] for r in rows],
+         "records": [{"stem": r["stem"]} for r in rows]}, indent=1))
+    dist: dict[str, int] = {}
+    for r in rows:
+        dist[r["classification"]] = dist.get(r["classification"], 0) + 1
+    spikes_ok = (len(spikes) == 10
+                 and all(sp["rejected"] for sp in spikes)
+                 and all(m == "norm_cut"
+                         for sp in spikes for m in sp["mode"].values()
+                         if m is not None))
+    enable_ok = all(m == "norm_cut" for r in rows
+                    for m in r["enabled_row_modes"].values() if m is not None)
+    gate.check(f"{prof.name}_spikes_all_rejected_by_norm", spikes_ok,
+               f"n={len(spikes)} rejected={sum(1 for s in spikes if s['rejected'])}")
+    gate.check(f"{prof.name}_enable_state_norm_rows", enable_ok,
+               "every enabled side audited under norm_cut rows")
+    return {"rows": rows, "distribution": dist,
+            "n": len(rows), "spikes": spikes,
+            "spikes_ok": spikes_ok, "enable_ok": enable_ok}
 
 
 def stage_norm(root: Path) -> None:
+    """Plan section 7: S1 -> S2 (numeric found no winner; the branch is
+    pre-registered).  Each S profile: five frozen frames, the 113 existing
+    counterfactuals under the REAL norm rows (all ten spikes must be
+    rejected), one full diagnosis6, and the full quality gates."""
+    from ireset.repair.profiles import load_profiles
+    from train24fix3_quality_gate import gate_report
+
     numeric = load_stage_summary(root, "numeric")
     if numeric.get("winner"):
         raise SystemExit(
             "stage norm is NOT to run: a numeric profile satisfied the "
             "development gates (plan section 6 exit -- norm is the branch "
             "for 'no numeric winner' only)")
-    raise SystemExit(
-        "stage norm requires the norm_cut implementation (plan section 7); "
-        "not yet available in this revision")
+    out = root / "norm"
+    diag = F_ROOT / "diag"
+    gate = Gate()
+    profiles = load_profiles()
+    winner = None
+    comparisons: dict[str, dict] = {}
+    not_executed: list[str] = []
+    for name in ("S1", "S2"):
+        if winner is not None:
+            not_executed.append(name)
+            continue
+        prof = profiles[name]
+        pdir = out / name
+        ff = _profile_frozen_frames(prof, diag)
+        cf = _norm_counterfactuals(prof, diag, pdir, gate)
+        six = _run_sixseg(name, pdir / "sixseg" / "rq")
+        qg = gate_report(Path(six["rq_dir"]))
+        base_ok = (six["n_kept"] == six["n_demos"]
+                   and six["code_changed_during_run"] is False)
+        cand_ok = base_ok and qg["ok"] and cf["spikes_ok"] and cf["enable_ok"]
+        comparisons[name] = {
+            "profile": prof.as_record(),
+            "frozen_frames": {k: ff[k] for k in ("rows", "n_adopted")},
+            "counterfactuals": {k: cf[k] for k in
+                                ("distribution", "n", "spikes_ok",
+                                 "enable_ok")},
+            "sixseg": {k: six[k] for k in
+                       ("rq_dir", "wall_s", "n_demos", "n_kept", "kept",
+                        "code_changed_during_run")},
+            "quality_gate": {"verdicts": qg["verdicts"]},
+            "base_gate_ok": base_ok, "quality_gate_ok": qg["ok"],
+            "selected": bool(cand_ok)}
+        write_guarded(pdir / "profile_summary.json", json.dumps(
+            comparisons[name], indent=1, default=float))
+        gate.check(f"{name}_base_gate", base_ok,
+                   f"keep {six['n_kept']}/{six['n_demos']}, "
+                   f"r9={six['code_changed_during_run']}")
+        gate.check(f"{name}_quality_gate", qg["ok"], qg["verdicts"])
+        if cand_ok:
+            winner = name
+    summary = {"stage": "norm", "ok": True,
+               "generated": time.strftime("%Y-%m-%d %H:%M:%S"),
+               "numeric_winner_was": numeric.get("winner"),
+               "winner": winner, "not_executed": not_executed,
+               "comparisons": comparisons, "checks": gate.checks,
+               "next": ("sixseg (formal stage E, selected profile)"
+                        if winner else
+                        "algorithm candidate comparison ENDED (plan 7.3): "
+                        "deliver the failure specification and a new "
+                        "minimal problem spec; the next strategy change "
+                        "needs a NEW pre-registered plan")}
+    write_guarded(stage_summary_path(root, "norm"),
+                  json.dumps(summary, indent=1, default=float))
+    print(f"norm -> winner={winner} ({stage_summary_path(root, 'norm')})")
+
+
+# ---------------------------------------------------------------------------
+# later stages (plan sections 8/9)
+# ---------------------------------------------------------------------------
 
 
 def stage_sixseg(root: Path) -> None:

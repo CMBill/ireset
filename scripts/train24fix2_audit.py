@@ -338,9 +338,12 @@ def escalate_frame(pipe: RepairPipeline, ctx: FrameContext, t: int,
 # R3 section 4.1: full-candidate audit
 # ---------------------------------------------------------------------------
 
-def fresh_audit_pipe(spec, cfg, vcfg) -> RepairPipeline:
-    """Independent evaluator/solver/validator per audit branch."""
-    pipe = RepairPipeline(spec=spec, cfg=cfg)
+def fresh_audit_pipe(spec, cfg, vcfg, c2_profile=None) -> RepairPipeline:
+    """Independent evaluator/solver/validator per audit branch.  ``c2_profile``
+    (train24fix3) attaches the profile so the real C2 rows carry the audited
+    bound FORM (axis vs norm_cut) -- the audit then judges exactly the
+    semantics the candidate would run under."""
+    pipe = RepairPipeline(spec=spec, cfg=cfg, c2_profile=c2_profile)
     pipe.validator.cfg = vcfg
     return pipe
 
@@ -444,7 +447,7 @@ def prefix_validation(spec, vcfg, prefix: list[np.ndarray],
 
 def full_candidate_audit(spec, cfg, vcfg, ctx: FrameContext, z_raw: np.ndarray,
                          *, prefix: list[np.ndarray], box_poses: np.ndarray,
-                         label: str) -> tuple[dict, dict]:
+                         label: str, c2_profile=None) -> tuple[dict, dict]:
     """The five checks of plan section 4.1 for ONE branch (the caller picks
     the C2 mode by ctx/cfg).  Returns ``(record, arrays)`` -- the record is
     JSON-safe, the arrays go to the NPZ bundle.  A query anomaly marks the
@@ -452,7 +455,7 @@ def full_candidate_audit(spec, cfg, vcfg, ctx: FrameContext, z_raw: np.ndarray,
     tools)."""
     from ireset.repair.pipeline import C2DistanceQueryError
 
-    pipe = fresh_audit_pipe(spec, cfg, vcfg)
+    pipe = fresh_audit_pipe(spec, cfg, vcfg, c2_profile)
     z_raw = np.asarray(z_raw, dtype=float).copy()
     rec: dict = {"label": label, "format": AUDIT_FORMAT}
 
