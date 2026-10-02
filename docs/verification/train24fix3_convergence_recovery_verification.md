@@ -1,0 +1,67 @@
+# train24fix3 收敛修复与转段执行验证记录
+
+日期:2026-10-02 起。对象:[train24fix3 收敛修复与教师数据转段执行计划](../plans/train24fix3_convergence_recovery_plan.md)。状态:**阶段 A/B/C 已完成——数值候选 N1–N3 全部未通过六段开发门(winner=None),按 §6.2 出口进入阶段 D 范数分支(待实施)**。实验根目录:`derived/data/teachers_regenerated/train24fix3_20261002_1147424/`。
+
+起点:代码 `e74a5f3`(方案提交 `dcf9d33`)。阶段 A 按方案 §4.1 任务 1 在任何算法修改前执行。
+
+## 0. 实施提交与测试
+
+| 提交 | 内容 |
+|---|---|
+| `dcf9d33` | 方案文档(预注册) |
+| `a7954e2` | 驱动 baseline 阶段(F 复核/参照登记/N0 冻结) |
+| `1147424` | 驱动修复:哈希统一全长摘要 + C 参照期望订正 |
+| `a53b6f7` | 提交单位 1:OSQP 设置配置化、逐帧 profile 门控、只读 trace、N0-N3/S1-S2 注册表、质量门工具、驱动 trace/numeric 阶段 |
+| `d8e1f25` | 提交单位 2+3(合并,装配改动交织):N2 行预条件 + N3 mu 恢复罚权 |
+
+测试 262 → **277 passed + 1 skipped**(`uv run --locked pytest tests/ -q`):新增 `tests/test_train24fix3_profiles.py` 9 项(注册表矩阵/未知字段·非法值·非法继承拒绝、N0 默认=历史硬编码、逐帧门控仅 C2 激活帧、solve_qp 设置穿透 spy、trace 开/关纯度逐位、v2 记录 N0 回填/非 N0 携带拒绝、effective 记录携带 profile)+ `tests/test_train24fix3_numeric.py` 7 项(N0/N1 挂载=无 profile 逐位一致、N2 行变换 ξ 列纯 /B 且松弛列两表述同 −1、±INF 哨兵有限值比较、松弛罚权单位 10000·B 仅 C2 族、高精度同解与 s_m=B·s_norm、真实接受行 N2 下逐位不变、N3 mu 罚权仅 C2 松弛且缺 mu 显式错、tight N3≡N2)。
+
+首轮 baseline(`train24fix3_20261002_a7954e2/`)因驱动两处登记缺陷判 FAIL(fb/cf 重放本身已 ALL MATCH、integrity 干净):(1) 用 `closed_loop_metrics.sha256` 16 位截断变体比 F 清单 64 位摘要,必然假漂移——AGENTS 已记录的"跨工具哈希必须同源"事实的直接复演;(2) C 参照期望误写 6 NPZ(1/6 keep 轮仅 sub16 保留 1 个)。修复(`1147424`)后重跑为权威 baseline,首轮目录保留为失败尝试证据。
+
+## 1. 阶段 A:baseline(PASS)
+
+`baseline/`,运行时干净树(仅未跟踪 `.zcodeignore`,内容哈希+副本按方案 §12 登记入 `n0_identity.json`;git/env/assets/有效配置/integrity 清单同册)。
+
+- **F 复核**(在算法修改前):fb 严格重放 **5/5 ALL MATCH**(integrity 干净)、cf 严格重放 **113/113 ALL MATCH 且 n==expected**(四视图距离交叉核验全 ok);重放输出写新目录 `baseline/{fb,cf}_replay/`,未触碰 reviewfix3 历史 `diag_replay/`。
+- **249 产物清单活性**:全哈希一致(drifted=[])。
+- **H/B/C/T 登记**:逐文件全长哈希入 `baseline_summary.json`;计数 H 5/B 6/C 1/T 13 全对。
+- **出口条件满足**:基线身份/重放成立、参照完整、profile 可还原且未知字段被拒。
+
+## 2. 阶段 B:五帧完整 trace(PASS)
+
+`trace/`,运行 `a53b6f7`(trace 钩子默认关闭;N0 行为不变由纯度测试钉死)。每帧完整升级链(skip 拒→prediction→prev_accepted→slack)3 次尝试、70–94 个 QP 的逐迭代记录(状态/目标分项/分族违反/回溯/终止)与 QP 数组 NPZ 落盘。
+
+**五帧失败身份逐项复现**(t_fail/状态 `infeasible`/term `no_merit_step_trust_min`/迭代数/QP 数与冻结 solver_fields 全等):sub10@44 26/26、sub12@12 27/27、sub3@14 20/20、sub7@32 31/31、sub8@20 27/27。
+
+**已证实的收敛形态**(§2.2 解释 1/2 的证据;支持"内层求解不足",不支持"结构性联合不可行"):
+
+- 最后尝试的全部恢复 QP 均终止于 `maximum iterations reached`(2500 耗尽),**prim_res ~1e-6~1e-5 而 dual_res 57–272**——原始侧近乎可行、对偶侧远未收敛,ADMM 对偶进度极慢(典型病态/对偶退化签名);
+- 恢复松弛大量微负(42–76 个/解,均在 prim 残差内),返回解未达约束集;
+- 外层线搜索仅能接受 ~0.1% 量级的 merit 下降,违反全部集中于 post 块(C2 行族),trust 在连续拒绝后塌缩至 `trust_radius_min`(0.00087890625)终止——µm 级 C2 残差未达 1e-6 接受门前耗尽路径。
+
+## 3. 阶段 C:N1→N2→N3 数值候选(完成,winner=None)
+
+`numeric/`,每 profile 五冻结帧升级链 + 完整 diagnosis6 quiet(单进程串行、线程 8、`--assert-task-gate 0.40`、三次运行 `code_changed_during_run=False`)+ §8 质量门。**三个 profile 的基础门(6/6 keep)全部未过,质量门随之未过**:
+
+| profile | 五冻结帧单帧升级 | 六段 keep | 六段失败帧(t_fail) |
+|---|---|---|---|
+| N1(eps 1e-9/20000/polish) | **4/5 采纳**(sub3 拒) | **0/6** | sub3@9、sub10@32、sub12@13、sub16@30、sub7@35、sub8@21 |
+| N2(N1+行预条件,代价保持) | 3/5 采纳(sub10/sub3 拒) | **1/6**(仅 sub16) | sub3@9、sub12@13、sub10@44、sub7@41、sub8@25 |
+| N3(N2+C2 罚权=mu) | **4/5 采纳**(sub3 拒) | **0/6** | sub12@11、sub3@23、sub10@33、sub16@41、sub8@22、sub7@53 |
+
+**裁决与机理**(按 §6.2 逐条):
+
+1. **数值候选在冻结帧层面恢复了合法解**(N1/N3 4/5、N2 3/5 单帧升级链采纳;N3 下多帧由 prediction/prev_accepted 直接通过)——µm 级 C2 越界处的信赖域塌缩确属数值/权衡问题,与阶段 B 的"内层求解不足"证据一致。五帧通过数仅用于解释排序(§6.2 条 3),不构成整段结论。
+2. **整段全部失败于新的前缀**:更高精度的内层改变首个 C2 激活帧的求解步,状态链自早期帧起漂移,各段在**更早或不同帧**失败(如 sub3 由 14→9/23、sub16 由 keep→30/41 拒)。"冻结帧成功≠整段成功"与方案 §1 的反向警示一致;不存在可用整段门抵消的单帧改善。
+3. **N2 与 N0 同为 1/6**(sub16,443.8s):行预条件在 OSQP 内部 scaling=10 之下无显著行为差异,属方案 §6.1 预先声明的允许结果,未追加 epsilon/罚权组合。
+4. 三次六段运行 R9 干净(运行期仓库零写入)、任务门断言 0.40 生效、报告内嵌 profile 解析值与注册表哈希。
+
+**出口**:按 §6.2"N1–N3 全未过时进入阶段 D"。未做任何预算外候选搜索(无新增 epsilon/罚权/信赖域/外层预算组合)。
+
+## 4. 阶段 D:范数分支 S1/S2(未实施——下一步)
+
+触发条件已满足(numeric winner=None)。待实施内容按方案 §7:norm_cut 真实范数行 + 切面装配(每 site 8 切面/8 方向预算、共享无量纲 slack `nᵀ(d+Jξ)/B≤1+s_j`、mu 罚权)、S1(0.045)/S2(0.049) 比较矩阵、五帧 + 113 反事实 + 完整六段、产物 format v3 分派(`configs_from_record` 全字段要求、旧 JSON/NPZ 按 axis 原语义解码)。驱动 `--stage norm` 已按前置门就位(numeric 无胜者时放行)。S1/S2 亦未过时按 §7.3 交付失败规格与新最小问题规格。
+
+## 5. 阶段 E/F/G
+
+未进入(依赖 D/E 门)。六段/train24 正式验收与生产交接未执行,§8/§9 的门不因本轮单帧改善而宣称任何通过。
