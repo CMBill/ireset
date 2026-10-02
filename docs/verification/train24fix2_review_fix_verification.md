@@ -1,6 +1,8 @@
 # train24fix2 实现审阅修复验证记录
 
-日期:2026-10-01。对象:[train24fix2 实现审阅修复方案](../plans/train24fix2_review_fix_plan.md)(R1-R5)。审阅基点 `0500b4a`(独立复跑 225 passed + 1 skipped);实施提交 `2aef500`(方案)→ `a0958df`(订正块)→ `a0bf9d5`(R2)→ `fa341e6`(R4)→ `bab948a`(R5)→ `73814d6`(R1+R3)→ `048523d`(skip 键形修复)→ `2158eb2`(对照脚本);全量测试 **248 passed + 1 skipped**。产物目录:`derived/data/teachers_regenerated/train24fix2_reviewfix_20261001/`(`source_manifest.json` + `diag/` + `sixseg/`);冻结参照只读未动。
+日期:2026-10-01。对象:[train24fix2 实现审阅修复方案](../plans/train24fix2_review_fix_plan.md)(R1-R5)。
+
+> **2026-10-02 订正指针:本文 §0-§8 的取证产物(`train24fix2_reviewfix_20261001/diag/`)经第二轮审阅(§9,缺陷 D1-D5)后被 `train24fix2_reviewfix2_20261002/` 取代**——其中 D3 为证据字段错位(完整场景距离双侧同值且退一帧),§6 的全部结论已在修正工具下按 §9.2 复验成立;§7 阶段 C(sixseg)不受影响。审阅基点 `0500b4a`(独立复跑 225 passed + 1 skipped);实施提交 `2aef500`(方案)→ `a0958df`(订正块)→ `a0bf9d5`(R2)→ `fa341e6`(R4)→ `bab948a`(R5)→ `73814d6`(R1+R3)→ `048523d`(skip 键形修复)→ `2158eb2`(对照脚本);全量测试 **248 passed + 1 skipped**。产物目录:`derived/data/teachers_regenerated/train24fix2_reviewfix_20261001/`(`source_manifest.json` + `diag/` + `sixseg/`);冻结参照只读未动。
 
 ## 0. 来源冻结与订正入口(方案 §7.A)
 
@@ -89,3 +91,31 @@ sub16 新记录 78 条 = **45 side_all_miss(与冻结轮计数全等)+ 33 side_p
 - [x] **六段**:有限合法路径状态/候选/计数/轨迹零变化;rq≡rv;ns 计数不变;三次运行零漂移;旧资源/参照哈希不变(source_manifest 33 项冻结只读)。
 
 **阶段裁决(方案 §8 末条):审阅修复与证据重验完成;六段仍为 rq 1/6,原 C2 修复目标(认证边缘碎裂恢复)未达成,继续暂停转段。**下一步须依据订正后的证据(五段 C2_ONLY 全证据链 + 信赖域塌缩终止事实 + sub8 关 C2 即 skip 通过的确定性差距)另立数值收敛或策略变化方案并预注册;本轮不选择替代机制、不继续搜索变体、不重跑 train24、不重标阈值。
+
+## 9. 第二轮审阅修复(reviewfix2,2026-10-02)
+
+对上轮取证工具的第二轮审阅发现五项缺陷(D1-D5),审阅基点 `143aebb`(248 passed + 1 skipped),实施提交 `28ab568`(全量 **257 passed + 1 skipped**,新增 9 项反例 `tests/test_train24fix2_review_fix2.py`)。产物目录 `derived/data/teachers_regenerated/train24fix2_reviewfix2_20261002/`(`diag/` 产物 + `diag_replay/` 严格重放摘要 + `source_manifest.json`);**上轮 `train24fix2_reviewfix_20261001/diag/` 的 fail_bind2_* 与 cert_trace_cf_* 产物自此被取代**(D3 证据字段错位 + D2/D4/D5 弱重放契约),其 `sixseg/` 阶段 C 对照不受本轮缺陷影响、结论保留。
+
+### 9.1 五项缺陷与修复
+
+- **D1 绑定身份未对照原报告(循环自比)**:`bind()` 原实现比较本次重跑与本次快照,`rq_dir` 未用。现 `identity_vs_report` 逐项对照 `--rq-dir` 冻结原报告行的 `t_fail`/`rejection.last_attempt_id`/`last_check_id`/`last_attempt.status` 四项,任何不匹配即 `IDENTITY_MISMATCH` **停止绑定**(不写审计,`identity_failed_items` 命名失败项);运行内部一致性检查保留为第二道。反例:四项各自被篡改(t_fail=999 等)逐项翻假;受控场景下伪造行→停止、真实行→进入完整审计。
+- **D2 重放仅比五项汇总值**:`deep_diff`/`arrays_diff` 全记录逐叶+数组逐位比对(行描述符、每个插值点明细、严格速度超限、前缀最坏值、重解候选审计、分类、结论强度);CLI 判据含 `classification_matches` 与完整性;fail_bind 重放**重算单帧升级(含 QP)与重解候选审计**;E 重放同理。反例:篡改描述符/前缀最坏值/插值点值/重解 term_reason/分类/行数组(哈希同步修好)各自翻 MISMATCH。
+- **D3 113 个 E 产物的完整场景距离字段全部错位**:旧实现把所选单侧的 `[t-1]` 写入双侧(序列 `[t]` 本已是前一完整场景)。现 `prev_scene_flags` 按 `[side]["scene"][t]` 冻结双侧,记录 `prev_scene_dist_both_m` 与 `prev_scene_source`(NPZ 路径+哈希);重放对哈希核验过的源 NPZ **新鲜查询逐侧交叉核验**。修正值:sub10@44 l=`0.0012341966700727114`、r=`0.0012351612733721542`(审阅期望值逐位命中;旧字段双侧同为 `0.0017623104519771862`=[43])。行门控只读 `c2_hand_enabled`(`hand_speed_rows_active`),故旧分类不受影响,证据字段重生成后分布不变。
+- **D4 冻结重放用当前配置、加载无完整性校验**:产物内嵌 `effective`(repair/repair_no_c2/validation 三配置)+`integrity`(16 项代码/配置/资产 SHA-256)+`npz_sha256`(NPZ 先写、哈希入 JSON);`load_products` 拒篡改 NPZ 与 pre-v2 产物;重放 `configs_from_record` 只从冻结值重建配置(现 YAML 漂移不改重放计算),`verify_integrity` 报告代码/配置/资产漂移并判不过。反例:任务门 0.20 漂移下重放不变(冻结生效);改产物内冻结门限/速度界→MISMATCH;改保存数组(哈希修好)→数组比对翻假。
+- **D5 二次重放吞入自身摘要**:候选发现改 `fail_bind2_index`/`cert_trace_cf_index` 生成时预期清单(缺失/空清单显式拒绝,不再 glob);重放输出一律写 `<diag>_replay/` 独立目录。反例:产物目录放置无格式摘要/诱饵文件被忽略;二次重放稳定 ALL MATCH;产物目录零重放文件。
+
+### 9.2 正式重生成与严格重放(rev `28ab568`,干净树)
+
+- **fail_bind 五段:对照原报告身份四项全配**(`id_vs_report=True` ×5;t_fail 44/12/14/32/20、分类 C2_ONLY、`infeasible/no_merit_step_trust_min`、关 C2 重解全部采纳)——上轮阶段 B 结论在修正后的身份校验下成立。
+- **cert_trace 全量**:302 s、81 断言全过、113 反事实重生成,分类分布不变(**13 PASS + 100 C2_ONLY**;尖峰 10/10 C2_ONLY)。
+- **严格重放(独立目录)**:fail_bind 5 记录、cf 113 记录**双双 ALL MATCH**——每条含完整记录逐叶、数组逐位、重解升级重算、冻结配置、完整性清单、分类一致;cf 侧 113 次 prev 场景距离新鲜查询交叉核验全过;二次执行重放仍 ALL MATCH(索引驱动,摘要不再回灌)。
+- `source_manifest.json`:249 项产物哈希 + 冻结输入活性复核(4 个目录标签与上轮逐哈希一致、HBT 内容冻结的 provenance 文件与 24 项索引条目 NPZ/教师输入截断哈希活性重验)。
+
+### 9.3 裁决
+
+第二轮五项缺陷全部修复且可证伪;上轮全部取证结论(五段身份、C2_ONLY 分类、任务 MPJPE 逐位值、六段零变化)在修正工具下**复验成立**,唯证据字段按 D3 订正。**原裁决不变:审阅修复与证据重验完成;六段仍 rq 1/6,原 C2 修复目标未达成,继续暂停转段。**
+
+### 9.4 新增工程事实
+
+- 仓库工具存在两种 SHA-256 变体:`closed_loop_metrics.sha256` 为 16 位截断(provenance 索引内嵌),`experiment_provenance`/产物清单为完整 64 位——跨工具哈希比对必须同源,否则出现"哈希不符"假阳性(本轮 source_manifest 复核即踩中)。
+- 完整记录级确定性实证:113 候选双分支审计 + 五段单帧升级(含 QP 重解)在同一提交状态下全记录逐叶、数组逐位可复现——此前仅五项汇总值被比对,正是 D2 类缺陷的藏身处。
