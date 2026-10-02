@@ -1,6 +1,6 @@
 # train24fix2 实现审阅修复方案
 
-日期：2026-10-01。状态：**仅制定方案，尚未实施**。审阅基点：`0500b4a`；独立复跑 `uv run --locked pytest tests/ -q` 为 **225 passed、1 skipped**。
+日期：2026-10-01。状态：**已实施完毕(R1-R5 全部落地,§8 验收清单六项全过;阶段裁决:审阅修复与证据重验完成,六段仍 rq 1/6,原 C2 修复目标未达成,继续暂停转段)**。审阅基点：`0500b4a`；独立复跑 `uv run --locked pytest tests/ -q` 为 **225 passed、1 skipped**；实施后全量 **248 passed + 1 skipped**。实施进度与证据见[审阅修复验证记录](../verification/train24fix2_review_fix_verification.md)。
 
 对象：[认证边缘碎裂最小修复方案](train24fix2_certification_edge_plan.md)及其[验证记录](../verification/train24fix2_verification.md)。本轮处理实现审阅发现的 5 项问题，属于 M2–M3 收尾中的实现与证据修复，先恢复可复核的失败归因，再为后续策略设计提供依据。
 
