@@ -542,6 +542,42 @@ def test_scope_change_reruns_only_affected_kind(tmp_path, monkeypatch):
     assert sum(1 for x in s2["subtasks"].values() if x["reused"]) == 10
 
 
+def test_reusable_attempt_bootstraps_only_audited_pre_scope_attempts(tmp_path):
+    """Attempts recorded before the scoped-reuse commit carry git_rev but no
+    code fingerprint: they reuse ONLY through the audited bootstrap map
+    (the fixing commit's diff provably left their kind's functions
+    byte-identical) -- an unaudited rev never bootstraps."""
+    reg = drv.SubtaskRegistry(tmp_path)
+    sem = {"profile": "solve:S1", "registry_sha256": "r", "set": "sub10",
+           "task_gate": 0.4, "report_sha256": "rep", "t_fail": 60,
+           "final_stage": "state_constraints"}
+    ident = {**sem, "code_scope": {"kind": "solve",
+                                    "sha256": drv._binding_scope_sha("solve")}}
+    att_dir = reg.begin("solve_S1_sub10", tmp_path,
+                        {**sem, "git_rev": "258802c", "git": {}}, 1)
+    out = att_dir / "o.json"
+    out.write_text("{}")
+    reg.complete("solve_S1_sub10", [out], 1)
+    # the bootstrap constant must BE the live solve scope (258802c's solve
+    # functions are byte-identical to the fixing commit's)
+    assert drv._BOOTSTRAP_SCOPES[("258802c", "solve")] \
+        == drv._binding_scope_sha("solve")
+    assert drv._reusable_attempt(reg, "solve_S1_sub10", ident) is not None
+    # an unaudited pre-scope rev never bootstraps (reload the registry --
+    # the edit went to disk, not to the in-memory doc)
+    doc = json.loads((tmp_path / "subtasks.json").read_text())
+    doc["subtasks"]["solve_S1_sub10"][0]["identity"]["git_rev"] = "deadbee"
+    (tmp_path / "subtasks.json").write_text(json.dumps(doc))
+    reg2 = drv.SubtaskRegistry(tmp_path)
+    assert drv._reusable_attempt(reg2, "solve_S1_sub10", ident) is None
+    # and a scope change still refuses even the bootstrapped rev
+    doc["subtasks"]["solve_S1_sub10"][0]["identity"]["git_rev"] = "258802c"
+    (tmp_path / "subtasks.json").write_text(json.dumps(doc))
+    reg3 = drv.SubtaskRegistry(tmp_path)
+    changed = {**ident, "code_scope": {"kind": "solve", "sha256": "changed"}}
+    assert drv._reusable_attempt(reg3, "solve_S1_sub10", changed) is None
+
+
 # ---------------------------------------------------------------------------
 # freeze_segment with_series: the cumulative anchor-drift curves
 # ---------------------------------------------------------------------------

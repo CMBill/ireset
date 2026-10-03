@@ -1822,20 +1822,45 @@ def _binding_scope_sha(kind: str) -> str:
     return h.hexdigest()
 
 
+#: bootstrap for binding attempts recorded BEFORE the scoped-reuse commit
+#: (their identity carries ``git_rev`` but no code fingerprint).  Audit
+#: (2026-10-03, ``git diff 258802c..e4bbf2b``): the fixing commit touched
+#: ONLY the anchor binding and the reuse machinery itself -- the
+#: solve-scope functions are byte-identical at 258802c, so that rev's solve
+#: scope equals the live hash below.  NO anchor entry: that tooling changed,
+#: its attempts can never bootstrap (they were failed attempts anyway).
+_BOOTSTRAP_SCOPES = {
+    ("258802c", "solve"):
+        "ff269b824cbc91c3dc4ea75724c3b299930387f1b8f62d68e68b5f6c2db95bca",
+}
+
+
 def _reusable_attempt(reg: "SubtaskRegistry", name: str, identity: dict):
     """Cross-commit reuse for the failure-prefix bindings (plan 12: verify
     the file hashes, rerun only the affected tasks): ``git_rev``/``git`` are
     deliberately NOT compared -- the semantic identity (profile, registry,
     set, report hash, t_fail, final stage) AND the binding-kind source
     fingerprint must match, and every registered output must still
-    hash-verify.  Anything else reruns into a NEW attempt directory."""
+    hash-verify.  Anything else reruns into a NEW attempt directory.  A
+    pre-scope attempt (no ``code_scope`` recorded) is bootstrapped through
+    the audited :data:`_BOOTSTRAP_SCOPES` map only."""
     for att in reg.attempts(name):
         if att.get("status") != "complete" or att.get("ok") is not True:
             continue
         prior = att.get("identity") or {}
         keys = ("profile", "registry_sha256", "set", "task_gate",
-                "report_sha256", "t_fail", "final_stage", "code_scope")
+                "report_sha256", "t_fail", "final_stage")
         if any(prior.get(k) != identity.get(k) for k in keys):
+            continue
+        prior_scope = prior.get("code_scope")
+        if prior_scope is None and identity.get("code_scope"):
+            boot = _BOOTSTRAP_SCOPES.get(
+                (prior.get("git_rev"),
+                 identity["code_scope"].get("kind")))
+            if boot is not None:
+                prior_scope = {"kind": identity["code_scope"].get("kind"),
+                               "sha256": boot}
+        if prior_scope != identity.get("code_scope"):
             continue
         if not reg._outputs_ok(att):
             continue
