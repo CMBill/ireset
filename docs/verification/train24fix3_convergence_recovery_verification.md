@@ -123,6 +123,31 @@
 - **实现级冒烟(提交前,/tmp 一次性,非正式运行)**:真实 S1/sub12 solve 绑定全链 803s——身份 13 项逐值全配(t_fail=14/attempt [0,14,2]/check `p0:t14:c39`/25 attempts/5729 QP/649 iters/C2 14/14)、升级链重放与段内失败全等、NPZ 748 QP 各带行身份+仅末 QP 全矩阵+前缀 [14,36]。正式 failure-prefix 运行在实验根重做该绑定(冻结 rev 下)。
 - **2026-10-03 运行期工具缺陷与修复(提交 `258802c` 后首轮正式运行暴露)**:首轮 failure-prefix(`--budget-min 360`)在 10 个 solve 绑定全部身份逐值全配完成后,**两个锚漂绑定在求解完成后的分析段崩溃**——`final_fail` 快照的轨迹本身就是 [T,43] 验证器场景(箱体在 36:43 列),`_bind_anchor_failure` 又对它 hstack 箱体得 [T,50],`load_teacher_npz` 按 qpos≠43 拒载(sub16 pass0 已写、sub3 双 pass 计算完成后同败;失败尝试目录保留为证据,阶段如实 INCOMPLETE)。修复:场景=轨迹本身+形状守卫;回归测试伪造双 pass 快照断言逐 pass NPZ 可按 [T,43] 载入。**同时落地 §12"行为修改后重跑受影响任务"的受影响范围复用**:`_binding_scope_sha`(绑定种类所执行函数的源码指纹,anchor 侧含 freeze_segment/ref_intervals_of)+`_reusable_attempt`(跨提交复用比对语义身份(profile/注册表/集合/报告哈希/t_fail/final_stage)+code_scope+输出哈希,**不比对 git_rev/git**——修复只动 anchor 侧源码,10 个 solve 绑定原样复用、仅 2 个锚漂绑定写 attempt_002 重跑;测试钉死"仅受影响种类重跑"。**首跑复用失败与 bootstrap**:scope 字段是修复提交才引入的,旧 attempt 身份没有它,首轮重跑被判不可复用而全部重跑(发现后立即停止,仅 solve_S1_sub10 多耗 ~10 分钟、留 attempt_002 半跑记录);补 `_BOOTSTRAP_SCOPES`——旧 attempt 仅当 (git_rev, kind) 在审计表内才按该 rev 的 scope 哈希 bootstrap(git diff 258802c..e4bbf2b 审计:修复提交只动 anchor 函数与复用机器,solve 侧函数两 rev 逐字节相同→其 scope 哈希相等;未审计 rev 永不 bootstrap、scope 变更仍拒,均有测试)。**预算调整登记(§12,单独登记)**:P 预算 360min 首轮耗 16174s(4.49h,其中 sub3 锚漂双 pass 求解 ~2h 因分析段崩溃作废);受影响重跑(2 锚漂绑定)按 240min 上限执行,累计 P 支出登记上限调整为 8h——超支归因=取证工具缺陷而非算法成本,受影响范围复用已把重复计算压到最小。测试 328→**330 passed + 1 skipped**。
 
+## 0.5 续行单位 3 运行结果:evidence 重验与实际失败前缀取证(2026-10-03/04,提交单位 3b)
+
+实验根 `derived/data/teachers_regenerated/train24fix3_recovery_20261003_258802c/`(运行冻结 rev `258802c`→修复后 `e4bbf2b`/`cbcf078` 仅触及取证工具,见 §0.4 运行期缺陷;未跟踪文件仅 `.zcodeignore`,内容哈希+副本登记入 evidence/untracked)。**§4.4 续行前置出口与 §5.3 出口全部成立。**
+
+**evidence 阶段(PASS,3782s/预算 240min,47 项 check 全绿,8 子任务全 complete)**:
+
+- 历史来源核验全过:norm_summary winner=None、双 S 六段报告 0/6+R9 干净+git_rev 在册、**live S1/S2 profile 与历史 resolved 逐字段相等且注册表哈希未漂移**(重跑即原冻结 profile)、旧 cf 目录 227 文件(113 npz 产物+113 json+索引)全 64 位摘要登记;续行 baseline 登记 H/B/C/T 参照+F 249 产物活性+未跟踪文件副本。
+- **10 个冻结帧逐项同历史**(ff 5+5:采纳 5/5、带 profile 完整审计通过 5/5、采纳来源/term 逐项一致——`historical_identical=True` 双 profile)。
+- **226 项反事实逐 stem 分类零差异**(`per_item_identical=True`,diff 列表空):S1 **41 PASS+72 C2_ONLY**、S2 **57 PASS+56 C2_ONLY** 与冻结目标精确命中;尖峰 10/10 全被真实范数行拒绝、启用态全部 norm_cut(硬门)。Q 修复保持原 N/S 行为的主张在真实数据上成立。
+- 严格重放双跑×双 profile 全 ALL MATCH(ff 5/5+cf 113/113,n==expected;run1/run2 逐项 verdict 稳定;产物目录零污染)。
+
+**failure-prefix 阶段(COMPLETE;三轮:首轮 16174s 完成 10 solve 绑定+2 锚漂绑定败于 §0.4 工具缺陷→修复后重跑被 scope bootstrap 复用 10 绑定、2 锚漂 attempt_002 重跑 6598s;13 项 check 全绿)**:
+
+- **10 个实际求解失败身份全部逐值绑定**(13 项身份:t_fail/attempt id/check id/status/skip_reason/final_stage/n_passes/attempts/qp_calls/iterations/C2 frames_on 双侧)。S1:sub10@60(6653 QP)/sub12@14(5729)/sub16@36(2735)/sub3@63(12172)/sub7@23(757)/sub8@32(5617);S2:sub10@60(6674)/sub12@14(6233)/sub7@23(749)/sub8@33(6082)。每绑定含:已采纳前缀、字段完备失败上下文、**失败帧升级链 trace 重放**(与段内失败 status/term/iterations/qp_calls 全等;三尝试链 skip→prediction→slack)、全 QP 行/列身份+仅末 QP 全矩阵(例 sub12 帧 748 QP)。
+- **十个失败的最后尝试全部终于 `no_merit_step_trust_min`**(信赖域塌缩)——与阶段 B 的 axis/N0 机理结论同构,S 范数分支的失败形态未变;按 §5.3 出口措辞仍为"固定流程未收敛",非结构性不可行证明。
+- **S2 sub16/sub3 两段锚漂两 pass 证据完整**(身份逐值:sub16 suffix_from=35、双 pass (35 att/3984 QP)+(27/2475)、violated `hand_grasp: right_hand anchor t=40`;sub3 suffix_from=9、(101/17435)+(90/15415)、violated `... t=85`;C2 frames_on l/r 与原报告全等):
+  - **sub16**:右参考区间 [24,42] vs 验证器认证 [27,42] vs C2 启用 t=27;认证区间累计漂移峰值 0.0202 m(区间内相对帧 13=绝对 t=40,与违反位置一致);左无参考区间。suffix 重试与首 pass 轨迹相同(重试未改变结局)。
+  - **sub3**(开局深接触):左参考 [0,89]/认证 [1,89]、右 [1,91]/[1,91],C2 双侧 t=1 启用;认证区间累计漂移左峰 0.0796 m/右峰 **0.1278 m**(对 0.02 容差),参考区间内速度峰值 ~0.049 m/s(骑在 S2 范数界上)——漂移在携带期缓慢累积,非单帧事件。
+  - **求解 ctx 手锚恒空**(两段全部帧 `hand_anchor` 均 None)——regen 模式从未建立手锚,认证锚漂全部来自无锚自由漂移+范数界允许的小步累积;这是 R2/R3 固定区间手锚(方案 §7.6)的直接动机证据。
+- 产物:`evidence/{ff_S1,cf_S1,replay_S1_run1|run2,ff_S2,cf_S2,replay_S2_run1|run2}/attempt_001`、`failure_prefix/{solve_<P>_<demo>,anchor_S2_sub16|sub3}/attempt_00{1,2}`;共 734MB/254 NPZ(§12 的 10GiB 预算内)。失败尝试(anchor attempt_001×2、solve_S1_sub10 attempt_002 半跑)保留为证据。
+
+**预算账(§12)**:Q=63min/240min;P=首轮 4.49h+中止重跑 ~10min+完成轮 1.83h≈6.5h(登记上限 8h,超支归因=取证工具缺陷,已单独登记)。测试 328→**331 passed + 1 skipped**(修复两轮 +2/+1 项回归)。
+
+**取代关系**:本轮 evidence 重验**不推翻**阶段 D 的 0/6 裁决(仅证明证据链在 Q 修复下行为等价、可完整重放);`train24fix3_20261002_1147424/norm/` 的 v1 产物为历史证据保持只读,新 recovery schema 产物以本根为准。**下一步=提交单位 4(R1 可行性优先恢复,方案 §7.5)——Q/P 出口已闭合,R 实验前工作树固定于本提交。**
+
 ## 0. 实施提交与测试
 
 | 提交 | 内容 |
@@ -140,9 +165,12 @@
 | `6b305c8` | 阶段 D 续跑完成记录+AGENTS 同步:§0.1 执行状态、§4 完整裁决与失败分类、§0/产物索引/预算表更新 |
 | `e68ea27` | 续行前置 Q1–Q4 证据修复(§0.2):profile 审计穿透+数组保留、recovery schema/加载器/双分支严格重放+目录约定统一、configs 回填仅 v2+integrity 补三文件、逐 QP 元数据一一对一+删补记、数组键单前缀+双前缀显式解码;测试 288→303+1s |
 | `5bea3be` | 提交单位 2 执行基建(§0.3):§8.1 全家族完整门(full 模式缺证据即败)、§12 子任务状态机、正式 stage_sixseg/stage_train24+`--profile` 交叉核验、freeze_segment with_series 增量;测试 303→316+1s(新增 `tests/test_train24fix3_formal.py` 13 项,含 B 运行四失败侧逐值冒烟;表内原记 315 系笔误已订正) |
-| (本提交) | 提交单位 3a 续行阶段入口(§0.4):stage_evidence(历史来源核验+续行 baseline 登记+8 子任务+逐项对照不强制)+ stage_failure_prefix(10 solve 绑定+2 anchor 锚漂,身份不符停止绑定)+紧凑 QP 序列化+锚漂曲线增量;测试 316→328+1s;正式运行在提交后冻结树执行 |
+| `258802c` | 提交单位 3a 续行阶段入口(§0.4):stage_evidence(历史来源核验+续行 baseline 登记+8 子任务+逐项对照不强制)+ stage_failure_prefix(10 solve 绑定+2 anchor 锚漂,身份不符停止绑定)+紧凑 QP 序列化+锚漂曲线增量;测试 316→328+1s;正式运行在提交后冻结树执行 |
+| `e4bbf2b` | 运行期修复:锚漂绑定 [T,43] 场景缺陷(final_fail 轨迹即验证器场景,原 hstack 得 [T,50] 拒载)+§12 受影响范围复用(_binding_scope_sha+_reusable_attempt);P 预算调整登记 360min→累计 8h;测试 328→330+1s |
+| `cbcf078` | 范围复用 bootstrap(_BOOTSTRAP_SCOPES 审计表:旧 attempt 仅按 (git_rev,kind) 表内条目 bootstrap,未审计 rev/scope 变更均拒);测试 330→331+1s |
+| (本提交) | 提交单位 3b 运行结果(§0.5):evidence PASS(10 帧逐项同历史+226 反事实零差异 41/72·57/56+双跑重放全 MATCH)与 failure-prefix COMPLETE(10 身份绑定全配+两段锚漂两 pass 证据+手锚恒空);验证记录/AGENTS/方案清单同步 |
 
-测试 262 → 288 passed + 1 skipped(阶段 A–C 完成时;`uv run --locked pytest tests/ -q` @ `84a7a7d`)→ **303 passed + 1 skipped**(Q1–Q4 后)→ **~~315~~ 316 passed + 1 skipped**(提交单位 2 后;订正见 §0.3)→ **328 passed + 1 skipped**(提交单位 3a 后)。288 档构成:`tests/test_train24fix3_profiles.py` 9 项(注册表矩阵/未知字段·非法值·非法继承拒绝、N0 默认=历史硬编码、逐帧门控仅 C2 激活帧、solve_qp 设置穿透 spy、trace 开/关纯度逐位、v2 记录 N0 回填/非 N0 携带拒绝、effective 记录携带 profile)+ `tests/test_train24fix3_numeric.py` 7 项(N0/N1 挂载=无 profile 逐位一致、N2 行变换 ξ 列纯 /B 且松弛列两表述同 −1、±INF 哨兵有限值比较、松弛罚权单位 10000·B 仅 C2 族、高精度同解与 s_m=B·s_norm、真实接受行 N2 下逐位不变、N3 mu 罚权仅 C2 松弛且缺 mu 显式错、tight N3≡N2)+ `tests/test_train24fix3_norm.py` 11 项(见 §4)。303 档新增 `tests/test_train24fix3_recovery.py` 15 项(见 §0.2)。316 档新增 `tests/test_train24fix3_formal.py` 13 项(见 §0.3)。328 档新增 `tests/test_train24fix3_continuation.py` 12 项(见 §0.4)。
+测试 262 → 288 passed + 1 skipped(阶段 A–C 完成时;`uv run --locked pytest tests/ -q` @ `84a7a7d`)→ **303 passed + 1 skipped**(Q1–Q4 后)→ **~~315~~ 316 passed + 1 skipped**(提交单位 2 后;订正见 §0.3)→ **328 passed + 1 skipped**(提交单位 3a 后)→ **331 passed + 1 skipped**(运行期修复后,单位 3b 运行时全量复验)。288 档构成:`tests/test_train24fix3_profiles.py` 9 项(注册表矩阵/未知字段·非法值·非法继承拒绝、N0 默认=历史硬编码、逐帧门控仅 C2 激活帧、solve_qp 设置穿透 spy、trace 开/关纯度逐位、v2 记录 N0 回填/非 N0 携带拒绝、effective 记录携带 profile)+ `tests/test_train24fix3_numeric.py` 7 项(N0/N1 挂载=无 profile 逐位一致、N2 行变换 ξ 列纯 /B 且松弛列两表述同 −1、±INF 哨兵有限值比较、松弛罚权单位 10000·B 仅 C2 族、高精度同解与 s_m=B·s_norm、真实接受行 N2 下逐位不变、N3 mu 罚权仅 C2 松弛且缺 mu 显式错、tight N3≡N2)+ `tests/test_train24fix3_norm.py` 11 项(见 §4)。303 档新增 `tests/test_train24fix3_recovery.py` 15 项(见 §0.2)。316 档新增 `tests/test_train24fix3_formal.py` 13 项(见 §0.3)。328 档新增 `tests/test_train24fix3_continuation.py` 12 项(见 §0.4)。331 档=运行期修复两轮新增 3 项(锚漂场景 [T,43] 回归+范围变更仅重跑受影响种类+bootstrap 审计表,见 §0.4 运行期缺陷块)。
 
 首轮 baseline(`train24fix3_20261002_a7954e2/`)因驱动两处登记缺陷判 FAIL(fb/cf 重放本身已 ALL MATCH、integrity 干净):(1) 用 `closed_loop_metrics.sha256` 16 位截断变体比 F 清单 64 位摘要,必然假漂移——AGENTS 已记录的"跨工具哈希必须同源"事实的直接复演;(2) C 参照期望误写 6 NPZ(1/6 keep 轮仅 sub16 保留 1 个)。修复(`1147424`)后重跑为权威 baseline,首轮目录保留为失败尝试证据。
 
