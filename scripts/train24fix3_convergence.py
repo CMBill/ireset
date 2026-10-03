@@ -18,6 +18,12 @@ Stages:
 - ``trace``    : five frozen frames' full escalation-chain trace (plan 5).
 - ``numeric``  : N1 -> N2 -> N3 fixed comparison (plan 6).
 - ``norm``     : S1 -> S2 (plan 7; only when numeric found no winner).
+- ``evidence`` : plan 4.4 item 6 continuation -- S1/S2 evidence
+  re-verification under the Q-fixed recovery schema (10 frozen frames, 226
+  counterfactuals, strict replay x2 each, item-by-item comparison against
+  the historical 41/72 and 57/56; continuation baseline registration).
+- ``failure-prefix`` : plan 5.3 -- the 10 actual solve-failure identities
+  (S1 x6 + S2 x4) and the S2 sub16/sub3 two-pass anchor-drift capture.
 - ``sixseg``   : formal stage-E acceptance for the SELECTED profile (plan 8).
 - ``train24``  : stage F for the FROZEN profile (plan 9).
 
@@ -55,16 +61,18 @@ def sha256_full(path: Path) -> str:
     source (2026-10-02 engineering note), so this driver hashes full-length
     everywhere it compares or registers file content."""
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
-from ireset.paths import DERIVED_DATA_DIR, PROJECT_ROOT  # noqa: E402
+from ireset.paths import DERIVED_DATA_DIR, PROJECT_ROOT, TEACHER_TRAJ_DIR  # noqa: E402
 from ireset.repair.config_io import load_mode_configs  # noqa: E402
 from train24fix2_audit import (  # noqa: E402
     arrays_diff,
+    assert_snapshot_matches_live,
     attach_integrity,
     classify_branches,
     configs_from_record,
     context_arrays,
     context_from,
     deep_diff,
+    escalate_frame,
     freeze_context,
     full_candidate_audit,
     integrity_manifest,
@@ -72,11 +80,16 @@ from train24fix2_audit import (  # noqa: E402
     load_products,
     verify_integrity,
 )
-from dataclasses import asdict  # noqa: E402
+from dataclasses import asdict, replace  # noqa: E402
 
 TEACHERS = DERIVED_DATA_DIR / "teachers_regenerated"
 #: plan section 3.2 reference registry (read-only)
 F_ROOT = TEACHERS / "train24fix2_reviewfix3_20261002"
+#: the historical A-D experiment root (plan 4.4 item 6 comparison targets;
+#: strictly read-only -- S1's 41/72 and S2's 57/56 counterfactual
+#: distributions, the 0/6 sixseg state and the failure identities all
+#: come from here)
+RECOVERY_SRC_ROOT = TEACHERS / "train24fix3_20261002_1147424"
 REFERENCES = {
     "H": {"root": TEACHERS / "labelq_20260926_sixseg", "subdirs": ("rq", "rv", "ns"),
           "expect": {"rq_npz": 5}},
@@ -1269,7 +1282,9 @@ def _prev_scene_cross_check(record: dict) -> dict:
 
 def replay_recovery(prof_dir: Path, out_dir: Path, *,
                     kinds: tuple[str, ...] = ("ff", "cf"),
-                    live_manifest: dict | None = None) -> dict:
+                    live_manifest: dict | None = None,
+                    ff_dir: Path | None = None,
+                    cf_dir: Path | None = None) -> dict:
     """Strict replay of one profile's recovery products (plan 4.4 item 4,
     Q2).  Index-driven over both kinds; every product is loaded through
     the verifying loader; the frozen inputs rebuild the computation --
@@ -1280,7 +1295,9 @@ def replay_recovery(prof_dir: Path, out_dir: Path, *,
     previous-scene distances are re-queried FRESH from the hash-verified
     source NPZ across all four frozen views.  Output goes ONLY to
     ``out_dir`` (the products directory is never written); the processed
-    count is part of the verdict (``n == expected``)."""
+    count is part of the verdict (``n == expected``).  ``ff_dir``/``cf_dir``
+    override the default ``<prof_dir>/<kind>`` layout for the §12 subtask
+    machine (each kind lives in its own attempt directory)."""
     import numpy as np
     from dataclasses import replace as _replace
 
@@ -1292,7 +1309,7 @@ def replay_recovery(prof_dir: Path, out_dir: Path, *,
         live_manifest = integrity_manifest()
     results: dict = {"ok": True, "kinds": {}}
     for kind in kinds:
-        pdir = prof_dir / kind
+        pdir = {"ff": ff_dir, "cf": cf_dir}.get(kind) or (prof_dir / kind)
         idx = _recovery_index(pdir, f"{kind}_index")
         entries: dict = {}
         ok = True
@@ -1465,6 +1482,793 @@ def stage_norm(root: Path) -> None:
     write_guarded(stage_summary_path(root, "norm"),
                   json.dumps(summary, indent=1, default=float))
     print(f"norm -> winner={winner} ({stage_summary_path(root, 'norm')})")
+
+
+# ---------------------------------------------------------------------------
+# continuation stages (plan 4.4 item 6 + 5.3 + 13): evidence re-verification
+# and actual-failure-prefix / anchor-drift forensics
+# ---------------------------------------------------------------------------
+
+
+def _write_stage_summary(root: Path, stage: str, doc: dict) -> None:
+    """Resume-capable stage-summary write: the summary is the driver's OWN
+    machine-readable verdict (regenerated from verified subtasks), so a
+    resumed run REWRITES it -- unlike product/attempt directories, which
+    stay refuse-overwrite forever (plan 12)."""
+    path = stage_summary_path(root, stage)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(doc, indent=1, default=float))
+
+
+def _dir_manifest(d: Path) -> dict[str, str]:
+    """{relative path: full sha256} of every file under ``d`` (source-of-
+    record registration for read-only historical evidence)."""
+    out: dict[str, str] = {}
+    if d.is_dir():
+        for p in sorted(d.rglob("*")):
+            if p.is_file():
+                out[str(p.relative_to(d))] = sha256_full(p)
+    return out
+
+
+def _historical_norm_evidence(gate: Gate) -> dict:
+    """Plan 4.4 item 6 / the continuation exit's 'the original sixseg state
+    has a reliable source': verify the historical A-D root's norm stage
+    summaries and both S sixseg reports for identity (git rev, R9 clean,
+    0/6 kept) and verify the LIVE S1/S2 profiles still equal the frozen
+    records the historical runs used -- a drifted registry would make any
+    re-run 'not the frozen profile'."""
+    from ireset.repair.profiles import load_profiles, profiles_yaml_sha256
+
+    norm_path = RECOVERY_SRC_ROOT / "norm" / "norm_summary.json"
+    gate.check("hist_norm_summary_exists", norm_path.is_file(), str(norm_path))
+    ns = json.loads(norm_path.read_text())
+    gate.check("hist_norm_winner_none", ns.get("winner") in (None, False),
+               f"winner={ns.get('winner')!r}")
+    out: dict = {"norm_summary": {
+        "path": str(norm_path), "sha256": sha256_full(norm_path),
+        "winner": ns.get("winner")}, "profiles": {}}
+    live = load_profiles()
+    for p in ("S1", "S2"):
+        ps_path = RECOVERY_SRC_ROOT / "norm" / p / "profile_summary.json"
+        rep_path = (RECOVERY_SRC_ROOT / "norm" / p / "sixseg" / "rq"
+                    / "regen_report_diagnosis6_strict.json")
+        gate.check(f"hist_{p}_profile_summary", ps_path.is_file(), str(ps_path))
+        gate.check(f"hist_{p}_sixseg_report", rep_path.is_file(), str(rep_path))
+        ps = json.loads(ps_path.read_text())
+        rep = json.loads(rep_path.read_text())
+        rep_prof = rep.get("profile") or {}
+        gate.check(f"hist_{p}_sixseg_0_of_6",
+                   rep.get("n_kept") == 0 and (ps.get("sixseg") or {}).get("n_kept") == 0,
+                   f"report n_kept={rep.get('n_kept')} summary="
+                   f"{(ps.get('sixseg') or {}).get('n_kept')}")
+        gate.check(f"hist_{p}_r9_clean",
+                   rep.get("end", {}).get("code_changed_during_run") is False,
+                   rep.get("end", {}).get("code_changed_during_run"))
+        gate.check(f"hist_{p}_git_rev_recorded", bool(rep.get("git_rev")),
+                   rep.get("git_rev"))
+        gate.check(f"hist_{p}_registry_frozen",
+                   rep_prof.get("registry_sha256") == profiles_yaml_sha256(),
+                   f"report={str(rep_prof.get('registry_sha256'))[:16]} "
+                   f"live={profiles_yaml_sha256()[:16]}")
+        gate.check(f"hist_{p}_resolved_frozen",
+                   rep_prof.get("resolved") == live[p].as_record(),
+                   "report profile record == live resolved profile")
+        gate.check(f"hist_{p}_cf_dir_113",
+                   len(list((RECOVERY_SRC_ROOT / "norm" / p / "cf").glob("cf_*.npz"))) == 113,
+                   f"npz products under {RECOVERY_SRC_ROOT / 'norm' / p / 'cf'} "
+                   f"(cf_*.json also matches cf_index.json)")
+        out["profiles"][p] = {
+            "profile_summary": {"path": str(ps_path), "sha256": sha256_full(ps_path)},
+            "sixseg_report": {"path": str(rep_path), "sha256": sha256_full(rep_path),
+                              "n_kept": rep.get("n_kept"), "git_rev": rep.get("git_rev")},
+            "ff_rows": (ps.get("frozen_frames") or {}).get("rows", []),
+            "cf_distribution": (ps.get("counterfactuals") or {}).get("distribution", {}),
+            "cf_dir": {"path": str(RECOVERY_SRC_ROOT / "norm" / p / "cf"),
+                       "manifest": _dir_manifest(RECOVERY_SRC_ROOT / "norm" / p / "cf")}}
+    return out
+
+
+def _cf_hist_map(p: str) -> dict[str, str | None]:
+    """stem -> the historical v1 norm classification (the 41/72 and 57/56
+    per-item comparison targets, read from the historical cf products)."""
+    out: dict[str, str | None] = {}
+    for f in sorted((RECOVERY_SRC_ROOT / "norm" / p / "cf").glob("cf_*.json")):
+        if f.name == "cf_index.json":        # not a product record
+            continue
+        out[f.stem[3:]] = json.loads(f.read_text()).get("classification")
+    return out
+
+
+def _ff_run(prof, att: Path) -> int:
+    """Frozen-frames subtask runner: products + a machine-readable stage
+    summary (so a REUSED attempt can rebuild the comparison without
+    re-solving)."""
+    res = _profile_frozen_frames(prof, F_ROOT / "diag", att)
+    write_guarded(att / "ff_stage_summary.json", json.dumps({
+        "n": len(res["rows"]),
+        "counts": {k: res[k] for k in (
+            "n_adopted", "n_full_audit_pass", "n_adopted_audit_fail",
+            "n_evidence_incomplete", "n_not_adopted")},
+        "rows": [{k: r[k] for k in (
+            "stem", "demo", "t", "adopted", "adopted_source", "last_status",
+            "last_term_reason", "outcome")} for r in res["rows"]]}, indent=1))
+    return len(res["rows"])
+
+
+def _cf_run(prof, att: Path, gate: Gate) -> int:
+    res = _norm_counterfactuals(prof, F_ROOT / "diag", att, gate)
+    write_guarded(att / "cf_stage_summary.json", json.dumps({
+        "n": res["n"], "distribution": res["distribution"],
+        "spikes_ok": res["spikes_ok"], "enable_ok": res["enable_ok"],
+        "classifications": {r["stem"]: r["classification"] for r in res["rows"]},
+        "spikes": res["spikes"]}, indent=1))
+    return res["n"]
+
+
+def _dir_outputs(d: Path) -> list[Path]:
+    return sorted(q for q in d.iterdir() if q.is_file()) if d.is_dir() else []
+
+
+def _baseline_registration(gate: Gate, out: Path) -> dict:
+    """Continuation baseline registration (plan 13: the evidence stage
+    registers baseline/H/B/C/F/T alongside the S1/S2 re-verification):
+    H/B/C/T reference hashes, the F 249-product liveness check, and the
+    content-hash + copy of every untracked workspace file."""
+    refs = _reference_registration(gate)
+    sm = json.loads((F_ROOT / "source_manifest.json").read_text())
+    drifted = [p["path"] for p in sm["products"]
+               if sha256_full(F_ROOT / p["path"]) != p["sha256"]]
+    gate.check("source_manifest_liveness",
+               not drifted and len(sm["products"]) == 249,
+               f"products={len(sm['products'])} drifted={drifted[:5]}")
+    untracked = _untracked_registration(out)
+    return {"references": refs, "source_manifest_products": len(sm["products"]),
+            "untracked": untracked}
+
+
+def stage_evidence(root: Path, budget_min: float | None = None) -> None:
+    """Plan 4.4 item 6 (Q-fix evidence re-verification, section-12 budget
+    4h): re-generate BOTH S profiles' five frozen frames and 113
+    counterfactuals under the NEW recovery schema, strictly replay each
+    TWICE into independent directories, and compare item-by-item against
+    the historical 41/72 (S1) and 57/56 (S2) -- differences are LOCATED
+    and explained, never forced back.  Also registers the continuation
+    baseline (H/B/C/T references, the F 249-product liveness, untracked
+    files) and verifies the historical sixseg state's source of record.
+    The original N/S algorithm is untouched (Q1-Q4 fixed evidence only)."""
+    out = root / "evidence"
+    gate = Gate()
+    diag = F_ROOT / "diag"
+    t0 = time.perf_counter()
+    deadline = t0 + (budget_min * 60.0 if budget_min else float("inf"))
+
+    hist = _historical_norm_evidence(gate)
+    baseline = _baseline_registration(gate, out)
+
+    from ireset.repair.profiles import load_profiles
+    profiles = load_profiles()
+    reg = SubtaskRegistry(out)
+    sub_results: dict[str, dict] = {}
+    not_run: list[str] = []
+    failures: dict[str, str] = {}
+
+    def _budgeted(name: str, identity: dict, expected: int, runner, outputs_of):
+        if time.perf_counter() > deadline:
+            not_run.append(name)
+            return None
+        try:
+            r = _subtask(reg, name, out, identity, expected, runner, outputs_of)
+            print(f"  [evidence {name}] reused={r['reused']} "
+                  f"processed={r['processed']}/{expected}")
+            sub_results[name] = r
+            return r
+        except Exception as exc:              # noqa: BLE001 -- record & continue
+            failures[name] = f"{type(exc).__name__}: {exc}"
+            gate.check(f"subtask_{name}", False, failures[name])
+            return None
+
+    per_profile: dict[str, dict] = {}
+    for p in ("S1", "S2"):
+        prof = profiles[p]
+        entry: dict = {}
+        ff = _budgeted(f"ff_{p}", _stage_identity(p, "fail_bind2_5"), 5,
+                       lambda att, _p=prof: _ff_run(_p, att),
+                       lambda att: _dir_outputs(att / "ff")
+                       + [att / "ff_stage_summary.json"])
+        cf = _budgeted(f"cf_{p}", _stage_identity(p, "cert_trace_cf_113"), 113,
+                       lambda att, _p=prof: _cf_run(_p, att, gate),
+                       lambda att: _dir_outputs(att / "cf")
+                       + [att / "cf_stage_summary.json"])
+        replays: dict[str, dict] = {}
+        if ff and cf:
+            ff_dir = Path(ff["dir"]) / "ff"
+            cf_dir = Path(cf["dir"]) / "cf"
+            prod_ident = {"ff_index": sha256_full(ff_dir / "ff_index.json"),
+                          "cf_index": sha256_full(cf_dir / "cf_index.json")}
+            for run in (1, 2):
+                def _rp(att, _ff=ff_dir, _cf=cf_dir):
+                    res = replay_recovery(_ff.parent, att, ff_dir=_ff, cf_dir=_cf)
+                    if not res["ok"]:
+                        raise RuntimeError("strict recovery replay mismatch")
+                    return (res["kinds"]["ff"]["n"] + res["kinds"]["cf"]["n"])
+                rp = _budgeted(
+                    f"replay_{p}_run{run}",
+                    {**_stage_identity(p, "recovery_replay_118"), "run": run,
+                     "products": prod_ident}, 118, _rp,
+                    lambda att: [att / "recovery_replay.json"])
+                if rp:
+                    doc = json.loads((Path(rp["dir"]) / "recovery_replay.json").read_text())
+                    replays[f"run{run}"] = {
+                        k: {"ok": v["ok"], "n": v["n"], "expected": v["expected"]}
+                        for k, v in doc["kinds"].items()}
+                    gate.check(f"{p}_replay_run{run}_all_match",
+                               doc["ok"] and all(
+                                   v["n"] == v["expected"] == (5 if k == "ff" else 113)
+                                   for k, v in doc["kinds"].items()),
+                               replays[f"run{run}"])
+            if len(replays) == 2:
+                d1 = json.loads((Path(sub_results[f"replay_{p}_run1"]["dir"])
+                                 / "recovery_replay.json").read_text())
+                d2 = json.loads((Path(sub_results[f"replay_{p}_run2"]["dir"])
+                                 / "recovery_replay.json").read_text())
+                sem = lambda d: {k: {s: [e.get("ok"), e.get("classification_recomputed"),
+                                         e.get("escalation_matches")]
+                                     for s, e in v["entries"].items()}
+                                 for k, v in d["kinds"].items()}
+                gate.check(f"{p}_replay_run1_run2_stable", sem(d1) == sem(d2),
+                           "second run's per-item verdicts identical")
+            gate.check(f"{p}_products_unpolluted",
+                       not (ff_dir / "recovery_replay.json").exists()
+                       and not (cf_dir / "recovery_replay.json").exists(),
+                       "replay wrote only into its own output directory")
+        elif f"ff_{p}" in not_run or f"cf_{p}" in not_run:
+            # the products were budget-skipped, so the replays could not
+            # START either -- record them, keeping the not-run list complete
+            not_run.extend([f"replay_{p}_run1", f"replay_{p}_run2"])
+        # -- per-item comparison against the historical targets (recorded
+        # verdicts: plan 4.4 requires differences be located and explained,
+        # never forced back -- they are NOT silent pass/fail gates)
+        if ff:
+            ffs = json.loads((Path(ff["dir"]) / "ff_stage_summary.json").read_text())
+            gate.check(f"{p}_ff_n_expected", ffs["n"] == 5, ffs["n"])
+            hist_rows = {r["stem"]: r for r in hist["profiles"][p]["ff_rows"]}
+            new_rows = {r["stem"]: r for r in ffs["rows"]}
+            ff_diffs: list = []
+            for stem, hr in hist_rows.items():
+                nr = new_rows.get(stem)
+                if nr is None:
+                    ff_diffs.append([stem, "missing_from_new", None])
+                    continue
+                for k in ("t", "adopted", "adopted_source", "last_status",
+                          "last_term_reason"):
+                    if (hr.get(k) or None) != (nr.get(k) or None):
+                        ff_diffs.append([stem, k, hr.get(k), nr.get(k)])
+            entry["ff"] = {"counts": ffs["counts"], "rows": ffs["rows"],
+                           "historical_identical": not ff_diffs,
+                           "diffs": ff_diffs}
+        if cf:
+            cfs = json.loads((Path(cf["dir"]) / "cf_stage_summary.json").read_text())
+            gate.check(f"{p}_cf_n_expected", cfs["n"] == 113, cfs["n"])
+            gate.check(f"{p}_spikes_all_rejected_by_norm", cfs["spikes_ok"],
+                       f"n={len(cfs.get('spikes', []))} "
+                       f"rejected={sum(1 for s in cfs.get('spikes', []) if s['rejected'])}")
+            gate.check(f"{p}_enable_state_norm_rows", cfs["enable_ok"],
+                       "every enabled side audited under norm_cut rows")
+            hist_cf = _cf_hist_map(p)
+            new_cf = cfs["classifications"]
+            cf_diffs = [[s, hist_cf.get(s), new_cf.get(s)]
+                        for s in sorted(set(hist_cf) | set(new_cf))
+                        if hist_cf.get(s) != new_cf.get(s)]
+            hist_dist = hist["profiles"][p]["cf_distribution"]
+            entry["cf"] = {"distribution": cfs["distribution"],
+                           "historical_distribution": hist_dist,
+                           "per_item_identical": not cf_diffs,
+                           "diffs": cf_diffs}
+        entry["replays"] = replays
+        per_profile[p] = entry
+
+    status = "COMPLETE" if not not_run and not failures else "INCOMPLETE"
+    summary = {
+        "stage": "evidence", "ok": gate.ok and status == "COMPLETE",
+        "status": status,
+        "generated": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "budget_min": budget_min, "elapsed_s": round(time.perf_counter() - t0, 1),
+        "historical": {p: {k: v for k, v in d.items() if k != "ff_rows"}
+                       for p, d in hist["profiles"].items()},
+        "historical_ff_rows": {p: d["ff_rows"] for p, d in hist["profiles"].items()},
+        "baseline_registration": baseline,
+        "subtasks": sub_results, "not_run_budget": not_run,
+        "subtask_failures": failures,
+        "per_profile": per_profile, "checks": gate.checks,
+        "next": ("failure-prefix (plan 5.3: 10 solve-failure identities + the "
+                 "S2 sub16/sub3 two-pass anchor drift)"
+                 if gate.ok and status == "COMPLETE" else
+                 "INCOMPLETE -- resume with the same command (verified "
+                 "subtasks are reused); differences/failures must be located "
+                 "and explained before any R candidate runs")}
+    _write_stage_summary(root, "evidence", summary)
+    print(f"evidence -> {'PASS' if summary['ok'] else status} "
+          f"({stage_summary_path(root, 'evidence')})")
+
+
+# ---------------------------------------------------------------------------
+# plan 5.3: actual failure prefixes and anchor drift
+# ---------------------------------------------------------------------------
+
+FP_FORMAT = "train24fix3_failure_prefix_v1"
+
+
+def _fp_trace_arrays(trace: dict) -> dict:
+    """Compact whole-frame QP evidence: the row/col IDENTITY arrays for
+    EVERY QP (Q3's one-to-one binding -- dimensions and descriptors are
+    complete for each solve) plus the per-iteration states; FULL numeric
+    matrices only for the final attempt's last QP, the frozen numerical
+    case of plan 5.2.  Full matrices for every cut re-solve of every outer
+    iteration would be gigabytes on an S-profile failure frame."""
+    import numpy as np
+
+    arr: dict = {}
+    atts = trace.get("attempts", [])
+    for ai, att in enumerate(atts):
+        for ii, it in enumerate(att.get("iterations", [])):
+            for key in ("z", "z_next", "xi_raw", "xi_clipped"):
+                v = it.get(key)
+                if v is not None:
+                    arr[f"a{ai}_it{ii}_{key}"] = np.asarray(v, dtype=float)
+        qas = att.get("qp_arrays", [])
+        for qi, qa in enumerate(qas):
+            full = (ai == len(atts) - 1 and qi == len(qas) - 1)
+            keys = (("P", "q", "A", "lo", "hi", "row_names", "col_names")
+                    if full else ("row_names", "col_names"))
+            for key in keys:
+                if key in qa:
+                    arr[f"a{ai}_qp{qi}_{key}"] = np.asarray(qa[key])
+    return arr
+
+
+def _rerun_segment(prof_name: str, demo: str):
+    """Common setup mirroring ``regenerate_teachers --mode regen
+    --validation-mode strict --profile <P>`` for ONE demo (the historical
+    sixseg rows were produced by exactly this configuration)."""
+    import numpy as np
+    from ireset.embodied.contact_sites import infer_reference_schedule
+    from ireset.repair.context import ReferenceCondition
+    from ireset.repair.pipeline import RepairPipeline
+    from ireset.repair.profiles import get_profile
+    from ireset.data.teacher import load_teacher_npz
+
+    scene, human, fps = load_teacher_npz(TEACHER_TRAJ_DIR / f"{demo}_original.npz")
+    cond = ReferenceCondition(human, scene[:, 36:43],
+                              infer_reference_schedule(human, scene[:, 36:43]))
+    rcfg, vcfg = load_mode_configs("strict")
+    cfg = replace(rcfg, regen_mode=True)
+    prof = get_profile(prof_name)
+    pipe = RepairPipeline(cfg=cfg, c2_profile=prof)
+    pipe.validator.cfg = vcfg
+    return scene, human, fps, cond, cfg, vcfg, prof, pipe
+
+
+def _bind_solve_failure(prof_name: str, demo: str, row: dict,
+                        rep_path: Path, att: Path) -> dict:
+    """Plan 5.3 item 1: bind ONE actual solve-failure identity.  The full
+    segment re-runs under the frozen profile with the read-only forensic
+    snapshot hook; the captured failure must match the ORIGINAL sixseg
+    report row item-by-item (t_fail / attempt id / check id / status /
+    pass count / algorithm counters / C2 frames) -- any mismatch STOPS the
+    binding (no product is written).  A successful binding freezes the
+    accepted prefix, the field-complete failure context and the failure
+    frame's escalation chain with per-QP dynamic metadata (Q3)."""
+    import numpy as np
+    from ireset.repair.pipeline import RepairPipeline
+    from ireset.repair.profiles import profiles_yaml_sha256
+
+    scene, human, fps, cond, cfg, vcfg, prof, pipe = _rerun_segment(prof_name, demo)
+    fails: list[dict] = []
+
+    def snap(kind, data):
+        if kind != "fail":
+            return
+        ctx_frozen = freeze_context(data["ctx"])
+        assert_snapshot_matches_live(ctx_frozen, data["ctx"])
+        fails.append({
+            "t": data["t"], "pass_index": data["pass_index"], "ctx": ctx_frozen,
+            "z_pred": np.asarray(data["z_pred"], dtype=float).copy(),
+            "z_prev": (np.asarray(data["z_prev"], dtype=float).copy()
+                       if data["z_prev"] is not None else None),
+            "res_fields": {k: getattr(data["last_res"], k) for k in (
+                "status", "term_reason", "iter_budget", "iterations",
+                "qp_calls", "slack_used", "trust", "last_qp_status",
+                "last_viol")},
+            "chk": {"ok": data["last_chk"].ok,
+                    "reason": data["last_chk"].reason,
+                    "check_id": data["last_chk"].check_id},
+            "last_rec": dict(data["last_rec"]),
+            "last_attempt_id": list(data["last_attempt_id"]),
+            "accepted": [a.copy() for a in data["accepted"]],
+            "prediction": np.asarray(data["prediction"]).copy(),
+            "last_z": np.asarray(data["last_res"].z, dtype=float).copy()})
+
+    pipe.snapshot = snap
+    t0 = time.perf_counter()
+    res = pipe.repair_trajectory(scene, cond)
+    wall = time.perf_counter() - t0
+    if res.accepted or not fails:
+        raise RuntimeError(f"{demo}: re-run accepted={res.accepted} with "
+                           f"{len(fails)} fail events -- nothing to bind")
+    last = fails[-1]
+    cost = res.diagnostics.get("cost") or {}
+    c2 = res.diagnostics.get("c2_hand_speed") or {}
+    rej = row.get("rejection") or {}
+    exp = {"t_fail": row.get("t_fail"), "skip_reason": row.get("skip_reason"),
+           "final_stage": row.get("final_stage"),
+           "last_attempt_id": rej.get("last_attempt_id"),
+           "last_check_id": rej.get("last_check_id"),
+           "last_attempt_status": (rej.get("last_attempt") or {}).get("status"),
+           "rejection_reason": rej.get("reason"),
+           "n_passes": len(row["cost"]["passes"]),
+           "cost_attempts": row["cost"]["attempts"],
+           "cost_qp_calls_total": row["cost"]["qp_calls_total"],
+           "cost_iterations_total": row["cost"]["iterations_total"],
+           "c2_frames_on_l": row["c2_hand_speed"]["frames_on"]["l"],
+           "c2_frames_on_r": row["c2_hand_speed"]["frames_on"]["r"]}
+    got = {"t_fail": last["t"], "skip_reason": res.diagnostics.get("skip_reason"),
+           "final_stage": res.diagnostics.get("final_stage"),
+           "last_attempt_id": last["last_attempt_id"],
+           "last_check_id": last["chk"]["check_id"],
+           "last_attempt_status": last["res_fields"]["status"],
+           "rejection_reason": last["res_fields"]["status"],
+           "n_passes": len(cost.get("passes", [])),
+           "cost_attempts": cost.get("attempts"),
+           "cost_qp_calls_total": cost.get("qp_calls_total"),
+           "cost_iterations_total": cost.get("iterations_total"),
+           "c2_frames_on_l": c2.get("frames_on", {}).get("l"),
+           "c2_frames_on_r": c2.get("frames_on", {}).get("r")}
+    mismatch = {k: [exp[k], got[k]] for k in exp if exp[k] != got[k]}
+    if mismatch:
+        raise RuntimeError(f"{prof_name}/{demo}: identity mismatch vs the "
+                           f"original report -- binding STOPPED: {mismatch}")
+
+    # the failure frame's escalation chain, re-run WITH the Q3 trace on
+    pipe2 = RepairPipeline(cfg=cfg, c2_profile=prof)
+    pipe2.validator.cfg = vcfg
+    pipe2.solver.trace = {"attempts": []}
+    esc = escalate_frame(pipe2, last["ctx"], last["t"], last["z_pred"],
+                         last["z_prev"])
+    trace = pipe2.solver.trace
+    atts = trace.get("attempts", [])
+    esc_exit = atts[-1].get("exit", {}) if atts else {}
+    esc_identity = {
+        "adopted": bool(esc["adopted"]), "skipped": bool(esc["skipped"]),
+        "last_status": esc["last_status"],
+        "last_term_reason": esc["last_term_reason"],
+        "n_attempts": len(esc["attempts"]),
+        "replay_last_iterations": esc_exit.get("it_done"),
+        "replay_last_qp_calls": esc_exit.get("qp_calls"),
+        "segment_last_status": last["res_fields"]["status"],
+        "segment_last_term": last["res_fields"]["term_reason"],
+        "segment_last_iterations": last["res_fields"]["iterations"],
+        "segment_last_qp_calls": last["res_fields"]["qp_calls"]}
+    if (esc["adopted"] or esc["skipped"]
+            or esc["last_status"] != last["res_fields"]["status"]
+            or esc["last_term_reason"] != last["res_fields"]["term_reason"]
+            or esc_identity["replay_last_iterations"] != last["res_fields"]["iterations"]
+            or esc_identity["replay_last_qp_calls"] != last["res_fields"]["qp_calls"]):
+        raise RuntimeError(f"{prof_name}/{demo}: escalation re-run diverged "
+                           f"from the segment's own failure: {esc_identity}")
+
+    src = TEACHER_TRAJ_DIR / f"{demo}_original.npz"
+    prod = {"format": FP_FORMAT, "kind": "solve_failure_binding",
+            "demo": demo, "profile": {"name": prof.name,
+                                       "resolved": prof.as_record(),
+                                       "registry_sha256": profiles_yaml_sha256()},
+            "identity": {"expected": exp, "this_run": got, "match": True},
+            "n_fail_events": len(fails),
+            "fail_events": [{"t": f["t"], "pass_index": f["pass_index"],
+                             "attempt_id": f["last_attempt_id"],
+                             "check_id": f["chk"]["check_id"],
+                             "status": f["res_fields"]["status"],
+                             "term_reason": f["res_fields"]["term_reason"]}
+                            for f in fails],
+            "last_solver_fields": last["res_fields"],
+            "last_check": last["chk"],
+            "last_rec": last["last_rec"],
+            "escalation": esc_identity,
+            "c2_hand_speed": c2,
+            "cost": {"attempts": cost.get("attempts"),
+                     "qp_calls_total": cost.get("qp_calls_total"),
+                     "iterations_total": cost.get("iterations_total"),
+                     "passes": cost.get("passes")},
+            "source": {"report": str(rep_path), "report_sha256": sha256_full(rep_path),
+                       "teacher_npz": str(src), "teacher_npz_sha256": sha256_full(src)},
+            "effective": {"repair": asdict(cfg), "validation": asdict(vcfg)},
+            "wall_s": round(wall, 1)}
+    attach_integrity(prod, cfg, vcfg)
+    arrays = {**context_arrays(last["ctx"]),
+              "prefix": np.asarray(last["accepted"], dtype=float).reshape(-1, 36),
+              "box_poses": np.asarray(last["prediction"][:, 36:43], dtype=float),
+              "z_pred": last["z_pred"], "last_z": last["last_z"],
+              **_fp_trace_arrays(trace)}
+    if last["z_prev"] is not None:
+        arrays["z_prev"] = last["z_prev"]
+    _write_products(att, f"bind_{demo}", prod, arrays)
+    write_guarded(att / f"esc_{demo}.json", json.dumps(
+        {"demo": demo, "profile": prof.name, "escalation": esc_identity,
+         "trace": _trace_jsonable(trace)}, indent=1, default=float))
+    print(f"  [bind {prof_name}/{demo}] t_fail={last['t']} status="
+          f"{last['res_fields']['status']} qp={cost.get('qp_calls_total')} "
+          f"({wall:.0f}s)")
+    return prod
+
+
+def _bind_anchor_failure(prof_name: str, demo: str, row: dict,
+                         rep_path: Path, att: Path) -> dict:
+    """Plan 5.3 item 2: the S2 sub16/sub3 two-pass anchor-drift capture.
+    The segment re-runs under the frozen profile; the per-pass 'solved
+    through' trajectory and the suffix-retry trajectory are captured with
+    their OWN final validations, and each pass gets the full per-side
+    anchor-drift analysis (reference intervals, C2 enable frames,
+    certified intervals / anchor establishment, cumulative drift curves,
+    first-failure / worst-speed frames, and whether the solver context
+    EVER carried a hand anchor -- regen mode must not).  The identity vs
+    the original report must match item-by-item or the binding stops."""
+    import numpy as np
+    from ireset.repair.profiles import profiles_yaml_sha256
+    from regenerate_teachers import to_teacher_layout
+    from train24fix2_cert_trace import freeze_segment, ref_intervals_of
+
+    scene, human, fps, cond, cfg, vcfg, prof, pipe = _rerun_segment(prof_name, demo)
+    finals: list[dict] = []
+    frames: list[dict] = []
+
+    def snap(kind, data):
+        if kind == "final_fail":
+            finals.append({
+                "pass_index": data["pass_index"],
+                "trajectory": np.asarray(data["trajectory"], dtype=float).copy(),
+                "passed": bool(data["final"].passed),
+                "failed_checks": {k: {"location": c.location,
+                                      "first_failure_frame": c.first_failure_frame}
+                                  for k, c in data["final"].checks.items()
+                                  if not c.passed},
+                "first_failure_frame": data["first_failure_frame"]})
+        elif kind == "frame":
+            ctx = data["ctx"]
+            frames.append({
+                "t": data["t"], "pass": data["pass_index"],
+                "c2_enabled": sorted(s for s, v in
+                                     (ctx.c2_hand_enabled or {}).items() if v),
+                "hand_anchor": {s: (v is not None) for s, v in
+                                (ctx.hand_anchor or {}).items()}})
+
+    pipe.snapshot = snap
+    t0 = time.perf_counter()
+    res = pipe.repair_trajectory(scene, cond)
+    wall = time.perf_counter() - t0
+    cost = res.diagnostics.get("cost") or {}
+    c2 = res.diagnostics.get("c2_hand_speed") or {}
+    rej = row.get("rejection") or {}
+    sr = row.get("suffix_retry") or {}
+    pass_keys = ("trajectory_pass", "status", "complete", "t_fail",
+                 "accepted_frames", "attempts", "qp_calls_total",
+                 "iterations_total")
+
+    def _strip(d):
+        """Both sides reduced to the two semantic keys -- the report rows
+        carry an extra ``evidence`` field that a re-run rebuilds only at
+        audit time; comparing it here would fail every binding."""
+        return {k: {"location": v["location"],
+                    "first_failure_frame": v["first_failure_frame"]}
+                for k, v in (d or {}).items()}
+
+    exp = {"final_stage": row.get("final_stage"), "t_fail": row.get("t_fail"),
+           "suffix_retry_from": sr.get("from_frame"),
+           "violated_rows": sorted(rej.get("violated_rows") or []),
+           "first_attempt_failed_checks": _strip(
+               sr.get("first_attempt_failed_checks")),
+           "validator_failed_checks": _strip(
+               rej.get("validator_failed_checks")),
+           "passes": [{k: p.get(k) for k in pass_keys}
+                      for p in row["cost"]["passes"]],
+           "c2_frames_on": row["c2_hand_speed"]["frames_on"]}
+    got = {"final_stage": res.diagnostics.get("final_stage"),
+           "t_fail": res.diagnostics.get("t_fail"),
+           "suffix_retry_from": res.diagnostics.get("suffix_retry_from"),
+           "violated_rows": sorted(
+               f"{k}: {v['location']}" for k, v in
+               (res.diagnostics.get("final_retry_failed_checks") or {}).items()),
+           "first_attempt_failed_checks": _strip(
+               res.diagnostics.get("failed_checks")),
+           "validator_failed_checks": _strip(
+               res.diagnostics.get("final_retry_failed_checks")),
+           "passes": [{k: p.get(k) for k in pass_keys}
+                      for p in cost.get("passes", [])],
+           "c2_frames_on": c2.get("frames_on")}
+    mismatch = {k: [exp[k], got[k]] for k in exp if exp[k] != got[k]}
+    if mismatch:
+        raise RuntimeError(f"{prof_name}/{demo}: identity mismatch vs the "
+                           f"original report -- binding STOPPED: {mismatch}")
+    if len(finals) != 2:
+        raise RuntimeError(f"{demo}: expected the two final_fail captures "
+                           f"(solved-through pass + suffix retry), got {len(finals)}")
+
+    box = scene[:, 36:43]
+    passes_out: list[dict] = []
+    for pi, f in enumerate(finals):
+        scene_pass = np.hstack([f["trajectory"], box])
+        npz_path = att / f"anchor_{demo}_pass{pi}_scene.npz"
+        np.savez(npz_path, qpos=to_teacher_layout(scene_pass),
+                 human_joints=human, fps=fps)
+        metrics = freeze_segment(npz_path, demo, cond, vcfg, cfg,
+                                 with_series=True)
+        sides_out: dict[str, dict] = {}
+        for side, eff in (("l", "left_hand"), ("r", "right_hand")):
+            ref_ivs = [[a, b] for a, b in ref_intervals_of(cond, eff)]
+            enabled = sorted(fr["t"] for fr in frames
+                             if fr["pass"] == pi and side in fr["c2_enabled"])
+            m = metrics["sides"][side]
+            series = m.get("series") or {}
+            speeds = [(v, t) for t, v in enumerate(series.get("h_speed", []))
+                      if v is not None]
+            cert_ivs = m["certified_intervals"]
+            sides_out[side] = {
+                "ref_intervals": ref_ivs,
+                "c2_enabled_frames": enabled,
+                "certified_intervals": cert_ivs,
+                "anchor_establishment_frames": [a for a, _ in cert_ivs],
+                "anchor_drift_certified_max_m": m["anchor_drift_certified_max_m"],
+                "anchor_drift_curves": series.get("anchor_drift_curves"),
+                "speed_ref_max_mps": m["speed_ref_max_mps"],
+                "worst_speed_frame": (max(speeds)[1] if speeds else None),
+                "hand_anchor_ever_nonempty": any(
+                    fr["hand_anchor"].get(side) for fr in frames
+                    if fr["pass"] == pi),
+                "interval_start_differences": {
+                    "ref_starts": [a for a, _ in ref_ivs],
+                    "cert_starts": [a for a, _ in cert_ivs],
+                    "first_c2_enable": (enabled[0] if enabled else None)}}
+        passes_out.append({
+            "pass_index": pi, "validator_passed": f["passed"],
+            "first_failure_frame": f["first_failure_frame"],
+            "failed_checks": f["failed_checks"],
+            "task_mpjpe": metrics["task_mpjpe"],
+            "sides": sides_out, "scene_npz": npz_path.name})
+
+    src = TEACHER_TRAJ_DIR / f"{demo}_original.npz"
+    prod = {"format": FP_FORMAT, "kind": "anchor_drift_binding",
+            "demo": demo, "profile": {"name": prof.name,
+                                       "resolved": prof.as_record(),
+                                       "registry_sha256": profiles_yaml_sha256()},
+            "identity": {"expected": exp, "this_run": got, "match": True},
+            "passes": passes_out,
+            "frame_facts": frames,
+            "hand_anchor_verdict": {
+                "any_nonempty": any(any(fr["hand_anchor"].values())
+                                    for fr in frames),
+                "note": "regen mode must never hold a hand anchor (plan 7.6: "
+                        "the establishment candidates' regen branch skips "
+                        "hand anchors) -- any True here is an engineering "
+                        "defect, not a drift explanation"},
+            "c2_hand_speed": c2,
+            "source": {"report": str(rep_path), "report_sha256": sha256_full(rep_path),
+                       "teacher_npz": str(src), "teacher_npz_sha256": sha256_full(src)},
+            "effective": {"repair": asdict(cfg), "validation": asdict(vcfg)},
+            "wall_s": round(wall, 1)}
+    attach_integrity(prod, cfg, vcfg)
+    _write_products(att, f"anchor_{demo}", prod, {
+        "box_poses": np.asarray(box, dtype=float),
+        **{f"pass{p['pass_index']}_trajectory": f2["trajectory"]
+           for p, f2 in zip(passes_out, finals)}})
+    print(f"  [anchor {prof_name}/{demo}] passes={len(passes_out)} "
+          f"first_fail={[p['first_failure_frame'] for p in passes_out]} "
+          f"({wall:.0f}s)")
+    return prod
+
+
+def stage_failure_prefix(root: Path, budget_min: float | None = None) -> None:
+    """Plan 5.3 (section-12 budget 6h): the 10 actual solve-failure
+    identities (S1's six last-executed attempts + S2's four solver-rejected
+    frames) and the S2 sub16/sub3 two-pass anchor-drift capture, each as a
+    §12 subtask.  A binding whose re-run diverges from the original report
+    FAILS its subtask -- it is never written as evidence."""
+    ev = load_stage_summary(root, "evidence")
+    if ev.get("status") != "COMPLETE" or not ev.get("ok"):
+        raise SystemExit("evidence stage must fully PASS before the "
+                         "failure-prefix forensics (plan 5.3 prerequisite)")
+    out = root / "failure_prefix"
+    gate = Gate()
+    t0 = time.perf_counter()
+    deadline = t0 + (budget_min * 60.0 if budget_min else float("inf"))
+    reg = SubtaskRegistry(out)
+
+    specs: list[dict] = []
+    reports: dict[str, tuple[Path, dict]] = {}
+    for p in ("S1", "S2"):
+        rep_path = (RECOVERY_SRC_ROOT / "norm" / p / "sixseg" / "rq"
+                    / "regen_report_diagnosis6_strict.json")
+        rep = json.loads(rep_path.read_text())
+        reports[p] = (rep_path, rep)
+        for row in rep["rows"]:
+            if row["final_stage"] == "state_constraints":
+                specs.append({"kind": "solve", "profile": p,
+                              "demo": row["demo"], "row": row})
+    for row in reports["S2"][1]["rows"]:
+        if row["final_stage"] == "final_validation":
+            specs.append({"kind": "anchor", "profile": "S2",
+                          "demo": row["demo"], "row": row})
+    n_solve = sum(1 for s in specs if s["kind"] == "solve")
+    n_anchor = sum(1 for s in specs if s["kind"] == "anchor")
+    gate.check("binding_specs_10_solve_2_anchor",
+               n_solve == 10 and n_anchor == 2,
+               f"solve={n_solve} anchor={n_anchor}")
+
+    sub_results: dict[str, dict] = {}
+    not_run: list[str] = []
+    failures: dict[str, str] = {}
+    for spec in specs:
+        name = f"{spec['kind']}_{spec['profile']}_{spec['demo']}"
+        rep_path = reports[spec["profile"]][0]
+        identity = {**_stage_identity(
+                        f"{spec['kind']}:{spec['profile']}", spec["demo"]),
+                    "report_sha256": sha256_full(rep_path),
+                    "t_fail": spec["row"].get("t_fail"),
+                    "final_stage": spec["row"].get("final_stage")}
+        if time.perf_counter() > deadline:
+            not_run.append(name)
+            continue
+        try:
+            prior = reg.verified(name, identity)
+            if prior is None:
+                att = reg.begin(name, out, identity, 1)
+                try:
+                    if spec["kind"] == "solve":
+                        _bind_solve_failure(spec["profile"], spec["demo"],
+                                            spec["row"], rep_path, att)
+                        outs = sorted(att.glob(f"bind_{spec['demo']}.*")) \
+                            + [att / f"esc_{spec['demo']}.json"]
+                    else:
+                        _bind_anchor_failure(spec["profile"], spec["demo"],
+                                             spec["row"], rep_path, att)
+                        outs = sorted(att.glob(f"anchor_{spec['demo']}*"))
+                    missing = [str(q) for q in outs if not q.is_file()]
+                    if missing:
+                        raise RuntimeError(f"binding outputs missing: {missing}")
+                    reg.complete(name, outs, 1)
+                except Exception:
+                    reg.fail(name, f"binding failed at "
+                                   f"{time.strftime('%H:%M:%S')}")
+                    raise
+            else:
+                print(f"  [{name}] reused attempt {prior['attempt']}")
+            sub_results[name] = {"reused": prior is not None,
+                                 "dir": (prior or reg.attempts(name)[-1])["dir"],
+                                 "identity": identity}
+            gate.check(f"bound_{name}", True, "identity item-by-item match")
+        except Exception as exc:              # noqa: BLE001 -- record & continue
+            failures[name] = f"{type(exc).__name__}: {exc}"
+            gate.check(f"bound_{name}", False, failures[name])
+
+    status = "COMPLETE" if not not_run and not failures else "INCOMPLETE"
+    summary = {
+        "stage": "failure_prefix", "ok": gate.ok and status == "COMPLETE",
+        "status": status,
+        "generated": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "budget_min": budget_min, "elapsed_s": round(time.perf_counter() - t0, 1),
+        "n_solve_bindings": n_solve, "n_anchor_bindings": n_anchor,
+        "sources": {p: {"path": str(rp), "sha256": sha256_full(rp)}
+                    for p, (rp, _r) in reports.items()},
+        "subtasks": sub_results, "not_run_budget": not_run,
+        "binding_failures": failures, "checks": gate.checks,
+        "next": ("all 10 solve identities bound + both anchor segments "
+                 "captured: the Q/P exits hold -- proceed to R1 (plan 7.5) "
+                 "under a NEW pre-registered commit"
+                 if gate.ok and status == "COMPLETE" else
+                 "INCOMPLETE -- resume with the same command; a mismatched "
+                 "identity must be located and explained (never re-bound "
+                 "by relaxing the comparison)")}
+    _write_stage_summary(root, "failure_prefix", summary)
+    print(f"failure-prefix -> {'PASS' if summary['ok'] else status} "
+          f"({stage_summary_path(root, 'failure_prefix')})")
 
 
 # ---------------------------------------------------------------------------
@@ -1798,6 +2602,8 @@ STAGES = {
     "trace": stage_trace,
     "numeric": stage_numeric,
     "norm": stage_norm,
+    "evidence": stage_evidence,
+    "failure-prefix": stage_failure_prefix,
     "sixseg": stage_sixseg,
     "train24": stage_train24,
 }
@@ -1812,12 +2618,20 @@ def main() -> None:
                     help="profile name for sixseg/train24 (cross-checked "
                          "against the SELECTION summary before anything "
                          "runs -- a mismatched name is an explicit failure)")
+    ap.add_argument("--budget-min", type=float, default=None,
+                    help="run-control budget in minutes for the budgeted "
+                         "continuation stages (evidence 4h / failure-prefix "
+                         "6h, plan section 12): subtasks not STARTED before "
+                         "the deadline are recorded not_run_budget and the "
+                         "stage ends INCOMPLETE -- never a partial pass")
     args = ap.parse_args()
     if args.stage in ("sixseg", "train24") and not args.profile:
         raise SystemExit(f"--profile is required for --stage {args.stage}")
     root = Path(args.out).resolve()
     if args.stage in ("sixseg", "train24"):
         STAGES[args.stage](root, profile=args.profile)
+    elif args.stage in ("evidence", "failure-prefix"):
+        STAGES[args.stage](root, budget_min=args.budget_min)
     else:
         STAGES[args.stage](root)
 

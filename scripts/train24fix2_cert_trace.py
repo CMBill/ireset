@@ -501,6 +501,13 @@ def freeze_segment(npz: Path, demo: str, cond: ReferenceCondition,
             if T > 1:
                 mc = np.abs(np.diff(local, axis=0)).max(axis=(1, 2)) / dt
                 max_comp[1:] = [float(m) for m in mc]
+            # per certified interval, the CUMULATIVE per-frame drift curve
+            # (train24fix3 plan 5.3 item 2 -- the anchor-drift forensics
+            # need where in the interval the drift grows, not only the max)
+            drift_curves = {
+                f"{a}-{b}": [float(x) for x in np.linalg.norm(
+                    local[a:b] - local[a], axis=-1).max(axis=1)]
+                for a, b in ivs}
             sides[side]["series"] = {
                 "hand_dist": [None if not np.isfinite(d) else float(d)
                               for d in dist],
@@ -509,6 +516,7 @@ def freeze_segment(npz: Path, demo: str, cond: ReferenceCondition,
                 "max_component": max_comp,
                 "supervision": sup.tolist(),
                 "cert_intervals": [[int(a), int(b)] for a, b in ivs],
+                "anchor_drift_curves": drift_curves,
             }
     return {"demo": demo, "npz": str(npz.resolve()), "npz_sha256": sha256(npz),
             "input_sha256": sha256(TEACHER_TRAJ_DIR / f"{demo}_original.npz"),
