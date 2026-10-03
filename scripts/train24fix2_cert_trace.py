@@ -433,8 +433,15 @@ def enable_gap_frames(series: dict, c2: dict, vcfg) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def freeze_segment(npz: Path, demo: str, cond: ReferenceCondition,
-                   vcfg, rcfg) -> dict:
-    """Unrounded side metrics of the section-5 core/complete quality gates."""
+                   vcfg, rcfg, *, with_series: bool = False) -> dict:
+    """Unrounded side metrics of the section-5 core/complete quality gates.
+
+    ``with_series=True`` (train24fix3 §8.2) ADDITIVELY returns the
+    already-computed per-frame series (dist / speed / supervision /
+    certified masks per side) under ``sides[side]["series"]`` -- the
+    mechanism gate's lost/gain reclassification consumes exactly
+    :func:`classify_side`'s inputs.  Default False keeps the historical
+    return shape byte-identical."""
     traj, _human, _fps = load_teacher_npz(npz)
     validator = IndependentValidator(cfg=vcfg)
     rep = validator.validate(traj, exclude=("box_ground",))
@@ -463,6 +470,7 @@ def freeze_segment(npz: Path, demo: str, cond: ReferenceCondition,
             drift.append(float(np.linalg.norm(
                 local[a:b] - local[a], axis=-1).max()))
         sup = cert & ref
+        sup = cert & ref
         inter = continuous_runs(sup)
         within = ref & (dist < vcfg.hand_enter_m)
         gap_ref = dist[ref] if ref.any() else np.array([])
@@ -488,6 +496,20 @@ def freeze_segment(npz: Path, demo: str, cond: ReferenceCondition,
             "anchor_drift_certified_max_m": (float(max(drift))
                                              if drift else None),
         }
+        if with_series:
+            max_comp: list = [None] * T
+            if T > 1:
+                mc = np.abs(np.diff(local, axis=0)).max(axis=(1, 2)) / dt
+                max_comp[1:] = [float(m) for m in mc]
+            sides[side]["series"] = {
+                "hand_dist": [None if not np.isfinite(d) else float(d)
+                              for d in dist],
+                "h_speed": [None if not np.isfinite(s) else float(s)
+                            for s in speed],
+                "max_component": max_comp,
+                "supervision": sup.tolist(),
+                "cert_intervals": [[int(a), int(b)] for a, b in ivs],
+            }
     return {"demo": demo, "npz": str(npz.resolve()), "npz_sha256": sha256(npz),
             "input_sha256": sha256(TEACHER_TRAJ_DIR / f"{demo}_original.npz"),
             "T": int(T), "validator_passed": bool(rep.passed),

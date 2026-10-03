@@ -102,6 +102,16 @@
 
 **兼容性与边界**:历史 S1/S2 v1 产物按 v1 路径可读(双前缀解码冒烟通过);旧 v2 产物走原 N0 回填不变(既有 reviewfix 测试全过);`load_norm_index` 约定变更使旧实验根内归档辅助脚本(`norm/s1_assemble.py` 等,ignored 产物)如重跑需按新约定传参——它们是一次性恢复脚本,保留为证据不重跑。**本提交未运行**:S1/S2 证据重生成(单位 3)、六段/train24 正式驱动与子任务状态机(单位 2)、R 候选;Q 修复对历史 N/S 行为的影响面=零(默认/trace 关闭路径逐位不变),阶段 D 的 0/6 裁决与失败分类不被本提交覆盖。
 
+## 0.3 续行前置阶段 Q:执行基建(2026-10-03,§11.1 提交单位 2)
+
+按方案 §8.2/§9/§12 补齐执行基建;测试 303→**315 passed + 1 skipped**(新增 12 项 `tests/test_train24fix3_formal.py`+1 项并入既有文件外的真实数据冒烟,见下)。本提交只落代码与测试,**未运行任何正式六段/train24**——阶段 D 结束时 winner=None,正式阶段入口就绪且其拒绝路径被测试覆盖(这正是当前真实状态)。
+
+- **完整门(§8.1 每项 verdict)**:`train24fix3_quality_gate.py` 重写为全家族门——覆盖(报告 demo 非空/无重复/与冻结名单集合相等,删失败 demo 不能缩分母)、NPZ 一致性(kept NPZ 集==accepted 集==metrics 集,T 一致)、全部保留段独立 strict 复验、逐侧 core/complete/task(原有)、**demo 级双手重叠**(`both_hands_metrics`,认证/监督/最长同监督段三计数不降)与**可用窗口**(TeacherWindowDataset 自身 60 帧/步长 30 的索引式 `(T-60)//30+1`,不另定义更宽松"可用")、sub16 C 保护(原有)、**机理族**(尖峰全拒+启用态合规取自 cf 摘要;四个冻结失败侧 sub10:r/sub3:r/sub8:l/sub8:r 对 H 的丢失/增益重分类 GATED 帧归零——复用认证边缘轮同款 `classify_side`,`freeze_segment` 增量 `with_series=True` 返回已算好的逐帧 dist/speed/max_component/supervision/cert 序列,默认 False 历史返回形状逐位不变)、**完整性族**(R9 干净/profile 与运行自身记录一致/行状态与 accepted 一致/argv 在册)、**标签族**(graded_labels_v1 清单:协议、行集==运行 demo 集、每保留段 label NPZ 16 位同源哈希+形状+布尔+supervision==ids≥0+strict_recheck;torch 级空监督零损失/零梯度契约由 `tests/test_label_quality.py` 钉死)。`full=True`(正式 E/F 模式)使**依赖证据的家族成为强制**:缺 cf 摘要/标签清单/profile/名单=显式 False,缺 gate 不是通过。CLI 增 `--full/--expected-set/--profile/--cf-summary/--labels`。
+- **子任务状态机(§12)**:驱动新增 `SubtaskRegistry`(`train24fix3_subtasks_v1` 机读索引)——每子任务登记 expected、身份(profile+注册表哈希+rev+工作树状态)、输出哈希、起止、实际处理数与状态;`verified()` 仅返回**完整+同身份+输出哈希仍验**的尝试(resume 只复用此);半写文件留为失败证据,重跑写新 `attempt_NNN` 目录(拒绝覆盖/移动);`--resume` 语义经崩溃续跑测试验证(崩溃→已完成 rq1/rq2 复用、rv 重跑 attempt_002、汇总从不完整文件生成 PASS 被拒)。
+- **正式阶段驱动**:`stage_sixseg` 落地——selection 交叉核验(norm/numeric 摘要 winner 与 `--profile` 与 winner 自身 profile_summary.selected 三方一致,错误选定/无 selection/winner=None 均 SystemExit)、rq1/rq2/rv(quiet×2+verbose)+ns(标准模式,**无 --profile**)四子任务、三跑一致(状态/计数/字段)+保留 NPZ 字节一致、ns 对照 **B/ns 参照报告**同计数且零 C2 证据、标签导出子任务、完整门子任务(full 模式)、选择证据双跑重放;全部通过才写 sixseg_summary。`stage_train24` 落地——sixseg PASS 前置、冻结 profile 锁定(不匹配即 SystemExit)、三跑、≥18/24 数量门+外来 demo 拒绝、六受试者均有可用窗口、T 13 段保留、标签+完整门。`_run_sixseg` 扩展(verbose/mode/set_name;标准模式按工具自身命名 `standard_report_*` 且不传 profile);CLI `--profile` 实际传入执行函数。
+- **测试**(12+1 项):伪造指标源的快速契约测试(每家族 verdict 在册且非 None、full 模式缺证据三家族显式 False、删行/重复行/kept 集不一致/strict 失败/GATED 翻转/R9 脏/profile 错/行不连贯/协议篡改/supervision-ids 不一致各自翻假)+ 真实数据双冒烟(C 运行:1 kept、H 比较按 kept 失败、mechanism 真实值;**B 运行:四冻结失败侧 13<15/13<18/27<29/37<41 逐值复现且 ok=False——单位 2 验收冒烟**)+ 注册机单测(复用/身份变更/输出篡改/失败留痕)+ 阶段全流程与崩溃续跑 + 拒绝路径(无 selection/winner=None/profile 不匹配/selected=False/缺 sixseg)。
+- **兼容性说明**:`freeze_segment` 的 `with_series` 为加法变更(默认关闭),`train24fix2_cert_trace.py` 文件哈希因此变化——历史产物对其的完整性漂移按方案 §4.1 冻结基线处理(预期差异,不改写旧清单);既有 26 项 v2/reviewfix 测试全过。实验根的 evidence/failure-prefix/recovery 目录随单位 3–4 的实际执行轮建立,驱动入口已就绪。
+
 ## 0. 实施提交与测试
 
 | 提交 | 内容 |
@@ -117,9 +127,10 @@
 | `2d5c934` | 记录增补 §0.1 续跑指针(新上下文入口、精确续跑命令、产物索引、登记表占位) |
 | `33c8c2b` | 预算调整登记(S1 8h/S2 10h,用户授权 2026-10-03,串行自动)——续跑启动前提交保 R9 |
 | `6b305c8` | 阶段 D 续跑完成记录+AGENTS 同步:§0.1 执行状态、§4 完整裁决与失败分类、§0/产物索引/预算表更新 |
-| (本提交) | 续行前置 Q1–Q4 证据修复(§0.2):profile 审计穿透+数组保留、recovery schema/加载器/双分支严格重放+目录约定统一、configs 回填仅 v2+integrity 补三文件、逐 QP 元数据一一对一+删补记、数组键单前缀+双前缀显式解码;测试 288→303+1s |
+| `e68ea27` | 续行前置 Q1–Q4 证据修复(§0.2):profile 审计穿透+数组保留、recovery schema/加载器/双分支严格重放+目录约定统一、configs 回填仅 v2+integrity 补三文件、逐 QP 元数据一一对一+删补记、数组键单前缀+双前缀显式解码;测试 288→303+1s |
+| (本提交) | 提交单位 2 执行基建(§0.3):§8.1 全家族完整门(full 模式缺证据即败)、§12 子任务状态机、正式 stage_sixseg/stage_train24+`--profile` 交叉核验、freeze_segment with_series 增量;测试 303→315+1s(新增 `tests/test_train24fix3_formal.py` 13 项,含 B 运行四失败侧逐值冒烟) |
 
-测试 262 → 288 passed + 1 skipped(阶段 A–C 完成时;`uv run --locked pytest tests/ -q` @ `84a7a7d`)→ **303 passed + 1 skipped**(Q1–Q4 后)。288 档构成:`tests/test_train24fix3_profiles.py` 9 项(注册表矩阵/未知字段·非法值·非法继承拒绝、N0 默认=历史硬编码、逐帧门控仅 C2 激活帧、solve_qp 设置穿透 spy、trace 开/关纯度逐位、v2 记录 N0 回填/非 N0 携带拒绝、effective 记录携带 profile)+ `tests/test_train24fix3_numeric.py` 7 项(N0/N1 挂载=无 profile 逐位一致、N2 行变换 ξ 列纯 /B 且松弛列两表述同 −1、±INF 哨兵有限值比较、松弛罚权单位 10000·B 仅 C2 族、高精度同解与 s_m=B·s_norm、真实接受行 N2 下逐位不变、N3 mu 罚权仅 C2 松弛且缺 mu 显式错、tight N3≡N2)+ `tests/test_train24fix3_norm.py` 11 项(见 §4)。303 档新增 `tests/test_train24fix3_recovery.py` 15 项(见 §0.2)。
+测试 262 → 288 passed + 1 skipped(阶段 A–C 完成时;`uv run --locked pytest tests/ -q` @ `84a7a7d`)→ **303 passed + 1 skipped**(Q1–Q4 后)→ **315 passed + 1 skipped**(提交单位 2 后)。288 档构成:`tests/test_train24fix3_profiles.py` 9 项(注册表矩阵/未知字段·非法值·非法继承拒绝、N0 默认=历史硬编码、逐帧门控仅 C2 激活帧、solve_qp 设置穿透 spy、trace 开/关纯度逐位、v2 记录 N0 回填/非 N0 携带拒绝、effective 记录携带 profile)+ `tests/test_train24fix3_numeric.py` 7 项(N0/N1 挂载=无 profile 逐位一致、N2 行变换 ξ 列纯 /B 且松弛列两表述同 −1、±INF 哨兵有限值比较、松弛罚权单位 10000·B 仅 C2 族、高精度同解与 s_m=B·s_norm、真实接受行 N2 下逐位不变、N3 mu 罚权仅 C2 松弛且缺 mu 显式错、tight N3≡N2)+ `tests/test_train24fix3_norm.py` 11 项(见 §4)。303 档新增 `tests/test_train24fix3_recovery.py` 15 项(见 §0.2)。315 档新增 `tests/test_train24fix3_formal.py` 13 项(见 §0.3)。
 
 首轮 baseline(`train24fix3_20261002_a7954e2/`)因驱动两处登记缺陷判 FAIL(fb/cf 重放本身已 ALL MATCH、integrity 干净):(1) 用 `closed_loop_metrics.sha256` 16 位截断变体比 F 清单 64 位摘要,必然假漂移——AGENTS 已记录的"跨工具哈希必须同源"事实的直接复演;(2) C 参照期望误写 6 NPZ(1/6 keep 轮仅 sub16 保留 1 个)。修复(`1147424`)后重跑为权威 baseline,首轮目录保留为失败尝试证据。
 

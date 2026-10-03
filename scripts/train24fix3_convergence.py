@@ -527,33 +527,258 @@ def _profile_frozen_frames(prof, diag: Path, pdir: Path | None = None) -> dict:
             "n_not_adopted": counts["not_adopted"] + counts["skipped"]}
 
 
-def _run_sixseg(profile_name: str, rq: Path) -> dict:
-    """One full diagnosis6 quiet run under the profile (plan 6.2 item 2)."""
+def _run_sixseg(profile_name: str | None, rq: Path, *, verbose: bool = False,
+                mode: str = "regen", set_name: str = "diagnosis6",
+                note: str | None = None) -> dict:
+    """One full run under the profile (plan 6.2 item 2 / 8.2-9).  ``None``
+    profile = the STANDARD-MODE control (ns): no ``--profile`` flag reaches
+    the subprocess (standard mode has no profile gating at all).  The
+    report file name follows the tool's own mode convention
+    (``regen_report_``/``standard_report_``)."""
     import subprocess
 
     rq.mkdir(parents=True, exist_ok=True)
+    prefix = "regen_report" if mode == "regen" else "standard_report"
+    report = rq / f"{prefix}_{set_name}_strict.json"
     cmd = ["uv", "run", "--locked", "python",
            "scripts/regenerate_teachers.py",
-           "--set", "diagnosis6", "--mode", "regen",
-           "--validation-mode", "strict", "--profile", profile_name,
+           "--set", set_name, "--mode", mode,
+           "--validation-mode", "strict",
            "--assert-task-gate", "0.40",
            "--output-dir", str(rq),
-           "--report", str(rq / "regen_report_diagnosis6_strict.json"),
-           "--note", f"train24fix3 numeric candidate {profile_name}"]
+           "--report", str(report),
+           "--note", note or (
+               f"train24fix3 formal run (profile {profile_name}, mode {mode})")]
+    if profile_name is not None:
+        cmd += ["--profile", profile_name]
+    if verbose:
+        cmd += ["--verbose"]
     t0 = time.perf_counter()
     proc = subprocess.run(cmd, cwd=PROJECT_ROOT, env=_thread_env())
     wall = time.perf_counter() - t0
     if proc.returncode != 0:
         raise RuntimeError(f"sixseg subprocess failed for {profile_name}")
-    report = json.loads(
-        (rq / "regen_report_diagnosis6_strict.json").read_text())
-    return {"rq_dir": str(rq), "wall_s": round(wall, 1),
-            "n_demos": report["n_demos"], "n_kept": report["n_kept"],
-            "kept": [r["demo"] for r in report["rows"] if r["accepted"]],
+    rep = json.loads(report.read_text())
+    return {"rq_dir": str(rq), "report_path": str(report),
+            "wall_s": round(wall, 1),
+            "n_demos": rep["n_demos"], "n_kept": rep["n_kept"],
+            "kept": [r["demo"] for r in rep["rows"] if r["accepted"]],
             "code_changed_during_run":
-                report.get("end", {}).get("code_changed_during_run"),
-            "argv": report.get("effective", {}).get("argv"),
-            "profile": report.get("profile")}
+                rep.get("end", {}).get("code_changed_during_run"),
+            "argv": rep.get("effective", {}).get("argv"),
+            "profile": rep.get("profile"),
+            "mode": rep.get("effective", {}).get("mode"),
+            "report": rep}
+
+
+def _run_labels(run_dir: Path, out_dir: Path) -> Path:
+    """Export this run's graded-label manifest (plan 8.1 label row)."""
+    import subprocess
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cmd = ["uv", "run", "--locked", "python", "scripts/export_label_manifest.py",
+           "--run", str(run_dir), "--out", str(out_dir),
+           "--validation-mode", "strict",
+           "--note", "train24fix3 formal stage label export"]
+    proc = subprocess.run(cmd, cwd=PROJECT_ROOT, env=_thread_env())
+    if proc.returncode != 0:
+        raise RuntimeError(f"label export failed for {run_dir}")
+    manifest = out_dir / "label_manifest.json"
+    if not manifest.is_file():
+        raise RuntimeError(f"label manifest missing after export: {manifest}")
+    return manifest
+
+
+# ---------------------------------------------------------------------------
+# plan section 12: the subtask state machine (formal stages E/F)
+# ---------------------------------------------------------------------------
+
+SUBTASK_FORMAT = "train24fix3_subtasks_v1"
+
+
+class SubtaskRegistry:
+    """§12 continuation state machine.  Every subtask (a formal stage's
+    runs / labels / gate / replay) is registered with its expected count,
+    input identity (profile + registry hash + git rev + worktree state),
+    output hashes, start/end, processed count and status.  ``verified``
+    returns a COMPLETE attempt ONLY when the identity matches AND every
+    registered output still hash-verifies -- resume reuses exactly that;
+    half-written attempts stay on disk as failed evidence and a rerun goes
+    to a NEW attempt directory (never an overwrite)."""
+
+    def __init__(self, root: Path) -> None:
+        self.path = Path(root) / "subtasks.json"
+        if self.path.exists():
+            self.doc = json.loads(self.path.read_text())
+            if self.doc.get("format") != SUBTASK_FORMAT:
+                raise ValueError(f"{self.path}: format "
+                                 f"{self.doc.get('format')!r} != "
+                                 f"{SUBTASK_FORMAT!r}")
+        else:
+            self.doc = {"format": SUBTASK_FORMAT, "subtasks": {}}
+
+    def _write(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(self.doc, indent=1, default=float))
+
+    def attempts(self, name: str) -> list[dict]:
+        return self.doc["subtasks"].get(name, [])
+
+    def _outputs_ok(self, att: dict) -> bool:
+        root = Path(att["root"])
+        outs = att.get("outputs") or {}
+        if not outs:
+            return False
+        for rel, digest in outs.items():
+            p = root / rel
+            if not p.is_file() or sha256_full(p) != digest:
+                return False
+        return True
+
+    def verified(self, name: str, identity: dict) -> dict | None:
+        """The attempt ``--resume`` may reuse: complete, same identity, and
+        still hash-verified on disk.  Anything else is not reusable."""
+        for att in self.attempts(name):
+            if att.get("status") != "complete" or att.get("ok") is not True:
+                continue
+            if att.get("identity") != identity:
+                continue
+            if not self._outputs_ok(att):
+                continue
+            return att
+        return None
+
+    def begin(self, name: str, root: Path, identity: dict,
+              expected: int) -> Path:
+        n = len(self.attempts(name)) + 1
+        att_dir = Path(root) / name / f"attempt_{n:03d}"
+        att_dir.mkdir(parents=True, exist_ok=False)   # never overwrite
+        self.doc["subtasks"].setdefault(name, []).append({
+            "attempt": n, "dir": str(att_dir), "root": str(root),
+            "identity": identity, "expected": int(expected),
+            "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "status": "running"})
+        self._write()
+        return att_dir
+
+    def complete(self, name: str, outputs: list[Path],
+                 processed: int) -> dict:
+        att = self.attempts(name)[-1]
+        root = Path(att["root"])
+        att["outputs"] = {str(p.relative_to(root)): sha256_full(p)
+                          for p in outputs}
+        att["processed"] = int(processed)
+        att["ok"] = bool(int(processed) == att["expected"])
+        att["status"] = "complete"
+        att["ended"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        self._write()
+        return att
+
+    def fail(self, name: str, reason: str) -> None:
+        if not self.attempts(name):
+            return
+        att = self.attempts(name)[-1]
+        att["status"] = "failed"
+        att["reason"] = reason
+        att["ended"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        self._write()
+
+
+def _stage_identity(profile_name: str | None, set_name: str) -> dict:
+    """Per-candidate frozen identity (§12): profile + registry content hash
+    + revision + worktree state.  A resume/重复运行 of the same candidate
+    requires THIS to be unchanged."""
+    from ireset.repair.profiles import profiles_yaml_sha256
+
+    return {"profile": profile_name, "registry_sha256": profiles_yaml_sha256(),
+            "git_rev": git_rev(), "git": git_state(),
+            "set": set_name, "task_gate": 0.40}
+
+
+def _subtask(reg: SubtaskRegistry, name: str, root: Path, identity: dict,
+             expected: int, runner, outputs_of):
+    """Run one subtask through the state machine.  ``runner(attempt_dir)``
+    returns the processed count; ``outputs_of(attempt_dir)`` lists the
+    files whose hashes register.  A verified same-identity completion is
+    REUSED (recorded as such); any failure marks the attempt failed and
+    propagates -- the half-written directory stays as evidence."""
+    prior = reg.verified(name, identity)
+    if prior is not None:
+        return {"name": name, "reused": True, "dir": prior["dir"],
+                "processed": prior["processed"], "ok": prior["ok"]}
+    att_dir = reg.begin(name, root, identity, expected)
+    try:
+        processed = runner(att_dir)
+        att = reg.complete(name, outputs_of(att_dir), processed)
+        return {"name": name, "reused": False, "dir": str(att_dir),
+                "processed": processed, "ok": att["ok"]}
+    except Exception as err:  # noqa: BLE001 -- the attempt is evidence
+        reg.fail(name, repr(err))
+        raise
+
+
+def _selection_winner(root: Path) -> tuple[str, dict]:
+    """The selected profile from the ALGORITHM stages' own summaries (never
+    inferred from directory existence): norm first (S branch), numeric
+    otherwise; winner=None refuses the formal stages."""
+    for stage, label in (("norm", "S"), ("numeric", "N")):
+        path = stage_summary_path(root, stage)
+        if not path.exists():
+            continue
+        summary = json.loads(path.read_text())
+        if not summary.get("ok"):
+            raise RuntimeError(
+                f"stage '{stage}' summary is not ok -- the formal stage "
+                f"refuses to start from a failed algorithm stage")
+        winner = summary.get("winner")
+        if winner is None:
+            raise RuntimeError(
+                f"stage '{stage}' recorded winner=None ({label} branch "
+                f"ended without a selection) -- the formal stages require "
+                f"a SELECTED profile (plan 7.3/8)")
+        return winner, summary
+    raise RuntimeError(
+        "no algorithm-stage summary found (norm/numeric) -- the formal "
+        "stages never start without one (prerequisites are never inferred "
+        "from directory existence)")
+
+
+def _reports_consistent(reports: list[dict]) -> tuple[bool, list[str]]:
+    """§8.2 item 2: three-run consistency on the ALGORITHM-SEMANTIC fields
+    (states, kept set, per-row counters); wall times and machine load are
+    compared nowhere here."""
+    diffs: list[str] = []
+    base = reports[0]
+    for i, other in enumerate(reports[1:], start=2):
+        for k in ("n_demos", "n_kept", "mode"):
+            if base.get(k) != other.get(k):
+                diffs.append(f"run{i}.{k}: {base.get(k)!r} != {other.get(k)!r}")
+        brow = {r["demo"]: r for r in base["rows"]}
+        orow = {r["demo"]: r for r in other["rows"]}
+        if set(brow) != set(orow):
+            diffs.append(f"run{i}: demo sets differ "
+                         f"{sorted(set(brow) ^ set(orow))[:6]}")
+        for demo in sorted(set(brow) & set(orow)):
+            for k in ("accepted", "status", "t_fail", "skip_reason",
+                      "slack_frames"):
+                if brow[demo].get(k) != orow[demo].get(k):
+                    diffs.append(f"run{i}.{demo}.{k}: "
+                                 f"{brow[demo].get(k)!r} != "
+                                 f"{orow[demo].get(k)!r}")
+    return not diffs, diffs
+
+
+def _npz_bytes_equal(dirs: list[Path], kept: list[str]) -> tuple[bool, list[str]]:
+    """Kept trajectory NPZs byte-identical across the compared runs."""
+    diffs: list[str] = []
+    base = Path(dirs[0])
+    for demo in kept:
+        hashes = [sha256_full(d / f"{demo}.npz")
+                  for d in dirs if (d / f"{demo}.npz").is_file()]
+        if len(hashes) != len(dirs) or len(set(hashes)) != 1:
+            diffs.append(f"{demo}.npz: {len(set(hashes))} distinct hashes "
+                         f"across {len(dirs)} runs")
+    return not diffs, diffs
 
 
 def stage_numeric(root: Path) -> None:
@@ -1243,18 +1468,329 @@ def stage_norm(root: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# later stages (plan sections 8/9)
+# later stages (plan sections 8/9) -- formal E/F through the subtask machine
 # ---------------------------------------------------------------------------
 
 
-def stage_sixseg(root: Path) -> None:
-    raise SystemExit("stage sixseg requires the selection summary (plan "
-                     "section 8); not yet implemented in this revision")
+def _formal_runs(reg: SubtaskRegistry, out: Path,
+                 profile_name: str | None, set_name: str,
+                 runs: list[tuple[str, dict]]) -> dict[str, dict]:
+    """The formal stage's execution runs as §12 subtasks.  ``runs`` pairs a
+    subtask name with the ``_run_sixseg`` kwargs (a ``profile_name`` entry
+    overrides the stage's profile -- the ns control passes None); each
+    attempt's processed count is the run's demo count and its outputs are
+    the report + every kept NPZ (a partial write can never verify)."""
+    expected = len(registered_set_of(set_name))
+    identity = _stage_identity(profile_name, set_name)
+    results: dict[str, dict] = {}
+    for name, kwargs in runs:
+        run_profile = kwargs.pop("profile_name", profile_name)
+
+        def runner(att_dir: Path, _kw=kwargs, _prof=run_profile) -> int:
+            info = _run_sixseg(_prof, att_dir, **_kw)
+            return int(info["n_demos"])
+
+        def outputs_of(att_dir: Path, _kw=kwargs) -> list[Path]:
+            prefix = ("regen_report" if _kw.get("mode", "regen") == "regen"
+                      else "standard_report")
+            rep = att_dir / f"{prefix}_{set_name}_strict.json"
+            doc = json.loads(rep.read_text())
+            outs = [rep] + [att_dir / f"{r['demo']}.npz"
+                            for r in doc["rows"] if r["accepted"]]
+            missing = [str(p) for p in outs if not p.is_file()]
+            if missing:
+                raise RuntimeError(f"run outputs missing: {missing[:3]}")
+            return outs
+
+        results[name] = _subtask(reg, name, out, identity, expected,
+                                 runner, outputs_of)
+        print(f"  [subtask {name}] reused={results[name]['reused']} "
+              f"processed={results[name]['processed']}/{expected}")
+    return results
 
 
-def stage_train24(root: Path) -> None:
-    raise SystemExit("stage train24 requires the formal sixseg pass (plan "
-                     "section 9); not yet implemented in this revision")
+def registered_set_of(set_name: str) -> list[str]:
+    """The FROZEN demo list a formal run must cover exactly (plan 8.2 --
+    coverage is judged against this, never against what the report kept)."""
+    from regenerate_teachers import registered_set
+
+    demos = registered_set(set_name)
+    if not demos:
+        raise RuntimeError(f"registered set {set_name!r} is empty")
+    return demos
+
+
+def stage_sixseg(root: Path, profile: str | None = None) -> None:
+    """Plan section 8: the FORMAL six-segment acceptance of the SELECTED
+    profile -- two quiet runs + one verbose + the standard-mode control,
+    all as §12 subtasks; triple consistency, labels, the FULL §8.1 gate
+    (every row an explicit verdict, missing evidence a failure) and the
+    strict replay of the selection's frozen evidence.  The verdict is
+    machine-written only when everything completed; any missing subtask
+    leaves the stage INCOMPLETE (never a pass from partial files)."""
+    from ireset.repair.profiles import profiles_yaml_sha256
+    from train24fix3_quality_gate import gate_report
+
+    winner, selection = _selection_winner(root)
+    if profile is not None and profile != winner:
+        raise SystemExit(
+            f"--profile {profile!r} != the selected profile {winner!r} -- "
+            f"the formal stage runs the SELECTION only (plan 8.2: 错误选"
+            f"定 profile 显式失败)")
+    # cross-check against the selection's own per-profile record
+    sel_path = root / ("norm" if selection.get("stage") == "norm"
+                       else "numeric") / winner / "profile_summary.json"
+    if sel_path.exists():
+        sel = json.loads(sel_path.read_text())
+        if sel.get("selected") is not True:
+            raise SystemExit(
+                f"{sel_path}: the winner's own record says selected="
+                f"{sel.get('selected')!r} -- refusing to formalize")
+    out = root / "sixseg"
+    out.mkdir(parents=True, exist_ok=True)
+    reg = SubtaskRegistry(out)
+    gate = Gate()
+    set_name = "diagnosis6"
+    expected_demos = registered_set_of(set_name)
+    expected_n = len(expected_demos)
+
+    runs = _formal_runs(reg, out, winner, set_name, [
+        ("rq1", {}), ("rq2", {}), ("rv", {"verbose": True}),
+        ("ns", {"mode": "standard", "profile_name": None}),
+    ])
+    rq1_dir = Path(runs["rq1"]["dir"])
+    rq2_dir = Path(runs["rq2"]["dir"])
+    rv_dir = Path(runs["rv"]["dir"])
+    ns_dir = Path(runs["ns"]["dir"])
+
+    reports = []
+    for name, d in (("rq1", rq1_dir), ("rq2", rq2_dir), ("rv", rv_dir)):
+        reports.append(json.loads(
+            (Path(runs[name]["dir"]) / "regen_report_diagnosis6_strict.json"
+             ).read_text()))
+    consistent, diffs = _reports_consistent(reports)
+    kept = [r["demo"] for r in reports[0]["rows"] if r["accepted"]]
+    npz_ok, npz_diffs = _npz_bytes_equal([rq1_dir, rq2_dir, rv_dir], kept)
+    gate.check("triple_run_consistency", consistent, diffs[:8])
+    gate.check("triple_npz_bytes_equal", npz_ok, npz_diffs[:8])
+
+    # the standard-mode control: no C2 evidence at all + algorithm counts
+    # equal to B's own ns reference (§8.2 item 3)
+    ns_rep = json.loads(
+        (ns_dir / "standard_report_diagnosis6_strict.json").read_text())
+    ns_problems: list[str] = []
+    if ns_rep.get("effective", {}).get("mode") != "standard":
+        ns_problems.append(f"mode={ns_rep.get('effective', {}).get('mode')!r}")
+    for r in ns_rep["rows"]:
+        if r.get("c2_hand_speed"):
+            ns_problems.append(f"{r['demo']}: C2 evidence in standard mode")
+    b_ns = REFERENCES["B"]["root"] / "ns" / "standard_report_diagnosis6_strict.json"
+    if b_ns.is_file():
+        b_rep = json.loads(b_ns.read_text())
+        b_ok, b_diffs = _reports_consistent([b_rep, ns_rep])
+        ns_problems += [f"vs B/ns: {d}" for d in b_diffs]
+    else:
+        ns_problems.append("B/ns reference report missing")
+    gate.check("ns_standard_control", not ns_problems, ns_problems[:8])
+
+    # labels + the FULL §8.1 gate (evidence-requiring families mandatory)
+    identity = _stage_identity(winner, set_name)
+    labels = _subtask(
+        reg, "labels", out, identity, expected_n,
+        lambda att: (_run_labels(rq1_dir, att), expected_n)[1],
+        lambda att: [att / "label_manifest.json"])
+    gate.check("labels_subtask_complete", labels["ok"],
+               {"reused": labels["reused"]})
+    qg = _subtask(
+        reg, "quality_gate", out, identity, 1,
+        lambda att: (_write_gate(att, rq1_dir, winner, set_name,
+                                 cf_summary=sel_path if sel_path.exists()
+                                 else None,
+                                 labels=Path(labels["dir"])
+                                 / "label_manifest.json"), 1)[1],
+        lambda att: [att / "quality_gate.json"])
+    qg_doc = json.loads((Path(qg["dir"]) / "quality_gate.json").read_text())
+    gate.check("quality_gate_full", qg_doc.get("ok") is True,
+               qg_doc.get("verdicts"))
+
+    # the selection's frozen evidence replays TWICE into independent dirs
+    replay = _subtask(
+        reg, "replay", out, identity, 2,
+        lambda att: (replay_recovery(root / ("norm" if selection.get("stage")
+                                             == "norm" else "numeric") / winner,
+                                     att / "run1"),
+                     replay_recovery(root / ("norm" if selection.get("stage")
+                                             == "norm" else "numeric") / winner,
+                                     att / "run2"), 2)[2],
+        lambda att: [att / "run1" / "recovery_replay.json",
+                     att / "run2" / "recovery_replay.json"])
+    replay_ok = all(
+        json.loads((Path(replay["dir"]) / f"run{i}" / "recovery_replay.json"
+                    ).read_text())["ok"] for i in (1, 2))
+    gate.check("selection_evidence_replay", replay_ok,
+               {"reused": replay["reused"]})
+
+    summary = {"stage": "sixseg", "ok": gate.ok,
+               "generated": time.strftime("%Y-%m-%d %H:%M:%S"),
+               "selected_profile": winner,
+               "registry_sha256": profiles_yaml_sha256(),
+               "expected_set": set_name,
+               "expected_demos": sorted(expected_demos),
+               "runs": {k: {kk: v[kk] for kk in ("reused", "dir", "processed",
+                                                 "ok")}
+                        for k, v in runs.items()},
+               "labels": {k: labels[k] for k in ("reused", "dir", "ok")},
+               "quality_gate": {"dir": qg["dir"], "ok": qg_doc.get("ok"),
+                                "verdicts": qg_doc.get("verdicts")},
+               "replay": {"dir": replay["dir"], "ok": replay_ok},
+               "checks": gate.checks,
+               "next": ("train24 (plan section 9)" if gate.ok else
+                        "formal sixseg FAILED -- no train24, no freeze")}
+    write_guarded(stage_summary_path(root, "sixseg"),
+                  json.dumps(summary, indent=1, default=float))
+    print(f"sixseg -> {'PASS' if gate.ok else 'FAIL'} "
+          f"({stage_summary_path(root, 'sixseg')})")
+
+
+def _write_gate(att_dir: Path, run_dir: Path, profile: str, set_name: str,
+                *, cf_summary, labels) -> Path:
+    """The FULL gate of one formal run, persisted as a subtask output."""
+    from train24fix3_quality_gate import gate_report
+
+    cf = (json.loads(Path(cf_summary).read_text())
+          if cf_summary and Path(cf_summary).is_file() else None)
+    if cf is None:
+        raise RuntimeError(
+            "the selection's profile_summary.json is REQUIRED evidence for "
+            "the formal gate (mechanism family) -- missing is a failure")
+    report = gate_report(run_dir, expected_demos=registered_set_of(set_name),
+                         profile=profile, cf_summary=cf,
+                         label_manifest=labels, full=True)
+    att_dir.mkdir(parents=True, exist_ok=True)
+    out = att_dir / "quality_gate.json"
+    if out.exists():
+        raise FileExistsError(f"refusing to overwrite {out}")
+    out.write_text(json.dumps(report, indent=1, default=float))
+    return out
+
+
+def stage_train24(root: Path, profile: str | None = None) -> None:
+    """Plan section 9: the frozen train24 rerun -- three complete clean runs
+    of the calibration24_train_v1 list as §12 subtasks, labels + the FULL
+    gate, the ≥18/24 quantity gate, per-subject usable windows and the T
+    keeps' preservation.  Requires the formal sixseg PASS; the profile is
+    locked from that stage's own summary."""
+    from ireset.repair.profiles import profiles_yaml_sha256
+    from train24fix3_quality_gate import gate_report
+
+    sixseg = load_stage_summary(root, "sixseg")
+    winner = sixseg.get("selected_profile")
+    if not winner:
+        raise SystemExit("the sixseg summary carries no selected profile -- "
+                         "stage train24 refuses to start")
+    if profile is not None and profile != winner:
+        raise SystemExit(
+            f"--profile {profile!r} != the frozen profile {winner!r} "
+            f"(plan 9: the profile is locked before any train24 read)")
+    out = root / "train24"
+    out.mkdir(parents=True, exist_ok=True)
+    reg = SubtaskRegistry(out)
+    gate = Gate()
+    set_name = "calibration24_train_v1"
+    expected_demos = registered_set_of(set_name)
+    expected_n = len(expected_demos)
+
+    runs = _formal_runs(reg, out, winner, set_name, [
+        ("run1", {"set_name": set_name}), ("run2", {"set_name": set_name}),
+        ("run3", {"set_name": set_name})])
+    run_dirs = [Path(runs[n]["dir"]) for n in ("run1", "run2", "run3")]
+    reports = [json.loads((d / f"regen_report_{set_name}_strict.json"
+                           ).read_text()) for d in run_dirs]
+    consistent, diffs = _reports_consistent(reports)
+    gate.check("triple_run_consistency", consistent, diffs[:8])
+    kept = [r["demo"] for r in reports[0]["rows"] if r["accepted"]]
+    npz_ok, npz_diffs = _npz_bytes_equal(run_dirs, kept)
+    gate.check("triple_npz_bytes_equal", npz_ok, npz_diffs[:8])
+
+    identity = _stage_identity(winner, set_name)
+    labels = _subtask(
+        reg, "labels", out, identity, expected_n,
+        lambda att: (_run_labels(run_dirs[0], att), expected_n)[1],
+        lambda att: [att / "label_manifest.json"])
+    gate.check("labels_subtask_complete", labels["ok"],
+               {"reused": labels["reused"]})
+    # the mechanism family's cf evidence is the SELECTION's own profile
+    # summary (norm/numeric -- the sixseg stage writes its own record but
+    # never a second profile summary)
+    sel_cf = None
+    for base in ("norm", "numeric"):
+        cand = root / base / winner / "profile_summary.json"
+        if cand.is_file():
+            sel_cf = cand
+            break
+    qg = _subtask(
+        reg, "quality_gate", out, identity, 1,
+        lambda att: (_write_gate(att, run_dirs[0], winner, set_name,
+                                 cf_summary=sel_cf,
+                                 labels=Path(labels["dir"])
+                                 / "label_manifest.json"), 1)[1],
+        lambda att: [att / "quality_gate.json"])
+    qg_doc = json.loads((Path(qg["dir"]) / "quality_gate.json").read_text())
+    gate.check("quality_gate_full", qg_doc.get("ok") is True,
+               qg_doc.get("verdicts"))
+
+    # quantity gate: >= 18/24 keep, kept demos all in the frozen list
+    n_kept = len(kept)
+    foreign = sorted(set(kept) - set(expected_demos))
+    gate.check("train24_quantity_ge_18", n_kept >= 18 and not foreign,
+               {"n_kept": n_kept, "foreign_kept": foreign[:5]})
+
+    # every subject of the frozen list has at least one KEPT demo with at
+    # least one usable 60-frame window (plan 9 item 4)
+    from train24fix3_quality_gate import _usable_windows, metrics_of_run
+    metrics = metrics_of_run(run_dirs[0])
+    subjects = {d.split("_")[0] for d in expected_demos}
+    per_subject: dict[str, int] = {}
+    for demo in kept:
+        seg = metrics.get(demo)
+        if seg is not None:
+            per_subject[demo.split("_")[0]] = per_subject.get(
+                demo.split("_")[0], 0) + _usable_windows(seg)
+    missing_subjects = sorted(s for s in subjects
+                              if per_subject.get(s, 0) < 1)
+    gate.check("train24_subjects_have_usable_windows",
+               not missing_subjects,
+               {"missing": missing_subjects,
+                "windows": {k: per_subject[k] for k in sorted(per_subject)}})
+
+    # the original T keeps stay strict+keep (plan 9 item 5): every T
+    # reference demo inside this run's scope must still be kept
+    t_dir = REFERENCES["T"]["root"]
+    t_kept = {p.stem for p in Path(t_dir).glob("*.npz")}
+    lost_t = sorted(d for d in t_kept
+                    if d in set(expected_demos) and d not in kept)
+    gate.check("train24_T_kept_preserved", not lost_t, lost_t[:6])
+
+    summary = {"stage": "train24", "ok": gate.ok,
+               "generated": time.strftime("%Y-%m-%d %H:%M:%S"),
+               "frozen_profile": winner,
+               "registry_sha256": profiles_yaml_sha256(),
+               "expected_set": set_name,
+               "expected_demos": sorted(expected_demos),
+               "n_kept": n_kept, "kept": sorted(kept),
+               "runs": {k: {kk: v[kk] for kk in ("reused", "dir", "processed",
+                                                 "ok")}
+                        for k, v in runs.items()},
+               "quality_gate": {"dir": qg["dir"], "ok": qg_doc.get("ok"),
+                                "verdicts": qg_doc.get("verdicts")},
+               "per_subject_windows": per_subject,
+               "checks": gate.checks,
+               "next": ("production handoff (plan section 10)" if gate.ok
+                        else "train24 FAILED -- no production handoff")}
+    write_guarded(stage_summary_path(root, "train24"),
+                  json.dumps(summary, indent=1, default=float))
+    print(f"train24 -> {'PASS' if gate.ok else 'FAIL'} "
+          f"({stage_summary_path(root, 'train24')})")
 
 
 STAGES = {
@@ -1273,13 +1809,17 @@ def main() -> None:
     ap.add_argument("--out", required=True,
                     help="experiment root (train24fix3_<date>_<shortrev>)")
     ap.add_argument("--profile", default=None,
-                    help="profile name for sixseg/train24 (frozen before the "
-                         "run starts; never used for candidate search)")
+                    help="profile name for sixseg/train24 (cross-checked "
+                         "against the SELECTION summary before anything "
+                         "runs -- a mismatched name is an explicit failure)")
     args = ap.parse_args()
     if args.stage in ("sixseg", "train24") and not args.profile:
         raise SystemExit(f"--profile is required for --stage {args.stage}")
     root = Path(args.out).resolve()
-    STAGES[args.stage](root)
+    if args.stage in ("sixseg", "train24"):
+        STAGES[args.stage](root, profile=args.profile)
+    else:
+        STAGES[args.stage](root)
 
 
 if __name__ == "__main__":
