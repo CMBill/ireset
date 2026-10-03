@@ -1,8 +1,77 @@
 # train24fix3 收敛修复与转段执行验证记录
 
-日期:2026-10-02 起。对象:[train24fix3 收敛修复与教师数据转段执行计划](../plans/train24fix3_convergence_recovery_plan.md)。状态:**阶段 A/B/C 已完成——数值候选 N1–N3 全部未通过六段开发门(winner=None),按 §6.2 出口进入阶段 D 范数分支(待实施)**。实验根目录:`derived/data/teachers_regenerated/train24fix3_20261002_1147424/`。
+日期:2026-10-02 起,2026-10-03 增补续跑指针。对象:[train24fix3 收敛修复与教师数据转段执行计划](../plans/train24fix3_convergence_recovery_plan.md)。状态:**阶段 A/B/C 完成(N1–N3 全未过六段开发门,winner=None);阶段 D(norm_cut S1/S2)实现完成、全量 288 passed + 1 skipped;S1 机理证据完成(五冻结帧 5/5 采纳、113 反事实、尖峰 10/10 全拒),S1 六段按 §12 预算中止记 INCOMPLETE(非门裁决),S2 未执行——等待预算调整登记后续跑**。实验根目录:`derived/data/teachers_regenerated/train24fix3_20261002_1147424/`。
 
 起点:代码 `e74a5f3`(方案提交 `dcf9d33`)。阶段 A 按方案 §4.1 任务 1 在任何算法修改前执行。
+
+## 0.1 续跑指针(新上下文入口——2026-10-03 写,以此为准继续工作)
+
+**一句话现状**:算法代码全部就绪且测试全绿;S1 的机理层证据(五帧/113 反事实/尖峰)已拿到且是本轮最强结果;唯一未完成的是 **S1 的六段比较(预算中止)与 S2 的全部比较**,完成后才能出阶段 D 的 winner 裁决。下一步动作是**登记预算调整并续跑六段**,不需要任何新的算法实现。
+
+**精确续跑步骤**(§12 规则:同冻结配置/profile、调整预算单独登记、续跑保持完整分母):
+
+1. **预算调整登记**(需用户授权后写入本节末尾的登记表):S1 六段按实测节奏(首段 51 min 未完)估计 ≥5h;S2 全套(五帧 ~5 min + 113 反事实 ~14 min + 六段 ≥5h + 质量门 ~4 min)估计 ≥6h。合计上限建议登记为 16h,可分两次挂后台。
+2. **S1 六段续跑**——注意**不能直接重跑 `--stage norm`**(驱动对已存在产物 refuse-overwrite,S1 的 cf/ 产物已在):用同一冻结 profile 直接跑 CLI,输出目录沿用 `norm/S1/sixseg/rq/`(该目录只有 dirty_diff patch,报告从未写过,无覆盖冲突):
+   ```bash
+   OMP_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8 MKL_NUM_THREADS=8 \
+   uv run --locked python scripts/regenerate_teachers.py \
+     --set diagnosis6 --mode regen --validation-mode strict --profile S1 \
+     --assert-task-gate 0.40 \
+     --output-dir derived/data/teachers_regenerated/train24fix3_20261002_1147424/norm/S1/sixseg/rq \
+     --report   derived/data/teachers_regenerated/train24fix3_20261002_1147424/norm/S1/sixseg/rq/regen_report_diagnosis6_strict.json \
+     --note "train24fix3 stage-D S1 sixseg continuation (budget-adjusted, frozen profile S1)"
+   ```
+   完成后跑质量门并核对 R9 干净(`end.code_changed_during_run == False`;**运行期间不得写仓库任何文件**):
+   ```bash
+   env PYTHONPATH=$PWD/src:$PWD/scripts uv run --locked python scripts/train24fix3_quality_gate.py \
+     --run derived/data/teachers_regenerated/train24fix3_20261002_1147424/norm/S1/sixseg/rq \
+     --out  derived/data/teachers_regenerated/train24fix3_20261002_1147424/norm/S1/quality_gate.json
+   ```
+3. **S2(0.049)全套**——`norm/S2/` 目录为空,驱动阶段可直接重入;但 `--stage norm` 会先重跑 S1 的五帧与 cf(撞 refuse-overwrite)。**续跑路径**:直接 `--stage norm` 前先把 `norm/S1/` 移到 `norm/S1_done_20261002/`(保留全部证据),或在 Python 里 `from train24fix3_convergence import _profile_frozen_frames, _norm_counterfactuals, _run_sixseg, Gate; from ireset.repair.profiles import get_profile` 分步执行 S2 并手写 `norm/norm_summary.json`(字段结构照抄 `stage_numeric` 的 summary)。
+4. **裁决规则**(方案 §7.3,预注册):S1/S2 任一通过全部六段门(基础 6/6 keep + R9 干净 + 质量门 H/B/C/T 全过 + 尖峰全拒 + 启用态核验)→ winner → 阶段 E(正式六段:2 quiet + 1 verbose + ns + 完整重放,§8.2);两者皆未过 → 阶段 D 结束,交付失败分类(数值未收敛/其他行阻塞/认证/漂移/任务退化/证据不足)与新最小问题规格,**不得因局部成功降低六段门进 train24**。
+
+**产物索引**(实验根 `train24fix3_20261002_1147424/`):
+
+| 目录 | 内容 | 状态 |
+|---|---|---|
+| `baseline/` | fb/cf 严格重放(新目录)、n0_identity、H/B/C/T 哈希 | 完成,PASS |
+| `trace/` | 五帧全迭代 trace(JSON+NPZ,每帧 3 尝试 70–94 QP) | 完成,PASS |
+| `numeric/{N1,N2,N3}/` | 每 profile:冻结帧+六段 rq+profile_summary | 完成,winner=None |
+| `numeric/numeric_summary.json` | 阶段 C 裁决 | 完成 |
+| `norm/S1/cf/` | 113 个 v3 产物+cf_index | 完成 |
+| `norm/S1/sixseg/rq/` | 仅 dirty_diff patch(六段 51 min 中止) | **INCOMPLETE,待续跑** |
+| `norm/stage_status_budget_stop.json` | 预算中止时间线+续跑范围 | 完成 |
+| `norm/norm_summary.json` | 阶段 D 裁决 | **不存在(阶段未完成)** |
+
+**本轮新增工程事实**(新上下文必读,AGENTS 事实链之外的本轮增量):
+
+- 驱动/工具的哈希比较必须用全长摘要:`closed_loop_metrics.sha256` 是 16 位截断变体,对 F 的 64 位清单必然假漂移(本轮 baseline 首跑即踩,修复 `1147424`;驱动内统一 `sha256_full`)。
+- `_qp_row_names` 的 pre 块是**条件布局**:`z_prev=None` 时无 joint_vel/root 行(64 行而非 99),静态描述符错位 29 行——必须按 ctx 条件构造;C2 块行号锚点取自真实装配(`c2_tail_end`),不沿用名义常数。
+- `check_rows` 返回的 names 是**碰撞块名**;全行描述符要经 `_check_descriptors`(消费方:`_row_dump`、trace、测试)。
+- norm_cut 在 N3 档求解设置(polish/1e-9/20000)下 C2 激活帧成本 ~10× 于 N3(切面重解 × 20000 迭代 QP);冻结帧墙钟 27–59s vs N3 的 3–13s。若预算仍是约束,可考虑的**非算法**缓解只有先跑六段挂后台过夜,不允许改求解设置来提速(那是新候选)。
+- `HAND_SITES` 按标签索引、C2 行布局按 site 索引;唯一映射常量 `scp._C2_SITE_LABELS = ("palm","thumb","pinky")`。
+- 质量门工具 `train24fix3_quality_gate.py` **无跨运行缓存**(曾按 demo 名缓存导致参照被候选值污染、H 比较假通过——已移除并复验);参照 demo 与运行 demo 集不重叠时记 N/A 不记失败(T 与六段集只共享部分 demo)。
+- v3 产物格式 `train24fix3_norm_products_v1`(自哈希+有效配置+注册表哈希+integrity,双视图索引);加载器 `load_norm_products`/`load_norm_index` 在驱动内,篡改(NPZ/格式/索引六变体)由 `tests/test_train24fix3_norm.py` 钉死。
+- 驱动 `train24fix3_convergence.py` 六阶段均读阶段摘要拒跳前置门;所有产物写入 refuse-overwrite——**中断后不能整阶段重跑**,续走分步 CLI/函数(见上)。
+- OSQP 1.1.3 的 `res.info` 字段名是 `iter/prim_res/dual_res/obj_val/status_polish`(无旧版 `pri_res/dua_res`);solve_qp 的 trace 已按此记录。
+
+**实现落点清单**(全部已提交、测试覆盖):
+
+- `src/ireset/repair/profiles.py`:`OsqpSettings`/`C2Profile`/`load_profiles`(闭合字段/继承展开/非法值拒绝)/`profiles_yaml_sha256`;注册表 `configs/repair/train24fix3_profiles.yaml`(N0–N3/S1–S2)。
+- `src/ireset/repair/scp.py`:`RepairConfig.osqp_*`(默认=N0)、`_frame_qp_settings`(profile 仅 C2 激活帧)、`solve_qp(settings=None)`+trace、`_fixed_post_rows`(axis/norm_cut 双模式真实行)、`_post_row_descriptors`(模式感知缓存)、`build_qp`(C2 盒行/切面行/`_c2_lin` 线性化/共享 site 松弛组/mu 罚权)、`_c2_cut_refine`(切面循环+预算+账目)、`_qp_row_names`、`solve_frame`(trace 插桩+切面接线+逐迭代清缓存)、`FrameResult.diagnostics["c2_cuts"]`。
+- `src/ireset/repair/pipeline.py`:`RepairPipeline(..., c2_profile=...)`。
+- `scripts/regenerate_teachers.py`:`--profile`(regen-only 守卫;解析值+注册表哈希入 effective 记录与报告)。
+- `scripts/train24fix2_audit.py`:`configs_from_record` v2 回填(v2 携带非 N0 新字段即拒)、`fresh_audit_pipe/full_candidate_audit` 的 `c2_profile` 参数。
+- `scripts/train24fix3_quality_gate.py`:H/B/C/T 逐侧不退化门+sub16 保护。
+- `scripts/train24fix3_convergence.py`:baseline/trace/numeric/norm 阶段 + v3 产物读写。
+- 测试:`tests/test_train24fix3_profiles.py`(9)/`test_train24fix3_numeric.py`(7)/`test_train24fix3_norm.py`(11)。
+
+**预算调整登记表**(授权后填写):
+
+| 日期 | 项 | 原预算 | 调整为 | 依据 | 授权 |
+|---|---|---|---|---|---|
+| (待登记) | S1 六段续跑 | §12 norm 总 2h(已耗尽) | (建议 ≤8h) | 首段实测 51min 未完,~10× 成本观察 | (用户) |
+| (待登记) | S2 全套 | 同上 | (建议 ≤8h) | 同上 + S1 冻结帧/cf 实测 ~19min | (用户) |
 
 ## 0. 实施提交与测试
 
@@ -15,8 +84,9 @@
 | `d8e1f25` | 提交单位 2+3(合并,装配改动交织):N2 行预条件 + N3 mu 恢复罚权 |
 | `3a23e92` | 阶段 D:norm_cut 范数分支实现(真实范数行/切面装配/共享松弛/v3 产物/norm 驱动阶段) |
 | `afffdf4` | 驱动修复:norm 产物目录创建 |
+| `84a7a7d` | 阶段 A–D 验证记录+AGENTS 同步(本文件的 §0–§5 与 AGENTS 顶部条目) |
 
-测试 262 → **277 passed + 1 skipped**(`uv run --locked pytest tests/ -q`):新增 `tests/test_train24fix3_profiles.py` 9 项(注册表矩阵/未知字段·非法值·非法继承拒绝、N0 默认=历史硬编码、逐帧门控仅 C2 激活帧、solve_qp 设置穿透 spy、trace 开/关纯度逐位、v2 记录 N0 回填/非 N0 携带拒绝、effective 记录携带 profile)+ `tests/test_train24fix3_numeric.py` 7 项(N0/N1 挂载=无 profile 逐位一致、N2 行变换 ξ 列纯 /B 且松弛列两表述同 −1、±INF 哨兵有限值比较、松弛罚权单位 10000·B 仅 C2 族、高精度同解与 s_m=B·s_norm、真实接受行 N2 下逐位不变、N3 mu 罚权仅 C2 松弛且缺 mu 显式错、tight N3≡N2)。
+测试 262 → 288 passed + 1 skipped(最终;`uv run --locked pytest tests/ -q` @ `84a7a7d`):`tests/test_train24fix3_profiles.py` 9 项(注册表矩阵/未知字段·非法值·非法继承拒绝、N0 默认=历史硬编码、逐帧门控仅 C2 激活帧、solve_qp 设置穿透 spy、trace 开/关纯度逐位、v2 记录 N0 回填/非 N0 携带拒绝、effective 记录携带 profile)+ `tests/test_train24fix3_numeric.py` 7 项(N0/N1 挂载=无 profile 逐位一致、N2 行变换 ξ 列纯 /B 且松弛列两表述同 −1、±INF 哨兵有限值比较、松弛罚权单位 10000·B 仅 C2 族、高精度同解与 s_m=B·s_norm、真实接受行 N2 下逐位不变、N3 mu 罚权仅 C2 松弛且缺 mu 显式错、tight N3≡N2)+ `tests/test_train24fix3_norm.py` 11 项(见 §4)。
 
 首轮 baseline(`train24fix3_20261002_a7954e2/`)因驱动两处登记缺陷判 FAIL(fb/cf 重放本身已 ALL MATCH、integrity 干净):(1) 用 `closed_loop_metrics.sha256` 16 位截断变体比 F 清单 64 位摘要,必然假漂移——AGENTS 已记录的"跨工具哈希必须同源"事实的直接复演;(2) C 参照期望误写 6 NPZ(1/6 keep 轮仅 sub16 保留 1 个)。修复(`1147424`)后重跑为权威 baseline,首轮目录保留为失败尝试证据。
 
