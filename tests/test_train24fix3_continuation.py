@@ -386,6 +386,163 @@ def test_stage_failure_prefix_mismatch_fails_binding(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# the anchor binding's data flow (regression for the 2026-10-03 crash) and
+# the plan-12 scoped reuse across a revision change
+# ---------------------------------------------------------------------------
+
+
+def test_anchor_binding_writes_loadable_scenes(tmp_path, monkeypatch):
+    """The final_fail trajectory IS the [T,43] validator scene: the binding's
+    per-pass NPZs must round-trip through ``load_teacher_npz`` (the crash
+    hstacked the box onto it -> [T,50] -> every binding failed post-solve)."""
+    import train24fix2_cert_trace as ct
+    from ireset.data.teacher import load_teacher_npz
+    from ireset.repair.config_io import load_mode_configs
+
+    T = 20
+    rng = np.random.default_rng(0)
+    traj = rng.normal(size=(T, 43))
+    human = rng.normal(size=(T, 52, 3))
+    loc, fff = "right_hand anchor t=14", 14
+
+    class _Chk:
+        passed = False
+        location = loc
+        first_failure_frame = fff
+
+    class _Final:
+        passed = False
+        checks = {"hand_grasp": _Chk()}
+
+    class _Ctx:
+        c2_hand_enabled = {"l": True, "r": True}
+        hand_anchor = {"l": None, "r": None}
+
+    class _Res:
+        accepted = False
+        diagnostics = {
+            "final_stage": "final_validation", "t_fail": None,
+            "suffix_retry_from": 9,
+            "failed_checks": {"hand_grasp": {"location": loc,
+                                             "first_failure_frame": fff}},
+            "final_retry_failed_checks": {"hand_grasp": {"location": loc,
+                                                          "first_failure_frame": fff}},
+            "cost": {"passes": [
+                {"trajectory_pass": 0, "status": "accepted", "complete": True,
+                 "t_fail": None, "accepted_frames": T, "attempts": 5,
+                 "qp_calls_total": 100, "iterations_total": 40},
+                {"trajectory_pass": 1, "status": "accepted", "complete": True,
+                 "t_fail": None, "accepted_frames": T, "attempts": 4,
+                 "qp_calls_total": 80, "iterations_total": 30}]},
+            "c2_hand_speed": {"frames_on": {"l": T, "r": T}}}
+
+    class _Pipe:
+        def __init__(self):
+            self.snapshot = None
+
+        def repair_trajectory(self, scene, cond):
+            for pi in (0, 1):
+                self.snapshot("final_fail", {
+                    "pass_index": pi, "trajectory": traj.copy(),
+                    "final": _Final(), "first_failure_frame": fff})
+                self.snapshot("frame", {
+                    "t": 1, "pass_index": pi, "ctx": _Ctx(),
+                    "z_pred": None, "z_prev": None, "box": None,
+                    "prediction": None})
+            return _Res()
+
+    rcfg, vcfg = load_mode_configs("strict")
+
+    class _Prof:
+        name = "S2"
+
+        def as_record(self):
+            return {"name": "S2"}
+
+    def fake_rerun(prof, demo):
+        return traj, human, 30.0, "cond", rcfg, vcfg, _Prof(), _Pipe()
+
+    def fake_freeze(npz, demo, cond, vcfg, rcfg, *, with_series=False):
+        return {"task_mpjpe": {"p50": 0.1, "p95": 0.11, "max": 0.2},
+                "sides": {side: {
+                    "certified_intervals": [[4, 16]],
+                    "anchor_drift_certified_max_m": 0.05,
+                    "speed_ref_max_mps": 0.03,
+                    "series": {"h_speed": [None] + [0.01] * (T - 1),
+                               "anchor_drift_curves": {"4-16": [0.0] * 12}}}
+                    for side in ("l", "r")}}
+
+    monkeypatch.setattr(drv, "_rerun_segment", fake_rerun)
+    monkeypatch.setattr(ct, "freeze_segment", fake_freeze)
+    monkeypatch.setattr(ct, "ref_intervals_of",
+                        lambda cond, eff: [(2, 18)])
+
+    row = {"final_stage": "final_validation", "t_fail": None,
+           "suffix_retry": {"from_frame": 9,
+                            "first_attempt_failed_checks": {
+                                "hand_grasp": {"location": loc,
+                                               "first_failure_frame": fff}}},
+           "rejection": {"violated_rows": [f"hand_grasp: {loc}"],
+                         "validator_failed_checks": {
+                             "hand_grasp": {"location": loc,
+                                            "first_failure_frame": fff}}},
+           "cost": {"passes": _Res.diagnostics["cost"]["passes"]},
+           "c2_hand_speed": {"frames_on": {"l": T, "r": T}}}
+    att = tmp_path / "att"
+    att.mkdir()
+    rep = tmp_path / "report.json"
+    rep.write_text("{}")                       # hashed into the source record
+    prod = drv._bind_anchor_failure("S2", "sub16_largebox_000", row,
+                                     rep, att)
+    assert prod["identity"]["match"] is True
+    assert len(prod["passes"]) == 2
+    assert prod["hand_anchor_verdict"]["any_nonempty"] is False
+    # THE regression: both pass scenes load as teacher qpos [T, 43]
+    for pi in (0, 1):
+        scene, _h, _f = load_teacher_npz(
+            att / f"anchor_sub16_largebox_000_pass{pi}_scene.npz")
+        assert scene.shape == (T, 43)
+    z = np.load(att / "anchor_sub16_largebox_000.npz")
+    assert z["pass0_trajectory"].shape == (T, 43)
+    # the per-side analysis consumed the fabricated freeze output
+    s = prod["passes"][0]["sides"]["r"]
+    assert s["ref_intervals"] == [[2, 18]]
+    assert s["certified_intervals"] == [[4, 16]]
+    assert s["anchor_establishment_frames"] == [4]
+    assert s["interval_start_differences"]["first_c2_enable"] == 1
+    assert s["hand_anchor_ever_nonempty"] is False
+
+
+def test_scope_change_reruns_only_affected_kind(tmp_path, monkeypatch):
+    """Plan 12's 'rerun only the AFFECTED tasks': a source change in one
+    binding kind's tooling forces that kind's attempts to rerun while the
+    other kind's verified attempts are reused across the revision change."""
+    _fake_evidence_summary(tmp_path)
+    _fake_bindings(monkeypatch)
+    real = drv._binding_scope_sha
+    drv.stage_failure_prefix(tmp_path)
+    s1 = json.loads(drv.stage_summary_path(tmp_path, "failure_prefix").read_text())
+    assert s1["ok"]
+    reg1 = json.loads((tmp_path / "failure_prefix" / "subtasks.json").read_text())
+
+    # simulate a commit that only touched the ANCHOR tooling
+    monkeypatch.setattr(drv, "_binding_scope_sha",
+                        lambda kind: real(kind) if kind == "solve" else "changed")
+    drv.stage_failure_prefix(tmp_path)
+    s2 = json.loads(drv.stage_summary_path(tmp_path, "failure_prefix").read_text())
+    assert s2["ok"] and s2["status"] == "COMPLETE"
+    reg2 = json.loads((tmp_path / "failure_prefix" / "subtasks.json").read_text())
+    for k, v in reg2["subtasks"].items():
+        if k.startswith("solve_"):
+            assert len(v) == 1, "unaffected kind must be reused verbatim"
+            assert v[0]["dir"] == reg1["subtasks"][k][0]["dir"]
+        else:
+            assert len(v) == 2, "affected kind must rerun into attempt_002"
+            assert v[-1]["identity"]["code_scope"]["sha256"] == "changed"
+    assert sum(1 for x in s2["subtasks"].values() if x["reused"]) == 10
+
+
+# ---------------------------------------------------------------------------
 # freeze_segment with_series: the cumulative anchor-drift curves
 # ---------------------------------------------------------------------------
 

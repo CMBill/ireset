@@ -1799,6 +1799,50 @@ def stage_evidence(root: Path, budget_min: float | None = None) -> None:
 FP_FORMAT = "train24fix3_failure_prefix_v1"
 
 
+def _binding_scope_sha(kind: str) -> str:
+    """Source fingerprint of the functions THIS binding kind executes --
+    the plan-12 'rerun only the AFFECTED tasks' guard.  A commit that
+    touches unrelated code cannot silently reuse an attempt across the
+    revision change, and one that touches this kind's tooling forces the
+    rerun even when every semantic identity field is unchanged.  (The
+    2026-10-03 anchor crash was a post-solve analysis bug; this guard is
+    what lets the ten unaffected solve bindings be reused verbatim.)"""
+    import hashlib
+    import inspect
+
+    fns = [_rerun_segment]
+    if kind == "solve":
+        fns += [_bind_solve_failure, _fp_trace_arrays]
+    else:
+        from train24fix2_cert_trace import freeze_segment, ref_intervals_of
+        fns += [_bind_anchor_failure, freeze_segment, ref_intervals_of]
+    h = hashlib.sha256()
+    for fn in fns:
+        h.update(inspect.getsource(fn).encode())
+    return h.hexdigest()
+
+
+def _reusable_attempt(reg: "SubtaskRegistry", name: str, identity: dict):
+    """Cross-commit reuse for the failure-prefix bindings (plan 12: verify
+    the file hashes, rerun only the affected tasks): ``git_rev``/``git`` are
+    deliberately NOT compared -- the semantic identity (profile, registry,
+    set, report hash, t_fail, final stage) AND the binding-kind source
+    fingerprint must match, and every registered output must still
+    hash-verify.  Anything else reruns into a NEW attempt directory."""
+    for att in reg.attempts(name):
+        if att.get("status") != "complete" or att.get("ok") is not True:
+            continue
+        prior = att.get("identity") or {}
+        keys = ("profile", "registry_sha256", "set", "task_gate",
+                "report_sha256", "t_fail", "final_stage", "code_scope")
+        if any(prior.get(k) != identity.get(k) for k in keys):
+            continue
+        if not reg._outputs_ok(att):
+            continue
+        return att
+    return None
+
+
 def _fp_trace_arrays(trace: dict) -> dict:
     """Compact whole-frame QP evidence: the row/col IDENTITY arrays for
     EVERY QP (Q3's one-to-one binding -- dimensions and descriptors are
@@ -2095,7 +2139,15 @@ def _bind_anchor_failure(prof_name: str, demo: str, row: dict,
     box = scene[:, 36:43]
     passes_out: list[dict] = []
     for pi, f in enumerate(finals):
-        scene_pass = np.hstack([f["trajectory"], box])
+        # the pass trajectory IS the [T, 43] validator scene (root+joints +
+        # box at cols 36:43).  Hstacking the box again produced [T, 50] and
+        # ``load_teacher_npz`` refused it -- the 2026-10-03 binding crash
+        # (both anchor attempts failed POST-solve on exactly this).
+        scene_pass = np.asarray(f["trajectory"], dtype=float)
+        if scene_pass.ndim != 2 or scene_pass.shape[1] != 43:
+            raise RuntimeError(
+                f"pass {pi} trajectory {scene_pass.shape} is not the "
+                f"[T, 43] validator scene")
         npz_path = att / f"anchor_{demo}_pass{pi}_scene.npz"
         np.savez(npz_path, qpos=to_teacher_layout(scene_pass),
                  human_joints=human, fps=fps)
@@ -2212,12 +2264,17 @@ def stage_failure_prefix(root: Path, budget_min: float | None = None) -> None:
                         f"{spec['kind']}:{spec['profile']}", spec["demo"]),
                     "report_sha256": sha256_full(rep_path),
                     "t_fail": spec["row"].get("t_fail"),
-                    "final_stage": spec["row"].get("final_stage")}
+                    "final_stage": spec["row"].get("final_stage"),
+                    "code_scope": {"kind": spec["kind"],
+                                   "sha256": _binding_scope_sha(spec["kind"])}}
         if time.perf_counter() > deadline:
             not_run.append(name)
             continue
         try:
-            prior = reg.verified(name, identity)
+            # cross-commit scoped reuse: git_rev/git are recorded but NOT
+            # compared -- plan 12's "verify the file hashes, rerun only the
+            # affected tasks" (the code_scope fingerprint is the guard)
+            prior = _reusable_attempt(reg, name, identity)
             if prior is None:
                 att = reg.begin(name, out, identity, 1)
                 try:
