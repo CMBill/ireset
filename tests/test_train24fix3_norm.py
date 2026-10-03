@@ -232,7 +232,7 @@ def test_cut_budgets_record_nonclosure_never_pass() -> None:
     calls = {"n": 0}
     ang = {"a": 0.0}
 
-    def fake_solve_qp(P, q, A, lo, hi, settings=None):
+    def fake_solve_qp(P, q, A, lo, hi, settings=None, qp_identity=None):
         calls["n"] += 1
         ang["a"] += 0.7
         xi = np.zeros(N_TANGENT)
@@ -338,7 +338,11 @@ def test_norm_index_contract(tmp_path) -> None:
     good = {"format": drv.NORM_FORMAT,
             "stems": ["a", "b"], "records": [{"stem": "a"}, {"stem": "b"}]}
     (base / "cf_index.json").write_text(json.dumps(good))
-    assert drv.load_norm_index(tmp_path)["stems"] == ["a", "b"]
+    # Q2 unified convention: the PRODUCTS directory itself (the dir holding
+    # cf_index.json) -- the pre-Q3 parent convention is a missing index now
+    assert drv.load_norm_index(base)["stems"] == ["a", "b"]
+    with pytest.raises(FileNotFoundError):
+        drv.load_norm_index(tmp_path)
     for mutate in ("empty_stems", "empty_records", "mismatch", "dup",
                    "bad_format", "missing"):
         d = tmp_path / f"cf_{mutate}"

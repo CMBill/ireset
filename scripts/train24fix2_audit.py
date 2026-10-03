@@ -636,9 +636,14 @@ def _integrity_files() -> list[Path]:
         files += sorted((root / "src" / "ireset" / sub).glob("*.py"))
     files += [root / "scripts" / f"{n}.py" for n in (
         "train24fix2_audit", "train24fix2_fail_bind", "train24fix2_cert_trace",
-        "experiment_provenance", "closed_loop_metrics", "regenerate_teachers")]
+        "experiment_provenance", "closed_loop_metrics", "regenerate_teachers",
+        # train24fix3 Q2: this round's evidence chain -- the convergence
+        # driver and the quality gate compute/hash the products; the
+        # profiles registry defines the audited C2 semantics
+        "train24fix3_convergence", "train24fix3_quality_gate")]
     files += [root / "configs" / "repair" / "qp_default.yaml",
-              root / "configs" / "eval" / "protocol.yaml"]
+              root / "configs" / "eval" / "protocol.yaml",
+              root / "configs" / "repair" / "train24fix3_profiles.yaml"]
     # assets: the same locked set experiment_provenance.asset_hashes covers,
     # plus the box mesh source directory -- hashed HERE with FULL digests
     # (asset_hashes truncates to 16 hex; a mixed-length manifest is exactly
@@ -694,19 +699,32 @@ def configs_from_record(record: dict, *, key: str = "repair"):
     (the frozen payload itself stays verbatim and its old fields must
     match exactly); a v2 record whose new fields carry anything but the
     N0 values is rejected -- v2 code cannot have produced profile values.
+
+    Every OTHER format (train24fix3 norm/recovery records) postdates the
+    fields: a missing solver field is a corrupt or foreign record and is
+    rejected -- backfill is v2-only, never a silent default (plan 4.3,
+    Q2's config wiring).
     """
     eff = record["effective"]
     payload = json.loads(json.dumps(eff[key]))
     vpayload = json.loads(json.dumps(eff["validation"]))
-    carried = {k: payload[k] for k in _SOLVER_FIELDS_N0 if k in payload}
-    if record.get("format") == AUDIT_FORMAT and any(
-            carried[k] != _SOLVER_FIELDS_N0[k] for k in carried):
-        raise ValueError(
-            "v2 record carries non-N0 train24fix3 solver fields -- not "
-            "producible by v2 code; refusing to interpret")
-    extra = {k: v for k, v in _SOLVER_FIELDS_N0.items() if k not in payload}
+    if record.get("format") == AUDIT_FORMAT:
+        carried = {k: payload[k] for k in _SOLVER_FIELDS_N0 if k in payload}
+        if any(carried[k] != _SOLVER_FIELDS_N0[k] for k in carried):
+            raise ValueError(
+                "v2 record carries non-N0 train24fix3 solver fields -- not "
+                "producible by v2 code; refusing to interpret")
+        payload = {**payload, **{k: v for k, v in _SOLVER_FIELDS_N0.items()
+                                 if k not in payload}}
+    else:
+        missing = [k for k in _SOLVER_FIELDS_N0 if k not in payload]
+        if missing:
+            raise ValueError(
+                f"record format {record.get('format')!r} lacks solver "
+                f"fields {missing} -- N0 backfill is v2-only; a new-format "
+                f"record without the full effective config is refused")
     cfg, vcfg = RepairConfig(**payload), ValidationConfig(**vpayload)
-    if json.loads(json.dumps(asdict(cfg))) != {**extra, **payload} or \
+    if json.loads(json.dumps(asdict(cfg))) != payload or \
             json.loads(json.dumps(asdict(vcfg))) != vpayload:
         raise ValueError("frozen effective config does not round-trip")
     return cfg, vcfg

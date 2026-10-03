@@ -353,6 +353,13 @@ class FrameSolver:
         #: slack bookkeeping of the last ``build_qp(slack=True)`` call
         #: (trace-only; identities of the relaxed rows + their penalties)
         self.last_slack_rows: dict | None = None
+        #: assembly metadata of the LAST ``build_qp`` call (trace-only,
+        #: train24fix3 Q3/plan 5.3): actual rows/cols, full per-row
+        #: descriptors (incl. slack copies + cut rows), column identities and
+        #: the slack map -- frozen per-solve by ``solve_qp`` so EVERY
+        #: ``prob.solve()`` is one-to-one with its own layout, never the
+        #: attempt-level "one cached row-name set" of the pre-Q3 code
+        self.last_qp_assembly: dict | None = None
         # -- train24fix3 norm_cut (plan section 7.2) -------------------------
         #: cutting planes of the CURRENT linearization only: cleared at
         #: every solve_frame entry AND at each outer iteration (a new z is a
@@ -1550,7 +1557,7 @@ class FrameSolver:
         # post tail, in their OWN space -- they never displace collision,
         # probe or endpoint/anchor rows, and the padding target grows by
         # their count so the fixed layout check cannot fire on them.
-        cut_rows_meta: list[tuple[str, int]] = []
+        cut_rows_meta: list[dict] = []
         if norm_prof is not None and self._c2_cuts:
             for cut in self._c2_cuts:
                 lin = self._c2_lin.get(cut["side"])
@@ -1570,7 +1577,9 @@ class FrameSolver:
                 A_rows.append(a.reshape(1, -1))
                 l_rows.append(np.array([-INF]))
                 u_rows.append(np.array([u_r]))
-                cut_rows_meta.append((cut["side"], int(cut["site"])))
+                cut_rows_meta.append({"side": cut["side"],
+                                      "site": int(cut["site"]),
+                                      "k": int(cut["k"])})
 
         # pad to the fixed layout length with inactive rows (collision block
         # may have fewer than MAX_PAIRS active pairs). The transition-probe
@@ -1615,7 +1624,8 @@ class FrameSolver:
                     base = c2_lo if side == "l" else c2_lo + 9
                     site_of_row[i] = (side, (i - base) // 3)
                 for k, meta in enumerate(cut_rows_meta):
-                    site_of_row[c2_tail_end + k] = meta
+                    site_of_row[c2_tail_end + k] = (meta["side"],
+                                                    meta["site"])
             row_slack = np.empty(len(idx), dtype=int)
             group_id: dict[tuple[str, int], int] = {}
             nxt = 0
@@ -1692,9 +1702,54 @@ class FrameSolver:
                                       in group_id.items()},
                     "penalty": [float(v) for v in q_new[N_TANGENT:]],
                     "n_s": int(n_s)}
+                # Q3 (plan 5.3): freeze THIS assembly's layout -- the
+                # expanded matrix, every row named (base + duplicated
+                # lower-side slack copies + slack nonneg rows), the column
+                # identities and the cut identities
+                self.last_qp_assembly = self._qp_assembly_meta(
+                    A_new, ctx, cut_rows_meta, base_names=names_all,
+                    idx=idx, n_s=n_s)
             return (spa.csc_matrix(P_new), q_new, spa.csc_matrix(A_new), lo_new, hi_new), n_s
 
+        if self.trace is not None:
+            self.last_qp_assembly = self._qp_assembly_meta(
+                A, ctx, cut_rows_meta,
+                base_names=self._qp_row_names(A.shape[0], ctx))
         return (spa.csc_matrix(P), q, spa.csc_matrix(A), lo, hi), 0
+
+    def _qp_assembly_meta(self, matrix, ctx: FrameContext, cut_rows_meta,
+                          *, base_names: list[str], idx=None,
+                          n_s: int = 0) -> dict:
+        """Layout metadata of ONE QP assembly (train24fix3 Q3, plan 5.3):
+        the ACTUAL matrix shape, a parallel descriptor for EVERY row (base
+        rows, the duplicated lower-side slack-copy rows, the slack
+        nonnegative rows), the column identities, the cut identities and the
+        row->slack map.  Trace-only; ``solve_qp`` freezes this beside each
+        actual solve so every ``prob.solve()`` is one-to-one with its own
+        layout -- the row count never comes from another assembly's matrix.
+        Raises on desync so a mislabelled layout cannot enter evidence."""
+        row_names = list(base_names)
+        if idx is not None:
+            row_names += [f"{base_names[i]}::slack_lo" for i in idx]
+            row_names += [f"s{s}::nonneg" for s in range(n_s)]
+            col_names = ([f"xi[{i}]" for i in range(N_TANGENT)]
+                         + [f"s{s}" for s in range(n_s)])
+        else:
+            col_names = [f"xi[{i}]" for i in range(N_TANGENT)]
+        if matrix.shape[0] != len(row_names) or matrix.shape[1] != len(col_names):
+            raise RuntimeError(
+                f"QP assembly metadata desync: matrix {matrix.shape} vs "
+                f"{len(row_names)} named rows / {len(col_names)} named cols")
+        return {"rows_n": int(matrix.shape[0]),
+                "cols_n": int(matrix.shape[1]),
+                "n_s": int(n_s),
+                "row_names": row_names,
+                "col_names": col_names,
+                "cuts": [dict(c) for c in cut_rows_meta],
+                "slack": (dict(self.last_slack_rows)
+                          if idx is not None and self.last_slack_rows
+                          else None),
+                "z_prev": ctx.z_prev is not None}
 
     def _qp_row_names(self, n_rows: int, ctx: FrameContext | None = None) -> list[str]:
         """Descriptors parallel to the LAST ``build_qp`` row layout (pre /
@@ -1744,7 +1799,8 @@ class FrameSolver:
         Lk = np.asarray(L[:, :15].todense()) if hasattr(L, "todense") else np.asarray(L)[:, :15]
         return np.kron(Lk, np.eye(3)) @ J_kpt.reshape(15 * 3, N_TANGENT)
 
-    def solve_qp(self, P, q, A, lo, hi, settings: OsqpSettings | None = None):
+    def solve_qp(self, P, q, A, lo, hi, settings: OsqpSettings | None = None,
+                 *, qp_identity: dict | None = None):
         """Solve one assembled QP.
 
         ``settings`` overrides the OSQP setup for THIS solve only; ``None``
@@ -1753,6 +1809,14 @@ class FrameSolver:
         hard-code). The train24fix3 per-frame profile gating happens in
         ``solve_frame`` (``_frame_qp_settings``), which owns the frame
         context this method deliberately does not.
+
+        ``qp_identity`` (train24fix3 Q3, plan 5.3) names THIS solve's place
+        in the frame computation (branch / outer iteration / cut round).
+        With tracing on, each record carries the identity, a monotonic QP
+        id, the ACTUAL matrix dimensions and -- when the assembly was built
+        by ``build_qp`` under tracing -- its full layout (row descriptors
+        and the row->slack map; the name arrays go to the NPZ side).  The
+        identity is evidence only: it never gates the solve.
         """
         prob = self._osqp
         if settings is None:
@@ -1775,7 +1839,18 @@ class FrameSolver:
             # copied as returned -- the historical pri_res/dua_res names
             # do not exist in this build.
             info = res.info
+            asm = self.last_qp_assembly
+            names_ok = bool(asm is not None
+                            and asm["rows_n"] == A.shape[0]
+                            and asm["cols_n"] == A.shape[1])
             self.qp_trace.append({
+                "qp_id": len(self.qp_trace),
+                "branch": None if qp_identity is None
+                else qp_identity.get("branch"),
+                "outer_iter": None if qp_identity is None
+                else qp_identity.get("outer_iter"),
+                "cut_round": None if qp_identity is None
+                else qp_identity.get("cut_round", 0),
                 "settings": asdict(settings),
                 "status": status,
                 "iter": int(info.iter),
@@ -1786,21 +1861,38 @@ class FrameSolver:
                 "x_returned": x is not None,
                 "x_absmax": (float(np.abs(x).max())
                              if x is not None else None),
+                "rows_n": int(A.shape[0]),
+                "cols_n": int(A.shape[1]),
+                "n_s": (None if asm is None else int(asm["n_s"])),
+                "n_cuts": (0 if asm is None else len(asm["cuts"])),
+                "z_prev": (None if asm is None else bool(asm["z_prev"])),
+                "layout_in_arrays": names_ok,
+                "slack_rows": (dict(asm["slack"])
+                               if names_ok and asm.get("slack") else None),
             })
             if self.qp_trace_arrays is not None:
-                self.qp_trace_arrays.append({
+                entry = {
                     "P": (np.asarray(P.todense()) if spa.issparse(P)
                           else np.array(P)),
                     "q": np.array(q),
                     "A": (np.asarray(A.todense()) if spa.issparse(A)
                           else np.array(A)),
-                    "lo": np.array(lo), "hi": np.array(hi)})
+                    "lo": np.array(lo), "hi": np.array(hi)}
+                if names_ok:
+                    # the name arrays are per-QP evidence: each dynamic
+                    # assembly (cuts added, slack layout) carries its OWN
+                    # descriptors, never the attempt-level cached set
+                    entry["row_names"] = np.asarray(asm["row_names"])
+                    entry["col_names"] = np.asarray(asm["col_names"])
+                self.qp_trace_arrays.append(entry)
         # OSQP returns garbage (huge) x on infeasibility: never trust it
         if x is None or not np.isfinite(x).all() or np.abs(x).max() > 1e6 or "infeasible" in status:
             return None, status
         return x, status
 
-    def _c2_cut_refine(self, x, status, z, ctx, trust, slack, mu, settings):
+    def _c2_cut_refine(self, x, status, z, ctx, trust, slack, mu, settings,
+                       *, branch: str | None = None,
+                       outer_iter: int | None = None):
         """norm_cut cutting-plane refinement (train24fix3 plan 7.2).
 
         After the FIRST solve of this iteration's QP, every site whose
@@ -1812,6 +1904,10 @@ class FrameSolver:
         read back as a real-norm pass (the nonlinear check rows are the
         only judge). Returns ``(x, status, n_extra_solves, stats)``;
         non-norm_cut profiles pass through with zero extra solves.
+
+        ``branch``/``outer_iter`` (Q3) reach every re-solve's trace record
+        with its own ``cut_round`` -- each dynamic assembly is identified
+        individually, never by the iteration's first QP.
         """
         prof = _norm_cut_profile(self.c2_profile)
         if prof is None or x is None:
@@ -1859,7 +1955,10 @@ class FrameSolver:
             (P, q, A, lo, hi), _ = self.build_qp(
                 z, ctx, trust, slack=slack, mu=mu)
             stats["resolves"] += 1
-            x, status = self.solve_qp(P, q, A, lo, hi, settings=settings)
+            x, status = self.solve_qp(
+                P, q, A, lo, hi, settings=settings,
+                qp_identity={"branch": branch, "outer_iter": outer_iter,
+                             "cut_round": _round + 1})
             if x is None:
                 break
         else:
@@ -2234,27 +2333,33 @@ class FrameSolver:
                     (Ps, qs, As, los, his), _ = self.build_qp(
                         z, ctx, trust, slack=True, mu=mu)
                     qp_calls += 1
-                    x_s, last_qp_status = self.solve_qp(Ps, qs, As, los, his,
-                                                        settings=settings)
-                    x_s, last_qp_status, n_cut, _cs = self._c2_cut_refine(
+                    x_s, last_qp_status = self.solve_qp(
+                        Ps, qs, As, los, his, settings=settings,
+                        qp_identity={"branch": "restoration",
+                                     "outer_iter": it, "cut_round": 0})
+                    x_s, last_qp_status, n_cut, cut_stats = self._c2_cut_refine(
                         x_s, last_qp_status, z, ctx, trust, True, mu,
-                        settings)
+                        settings, branch="restoration", outer_iter=it)
                     qp_calls += n_cut
-                    if attempt_trace is not None and len(attempt_trace["qp"]):
-                        qp_rec = attempt_trace["qp"][-1]
-                        qp_rec["branch"] = "restoration"
-                        qp_rec["rows_n"] = int(As.shape[0])
-                        qp_rec["cut_resolves"] = int(n_cut)
-                        if "qp_row_names" not in attempt_trace:
-                            attempt_trace["qp_row_names"] = self._qp_row_names(
-                                int(As.shape[0]), ctx)
-                        qp_rec["slack"] = (None if x_s is None else {
-                            "values": [float(v) for v in x_s[N_TANGENT:]],
-                            "negative": int((np.asarray(x_s[N_TANGENT:]) < 0).sum()),
-                            "nonfinite": int((~np.isfinite(
-                                np.asarray(x_s[N_TANGENT:]))).sum()),
-                            "rows": (dict(self.last_slack_rows)
-                                     if self.last_slack_rows else None)})
+                    if it_rec is not None:
+                        # train24fix3 Q3: branch/round/layout travel IN each
+                        # QP's own record now (solve_qp freezes the assembly
+                        # metadata of the LAST build_qp -- cut re-solves
+                        # included); the iteration view keeps the cut
+                        # accounting and the final slack vector of this
+                        # iteration's restoration solves.  The pre-Q3 code
+                        # patched only the LAST record with the INITIAL
+                        # assembly's row count.
+                        it_rec["c2_cut_stats"] = cut_stats
+                        it_rec["restoration_slack"] = (
+                            None if x_s is None else {
+                                "values": [float(v)
+                                           for v in x_s[N_TANGENT:]],
+                                "negative": int(
+                                    (np.asarray(x_s[N_TANGENT:]) < 0).sum()),
+                                "nonfinite": int(
+                                    (~np.isfinite(
+                                        np.asarray(x_s[N_TANGENT:]))).sum())})
                     if x_s is None:
                         trust *= cfg.shrink_factor
                         if it_rec is not None:
@@ -2270,20 +2375,16 @@ class FrameSolver:
                     (P, qv, A, lo_a, hi_a), _ = self.build_qp(
                     z, ctx, trust, slack=False, mu=mu)
                     qp_calls += 1
-                    xi, last_qp_status = self.solve_qp(P, qv, A, lo_a, hi_a,
-                                                       settings=settings)
-                    xi, last_qp_status, n_cut, _cs = self._c2_cut_refine(
+                    xi, last_qp_status = self.solve_qp(
+                        P, qv, A, lo_a, hi_a, settings=settings,
+                        qp_identity={"branch": "tight",
+                                     "outer_iter": it, "cut_round": 0})
+                    xi, last_qp_status, n_cut, cut_stats = self._c2_cut_refine(
                         xi, last_qp_status, z, ctx, trust, False, mu,
-                        settings)
+                        settings, branch="tight", outer_iter=it)
                     qp_calls += n_cut
-                    if attempt_trace is not None and len(attempt_trace["qp"]):
-                        qp_rec = attempt_trace["qp"][-1]
-                        qp_rec["branch"] = "tight"
-                        qp_rec["rows_n"] = int(A.shape[0])
-                        qp_rec["cut_resolves"] = int(n_cut)
-                        if "qp_row_names" not in attempt_trace:
-                            attempt_trace["qp_row_names"] = self._qp_row_names(
-                                int(A.shape[0]), ctx)
+                    if it_rec is not None:
+                        it_rec["c2_cut_stats"] = cut_stats
                     if xi is None:
                         restoration = True
                         if it_rec is not None:
@@ -2391,6 +2492,7 @@ class FrameSolver:
                 self.qp_trace = None
                 self.qp_trace_arrays = None
                 self.last_slack_rows = None
+                self.last_qp_assembly = None
 
     def _result(self, accepted, z, it_done, used_slack, merit, qp_calls, trust,
                 last_viol, last_names, status=None, review=None,

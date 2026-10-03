@@ -58,14 +58,19 @@ def sha256_full(path: Path) -> str:
 from ireset.paths import DERIVED_DATA_DIR, PROJECT_ROOT  # noqa: E402
 from ireset.repair.config_io import load_mode_configs  # noqa: E402
 from train24fix2_audit import (  # noqa: E402
+    arrays_diff,
     attach_integrity,
     classify_branches,
     configs_from_record,
+    context_arrays,
     context_from,
+    deep_diff,
+    freeze_context,
     full_candidate_audit,
     integrity_manifest,
     load_index,
     load_products,
+    verify_integrity,
 )
 from dataclasses import asdict  # noqa: E402
 
@@ -305,8 +310,12 @@ def _trace_arrays(trace: dict) -> dict:
                 if v is not None:
                     arr[f"a{ai}_it{ii}_{key}"] = np.asarray(v, dtype=float)
         for qi, qa in enumerate(att.get("qp_arrays", [])):
-            for key in ("P", "q", "A", "lo", "hi"):
-                arr[f"a{ai}_qp{qi}_{key}"] = np.asarray(qa[key], dtype=float)
+            # Q3: row/col name arrays are per-QP evidence -- a dynamic
+            # assembly (cuts added, slack layout) carries its OWN
+            # descriptors, never the attempt-level cached set
+            for key in ("P", "q", "A", "lo", "hi", "row_names", "col_names"):
+                if key in qa:
+                    arr[f"a{ai}_qp{qi}_{key}"] = np.asarray(qa[key])
     return arr
 
 
@@ -395,12 +404,19 @@ def stage_trace(root: Path) -> None:
 # stage C: numeric candidates (plan section 6)
 # ---------------------------------------------------------------------------
 
-def _profile_frozen_frames(prof, diag: Path) -> dict:
-    """Five frozen frames under ONE profile: the full escalation; an
-    adopted candidate additionally gets the complete C2-on audit (plan
-    6.2 item 1 -- legal-solve / failure / timeout / insufficient evidence
-    are listed separately, never merged)."""
+def _profile_frozen_frames(prof, diag: Path, pdir: Path | None = None) -> dict:
+    """Five frozen frames under ONE profile (plan 6.2 item 1).  Q1 fixes
+    two defects of the first implementation: the adopted candidate's full
+    audit now runs WITH THE SAME FROZEN PROFILE (the pre-Q1 call audited
+    norm_cut adoptions through the axis interpreter), and the audit's
+    arrays are KEPT -- frozen into the recovery product, never discarded.
+    Outcomes are listed separately (legal-solve / adopted-but-audit-fail /
+    evidence-incomplete / not-adopted), never merged into one number.
+    ``pdir`` (the profile directory) enables product freezing for the
+    strict replay (plan 4.4)."""
+    import numpy as np
     from ireset.repair.pipeline import RepairPipeline
+    from ireset.repair.profiles import profiles_yaml_sha256
     from train24fix2_audit import (
         configs_from_record,
         context_from,
@@ -411,7 +427,8 @@ def _profile_frozen_frames(prof, diag: Path) -> dict:
 
     idx = load_index(diag, "fail_bind2_index")
     rows = []
-    audits = {}
+    audits: dict[str, dict] = {}
+    ff_dir = pdir / "ff" if pdir is not None else None
     for stem in idx["stems"]:
         record, arrays = load_products(diag, stem)
         cfg, vcfg = configs_from_record(record)
@@ -423,6 +440,7 @@ def _profile_frozen_frames(prof, diag: Path) -> dict:
         t0 = time.perf_counter()
         esc = escalate_frame(pipe, ctx, t, ctx.z_pred, ctx.z_prev)
         wall = time.perf_counter() - t0
+        frozen = record["last_attempt"]["solver_fields"]
         row = {"stem": stem, "demo": record["demo"], "t": t,
                "skipped": bool(esc["skipped"]),
                "adopted": bool(esc["adopted"]),
@@ -430,23 +448,83 @@ def _profile_frozen_frames(prof, diag: Path) -> dict:
                "last_status": esc["last_status"],
                "last_term_reason": esc["last_term_reason"],
                "n_attempts": len(esc["attempts"]),
-               "wall_s": round(wall, 2)}
+               "wall_s": round(wall, 2),
+               "frozen_status": frozen["status"],
+               "frozen_term": frozen["term_reason"]}
+        prefix = ([arrays["prefix"][i].copy()
+                   for i in range(arrays["prefix"].shape[0])]
+                  if arrays["prefix"].size else [])
         if esc["adopted"]:
-            prefix = ([arrays["prefix"][i].copy()
-                       for i in range(arrays["prefix"].shape[0])]
-                      if arrays["prefix"].size else [])
-            arec, _aarr = full_candidate_audit(
+            # Q1: the audit judges the SAME semantics the candidate ran
+            # under -- the frozen profile goes in, and the returned arrays
+            # (previously discarded) are frozen with the record
+            arec, aarr = full_candidate_audit(
                 spec, cfg, vcfg, ctx, esc["adopted_z"],
                 prefix=prefix, box_poses=arrays["box_poses"],
-                label="profile_adopted")
+                label="profile_adopted", c2_profile=prof)
             audits[stem] = arec
             row["adopted_audit_branch_pass"] = arec.get("branch_pass")
+            if arec.get("verdict") == "EVIDENCE_INCOMPLETE":
+                row["outcome"] = "adopted_evidence_incomplete"
+            elif arec.get("branch_pass"):
+                row["outcome"] = "adopted_audit_pass"
+            else:
+                row["outcome"] = "adopted_audit_fail"
+            if ff_dir is not None:
+                prod = {
+                    "format": RECOVERY_FORMAT, "kind": "frozen_frame",
+                    "stem": f"ff_{stem}",
+                    "profile": {"name": prof.name,
+                                "resolved": prof.as_record(),
+                                "registry_sha256": profiles_yaml_sha256()},
+                    "input": {
+                        "demo": record["demo"], "t": t,
+                        "pass_index": record.get("pass_index"),
+                        "attempt_id": record["last_attempt"].get("attempt_id"),
+                        "frozen_last_status": frozen["status"],
+                        "frozen_last_term": frozen["term_reason"]},
+                    "source": {
+                        "diag_root": str(diag), "stem": stem,
+                        "json_sha256": sha256_full(diag / f"{stem}.json"),
+                        "npz_sha256": sha256_full(diag / f"{stem}.npz")},
+                    "escalation": {
+                        k: row[k] for k in
+                        ("skipped", "adopted", "adopted_source",
+                         "last_status", "last_term_reason", "n_attempts")},
+                    "effective": {"repair": asdict(cfg),
+                                  "validation": asdict(vcfg)},
+                    "audit": arec,
+                    "replay_meta": record["provenance"]["context_meta"],
+                }
+                attach_integrity(prod, cfg, vcfg)
+                _write_products(ff_dir, f"ff_{stem}", prod, {
+                    **context_arrays(ctx), **aarr,
+                    "adopted_z": np.asarray(esc["adopted_z"], dtype=float),
+                    "prefix": np.asarray(prefix, dtype=float).reshape(
+                        -1, 36),
+                    "box_poses": np.asarray(arrays["box_poses"],
+                                            dtype=float)})
+        else:
+            row["outcome"] = "skipped" if esc["skipped"] else "not_adopted"
         rows.append(row)
         print(f"  [{prof.name}] {stem}: adopted={row['adopted']} "
-              f"term={row['last_term_reason']} ({row['wall_s']}s)")
-    return {"rows": rows,
+              f"outcome={row['outcome']} term={row['last_term_reason']} "
+              f"({row['wall_s']}s)")
+    if ff_dir is not None and rows:
+        write_guarded(ff_dir / "ff_index.json", json.dumps(
+            {"format": RECOVERY_FORMAT,
+             "stems": [f"ff_{r['stem']}" for r in rows],
+             "records": [{"stem": f"ff_{r['stem']}"} for r in rows]},
+            indent=1))
+    counts = {k: sum(1 for r in rows if r["outcome"] == k) for k in (
+        "adopted_audit_pass", "adopted_audit_fail",
+        "adopted_evidence_incomplete", "not_adopted", "skipped")}
+    return {"rows": rows, "audits": audits,
             "n_adopted": sum(1 for r in rows if r["adopted"]),
-            "audits": audits}
+            "n_full_audit_pass": counts["adopted_audit_pass"],
+            "n_adopted_audit_fail": counts["adopted_audit_fail"],
+            "n_evidence_incomplete": counts["adopted_evidence_incomplete"],
+            "n_not_adopted": counts["not_adopted"] + counts["skipped"]}
 
 
 def _run_sixseg(profile_name: str, rq: Path) -> dict:
@@ -501,7 +579,7 @@ def stage_numeric(root: Path) -> None:
             continue
         prof = profiles[name]
         pdir = out / name
-        ff = _profile_frozen_frames(prof, diag)
+        ff = _profile_frozen_frames(prof, diag, pdir)
         six = _run_sixseg(name, pdir / "sixseg" / "rq")
         qg = gate_report(Path(six["rq_dir"]))
         base_ok = (six["n_kept"] == six["n_demos"]
@@ -509,8 +587,11 @@ def stage_numeric(root: Path) -> None:
         cand_ok = base_ok and qg["ok"]
         comparisons[name] = {
             "profile": prof.as_record(),
-            "frozen_frames": {k: ff[k] for k in ("rows", "n_adopted")},
-            "frozen_frame_adopted_audits": ff["audits"],
+            "frozen_frames": {k: ff[k] for k in (
+                "rows", "n_adopted", "n_full_audit_pass",
+                "n_adopted_audit_fail", "n_evidence_incomplete",
+                "n_not_adopted")},
+            "frozen_frame_products": str(pdir / "ff"),
             "sixseg": {k: six[k] for k in
                        ("rq_dir", "wall_s", "n_demos", "n_kept", "kept",
                         "code_changed_during_run", "profile")},
@@ -530,9 +611,7 @@ def stage_numeric(root: Path) -> None:
     summary = {"stage": "numeric", "ok": True,
                "generated": time.strftime("%Y-%m-%d %H:%M:%S"),
                "winner": winner, "not_executed": not_executed,
-               "comparisons": {k: {kk: vv for kk, vv in v.items()
-                                   if kk != "frozen_frame_adopted_audits"}
-                               for k, v in comparisons.items()},
+               "comparisons": comparisons,
                "checks": gate.checks,
                "next": ("sixseg (formal stage E, selected profile)"
                         if winner else "norm (S1 -> S2, plan section 7)")}
@@ -547,20 +626,35 @@ def stage_numeric(root: Path) -> None:
 # ---------------------------------------------------------------------------
 
 #: product format of the norm-stage counterfactual products (plan 7.2:
-#: new modes use a NEW format; the v2 forensic products stay v2-decoded)
+#: new modes use a NEW format; the v2 forensic products stay v2-decoded).
+#: HISTORICAL schema (2026-10-02/03 S1+S2 runs): its records lack the
+#: replay inputs (no frozen context/prefix/source/current branch) and its
+#: NPZ array keys carry the double ``rows__`` prefix (Q4) -- products in
+#: this format stay byte-preserved, load through this path only and are at
+#: most "historical summary / evidence incomplete" (plan 4.4 item 1).
 NORM_FORMAT = "train24fix3_norm_products_v1"
+#: the COMPLETE diagnostic schema of the continuation round (plan 4.4):
+#: identity, frozen FrameContext, candidate, accepted prefix + box
+#: sequence, BOTH branch audits, source hashes, full effective configs,
+#: resolved profile and the live integrity manifest.  New-format records
+#: get NO config backfill (Q2) and their array keys keep exactly the
+#: audit-returned single ``rows__<label>__*`` prefix (Q4).
+RECOVERY_FORMAT = "train24fix3_recovery_audit_v1"
+#: version marker of the dynamic per-QP trace products (plan 4.4 item 1 /
+#: 5.3 -- the Q3 one-to-one solve<->metadata<->matrix binding)
+QP_TRACE_FORMAT = "train24fix3_qp_trace_v2"
+_V1_AUDIT_LABEL = "plus_c2_norm"
+_V1_DOUBLE_PREFIX = f"rows__{_V1_AUDIT_LABEL}__rows__{_V1_AUDIT_LABEL}__"
 
 
-def _write_norm_products(pdir: Path, stem: str, record: dict,
-                         arrays: dict) -> None:
-    """Versioned JSON + NPZ, refusing overwrite; the NPZ is hashed INTO the
-    JSON after writing (self-hash), the effective configs + resolved
-    profile + integrity manifest are embedded so a replay never reads the
-    current YAML."""
+def _write_products(pdir: Path, name: str, record: dict,
+                    arrays: dict) -> None:
+    """Versioned JSON + NPZ under one product ``name``; refuses overwrite;
+    the NPZ is hashed INTO the JSON after writing (self-hash)."""
     import numpy as np
 
     pdir.mkdir(parents=True, exist_ok=True)
-    jpath, npath = pdir / f"cf_{stem}.json", pdir / f"cf_{stem}.npz"
+    jpath, npath = pdir / f"{name}.json", pdir / f"{name}.npz"
     if jpath.exists() or npath.exists():
         raise FileExistsError(f"refusing to overwrite {jpath}")
     np.savez(npath, **arrays)
@@ -569,10 +663,42 @@ def _write_norm_products(pdir: Path, stem: str, record: dict,
                                 default=float))
 
 
+def _write_norm_products(pdir: Path, stem: str, record: dict,
+                         arrays: dict) -> None:
+    """The historical v1 norm writer (kept verbatim for the S1/S2 layout;
+    new code writes :data:`RECOVERY_FORMAT` via ``_write_products``)."""
+    if record.get("format") not in (None, NORM_FORMAT):
+        raise ValueError(f"the cf_ writer produces the v1 layout only "
+                         f"(format {NORM_FORMAT!r}); got "
+                         f"{record.get('format')!r}")
+    _write_products(pdir, f"cf_{stem}", record, arrays)
+
+
+def _profile_from_record(record: dict):
+    """Rebuild the frozen profile from a recovery product's RESOLVED values
+    (Q2).  The registry YAML may have moved on between generation and
+    replay (R1-R3 add entries) -- the replay uses the product's own
+    expansion, never the live registry."""
+    from ireset.repair.profiles import C2Profile, OsqpSettings
+
+    prof = record.get("profile") or {}
+    resolved = prof.get("resolved")
+    if not prof.get("name") or not isinstance(resolved, dict):
+        raise ValueError("record carries no resolved profile -- the replay "
+                         "cannot reconstruct the audited C2 semantics")
+    try:
+        solver = OsqpSettings(**resolved["solver"])
+        kwargs = {k: v for k, v in resolved.items() if k != "solver"}
+        return C2Profile(solver=solver, **kwargs)
+    except (KeyError, TypeError) as err:
+        raise ValueError(f"resolved profile does not reconstruct: "
+                         f"{err}") from err
+
+
 def load_norm_products(pdir: Path, stem: str) -> tuple[dict, dict]:
     """Load one v3 norm product: format checked, NPZ hash verified against
-    the JSON's self-hash, integrity verified against the live tree (v3
-    records REQUIRE the full effective fields -- no backfill)."""
+    the JSON's self-hash (the HISTORICAL schema -- complete verification
+    and strict replay exist only for :data:`RECOVERY_FORMAT` records)."""
     import numpy as np
 
     jpath = pdir / f"cf_{stem}.json"
@@ -593,10 +719,131 @@ def load_norm_products(pdir: Path, stem: str) -> tuple[dict, dict]:
     return record, arrays
 
 
+def decode_norm_v1_arrays(arrays: dict) -> tuple[dict, str]:
+    """Explicit decode of the HISTORICAL v1 double-prefixed array keys
+    (Q4): ``rows__plus_c2_norm__rows__plus_c2_norm__*`` maps to the
+    canonical single-prefix names.  Returns ``(canonical_arrays,
+    layout_marker)``; a mixed or foreign layout is an explicit error --
+    v1 bundles are decoded AS v1, never silently renamed, and the marker
+    forbids claiming cross-version array identity."""
+    out: dict = {}
+    for k, v in arrays.items():
+        if k.startswith(_V1_DOUBLE_PREFIX):
+            out[f"rows__{_V1_AUDIT_LABEL}__"
+                + k[len(_V1_DOUBLE_PREFIX):]] = v
+    if not out:
+        raise ValueError("no v1 double-prefixed arrays found -- a bundle "
+                         "without any is not a v1 layout")
+    for k in arrays:
+        if not k.startswith(_V1_DOUBLE_PREFIX):
+            raise ValueError(f"v1 array layout carries non-double-prefixed "
+                             f"key {k!r} -- a mixed layout is corruption, "
+                             f"not a v1 bundle")
+    return out, "v1_double_prefix"
+
+
+def load_recovery_products(pdir: Path, name: str, *,
+                           live_manifest: dict | None = None
+                           ) -> tuple[dict, dict]:
+    """Load + VERIFY one recovery product (plan 4.4 / Q2).  Beyond the v1
+    checks (format, NPZ self-hash) this loader requires: complete frozen
+    effective configs that round-trip (new formats get NO backfill -- a
+    missing solver field is a corrupt/foreign record), a reconstructable
+    resolved profile, LIVE source files whose full-length hashes still
+    match the registration, and a fresh-disk integrity check."""
+    import numpy as np
+
+    jpath = pdir / f"{name}.json"
+    if not jpath.exists():
+        raise FileNotFoundError(f"{jpath}: recovery product missing")
+    record = json.loads(jpath.read_text())
+    if record.get("format") != RECOVERY_FORMAT:
+        raise ValueError(f"{jpath}: format {record.get('format')!r} != "
+                         f"{RECOVERY_FORMAT!r}")
+    npath = pdir / f"{name}.npz"
+    digest = sha256_full(npath)
+    if digest != record.get("npz_sha256"):
+        raise ValueError(f"{npath}: sha256 {digest} != recorded "
+                         f"{record.get('npz_sha256')}")
+    try:
+        configs_from_record(record)
+        if record.get("kind") == "counterfactual":
+            configs_from_record(record, key="repair_no_c2")
+    except (KeyError, TypeError, ValueError) as err:
+        raise ValueError(f"{jpath}: frozen effective configs incomplete "
+                         f"or not round-trippable: {err}") from err
+    _profile_from_record(record)
+    src = record.get("source")
+    if not isinstance(src, dict) or not all(
+            src.get(k) for k in ("diag_root", "stem", "json_sha256",
+                                 "npz_sha256")):
+        raise ValueError(f"{jpath}: source registration missing or "
+                         f"incomplete -- provenance is mandatory, a "
+                         f"sourceless record is never loaded")
+    for key, suffix in (("json_sha256", ".json"), ("npz_sha256", ".npz")):
+        path = Path(src["diag_root"]) / f"{src['stem']}{suffix}"
+        if not path.is_file():
+            raise FileNotFoundError(f"{jpath}: registered source {path} "
+                                    f"is missing")
+        live = sha256_full(path)
+        if live != src[key]:
+            raise ValueError(f"{path}: source {key} {live} != recorded "
+                             f"{src[key]} (tampered or wrong file)")
+    drift = verify_integrity(record, live_manifest=live_manifest)
+    if drift:
+        raise ValueError(f"{jpath}: integrity drift since generation: "
+                         f"{drift[:5]}")
+    with np.load(npath) as data:
+        arrays = {k: data[k] for k in data.files}
+    return record, arrays
+
+
+def _recovery_index(pdir: Path, name: str) -> dict:
+    """Dual-view recovery index (plan 4.4 item 5): both views non-empty,
+    duplicate-free and set-equal; wrong/foreign format rejected.  Q2's
+    UNIFIED directory convention: ``pdir`` IS the products directory (the
+    one holding ``<name>.json`` and the product files) -- no loader
+    appends a subdirectory to its argument."""
+    path = pdir / f"{name}.json"
+    if not path.exists():
+        raise FileNotFoundError(f"{path}: recovery index missing -- "
+                                f"refusing to replay an empty candidate set")
+    idx = json.loads(path.read_text())
+    if idx.get("format") != RECOVERY_FORMAT:
+        raise ValueError(f"{path}: format {idx.get('format')!r} != "
+                         f"{RECOVERY_FORMAT!r}")
+    stems = idx.get("stems")
+    if not isinstance(stems, list) or not stems:
+        raise ValueError(f"{path}: index lists no candidates")
+    if len(set(stems)) != len(stems):
+        raise ValueError(f"{path}: duplicate stems in index")
+    records = idx.get("records")
+    if not isinstance(records, list) or not records:
+        raise ValueError(f"{path}: index records empty while stems list "
+                         f"{len(stems)}")
+    rec_stems = [r.get("stem") if isinstance(r, dict) else None
+                 for r in records]
+    if any(x is None for x in rec_stems) or \
+            len(set(rec_stems)) != len(rec_stems) or \
+            set(rec_stems) != set(stems):
+        raise ValueError(f"{path}: index records and stems disagree")
+    return idx
+
+
+def load_recovery_index(pdir: Path, name: str = "cf_index") -> dict:
+    """The counterfactual products' recovery index (see
+    :func:`_recovery_index`)."""
+    return _recovery_index(pdir, name)
+
+
 def load_norm_index(pdir: Path) -> dict:
     """The norm stage's dual-view index under the G1 contract (non-empty,
-    duplicate-free, records/stems set-equal, correct format)."""
-    path = pdir / "cf" / "cf_index.json"
+    duplicate-free, records/stems set-equal, correct format).  Q2 unified
+    convention: ``pdir`` is the products directory itself (matching
+    :func:`load_norm_products`); the pre-Q3 code appended ``cf/`` to a
+    PARENT argument here -- one loader must not invent path levels
+    another loader does not have."""
+    path = pdir / "cf_index.json"
     if not path.exists():
         raise FileNotFoundError(f"{path}: norm index missing -- refusing "
                                 f"to replay an empty candidate set")
@@ -612,7 +859,7 @@ def load_norm_index(pdir: Path) -> dict:
     records = idx.get("records")
     if not isinstance(records, list) or not records:
         raise ValueError(f"{path}: index records empty while stems list "
-                          f"{len(stems)}")
+                         f"{len(stems)}")
     rec_stems = [r.get("stem") if isinstance(r, dict) else None
                  for r in records]
     if any(x is None for x in rec_stems) or \
@@ -624,17 +871,22 @@ def load_norm_index(pdir: Path) -> dict:
 
 def _norm_counterfactuals(prof, diag: Path, pdir: Path, gate: Gate) -> dict:
     """113 existing counterfactuals re-audited under the S profile's REAL
-    norm rows (plan 7.3).  Only the plus-C2 branch is recomputed -- audits
-    solve nothing, so the current (C2-off) branch is profile-independent
-    and the frozen one stands.  The TEN spike candidates must ALL be
-    rejected by the real norm constraint; historical certified candidates
-    are classified as they come (no 13/90 distribution is required)."""
+    norm rows (plan 7.3).  Q2/Q4 rewrite: BOTH branches are recomputed
+    under the current code -- the current (C2-off) branch with the frozen
+    ``repair_no_c2`` config, the C2-on branch with the profile attached --
+    and the classification comes from THESE two audits (never the frozen
+    chain's old summary).  The complete inputs (identity, context,
+    candidate, prefix, box sequence, both audits, source hashes, effective
+    configs, resolved profile, integrity) freeze into recovery products;
+    array keys keep the audit-returned SINGLE prefix (Q4 -- the first
+    implementation re-prefixed already-prefixed keys).  The TEN spike
+    candidates must ALL be rejected by the real norm constraint;
+    historical certified candidates are classified as they come."""
+    import numpy as np
     from dataclasses import asdict as _asdict
     from dataclasses import replace as _replace
 
     from ireset.repair.pipeline import RepairPipeline
-    from train24fix2_audit import freeze_context
-
     from ireset.repair.profiles import profiles_yaml_sha256
 
     idx = load_index(diag, "cert_trace_cf_index")
@@ -644,6 +896,7 @@ def _norm_counterfactuals(prof, diag: Path, pdir: Path, gate: Gate) -> dict:
     for stem in idx["stems"]:
         record, arrays = load_products(diag, stem)
         cfg, vcfg = configs_from_record(record)
+        cfg_current, _ = configs_from_record(record, key="repair_no_c2")
         spec = RepairPipeline(cfg=cfg).spec
         ctx = context_from(arrays, record["replay_meta"])
         ctx_plus = _replace(
@@ -654,11 +907,14 @@ def _norm_counterfactuals(prof, diag: Path, pdir: Path, gate: Gate) -> dict:
         prefix = ([arrays["prefix"][i].copy()
                    for i in range(arrays["prefix"].shape[0])]
                   if arrays["prefix"].size else [])
+        cur_rec, cur_arr = full_candidate_audit(
+            spec, cfg_current, vcfg, ctx, arrays["z_cand"],
+            prefix=prefix, box_poses=arrays["box_poses"], label="current")
         arec, aarr = full_candidate_audit(
             spec, cfg, vcfg, ctx_plus, arrays["z_cand"],
             prefix=prefix, box_poses=arrays["box_poses"],
-            label="plus_c2_norm", c2_profile=prof)
-        classification = classify_branches(record["audits"]["current"], arec)
+            label=_V1_AUDIT_LABEL, c2_profile=prof)
+        classification = classify_branches(cur_rec, arec)
         enabled_modes = {side: (v.get("mode") if v.get("enabled") else None)
                          for side, v in
                          (arec.get("endpoint", {}).get("c2_last_hand_speed")
@@ -666,6 +922,8 @@ def _norm_counterfactuals(prof, diag: Path, pdir: Path, gate: Gate) -> dict:
         row = {"stem": stem,
                "classification": classification,
                "plus_branch_pass": arec.get("branch_pass"),
+               "current_branch_pass": cur_rec.get("branch_pass"),
+               "current_branch_recomputed": True,
                "frozen_classification": record.get("classification"),
                "enabled_row_modes": enabled_modes,
                "violating": (arec.get("endpoint", {}).get("violating") or [])[:6]}
@@ -675,24 +933,49 @@ def _norm_counterfactuals(prof, diag: Path, pdir: Path, gate: Gate) -> dict:
             spikes.append({"stem": stem,
                            "rejected": not arec.get("branch_pass"),
                            "mode": enabled_modes})
-        prod = {"format": NORM_FORMAT, "stem": stem, "profile": prof.name,
-                "profile_resolved": prof.as_record(),
-                "registry_sha256": profiles_yaml_sha256(),
+        prod = {"format": RECOVERY_FORMAT, "kind": "counterfactual",
+                "stem": f"cf_{stem}",
+                "profile": {"name": prof.name,
+                            "resolved": prof.as_record(),
+                            "registry_sha256": profiles_yaml_sha256()},
+                "input": {"demo": record["demo"], "t": record["frame"],
+                          "side": record["side"],
+                          "candidate_source": record["candidate_source"]},
+                "source": {"diag_root": str(diag), "stem": stem,
+                           "json_sha256": sha256_full(diag / f"{stem}.json"),
+                           "npz_sha256": sha256_full(diag / f"{stem}.npz"),
+                           "prev_scene_source":
+                               record.get("prev_scene_source")},
+                "distance_views": {
+                    "both_m": record["prev_scene_dist_both_m"],
+                    "selected_m": record["prev_scene_dist_m"],
+                    "selected_side": record["side"],
+                    "flags": record["prev_scene_dist_flags"]},
+                "c2_enable_flags": record["c2_enable_flags"],
+                "c2_reasons": record["c2_reasons"],
                 "effective": {"repair": _asdict(cfg),
-                              "validation": _asdict(vcfg)},
-                "audits": {"plus_c2_norm": arec},
+                              "validation": _asdict(vcfg),
+                              "repair_no_c2": _asdict(cfg_current)},
+                "audits": {"current": cur_rec, _V1_AUDIT_LABEL: arec},
                 "classification": classification,
-                "frozen_classification": record.get("classification")}
+                "frozen_classification": record.get("classification"),
+                "replay_meta": record["replay_meta"]}
         attach_integrity(prod, cfg, vcfg)
-        _write_norm_products(out, stem, prod,
-                             {f"rows__plus_c2_norm__{k}": v
-                              for k, v in aarr.items()})
+        # Q4: the audit-returned keys go out AS-IS -- exactly one
+        # ``rows__<label>__`` namespace level, never a second one
+        _write_products(out, f"cf_{stem}", prod, {
+            **context_arrays(ctx), **cur_arr, **aarr,
+            "z_cand": np.asarray(arrays["z_cand"], dtype=float),
+            "prefix": np.asarray(prefix, dtype=float).reshape(-1, 36),
+            "box_poses": np.asarray(arrays["box_poses"], dtype=float)})
         print(f"  [{prof.name}] {stem}: class={classification} "
               f"pass={arec.get('branch_pass')}")
-    # dual-view index (non-empty, unique, set-equal -- the G1 contract)
+    # dual-view index (non-empty, unique, set-equal -- the G1 contract);
+    # stems are the PRODUCT names (cf_<stem>), exactly what a replay loads
     write_guarded(out / "cf_index.json", json.dumps(
-        {"format": NORM_FORMAT, "stems": [r["stem"] for r in rows],
-         "records": [{"stem": r["stem"]} for r in rows]}, indent=1))
+        {"format": RECOVERY_FORMAT,
+         "stems": [f"cf_{r['stem']}" for r in rows],
+         "records": [{"stem": f"cf_{r['stem']}"} for r in rows]}, indent=1))
     dist: dict[str, int] = {}
     for r in rows:
         dist[r["classification"]] = dist.get(r["classification"], 0) + 1
@@ -710,6 +993,178 @@ def _norm_counterfactuals(prof, diag: Path, pdir: Path, gate: Gate) -> dict:
     return {"rows": rows, "distribution": dist,
             "n": len(rows), "spikes": spikes,
             "spikes_ok": spikes_ok, "enable_ok": enable_ok}
+
+
+def _prev_scene_cross_check(record: dict) -> dict:
+    """Four-view fresh query of the previous full-scene distance against
+    the hash-verified source NPZ (plan 4.4 item 3; the reviewfix3 G2
+    contract).  The source's own ``sha256`` is the historical 16-hex
+    domain -- compared with the SAME function, never against a full
+    digest.  A missing source is an explicit failure, never a skip."""
+    from closed_loop_metrics import sha256 as sha256_16
+    from train24fix2_cert_trace import load_teacher_npz, prev_scene_distances_at
+
+    views = record.get("distance_views") or {}
+    t = record["input"]["t"]
+    checks: dict = {}
+    if t == 0:
+        if any(views.get(k, {}).get(s) is not None
+               for k in ("both_m", "flags") for s in ("l", "r")) or \
+                views.get("selected_m") is not None:
+            checks["t0"] = "t=0 must freeze None distances"
+        return checks
+    src = (record.get("source") or {}).get("prev_scene_source")
+    if not isinstance(src, dict) or "npz" not in src or "sha256" not in src:
+        checks["source_npz"] = ("prev_scene_source missing or incomplete -- "
+                                "the fresh-query cross-check is mandatory, "
+                                "never skippable")
+        return checks
+    npz = Path(src["npz"])
+    if not npz.is_file():
+        checks["source_npz"] = f"{npz}: source NPZ missing"
+        return checks
+    digest = sha256_16(npz)
+    if digest != src["sha256"]:
+        checks["source_npz"] = (f"sha256 (16-hex domain) {digest} != "
+                                f"recorded {src['sha256']}")
+        return checks
+    traj, _h, _f = load_teacher_npz(npz)
+    fresh_at = prev_scene_distances_at(traj, t)
+    for s in ("l", "r"):
+        for view in ("both_m", "flags"):
+            if views[view][s] != fresh_at[s]:
+                checks[f"{view}:{s}"] = (f"saved {views[view][s]!r} != "
+                                         f"fresh {fresh_at[s]!r}")
+    side = views["selected_side"]
+    if views["selected_m"] != fresh_at[side]:
+        checks[f"selected:{side}"] = (f"saved {views['selected_m']!r} != "
+                                      f"fresh {fresh_at[side]!r}")
+    return checks
+
+
+def replay_recovery(prof_dir: Path, out_dir: Path, *,
+                    kinds: tuple[str, ...] = ("ff", "cf"),
+                    live_manifest: dict | None = None) -> dict:
+    """Strict replay of one profile's recovery products (plan 4.4 item 4,
+    Q2).  Index-driven over both kinds; every product is loaded through
+    the verifying loader; the frozen inputs rebuild the computation --
+    counterfactuals recompute BOTH branch audits and re-classify (the old
+    current-branch summary is never borrowed), frozen frames re-run the
+    full escalation chain -- and EVERYTHING semantic is compared
+    (``deep_diff`` over complete records, ``arrays_diff`` bitwise).  The
+    previous-scene distances are re-queried FRESH from the hash-verified
+    source NPZ across all four frozen views.  Output goes ONLY to
+    ``out_dir`` (the products directory is never written); the processed
+    count is part of the verdict (``n == expected``)."""
+    import numpy as np
+    from dataclasses import replace as _replace
+
+    from ireset.repair.pipeline import RepairPipeline
+    from train24fix2_audit import escalate_frame
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if live_manifest is None:
+        live_manifest = integrity_manifest()
+    results: dict = {"ok": True, "kinds": {}}
+    for kind in kinds:
+        pdir = prof_dir / kind
+        idx = _recovery_index(pdir, f"{kind}_index")
+        entries: dict = {}
+        ok = True
+        for name in idx["stems"]:
+            record, arrays = load_recovery_products(
+                pdir, name, live_manifest=live_manifest)
+            entry: dict = {"stem": name}
+            entries[name] = entry
+            cfg, vcfg = configs_from_record(record)
+            prof = _profile_from_record(record)
+            spec = RepairPipeline(cfg=cfg).spec
+            ctx = context_from(arrays, record["replay_meta"])
+            prefix = ([arrays["prefix"][i].copy()
+                       for i in range(arrays["prefix"].shape[0])]
+                      if arrays["prefix"].size else [])
+            box_poses = arrays["box_poses"]
+            diffs: list[str] = []
+            arr_diffs: list[str] = []
+            fresh_arrays: dict = {}
+            if record["kind"] == "counterfactual":
+                cfg_current, _ = configs_from_record(record,
+                                                     key="repair_no_c2")
+                ctx_plus = _replace(
+                    freeze_context(ctx),
+                    c2_hand_enabled=record["c2_enable_flags"],
+                    c2_hand_reason=record["c2_reasons"],
+                    prev_hand_scene_dist=record["distance_views"]["flags"])
+                cur_rec, cur_arr = full_candidate_audit(
+                    spec, cfg_current, vcfg, ctx, arrays["z_cand"],
+                    prefix=prefix, box_poses=box_poses, label="current")
+                arec, aarr = full_candidate_audit(
+                    spec, cfg, vcfg, ctx_plus, arrays["z_cand"],
+                    prefix=prefix, box_poses=box_poses,
+                    label=_V1_AUDIT_LABEL, c2_profile=prof)
+                classification = classify_branches(cur_rec, arec)
+                fresh = {"audits": {"current": cur_rec,
+                                    _V1_AUDIT_LABEL: arec},
+                         "classification": classification}
+                diffs = deep_diff({k: record.get(k) for k in fresh}, fresh)
+                fresh_arrays = {**cur_arr, **aarr}
+                entry["classification_recomputed"] = classification
+                entry["classification_matches"] = \
+                    classification == record.get("classification")
+                prev_checks = _prev_scene_cross_check(record)
+                entry["prev_scene_check"] = prev_checks or "ok"
+            else:      # frozen_frame: the full escalation chain re-runs
+                pipe = RepairPipeline(spec=spec, cfg=cfg, c2_profile=prof)
+                pipe.validator.cfg = vcfg
+                esc = escalate_frame(pipe, ctx, record["input"]["t"],
+                                     ctx.z_pred, ctx.z_prev)
+                esc_summary = {k: esc[k] for k in (
+                    "skipped", "adopted", "adopted_source", "last_status",
+                    "last_term_reason")}
+                esc_summary["n_attempts"] = len(esc["attempts"])
+                diffs = deep_diff(record.get("escalation"), esc_summary)
+                if esc["adopted"]:
+                    z = np.asarray(esc["adopted_z"], dtype=float)
+                    if not np.array_equal(arrays["adopted_z"], z):
+                        arr_diffs.append("adopted_z: values differ")
+                    arec, aarr = full_candidate_audit(
+                        spec, cfg, vcfg, ctx, z, prefix=prefix,
+                        box_poses=box_poses, label="profile_adopted",
+                        c2_profile=prof)
+                    diffs += [f"audit.{d}"
+                              for d in deep_diff(record.get("audit"), arec)]
+                    fresh_arrays = aarr
+                entry["escalation_matches"] = not diffs
+            recomp = {k: arrays[k] for k in fresh_arrays if k in arrays}
+            arr_diffs += arrays_diff(recomp, fresh_arrays)
+            arr_diffs += [f"{k}: recomputed array absent from saved bundle"
+                          for k in sorted(fresh_arrays) if k not in arrays]
+            entry.update({
+                "record_diff_paths": diffs[:40],
+                "n_record_diffs": len(diffs),
+                "array_diffs": arr_diffs[:40],
+                "matches": not diffs and not arr_diffs,
+            })
+            entry["ok"] = (entry["matches"]
+                           and entry.get("classification_matches", True)
+                           and entry.get("prev_scene_check", "ok") == "ok")
+            ok = ok and entry["ok"]
+            print(f"  [replay {kind}] {name}: ok={entry['ok']} "
+                  f"diffs={len(diffs)} arrays={len(arr_diffs)}")
+        # the processed count is part of the verdict (an index/products
+        # disagreement must never shrink the replay to "0 records MATCH")
+        if len(entries) != len(idx["stems"]):
+            ok = False
+        results["kinds"][kind] = {"ok": ok, "n": len(entries),
+                                  "expected": len(idx["stems"]),
+                                  "entries": entries}
+        results["ok"] = results["ok"] and ok
+    (out_dir / "recovery_replay.json").write_text(
+        json.dumps(results, indent=1, allow_nan=False, default=float))
+    print(f"[replay] {'ALL MATCH' if results['ok'] else 'MISMATCH'} "
+          f"({', '.join(f'{k}: {v['n']}/{v['expected']}' for k, v in results['kinds'].items())}) "
+          f"-> {out_dir / 'recovery_replay.json'}")
+    return results
 
 
 def stage_norm(root: Path) -> None:
@@ -739,7 +1194,7 @@ def stage_norm(root: Path) -> None:
             continue
         prof = profiles[name]
         pdir = out / name
-        ff = _profile_frozen_frames(prof, diag)
+        ff = _profile_frozen_frames(prof, diag, pdir)
         cf = _norm_counterfactuals(prof, diag, pdir, gate)
         six = _run_sixseg(name, pdir / "sixseg" / "rq")
         qg = gate_report(Path(six["rq_dir"]))
@@ -748,10 +1203,15 @@ def stage_norm(root: Path) -> None:
         cand_ok = base_ok and qg["ok"] and cf["spikes_ok"] and cf["enable_ok"]
         comparisons[name] = {
             "profile": prof.as_record(),
-            "frozen_frames": {k: ff[k] for k in ("rows", "n_adopted")},
+            "frozen_frames": {k: ff[k] for k in (
+                "rows", "n_adopted", "n_full_audit_pass",
+                "n_adopted_audit_fail", "n_evidence_incomplete",
+                "n_not_adopted")},
+            "frozen_frame_products": str(pdir / "ff"),
             "counterfactuals": {k: cf[k] for k in
                                 ("distribution", "n", "spikes_ok",
                                  "enable_ok")},
+            "counterfactual_products": str(pdir / "cf"),
             "sixseg": {k: six[k] for k in
                        ("rq_dir", "wall_s", "n_demos", "n_kept", "kept",
                         "code_changed_during_run")},
