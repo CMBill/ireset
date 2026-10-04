@@ -160,6 +160,19 @@
 - **测试 8+1 项**(新增 `tests/test_train24fix3_recovery_candidate.py` 8 项+continuation 增 recovery 驱动 1 项):注册闭合与非法组合拒、恢复目标构成(P/q/定价逐项+缺映射工程错)、谓词六反例、深违反积分场景(**接受过的恢复步 objective_c>objective_z 且 phi_c<phi——旧 merit 规则必拒的用例**;phase_switches/预算/QP 连续性;可行后接受步 viol_c<=1e-6)、C2 未激活帧 R1≡S1 逐位、标准模式与 C2 解除 R1≡无 profile 逐位。全量 **331 → 340 passed + 1 skipped**。
 - **范围说明(§7.7 项 3 的执行解释)**:§5.3 实际失败用例的"补放"以五冻结帧升级链(前缀+完整审计+恢复相位事实)承载——五帧即实际失败前缀的冻结身份;整段级重放仅在六段失败需要取证时按需执行,不预先消耗预算。
 
+## 0.7 提交单位 4b:R1 开发比较运行结果(2026-10-04,方案 §7.7;**R1 未过完整六段门,winner=None,按固定顺序下一候选=R2**)
+
+运行:同根 `recovery/R1/`(冻结 rev `24cae93`,干净树仅未跟踪 `.zcodeignore`),`--stage recovery --budget-min 480`。**预算登记(§12,单独登记的超支)**:实测 8.74h(六段 8.57h)超候选 8h 上限与六段 6h 子预算——归因=候选实测成本而非工具缺陷:C2 激活帧的恢复相烧满 40/80 迭代预算(S1 帧早塌缩反而便宜),sub12 达 50.6ms/frame×148 帧、全段 119,893 次 QP;裁决不受影响(门只看质量),超支如实入账。
+
+- **五冻结帧**:5/5 采纳+5/5 带 profile 完整审计过(18–95s/帧;sub10/sub8 以 `budget_exhausted` 达可行,sub12/sub3/sub7 仍 `no_merit_step_trust_min` 后由 best 返回)。
+- **113 反事实**:41 PASS+72 C2_ONLY(与 S1 逐项同——R1 行集合=S1,反事实审计不跑求解器,预期一致);尖峰 10/10 拒、启用态全 norm_cut。
+- **六段 1/6 keep(仅 sub16)**——**失败模式相对 S1 发生结构性变化**:
+  - **sub16 首次整段保留**(S1/S2 于 t=36 拒;cert 右区间覆盖 0.833、接触 0.889、task p95 0.1039;C 保护门仍 False——交集帧数 <15)。
+  - **sub3/sub7/sub12 三段被恢复相完整解到终点**(S1 分别于 t=63/23/14 信赖域塌缩拒):sub3 189 att/58,671 QP、sub7 204/59,843、sub12 544/119,893——**µm 级 C2 塌缩确属恢复目标问题(R1 的核心机理验证)**;但整段在**独立终检**死于**手锚漂移**(sub3 right@t87 首败 17、sub7 left@t100 首败 38、sub12 left@t133)+sub12 另有根线速度骑界超限 3.9e-7 m/s @t103(已知 µm 级速度边缘类)——与 §5.3 锚漂取证完全一致(regen 模式手锚恒空,范数界内小步累积)。
+  - sub10@60/sub8@26 仍 `state_constraints`(sub10 与 S1 同帧同因;sub8 26 vs S1 32)。
+- **门**:base 1/6 未过;质量族 H/B/C/T 逐侧比较未过(仅 sub16 在册);机理族尖峰/启用过、GATED 重分类因四失败侧所在 demo 未保留而 sides_classified=0(如实记 False,非门豁免);完整性族全过(R9 干净/profile 一致/argv 在册)。
+- **裁决与下一步**:R1 `selected=False`、winner=None——按 §7.4 固定顺序进入 **R2(固定区间手锚,§7.6)**:三段手锚漂移失败正是 R2 的直接靶点(sub10/sub8 的 state_constraints 是否受助于锚行由 R2 实测决定);不得为通过门追加豁免/调参。R2/R3 未注册未实现,属提交单位 5。
+
 ## 0. 实施提交与测试
 
 | 提交 | 内容 |
@@ -182,7 +195,8 @@
 | `cbcf078` | 范围复用 bootstrap(_BOOTSTRAP_SCOPES 审计表:旧 attempt 仅按 (git_rev,kind) 表内条目 bootstrap,未审计 rev/scope 变更均拒);测试 330→331+1s |
 | `9a97243` | 提交单位 3b 运行结果(§0.5):evidence PASS(10 帧逐项同历史+226 反事实零差异 41/72·57/56+双跑重放全 MATCH)与 failure-prefix COMPLETE(10 身份绑定全配+两段锚漂两 pass 证据+手锚恒空);验证记录/AGENTS/方案清单同步 |
 
-| (本提交) | 提交单位 4a R1 可行性优先恢复实现(§0.6):recovery_policy 注册+phi 分族+恢复目标(mu/accept_scale 显式映射)+阶段机/接受式/可行后保持+FrameResult 恢复事实+`--stage recovery` 驱动;evidence 历史核验门按 §7.4 语义修正;测试 331→340+1s |
+| `24cae93` | 提交单位 4a R1 可行性优先恢复实现(§0.6):recovery_policy 注册+phi 分族+恢复目标(mu/accept_scale 显式映射)+阶段机/接受式/可行后保持+FrameResult 恢复事实+`--stage recovery` 驱动;evidence 历史核验门按 §7.4 语义修正;测试 331→340+1s |
+| (本提交) | 提交单位 4b R1 开发比较结果(§0.7):1/6 keep(仅 sub16 首次保留)、sub3/sub7/sub12 被恢复相解到终点后死于手锚漂移终检(µm 塌缩=恢复目标问题的机理验证)、winner=None→按序进入 R2;预算超支 8.74h/8h 单独登记 |
 测试 262 → 288 passed + 1 skipped(阶段 A–C 完成时;`uv run --locked pytest tests/ -q` @ `84a7a7d`)→ **303 passed + 1 skipped**(Q1–Q4 后)→ **~~315~~ 316 passed + 1 skipped**(提交单位 2 后;订正见 §0.3)→ **328 passed + 1 skipped**(提交单位 3a 后)→ **331 passed + 1 skipped**(运行期修复后,单位 3b 运行时全量复验)→ **340 passed + 1 skipped**(提交单位 4a 后;新增 `tests/test_train24fix3_recovery_candidate.py` 8 项+continuation recovery 驱动 1 项,见 §0.6)。288 档构成:`tests/test_train24fix3_profiles.py` 9 项(注册表矩阵/未知字段·非法值·非法继承拒绝、N0 默认=历史硬编码、逐帧门控仅 C2 激活帧、solve_qp 设置穿透 spy、trace 开/关纯度逐位、v2 记录 N0 回填/非 N0 携带拒绝、effective 记录携带 profile)+ `tests/test_train24fix3_numeric.py` 7 项(N0/N1 挂载=无 profile 逐位一致、N2 行变换 ξ 列纯 /B 且松弛列两表述同 −1、±INF 哨兵有限值比较、松弛罚权单位 10000·B 仅 C2 族、高精度同解与 s_m=B·s_norm、真实接受行 N2 下逐位不变、N3 mu 罚权仅 C2 松弛且缺 mu 显式错、tight N3≡N2)+ `tests/test_train24fix3_norm.py` 11 项(见 §4)。303 档新增 `tests/test_train24fix3_recovery.py` 15 项(见 §0.2)。316 档新增 `tests/test_train24fix3_formal.py` 13 项(见 §0.3)。328 档新增 `tests/test_train24fix3_continuation.py` 12 项(见 §0.4)。331 档=运行期修复两轮新增 3 项(锚漂场景 [T,43] 回归+范围变更仅重跑受影响种类+bootstrap 审计表,见 §0.4 运行期缺陷块)。
 
 首轮 baseline(`train24fix3_20261002_a7954e2/`)因驱动两处登记缺陷判 FAIL(fb/cf 重放本身已 ALL MATCH、integrity 干净):(1) 用 `closed_loop_metrics.sha256` 16 位截断变体比 F 清单 64 位摘要,必然假漂移——AGENTS 已记录的"跨工具哈希必须同源"事实的直接复演;(2) C 参照期望误写 6 NPZ(1/6 keep 轮仅 sub16 保留 1 个)。修复(`1147424`)后重跑为权威 baseline,首轮目录保留为失败尝试证据。
