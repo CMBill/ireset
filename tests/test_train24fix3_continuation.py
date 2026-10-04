@@ -653,6 +653,73 @@ def test_stage_recovery_flow_and_refusal(tmp_path, monkeypatch):
     assert psum["selected"] is True and psum["sixseg"]["n_kept"] == 6
 
 
+def test_stage_recovery_reuses_prior_complete_candidate(tmp_path, monkeypatch):
+    """A prior COMPLETE comparison of the same resolved profile (products
+    intact, R9 clean) is reused verbatim -- a rerun after registering a
+    later candidate must not redo the earlier candidate's compute, and the
+    refuse-overwrite convention would otherwise turn the rerun into an
+    error.  A drifted profile record forces that candidate's rerun."""
+    _fake_evidence_summary(tmp_path)
+    fp = drv.stage_summary_path(tmp_path, "failure_prefix")
+    fp.parent.mkdir(parents=True, exist_ok=True)
+    fp.write_text(json.dumps({"stage": "failure_prefix", "ok": True,
+                              "status": "COMPLETE"}))
+    calls: list[str] = []
+
+    def fake_ff(prof, diag, pdir):
+        calls.append(f"ff:{prof.name}")
+        return {"rows": [], "n_adopted": 0, "n_full_audit_pass": 0,
+                "n_adopted_audit_fail": 0, "n_evidence_incomplete": 0,
+                "n_not_adopted": 0}
+
+    def fake_cf(prof, diag, pdir, gate):
+        calls.append(f"cf:{prof.name}")
+        return {"rows": [], "distribution": {}, "n": 113, "spikes": [],
+                "spikes_ok": True, "enable_ok": True}
+
+    def fake_six(profile_name, rq, **kw):
+        calls.append(f"sixseg:{profile_name}")
+        rq.mkdir(parents=True, exist_ok=True)
+        rep = rq / "regen_report_diagnosis6_strict.json"
+        rep.write_text(json.dumps({
+            "n_kept": 1, "rows": [{"demo": "sub16_largebox_000",
+                                   "accepted": True}],
+            "end": {"code_changed_during_run": False}}))
+        return {"rq_dir": str(rq), "wall_s": 1.0, "n_demos": 6,
+                "n_kept": 1, "kept": ["sub16_largebox_000"],
+                "code_changed_during_run": False, "report": {}}
+
+    import train24fix3_quality_gate as qg_mod
+    monkeypatch.setattr(drv, "_profile_frozen_frames", fake_ff)
+    monkeypatch.setattr(drv, "_norm_counterfactuals", fake_cf)
+    monkeypatch.setattr(drv, "_run_sixseg", fake_six)
+    monkeypatch.setattr(qg_mod, "gate_report",
+                        lambda run_dir, **kw: {"ok": False, "verdicts": {}})
+    # first run: R1 executed (failed its gate), then R2
+    drv.stage_recovery(tmp_path)
+    assert calls == ["ff:R1", "cf:R1", "sixseg:R1",
+                     "ff:R2", "cf:R2", "sixseg:R2"]
+    # second run: both prior comparisons reused, nothing re-executed
+    calls.clear()
+    drv.stage_recovery(tmp_path)
+    s2 = json.loads(drv.stage_summary_path(tmp_path, "recovery").read_text())
+    assert calls == []
+    assert s2["comparisons"]["R1"]["reused"] is True
+    assert s2["comparisons"]["R2"]["reused"] is True
+    assert s2["winner"] is None
+    # a drifted profile record: the prior comparison neither verifies for
+    # reuse NOR may be overwritten -- an explicit refusal, never a silent
+    # redo (retiring prior products is a registered decision)
+    ps = json.loads((tmp_path / "recovery" / "R2"
+                     / "profile_summary.json").read_text())
+    ps["profile"]["c2_norm_speed_mps"] = 0.049
+    (tmp_path / "recovery" / "R2" / "profile_summary.json").write_text(
+        json.dumps(ps))
+    with pytest.raises(SystemExit, match="does not verify for reuse"):
+        drv.stage_recovery(tmp_path)
+    assert calls == []
+
+
 # ---------------------------------------------------------------------------
 # freeze_segment with_series: the cumulative anchor-drift curves
 # ---------------------------------------------------------------------------

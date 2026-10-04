@@ -2375,6 +2375,44 @@ def stage_failure_prefix(root: Path, budget_min: float | None = None) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _reusable_candidate(pdir: Path, prof) -> dict | None:
+    """A PRIOR candidate comparison whose products are complete and whose
+    frozen identity still matches (plan 12: rerunning the fixed order after
+    a later candidate's registration must not redo the earlier candidate's
+    hours of compute).  Reuse requires: the recorded profile record equals
+    the live resolved one (with the documented old-behavior default
+    backfilled for fields that did not exist when it was recorded -- plan
+    7.4), the sixseg report still exists with the matching keep set and a
+    clean R9, and every comparison family present.  Anything else reruns."""
+    summary = pdir / "profile_summary.json"
+    if not summary.is_file():
+        return None
+    try:
+        comp = json.loads(summary.read_text())
+    except json.JSONDecodeError:
+        return None
+    recorded = dict(comp.get("profile") or {})
+    recorded.setdefault("regen_anchor_policy", None)   # plan 7.4 old default
+    if recorded != prof.as_record():
+        return None
+    six = comp.get("sixseg") or {}
+    rep = Path(str(six.get("rq_dir", ""))) / "regen_report_diagnosis6_strict.json"
+    if not rep.is_file():
+        return None
+    doc = json.loads(rep.read_text())
+    kept = [r["demo"] for r in doc.get("rows", []) if r.get("accepted")]
+    if doc.get("n_kept") != six.get("n_kept") or kept != six.get("kept"):
+        return None
+    if doc.get("end", {}).get("code_changed_during_run") is not False:
+        return None
+    if any(k not in comp for k in ("frozen_frames", "counterfactuals",
+                                   "quality_gate")):
+        return None
+    comp = dict(comp)
+    comp["reused"] = True
+    return comp
+
+
 def stage_recovery(root: Path, budget_min: float | None = None) -> None:
     """Plan 7.4/7.7: run the registered recovery candidates in the fixed
     order R1 -> R2 -> R3 (only those present in the registry; later ones
@@ -2382,7 +2420,10 @@ def stage_recovery(root: Path, budget_min: float | None = None) -> None:
     F frozen frames with the full audit, the 113 counterfactuals with the
     spike/enable verification, ONE quiet diagnosis6 from the original
     inputs and the full section-8.1 gate -- failed segments stay in the
-    denominator.  Prerequisites: the evidence re-verification and the
+    denominator.  A prior COMPLETE comparison of the SAME resolved profile
+    (report intact, R9 clean) is REUSED verbatim -- the refuse-overwrite
+    product convention makes a rerun an explicit failure, never a silent
+    redo.  Prerequisites: the evidence re-verification and the
     failure-prefix forensics both fully passed (plan 7.4's pre-gate)."""
     from ireset.repair.profiles import load_profiles
     from train24fix3_quality_gate import gate_report
@@ -2417,6 +2458,24 @@ def stage_recovery(root: Path, budget_min: float | None = None) -> None:
                        "not started before the registered deadline")
             continue
         pdir = out / name
+        prior = _reusable_candidate(pdir, prof)
+        if prior is None and (pdir / "profile_summary.json").exists():
+            raise SystemExit(
+                f"{name}: a prior comparison exists at {pdir} but does not "
+                f"verify for reuse (drifted profile record / missing report /"
+                f" dirty R9) -- retiring it is an explicit registered "
+                f"decision; products are never overwritten in place")
+        if prior is not None:
+            comparisons[name] = prior
+            gate.check(f"{name}_reused", True,
+                       "prior complete comparison reused verbatim (products "
+                       "intact, R9 clean); the refuse-overwrite convention "
+                       "makes a redo explicit, never silent")
+            if prior.get("selected"):
+                winner = name
+            print(f"  [{name}] prior comparison reused (selected="
+                  f"{prior.get('selected')})")
+            continue
         ff = _profile_frozen_frames(prof, diag, pdir)
         cf = _norm_counterfactuals(prof, diag, pdir, gate)
         six = _run_sixseg(name, pdir / "sixseg" / "rq")
