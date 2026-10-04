@@ -32,10 +32,14 @@ PROFILE_SCHEMA = "train24fix3_profiles_v1"
 #: closed field sets (unknown keys are rejected, never silently dropped)
 _SOLVER_FIELDS = {"polish", "eps_abs", "eps_rel", "max_iter", "scaling"}
 _PROFILE_FIELDS = {"description", "base", "solver", "c2_mode",
-                   "c2_row_precondition", "c2_slack_penalty", "c2_norm_speed_mps"}
+                   "c2_row_precondition", "c2_slack_penalty",
+                   "c2_norm_speed_mps", "recovery_policy"}
 _C2_MODES = {"axis", "norm_cut"}
 _PRECONDITIONS = {"none", "divide_by_bound"}
 _SLACK_PENALTIES = {"legacy", "scaled_10000B", "mu"}
+#: plan 7.4/7.5: R1 = the feasibility-first recovery phase; None (default)
+#: keeps every historical N/S profile on the pure original path
+_RECOVERY_POLICIES = {None, "feasibility_first"}
 #: the certification entry gate the S bounds must stay strictly below (plan 7.1)
 _HAND_ENTRY_SPEED_MPS = 0.05
 
@@ -78,6 +82,11 @@ class C2Profile:
     c2_slack_penalty: str = "legacy"
     #: norm_cut only: the per-site bound V (m/s); None for axis mode
     c2_norm_speed_mps: float | None = None
+    #: plan 7.4/7.5 (R candidates): "feasibility_first" activates the
+    #: recovery-phase machinery on C2-active regen frames; None = the
+    #: original N/S behaviour everywhere (the default of every historical
+    #: profile -- the registry version bump keeps their interpretation)
+    recovery_policy: str | None = None
     description: str = ""
 
     def as_record(self) -> dict:
@@ -122,15 +131,25 @@ def _parse_profile(name: str, section: dict) -> C2Profile:
     else:
         if not isinstance(speed, (int, float)) or not 0.0 < float(speed):
             raise ValueError(f"{where}: norm_cut requires a positive "
-                             "c2_norm_speed_mps")
+                             f"c2_norm_speed_mps")
         speed = float(speed)
         if speed * (1.0 + 1e-6) >= _HAND_ENTRY_SPEED_MPS:
             raise ValueError(
                 f"{where}: c2_norm_speed_mps {speed} does not satisfy "
                 f"V*(1+1e-6) < {_HAND_ENTRY_SPEED_MPS} (validator entry gate)")
+    recovery = section.get("recovery_policy")
+    if recovery not in _RECOVERY_POLICIES:
+        raise ValueError(f"{where}: recovery_policy must be one of "
+                         f"{sorted(x for x in _RECOVERY_POLICIES if x is not None)}"
+                         f" or omitted")
+    if recovery is not None and mode != "norm_cut":
+        # the pre-registered R candidates are norm-based (plan 7.4); an
+        # axis-mode recovery profile is an unregistered combination
+        raise ValueError(f"{where}: recovery_policy requires c2_mode "
+                         f"norm_cut (the R matrix is norm-based)")
     return C2Profile(name=name, solver=solver, c2_mode=mode,
                      c2_row_precondition=precond, c2_slack_penalty=penalty,
-                     c2_norm_speed_mps=speed,
+                     c2_norm_speed_mps=speed, recovery_policy=recovery,
                      description=str(section.get("description", "")))
 
 

@@ -66,3 +66,16 @@ profiles:
     base: S1
     c2_mode: norm_cut
     c2_norm_speed_mps: 0.049
+
+  R1:
+    description: >-
+      Recovery candidate 1 (plan 7.4/7.5): the S1 numeric path with the
+      feasibility-first recovery PHASE -- when the frame's accept-row phi
+      exceeds 1e-6 with a positive C2 contribution, the iteration switches
+      to a recovery QP whose objective is ONLY the registered step
+      regularization plus mu-priced (accept-scale-normalized) slacks;
+      recovery steps must strictly reduce phi without worsening any non-C2
+      family or the task, and tracking resumes only after phi <= 1e-6 and
+      never leaves the feasibility gate. No new hand anchors (R2/R3 only).
+    base: S1
+    recovery_policy: feasibility_first

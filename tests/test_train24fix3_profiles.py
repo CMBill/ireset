@@ -52,7 +52,7 @@ REGISTRY = (Path(__file__).resolve().parents[1] / "configs" / "repair"
 
 def test_registry_loads_and_matches_plan_matrix() -> None:
     profiles = load_profiles()
-    assert sorted(profiles) == ["N0", "N1", "N2", "N3", "S1", "S2"]
+    assert sorted(profiles) == ["N0", "N1", "N2", "N3", "R1", "S1", "S2"]
     n0 = profiles["N0"]
     assert n0.solver == OsqpSettings() == OsqpSettings.from_config(RepairConfig())
     n1 = profiles["N1"]

@@ -148,6 +148,18 @@
 
 **取代关系**:本轮 evidence 重验**不推翻**阶段 D 的 0/6 裁决(仅证明证据链在 Q 修复下行为等价、可完整重放);`train24fix3_20261002_1147424/norm/` 的 v1 产物为历史证据保持只读,新 recovery schema 产物以本根为准。**下一步=提交单位 4(R1 可行性优先恢复,方案 §7.5)——Q/P 出口已闭合,R 实验前工作树固定于本提交。**
 
+## 0.6 提交单位 4a:R1 可行性优先恢复实现(2026-10-04,方案 §7.4/§7.5/§11.1 单位 4;正式比较在其后冻结树上运行,结果另记)
+
+- **注册(§7.4)**:`C2Profile` 增 `recovery_policy` 闭合字段(None=旧行为默认;`feasibility_first`=R1);解析器拒绝未知值与 axis+recovery 组合(R 矩阵为范数基);注册表 yaml 增 `R1`(base S1+recovery_policy);历史 N0–N3/S1–S2 解释保持(resolved 记录新增字段默认 None——**evidence 阶段的历史核验门相应修正**:注册表文件 sha 门改为"记录在册"门(注册表按方案预注册新增 R 候选属预期漂移,sha 永不要求相等),语义冻结改为 resolved 门且按 §7.4"历史 schema 只补明确的旧行为默认"对历史记录回填 `recovery_policy: None` 后比对——该修正有 continuation 测试覆盖且 live S1/S2 必须仍为 None)。
+- **门控(§7.5)**:`_recovery_profile`+solve_frame 内联门——仅 regen+C2 参数非零+本帧至少一侧 C2 行激活+显式 R profile 时开启;标准模式/C2 全关/未激活帧/N/S profile/无 profile 逐路径原样(纯度测试:R1 附着但 C2 未激活帧与 S1 逐位同解、标准模式与 C2 解除下与无 profile 逐位同解)。
+- **phi 分族**:`_phi_parts` 在 accept 行上按 `violation(val,l,u,scale)` 同式分解——C2 贡献(hand_norm/hand_speed 尾)+按行族(限位/关节速度/根速度/碰撞注册类/probe+kind/手锚/脚锚/脚速)的 `phi_g`。
+- **恢复目标(§7.5 项 2)**:`build_qp(objective_mode="recovery")`——P 仅 `2·regularization_weight·diag(D⁻²)`(预测/时间/Laplacian/手部跟踪/稳定目标全部取消,测试断言 P 逐元素等于该式、q[:35] 全零);slack 代价=可行性代理 `mu·sum(s_i/accept_scale_i)`:C2 site 共享松弛按无量纲 mu、其余行经**显式行名→accept scale 映射**(solve_frame 每迭代冻结,probe 名前缀归一)按 `mu/scale` 定价;缺映射或某可松弛行无合法 accept 对应=**工程错误**显式抛出(测试);trust 硬行/非负 slack/切面/每 site 共享松弛照旧。`_c2_cut_refine` 穿透 objective_mode(切面重解同目标)。
+- **阶段机与接受式(§7.5 项 1/3/4)**:每迭代从当前真实 accept 行重判阶段——phi>1e-6 且 phi_c2>0 进入 recovery(非 C2 单独违反走原 restoration 路径);总 phi<=1e-6 才回跟踪(不因 C2 暂时归零提前);恢复步接受=`_recovery_step_ok`(严格 phi 下降+每非 C2 族 `phi_g(c)<=phi_g(z)`(零违反族不得新增)+任务 `mpjpe_c<=max(0.40,mpjpe(z))`+非有限拒;跟踪目标允许上升,逐分项入 trace)——谓词独立可测(反例:族退化拒/零族新增拒/任务超 cap 拒/NaN 拒/非严格下降拒/cap 随更差任务放宽);恢复中 phi 下降过半扩 trust,跟踪保原 merit 扩张;**可行后跟踪步加 phi_c<=1e-6 硬保持**(trace 记 feasibility_hold,merit 改善但破可行的步被拒);同一尝试 40/80 预算连续(迭代号/QP id 单调,测试),切换不清零不 multi-start;全扫描发现新违反照常作废 best 并按当前行重判阶段。
+- **真实出口(§7.5 项 5)**:恢复步不提交任何 Contact/C2/锚状态;success_review/端点/插值/V1/前缀/终检全部原样;`FrameResult` 保留历史 status,新增 `recovery` 事实(active/phase_final/recovery_iters/phase_switches/recovery_achieved,非 R1 尝试恒 None);term 事实新增 `no_recovery_step_trust_min`/`recovery_qp_failed_trust_min`(仅恢复相),trace 增 r1 相位/phi/分族记录(仅 R1 帧,N/S trace 结构不变)。
+- **驱动**:落地方案 §13 的 `--stage recovery`(evidence+failure-prefix 双前置全过才启动;按注册序跑 R 候选:5 冻结帧完整审计+113 反事实+尖峰/启用态+一次 quiet 六段+§8.1 门(expected 冻结名单+cf 机理事实);通过者入 winner、后继记 not_executed;预算控制同前)。
+- **测试 8+1 项**(新增 `tests/test_train24fix3_recovery_candidate.py` 8 项+continuation 增 recovery 驱动 1 项):注册闭合与非法组合拒、恢复目标构成(P/q/定价逐项+缺映射工程错)、谓词六反例、深违反积分场景(**接受过的恢复步 objective_c>objective_z 且 phi_c<phi——旧 merit 规则必拒的用例**;phase_switches/预算/QP 连续性;可行后接受步 viol_c<=1e-6)、C2 未激活帧 R1≡S1 逐位、标准模式与 C2 解除 R1≡无 profile 逐位。全量 **331 → 340 passed + 1 skipped**。
+- **范围说明(§7.7 项 3 的执行解释)**:§5.3 实际失败用例的"补放"以五冻结帧升级链(前缀+完整审计+恢复相位事实)承载——五帧即实际失败前缀的冻结身份;整段级重放仅在六段失败需要取证时按需执行,不预先消耗预算。
+
 ## 0. 实施提交与测试
 
 | 提交 | 内容 |
@@ -168,9 +180,10 @@
 | `258802c` | 提交单位 3a 续行阶段入口(§0.4):stage_evidence(历史来源核验+续行 baseline 登记+8 子任务+逐项对照不强制)+ stage_failure_prefix(10 solve 绑定+2 anchor 锚漂,身份不符停止绑定)+紧凑 QP 序列化+锚漂曲线增量;测试 316→328+1s;正式运行在提交后冻结树执行 |
 | `e4bbf2b` | 运行期修复:锚漂绑定 [T,43] 场景缺陷(final_fail 轨迹即验证器场景,原 hstack 得 [T,50] 拒载)+§12 受影响范围复用(_binding_scope_sha+_reusable_attempt);P 预算调整登记 360min→累计 8h;测试 328→330+1s |
 | `cbcf078` | 范围复用 bootstrap(_BOOTSTRAP_SCOPES 审计表:旧 attempt 仅按 (git_rev,kind) 表内条目 bootstrap,未审计 rev/scope 变更均拒);测试 330→331+1s |
-| (本提交) | 提交单位 3b 运行结果(§0.5):evidence PASS(10 帧逐项同历史+226 反事实零差异 41/72·57/56+双跑重放全 MATCH)与 failure-prefix COMPLETE(10 身份绑定全配+两段锚漂两 pass 证据+手锚恒空);验证记录/AGENTS/方案清单同步 |
+| `9a97243` | 提交单位 3b 运行结果(§0.5):evidence PASS(10 帧逐项同历史+226 反事实零差异 41/72·57/56+双跑重放全 MATCH)与 failure-prefix COMPLETE(10 身份绑定全配+两段锚漂两 pass 证据+手锚恒空);验证记录/AGENTS/方案清单同步 |
 
-测试 262 → 288 passed + 1 skipped(阶段 A–C 完成时;`uv run --locked pytest tests/ -q` @ `84a7a7d`)→ **303 passed + 1 skipped**(Q1–Q4 后)→ **~~315~~ 316 passed + 1 skipped**(提交单位 2 后;订正见 §0.3)→ **328 passed + 1 skipped**(提交单位 3a 后)→ **331 passed + 1 skipped**(运行期修复后,单位 3b 运行时全量复验)。288 档构成:`tests/test_train24fix3_profiles.py` 9 项(注册表矩阵/未知字段·非法值·非法继承拒绝、N0 默认=历史硬编码、逐帧门控仅 C2 激活帧、solve_qp 设置穿透 spy、trace 开/关纯度逐位、v2 记录 N0 回填/非 N0 携带拒绝、effective 记录携带 profile)+ `tests/test_train24fix3_numeric.py` 7 项(N0/N1 挂载=无 profile 逐位一致、N2 行变换 ξ 列纯 /B 且松弛列两表述同 −1、±INF 哨兵有限值比较、松弛罚权单位 10000·B 仅 C2 族、高精度同解与 s_m=B·s_norm、真实接受行 N2 下逐位不变、N3 mu 罚权仅 C2 松弛且缺 mu 显式错、tight N3≡N2)+ `tests/test_train24fix3_norm.py` 11 项(见 §4)。303 档新增 `tests/test_train24fix3_recovery.py` 15 项(见 §0.2)。316 档新增 `tests/test_train24fix3_formal.py` 13 项(见 §0.3)。328 档新增 `tests/test_train24fix3_continuation.py` 12 项(见 §0.4)。331 档=运行期修复两轮新增 3 项(锚漂场景 [T,43] 回归+范围变更仅重跑受影响种类+bootstrap 审计表,见 §0.4 运行期缺陷块)。
+| (本提交) | 提交单位 4a R1 可行性优先恢复实现(§0.6):recovery_policy 注册+phi 分族+恢复目标(mu/accept_scale 显式映射)+阶段机/接受式/可行后保持+FrameResult 恢复事实+`--stage recovery` 驱动;evidence 历史核验门按 §7.4 语义修正;测试 331→340+1s |
+测试 262 → 288 passed + 1 skipped(阶段 A–C 完成时;`uv run --locked pytest tests/ -q` @ `84a7a7d`)→ **303 passed + 1 skipped**(Q1–Q4 后)→ **~~315~~ 316 passed + 1 skipped**(提交单位 2 后;订正见 §0.3)→ **328 passed + 1 skipped**(提交单位 3a 后)→ **331 passed + 1 skipped**(运行期修复后,单位 3b 运行时全量复验)→ **340 passed + 1 skipped**(提交单位 4a 后;新增 `tests/test_train24fix3_recovery_candidate.py` 8 项+continuation recovery 驱动 1 项,见 §0.6)。288 档构成:`tests/test_train24fix3_profiles.py` 9 项(注册表矩阵/未知字段·非法值·非法继承拒绝、N0 默认=历史硬编码、逐帧门控仅 C2 激活帧、solve_qp 设置穿透 spy、trace 开/关纯度逐位、v2 记录 N0 回填/非 N0 携带拒绝、effective 记录携带 profile)+ `tests/test_train24fix3_numeric.py` 7 项(N0/N1 挂载=无 profile 逐位一致、N2 行变换 ξ 列纯 /B 且松弛列两表述同 −1、±INF 哨兵有限值比较、松弛罚权单位 10000·B 仅 C2 族、高精度同解与 s_m=B·s_norm、真实接受行 N2 下逐位不变、N3 mu 罚权仅 C2 松弛且缺 mu 显式错、tight N3≡N2)+ `tests/test_train24fix3_norm.py` 11 项(见 §4)。303 档新增 `tests/test_train24fix3_recovery.py` 15 项(见 §0.2)。316 档新增 `tests/test_train24fix3_formal.py` 13 项(见 §0.3)。328 档新增 `tests/test_train24fix3_continuation.py` 12 项(见 §0.4)。331 档=运行期修复两轮新增 3 项(锚漂场景 [T,43] 回归+范围变更仅重跑受影响种类+bootstrap 审计表,见 §0.4 运行期缺陷块)。
 
 首轮 baseline(`train24fix3_20261002_a7954e2/`)因驱动两处登记缺陷判 FAIL(fb/cf 重放本身已 ALL MATCH、integrity 干净):(1) 用 `closed_loop_metrics.sha256` 16 位截断变体比 F 清单 64 位摘要,必然假漂移——AGENTS 已记录的"跨工具哈希必须同源"事实的直接复演;(2) C 参照期望误写 6 NPZ(1/6 keep 轮仅 sub16 保留 1 个)。修复(`1147424`)后重跑为权威 baseline,首轮目录保留为失败尝试证据。
 

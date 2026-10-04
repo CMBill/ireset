@@ -24,6 +24,9 @@ Stages:
   the historical 41/72 and 57/56; continuation baseline registration).
 - ``failure-prefix`` : plan 5.3 -- the 10 actual solve-failure identities
   (S1 x6 + S2 x4) and the S2 sub16/sub3 two-pass anchor-drift capture.
+- ``recovery`` : plan 7.7 -- the registered R candidates in fixed order
+  (R1 -> R2 -> R3): frozen frames, counterfactuals, one quiet sixseg and
+  the full gate per candidate; prerequisites are evidence + failure-prefix.
 - ``sixseg``   : formal stage-E acceptance for the SELECTED profile (plan 8).
 - ``train24``  : stage F for the FROZEN profile (plan 9).
 
@@ -1547,13 +1550,24 @@ def _historical_norm_evidence(gate: Gate) -> dict:
                    rep.get("end", {}).get("code_changed_during_run"))
         gate.check(f"hist_{p}_git_rev_recorded", bool(rep.get("git_rev")),
                    rep.get("git_rev"))
-        gate.check(f"hist_{p}_registry_frozen",
-                   rep_prof.get("registry_sha256") == profiles_yaml_sha256(),
+        gate.check(f"hist_{p}_registry_recorded",
+                   bool(rep_prof.get("registry_sha256")),
                    f"report={str(rep_prof.get('registry_sha256'))[:16]} "
-                   f"live={profiles_yaml_sha256()[:16]}")
+                   f"live={profiles_yaml_sha256()[:16]} (the registry file "
+                   f"itself gains the pre-registered R candidates, plan 7.4 "
+                   f"-- its SHA is recorded, never required equal; the "
+                   f"SEMANTIC freeze is the resolved gate below)")
+        # plan 7.4: "历史 schema 只补明确的旧行为默认" -- the historical
+        # records predate the recovery_policy field; their implicit default
+        # (None = the pure original path) is backfilled for the comparison,
+        # and the live S1/S2 profiles must still carry exactly that default
+        hist_resolved = dict(rep_prof.get("resolved") or {})
         gate.check(f"hist_{p}_resolved_frozen",
-                   rep_prof.get("resolved") == live[p].as_record(),
-                   "report profile record == live resolved profile")
+                   {**hist_resolved, "recovery_policy": None}
+                   == live[p].as_record()
+                   and live[p].recovery_policy is None,
+                   "report profile record (+ the documented old-behavior "
+                   "default recovery_policy=None) == live resolved profile")
         gate.check(f"hist_{p}_cf_dir_113",
                    len(list((RECOVERY_SRC_ROOT / "norm" / p / "cf").glob("cf_*.npz"))) == 113,
                    f"npz products under {RECOVERY_SRC_ROOT / 'norm' / p / 'cf'} "
@@ -2354,6 +2368,105 @@ def stage_failure_prefix(root: Path, budget_min: float | None = None) -> None:
 
 
 # ---------------------------------------------------------------------------
+# plan 7.7: the R-candidate development comparison (D+)
+# ---------------------------------------------------------------------------
+
+
+def stage_recovery(root: Path, budget_min: float | None = None) -> None:
+    """Plan 7.4/7.7: run the registered recovery candidates in the fixed
+    order R1 -> R2 -> R3 (only those present in the registry; later ones
+    record not_executed once a candidate passes).  Per candidate: the five
+    F frozen frames with the full audit, the 113 counterfactuals with the
+    spike/enable verification, ONE quiet diagnosis6 from the original
+    inputs and the full section-8.1 gate -- failed segments stay in the
+    denominator.  Prerequisites: the evidence re-verification and the
+    failure-prefix forensics both fully passed (plan 7.4's pre-gate)."""
+    from ireset.repair.profiles import load_profiles
+    from train24fix3_quality_gate import gate_report
+
+    load_stage_summary(root, "evidence")
+    fp = load_stage_summary(root, "failure_prefix")
+    if fp.get("status") != "COMPLETE" or not fp.get("ok"):
+        raise SystemExit("failure-prefix must fully PASS before any R "
+                         "candidate runs (plan 7.4 pre-gate)")
+    out = root / "recovery"
+    gate = Gate()
+    diag = F_ROOT / "diag"
+    profiles = load_profiles()
+    r_names = [n for n in ("R1", "R2", "R3") if n in profiles]
+    t0 = time.perf_counter()
+    deadline = t0 + (budget_min * 60.0 if budget_min else float("inf"))
+    comparisons: dict[str, dict] = {}
+    winner = None
+    not_executed: list[str] = []
+
+    for name in r_names:
+        prof = profiles[name]
+        if prof.recovery_policy is None:
+            raise SystemExit(f"profile {name} is registered without a "
+                             f"recovery_policy -- not an R candidate")
+        if winner is not None:
+            not_executed.append(name)
+            continue
+        if time.perf_counter() > deadline:
+            not_executed.append(name)
+            gate.check(f"{name}_budget", False,
+                       "not started before the registered deadline")
+            continue
+        pdir = out / name
+        ff = _profile_frozen_frames(prof, diag, pdir)
+        cf = _norm_counterfactuals(prof, diag, pdir, gate)
+        six = _run_sixseg(name, pdir / "sixseg" / "rq")
+        qg = gate_report(Path(six["rq_dir"]),
+                         expected_demos=registered_set_of("diagnosis6"),
+                         profile=name,
+                         cf_summary={k: cf[k] for k in
+                                     ("spikes_ok", "enable_ok",
+                                      "distribution", "n")},
+                         full=False)
+        base_ok = (six["n_kept"] == six["n_demos"]
+                   and six["code_changed_during_run"] is False)
+        cand_ok = base_ok and qg["ok"] and cf["spikes_ok"] and cf["enable_ok"]
+        comparisons[name] = {
+            "profile": prof.as_record(),
+            "frozen_frames": {k: ff[k] for k in (
+                "rows", "n_adopted", "n_full_audit_pass",
+                "n_adopted_audit_fail", "n_evidence_incomplete",
+                "n_not_adopted")},
+            "counterfactuals": {k: cf[k] for k in
+                                ("distribution", "n", "spikes_ok",
+                                 "enable_ok")},
+            "sixseg": {k: six[k] for k in (
+                "rq_dir", "wall_s", "n_demos", "n_kept", "kept",
+                "code_changed_during_run")},
+            "quality_gate": {"verdicts": qg["verdicts"], "ok": qg["ok"]},
+            "base_gate_ok": base_ok, "selected": bool(cand_ok)}
+        write_guarded(pdir / "profile_summary.json", json.dumps(
+            comparisons[name], indent=1, default=float))
+        gate.check(f"{name}_base_gate", base_ok,
+                   f"keep {six['n_kept']}/{six['n_demos']}, "
+                   f"r9={six['code_changed_during_run']}")
+        gate.check(f"{name}_quality_gate", qg["ok"], qg["verdicts"])
+        if cand_ok:
+            winner = name
+
+    summary = {"stage": "recovery", "ok": gate.ok,
+               "generated": time.strftime("%Y-%m-%d %H:%M:%S"),
+               "budget_min": budget_min,
+               "elapsed_s": round(time.perf_counter() - t0, 1),
+               "winner": winner, "not_executed": not_executed,
+               "comparisons": comparisons, "checks": gate.checks,
+               "next": ("sixseg (formal stage E) for the selected R profile"
+                        if winner else
+                        "R candidates exhausted / budget stop: deliver the "
+                        "failure specification (plan 7.7 item 5); the next "
+                        "strategy change needs a NEW pre-registered plan")}
+    _write_stage_summary(root, "recovery", summary)
+    print(f"recovery -> winner={winner} "
+          f"({stage_summary_path(root, 'recovery')})")
+
+
+# ---------------------------------------------------------------------------
 # later stages (plan sections 8/9) -- formal E/F through the subtask machine
 # ---------------------------------------------------------------------------
 
@@ -2686,6 +2799,7 @@ STAGES = {
     "norm": stage_norm,
     "evidence": stage_evidence,
     "failure-prefix": stage_failure_prefix,
+    "recovery": stage_recovery,
     "sixseg": stage_sixseg,
     "train24": stage_train24,
 }
@@ -2712,7 +2826,7 @@ def main() -> None:
     root = Path(args.out).resolve()
     if args.stage in ("sixseg", "train24"):
         STAGES[args.stage](root, profile=args.profile)
-    elif args.stage in ("evidence", "failure-prefix"):
+    elif args.stage in ("evidence", "failure-prefix", "recovery"):
         STAGES[args.stage](root, budget_min=args.budget_min)
     else:
         STAGES[args.stage](root)

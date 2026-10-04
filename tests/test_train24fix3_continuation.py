@@ -579,6 +579,79 @@ def test_reusable_attempt_bootstraps_only_audited_pre_scope_attempts(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# stage_recovery: the R-candidate development comparison driver
+# ---------------------------------------------------------------------------
+
+
+def test_stage_recovery_flow_and_refusal(tmp_path, monkeypatch):
+    """The R driver refuses without the Q/P pre-gates and runs the
+    registered R candidates in order (only R1 exists today: ff + cf + one
+    quiet sixseg + the full gate; a passing candidate wins, later ones are
+    recorded not_executed)."""
+    with pytest.raises(RuntimeError, match="summary missing"):
+        drv.stage_recovery(tmp_path)
+    _fake_evidence_summary(tmp_path)
+    # failure-prefix summary still missing
+    with pytest.raises(RuntimeError, match="failure_prefix.*summary missing"):
+        drv.stage_recovery(tmp_path)
+    # failure-prefix present but not ok
+    fp = drv.stage_summary_path(tmp_path, "failure_prefix")
+    fp.parent.mkdir(parents=True, exist_ok=True)
+    fp.write_text(json.dumps({"stage": "failure_prefix", "ok": False,
+                              "status": "COMPLETE"}))
+    with pytest.raises(RuntimeError, match="did not pass"):
+        drv.stage_recovery(tmp_path)
+    fp.write_text(json.dumps({"stage": "failure_prefix", "ok": True,
+                              "status": "COMPLETE"}))
+
+    calls: list[str] = []
+
+    def fake_ff(prof, diag, pdir):
+        calls.append(f"ff:{prof.name}")
+        rows = [{"stem": f"fb{i}", "demo": "d", "t": i, "adopted": True,
+                 "adopted_source": "prediction", "last_status": "solved",
+                 "last_term_reason": "converged", "outcome":
+                     "adopted_audit_pass"} for i in range(5)]
+        (pdir / "ff").mkdir(parents=True, exist_ok=True)
+        return {"rows": rows, "n_adopted": 5, "n_full_audit_pass": 5,
+                "n_adopted_audit_fail": 0, "n_evidence_incomplete": 0,
+                "n_not_adopted": 0}
+
+    def fake_cf(prof, diag, pdir, gate):
+        calls.append(f"cf:{prof.name}")
+        return {"rows": [], "distribution": {"PASS": 113}, "n": 113,
+                "spikes": [], "spikes_ok": True, "enable_ok": True}
+
+    def fake_six(profile_name, rq, **kw):
+        calls.append(f"sixseg:{profile_name}")
+        rq.mkdir(parents=True, exist_ok=True)
+        return {"rq_dir": str(rq), "wall_s": 1.0, "n_demos": 6,
+                "n_kept": 6, "kept": ["d1"], "code_changed_during_run": False,
+                "report": {}}
+
+    import train24fix3_quality_gate as qg_mod
+    monkeypatch.setattr(drv, "_profile_frozen_frames", fake_ff)
+    monkeypatch.setattr(drv, "_norm_counterfactuals", fake_cf)
+    monkeypatch.setattr(drv, "_run_sixseg", fake_six)
+    gate_calls: list[str] = []
+
+    def fake_gate(run_dir, **kw):
+        gate_calls.append(kw.get("profile"))
+        return {"ok": True, "verdicts": {"everything": True}}
+    monkeypatch.setattr(qg_mod, "gate_report", fake_gate)
+
+    drv.stage_recovery(tmp_path)
+    s = json.loads(drv.stage_summary_path(tmp_path, "recovery").read_text())
+    assert s["ok"] and s["winner"] == "R1" and s["not_executed"] == []
+    assert calls == ["ff:R1", "cf:R1", "sixseg:R1"]
+    assert gate_calls == ["R1"]
+    # the gate call carried the frozen demo list + the cf mechanism facts
+    psum = json.loads((tmp_path / "recovery" / "R1"
+                       / "profile_summary.json").read_text())
+    assert psum["selected"] is True and psum["sixseg"]["n_kept"] == 6
+
+
+# ---------------------------------------------------------------------------
 # freeze_segment with_series: the cumulative anchor-drift curves
 # ---------------------------------------------------------------------------
 

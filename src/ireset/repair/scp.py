@@ -166,6 +166,17 @@ def _norm_cut_profile(c2_profile):
     return None
 
 
+def _recovery_profile(c2_profile):
+    """The attached profile when it carries the R1 feasibility-first
+    recovery policy (plan 7.4/7.5; else None).  Together with the regen +
+    C2-armed + C2-active gating in solve_frame this is the ONLY switch that
+    turns the recovery-phase machinery on -- every historical N/S profile
+    and every unprofiled run keeps the original path untouched."""
+    if c2_profile is not None and c2_profile.recovery_policy == "feasibility_first":
+        return c2_profile
+    return None
+
+
 @dataclass
 class FrameResult:
     accepted: bool
@@ -210,6 +221,9 @@ class FrameResult:
     #: pipeline-side acceptance check cache (scp.FrameCheck); set by the
     #: pipeline so a state is checked once and the log serializes that result
     frame_check: object | None = None
+    #: R1 recovery-phase facts (plan 7.5 item 5: an explicit phase record
+    #: beside the historical status; None on every non-R1 attempt)
+    recovery: dict | None = None
 
 
 @dataclass
@@ -360,6 +374,12 @@ class FrameSolver:
         #: ``prob.solve()`` is one-to-one with its own layout, never the
         #: attempt-level "one cached row-name set" of the pre-Q3 code
         self.last_qp_assembly: dict | None = None
+        #: R1 (plan 7.5 item 2): accept-row scale by row NAME, frozen by
+        #: solve_frame for the CURRENT iteration -- the recovery objective
+        #: prices each relaxable row's slack mu/accept_scale through it.
+        #: Empty/None outside recovery iterations (a stale map can never
+        #: price a later iteration's rows).
+        self._accept_scale_by_name: dict[str, float] | None = None
         # -- train24fix3 norm_cut (plan section 7.2) -------------------------
         #: cutting planes of the CURRENT linearization only: cleared at
         #: every solve_frame entry AND at each outer iteration (a new z is a
@@ -1281,6 +1301,52 @@ class FrameSolver:
         finite = (np.abs(l) < INF / 2) | (np.abs(u) < INF / 2)
         return float(viol[finite].sum())
 
+    def _recovery_step_ok(self, phi, phi_g, mpjpe_z, phi_c, phi_g_c, mpjpe_c):
+        """R1 recovery-step acceptance predicate (plan 7.5 item 3).  Strict
+        real-phi decrease; EVERY non-C2 family may not worsen (a family at
+        zero violation must stay at zero); the task stays under
+        max(gate, mpjpe(z)); non-finite phi/mpjpe rejects.  The tracking
+        objective is deliberately absent -- it is ALLOWED to rise."""
+        fam_ok = all(phi_g_c.get(g, 0.0) <= phi_g.get(g, 0.0) + 1e-12
+                     for g in set(phi_g) | set(phi_g_c))
+        task_cap = max(self.cfg.task_mpjpe_tol_m, float(mpjpe_z))
+        ok = (np.isfinite(phi_c) and np.isfinite(mpjpe_c)
+              and float(phi_c) < float(phi) and fam_ok
+              and float(mpjpe_c) <= task_cap)
+        return ok, {"families_ok": bool(fam_ok), "task_cap": float(task_cap)}
+
+    def _phi_parts(self, val, lo, hi, scl, names, ids) -> tuple[float, float, dict]:
+        """R1's phi decomposition (plan 7.5 gating): the same
+        ``violation(val, l, u, scale)`` per-row sum over the ACCEPT rows,
+        split into the C2 contribution (the hand_norm/hand_speed tail) and
+        the per-family non-C2 contributions ``phi_g`` (family = the row's
+        block identity: joint_limit/joint_vel/root_vel/collision-registry
+        kind/probe/hand_anchor/foot_anchor/foot_speed).  This is a REPORT
+        of the real rows -- the recovery step acceptance replays it on
+        every retract candidate; nothing here re-linearizes."""
+        finite = (np.abs(lo) < INF / 2) | (np.abs(hi) < INF / 2)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            v = np.maximum(np.maximum(lo - val, val - hi), 0.0) \
+                / np.where(scl > 0.0, scl, 1.0)
+        v = np.where(finite & np.isfinite(v), v, 0.0)
+        phi_c2 = 0.0
+        fam: dict[str, float] = {}
+        for i, nm in enumerate(names):
+            if i >= len(v):
+                break
+            if nm.startswith(("hand_norm", "hand_speed")):
+                phi_c2 += float(v[i])
+                continue
+            if nm.startswith("probe:"):
+                g = ("probe:" + str(ids[i][2])
+                     if ids is not None and i < len(ids) and ids[i] else "probe")
+            elif ids is not None and i < len(ids) and ids[i] is not None:
+                g = str(ids[i][2])
+            else:
+                g = nm.split("[", 1)[0].split(":", 1)[0]
+            fam[g] = fam.get(g, 0.0) + float(v[i])
+        return float(v.sum()), float(phi_c2), fam
+
     def objective(self, res: dict) -> float:
         cfg = self.cfg
         f = cfg.prediction_weight * float((res["r_pred"] ** 2).sum())
@@ -1331,17 +1397,31 @@ class FrameSolver:
         return out
 
     def build_qp(self, z: np.ndarray, ctx: FrameContext, trust: float,
-                 slack: bool = False, *, mu: float | None = None):
-        """Assemble the QP at state z (caller must have forwarded to z)."""
+                 slack: bool = False, *, mu: float | None = None,
+                 objective_mode: str = "tracking"):
+        """Assemble the QP at state z (caller must have forwarded to z).
+
+        ``objective_mode="recovery"`` (plan 7.5 item 2, R1): the objective
+        keeps ONLY the registered step regularization
+        ``regularization_weight * ||D^-1 xi||^2`` plus the feasibility
+        proxy ``mu * sum(s_i / accept_scale_i)`` on the slacks -- every
+        tracking term (prediction, temporal, Laplacian, regen hand
+        tracking, grasp stability) is cancelled for this assembly.  The
+        linear proxy is a SOLVER AID; the real phi of the retracted
+        candidate remains the acceptance judge.
+        """
         ev, cfg = self.ev, self.cfg
+        if objective_mode not in ("tracking", "recovery"):
+            raise ValueError(f"unknown objective_mode {objective_mode!r}")
 
         # objective blocks
         P = np.zeros((N_TANGENT, N_TANGENT))
         q = np.zeros(N_TANGENT)
-        for w, J_r, r in self.tracking_qp_blocks(z, ctx):
+        for w, J_r, r in (() if objective_mode == "recovery"
+                          else self.tracking_qp_blocks(z, ctx)):
             P += 2.0 * w * (J_r.T @ J_r)
             q += 2.0 * w * (J_r.T @ r)
-        if ctx.mesh_L is not None:
+        if objective_mode == "tracking" and ctx.mesh_L is not None:
             R_g, x_g = ev.box_frame()
             kpt_w = ev.site_positions(ev.kpt_ids)
             kpt_g = (R_g.T @ (kpt_w - x_g).T).T
@@ -1359,7 +1439,7 @@ class FrameSolver:
         P += 2.0 * cfg.regularization_weight * np.diag(self.Dinv2)
 
         # regeneration hand tracking (Gauss-Newton block)
-        if cfg.regen_mode and ctx.ref_hand_kpts:
+        if objective_mode == "tracking" and cfg.regen_mode and ctx.ref_hand_kpts:
             J_hand_rows = []
             for side in ("l", "r"):
                 if ctx.ref_hand_kpts.get(side) is not None:
@@ -1379,7 +1459,8 @@ class FrameSolver:
         # grasp-stability soft target (F4 section 7.2): same Gauss-Newton
         # assembly as the tracking terms, so the QP model and the merit the
         # line search evaluates stay one objective
-        r_stab = self._stab_residual(ctx)
+        r_stab = (self._stab_residual(ctx)
+                  if objective_mode == "tracking" else None)
         if r_stab is not None and len(r_stab):
             J_stab = self._stab_jacobian(ctx)
             P += 2.0 * cfg.regen_hand_stab_weight * (J_stab.T @ J_stab)
@@ -1665,7 +1746,38 @@ class FrameSolver:
             # and the trust rows stay hard -- nothing else is transformed.
             # norm_cut: the shared site slacks carry the profile penalty.
             penalties = np.full(n_s, float(cfg.slack_penalty))
-            if c2_precond:
+            if objective_mode == "recovery":
+                # R1 (plan 7.5 item 2): the recovery proxy prices EVERY
+                # relaxable row's slack as mu / accept_scale -- the C2 site
+                # slacks stay dimensionless at plain mu (priced once per
+                # site).  The row identity -> accept-scale mapping is the
+                # one solve_frame froze for THIS iteration; a relaxable row
+                # without a legitimate accept counterpart is an ENGINEERING
+                # ERROR, never a silently defaulted scale.
+                if mu is None:
+                    raise ValueError("the recovery objective requires the "
+                                     "current merit weight mu")
+                if not self._accept_scale_by_name:
+                    raise RuntimeError(
+                        "recovery objective without the accept-scale map: "
+                        "solve_frame must freeze it for this iteration")
+                names_rec = self._qp_row_names(A.shape[0], ctx)
+                for k, i in enumerate(idx):
+                    col = row_slack[k]
+                    if site_of_row.get(int(i)) is not None:
+                        penalties[col] = float(mu)
+                        continue
+                    nm = names_rec[int(i)]
+                    sc = self._accept_scale_by_name.get(
+                        nm, self._accept_scale_by_name.get(f"probe:{nm}"))
+                    if sc is None or not np.isfinite(sc) or float(sc) <= 0.0:
+                        raise RuntimeError(
+                            f"recovery slack pricing: relaxable row {nm!r} "
+                            f"has no legitimate accept scale")
+                    penalties[col] = float(mu) / float(sc)
+            # the legacy penalty overlays below describe the TRACKING
+            # restoration program; the recovery proxy above is final
+            if c2_precond and objective_mode != "recovery":
                 def _is_c2_row(i: int) -> bool:
                     return i in site_of_row or c2_lo <= i < c2_tail_end
                 if self.c2_profile.c2_slack_penalty == "scaled_10000B":
@@ -1892,7 +2004,8 @@ class FrameSolver:
 
     def _c2_cut_refine(self, x, status, z, ctx, trust, slack, mu, settings,
                        *, branch: str | None = None,
-                       outer_iter: int | None = None):
+                       outer_iter: int | None = None,
+                       objective_mode: str = "tracking"):
         """norm_cut cutting-plane refinement (train24fix3 plan 7.2).
 
         After the FIRST solve of this iteration's QP, every site whose
@@ -1953,7 +2066,8 @@ class FrameSolver:
             if not added:
                 break
             (P, q, A, lo, hi), _ = self.build_qp(
-                z, ctx, trust, slack=slack, mu=mu)
+                z, ctx, trust, slack=slack, mu=mu,
+                objective_mode=objective_mode)
             stats["resolves"] += 1
             x, status = self.solve_qp(
                 P, q, A, lo, hi, settings=settings,
@@ -2202,6 +2316,32 @@ class FrameSolver:
         # profile's only when the frame carries active C2 rows, else None
         # (= the RepairConfig osqp_* defaults, the frozen N0 behaviour)
         settings = self._frame_qp_settings(ctx)
+        # R1 (plan 7.5 gating): the recovery-phase machinery runs ONLY on a
+        # regen frame with C2 armed, at least one side's rows active, and an
+        # explicit recovery profile attached.  Every other frame (standard
+        # mode, C2 off, approach frames, all N/S profiles, no profile) keeps
+        # the original path -- the phases below stay inert.
+        c2_sides_active = [s for s in ("l", "r")
+                           if hand_speed_rows_active(cfg, ctx, s)]
+        r1_active = (cfg.regen_mode and cfg.regen_hand_speed_mps > 0.0
+                     and len(c2_sides_active) > 0
+                     and _recovery_profile(self.c2_profile) is not None)
+        phase = "tracking"
+        recovery_achieved = False
+        rec_iters = 0
+        phase_switches = 0
+
+        def _rec_facts() -> dict | None:
+            """R1 phase facts for FrameResult (plan 7.5 item 5): an explicit
+            record beside the historical status; None on every non-R1
+            attempt so the historical result shape is untouched."""
+            if not r1_active:
+                return None
+            return {"policy": "feasibility_first",
+                    "phase_final": phase,
+                    "recovery_iters": int(rec_iters),
+                    "phase_switches": int(phase_switches),
+                    "recovery_achieved": bool(recovery_achieved)}
         # train24fix3 (plan 5.1): OFF by default. When self.trace is a dict,
         # every attempt of this frame appends a full record (iterations,
         # QP solves, line search, exit evidence); solve_qp appends to
@@ -2214,9 +2354,9 @@ class FrameSolver:
                 "force_slack": bool(force_slack),
                 "used_settings": (None if settings is None
                                   else asdict(settings)),
-                "c2_sides": [s for s in ("l", "r")
-                             if hand_speed_rows_active(cfg, ctx, s)],
+                "c2_sides": c2_sides_active,
                 "mu": float(mu), "iter_budget": 0,
+                "r1_active": bool(r1_active),
                 "iterations": [], "qp": [], "qp_arrays": [],
                 "exit": None}
             self.trace.setdefault("attempts", []).append(attempt_trace)
@@ -2264,6 +2404,8 @@ class FrameSolver:
                 val, lo, hi, scl = self.constraint_rows(z, ctx, trust, mode="accept")
                 viol = self.violation(val, lo, hi, scl)
                 last_viol = viol
+                names_all: list[str] | None = None
+                ids_all = None
                 if viol <= 1e-6:
                     last_names = []
                 else:
@@ -2279,6 +2421,40 @@ class FrameSolver:
                     last_names, _ids, _recs = self._violating(val, lo, hi, names_all, ids_all)
                 merit = self.objective(res) + mu * viol
                 feasible = viol <= 1e-6
+                # R1 (plan 7.5 item 1/4): per-iteration phase determination
+                # from the CURRENT real accept rows -- enter recovery when
+                # phi > 1e-6 with a positive C2 contribution (a non-C2-only
+                # violation stays on the original restoration path); leave
+                # recovery ONLY on total phi <= 1e-6, never because C2 hit
+                # zero while other rows still violate.  A full-scan discovery
+                # that re-raises phi re-enters recovery through this same
+                # re-determination.
+                phi = phi_c2 = None
+                phi_g: dict | None = None
+                if r1_active:
+                    if names_all is None:
+                        names_all, ids_all = self.row_descriptors()
+                        if len(names_all) != len(val):
+                            raise RuntimeError(
+                                f"row descriptors out of sync with the value "
+                                f"array ({len(names_all)} vs {len(val)})")
+                    phi, phi_c2, phi_g = self._phi_parts(
+                        val, lo, hi, scl, names_all, ids_all)
+                    if phi <= 1e-6:
+                        if phase == "recovery":
+                            recovery_achieved = True
+                            phase = "tracking"
+                            phase_switches += 1
+                    elif phi_c2 > 0.0 and phase != "recovery":
+                        phase = "recovery"
+                        phase_switches += 1
+                    # the recovery objective's accept-scale map belongs to
+                    # THIS iteration only (build_qp prices mu/scale by name)
+                    self._accept_scale_by_name = {
+                        nm: float(scl[i]) for i, nm in enumerate(names_all)
+                        if np.isfinite(scl[i]) and float(scl[i]) > 0.0}
+                else:
+                    self._accept_scale_by_name = None
                 if feasible and merit < best_merit:
                     best_z, best_merit, best_feasible = z.copy(), merit, True
                 if attempt_trace is not None:
@@ -2298,6 +2474,13 @@ class FrameSolver:
                         "qp_from": len(attempt_trace["qp"]),
                         "line_search": [], "trust_after": None,
                         "early_exit": None}
+                    if r1_active:
+                        it_rec["r1"] = {"phase": phase,
+                                        "phi": float(phi),
+                                        "phi_c2": float(phi_c2),
+                                        "phi_families":
+                                            {k: float(v) for k, v in
+                                             (phi_g or {}).items()}}
                     attempt_trace["iterations"].append(it_rec)
                 if feasible and res["mpjpe"] <= cfg.task_mpjpe_tol_m and self._stationary(z, ctx):
                     # stage 1 + F1: a candidate could satisfy the budgeted rows
@@ -2323,13 +2506,56 @@ class FrameSolver:
                                             qp_calls, trust, last_viol, last_names,
                                             qp_status=last_qp_status,
                                             term_reason="converged",
-                                            iter_budget=max_iters)
+                                            iter_budget=max_iters,
+                                            recovery=_rec_facts())
                     if it_rec is not None:
                         it_rec["early_exit"] = "review_failed_candidate_invalidated"
                     if best_z is not None and np.array_equal(best_z, z):
                         best_z, best_merit, best_feasible = None, float("inf"), False
 
-                if restoration:
+                if r1_active and phase == "recovery":
+                    # R1 recovery QP (plan 7.5 item 2): the SAME row set,
+                    # drive bounds, trust hard rows, norm box rows, cutting
+                    # planes and per-site shared slacks as the restoration
+                    # program -- ONLY the objective changes (registered step
+                    # regularization + mu/scale-priced feasibility proxy).
+                    rec_iters += 1
+                    (Ps, qs, As, los, his), _ = self.build_qp(
+                        z, ctx, trust, slack=True, mu=mu,
+                        objective_mode="recovery")
+                    qp_calls += 1
+                    x_s, last_qp_status = self.solve_qp(
+                        Ps, qs, As, los, his, settings=settings,
+                        qp_identity={"branch": "recovery",
+                                     "outer_iter": it, "cut_round": 0})
+                    x_s, last_qp_status, n_cut, cut_stats = self._c2_cut_refine(
+                        x_s, last_qp_status, z, ctx, trust, True, mu,
+                        settings, branch="recovery", outer_iter=it,
+                        objective_mode="recovery")
+                    qp_calls += n_cut
+                    if it_rec is not None:
+                        it_rec["c2_cut_stats"] = cut_stats
+                        it_rec["recovery_slack"] = (
+                            None if x_s is None else {
+                                "values": [float(v)
+                                           for v in x_s[N_TANGENT:]],
+                                "negative": int(
+                                    (np.asarray(x_s[N_TANGENT:]) < 0).sum()),
+                                "nonfinite": int(
+                                    (~np.isfinite(
+                                        np.asarray(x_s[N_TANGENT:]))).sum())})
+                    if x_s is None:
+                        trust *= cfg.shrink_factor
+                        if it_rec is not None:
+                            it_rec["trust_after"] = float(trust)
+                            it_rec["qp_failed"] = True
+                        if trust < cfg.trust_radius_min:
+                            term_reason = "recovery_qp_failed_trust_min"
+                            break
+                        continue
+                    used_slack = True
+                    xi = x_s[:N_TANGENT]
+                elif restoration:
                     (Ps, qs, As, los, his), _ = self.build_qp(
                         z, ctx, trust, slack=True, mu=mu)
                     qp_calls += 1
@@ -2400,32 +2626,86 @@ class FrameSolver:
                 # backtracking line search: deep-penetration linearizations can
                 # mispredict, and a full step may increase the true violation
                 accepted_step = False
-                for step_scale in (1.0, 0.5, 0.25, 0.125):
-                    cand = retract_batch(self.ev.model, z[None], (step_scale * xi)[None])[0]
-                    res_c = self.evaluate(cand, ctx)
-                    val_c, lo_c, hi_c, scl_c = self.constraint_rows(cand, ctx, trust, mode="accept")
-                    merit_c = self.objective(res_c) + mu * self.violation(val_c, lo_c, hi_c, scl_c)
-                    if it_rec is not None:
-                        it_rec["line_search"].append(
-                            {"scale": float(step_scale),
-                             "merit_c": float(merit_c),
-                             "viol_c": float(self.violation(val_c, lo_c, hi_c, scl_c)),
-                             "mpjpe_c": float(res_c["mpjpe"]),
-                             "accepted": False})
-                    if merit_c < merit:
-                        z = cand
-                        accepted_step = True
+                if r1_active and phase == "recovery":
+                    # R1 recovery acceptance (plan 7.5 item 3): the same four
+                    # step scales, but the judge is the REAL phi of the
+                    # retracted candidate -- strict phi decrease, no non-C2
+                    # family may worsen (a zero-violation family must stay at
+                    # zero), and the task stays under max(gate, mpjpe(z)).
+                    # The tracking objective is ALLOWED to rise; the per-term
+                    # cost is recorded.  Non-finite phi/mpjpe rejects the step.
+                    obj_z = self.objective(res)
+                    for step_scale in (1.0, 0.5, 0.25, 0.125):
+                        cand = retract_batch(self.ev.model, z[None],
+                                             (step_scale * xi)[None])[0]
+                        res_c = self.evaluate(cand, ctx)
+                        val_c, lo_c, hi_c, scl_c = self.constraint_rows(
+                            cand, ctx, trust, mode="accept")
+                        names_c, ids_c = self.row_descriptors()
+                        phi_c, phi_c2_c, phi_g_c = self._phi_parts(
+                            val_c, lo_c, hi_c, scl_c, names_c, ids_c)
+                        mpjpe_c = float(res_c["mpjpe"])
+                        ok, okinfo = self._recovery_step_ok(
+                            phi, phi_g, res["mpjpe"], phi_c, phi_g_c, mpjpe_c)
                         if it_rec is not None:
-                            it_rec["line_search"][-1]["accepted"] = True
-                        # stage 1: the step may have carried the state near pairs
-                        # outside the frozen candidate set; schedule a partial
-                        # refresh (fast families + carried extras) so later
-                        # linearizations see them. The uncapped success review
-                        # remains the correctness gate.
-                        self._refresh_counter += 1
-                        if merit_c < 0.5 * merit:
-                            trust = min(cfg.trust_radius_max, trust * cfg.expand_factor)
-                        break
+                            it_rec["line_search"].append(
+                                {"scale": float(step_scale),
+                                 "phi_c": float(phi_c) if np.isfinite(phi_c) else None,
+                                 "phi_c2_c": float(phi_c2_c),
+                                 "mpjpe_c": (mpjpe_c if np.isfinite(mpjpe_c)
+                                             else None),
+                                 "objective_z": float(obj_z),
+                                 "objective_c": (float(self.objective(res_c))
+                                                 if np.isfinite(mpjpe_c)
+                                                 else None),
+                                 "families_ok": okinfo["families_ok"],
+                                 "accepted": False})
+                        if ok:
+                            z = cand
+                            accepted_step = True
+                            if it_rec is not None:
+                                it_rec["line_search"][-1]["accepted"] = True
+                            self._refresh_counter += 1
+                            if phi_c < 0.5 * phi:
+                                trust = min(cfg.trust_radius_max,
+                                            trust * cfg.expand_factor)
+                            break
+                else:
+                    for step_scale in (1.0, 0.5, 0.25, 0.125):
+                        cand = retract_batch(self.ev.model, z[None], (step_scale * xi)[None])[0]
+                        res_c = self.evaluate(cand, ctx)
+                        val_c, lo_c, hi_c, scl_c = self.constraint_rows(cand, ctx, trust, mode="accept")
+                        merit_c = self.objective(res_c) + mu * self.violation(val_c, lo_c, hi_c, scl_c)
+                        # R1 tracking hold (plan 7.5 item 4): once recovery
+                        # achieved feasibility, a tracking step must keep
+                        # phi <= 1e-6 -- the merit descent alone may not buy
+                        # the violation back
+                        hold_ok = True
+                        if r1_active and recovery_achieved:
+                            hold_ok = self.violation(val_c, lo_c, hi_c, scl_c) <= 1e-6
+                        if it_rec is not None:
+                            it_rec["line_search"].append(
+                                {"scale": float(step_scale),
+                                 "merit_c": float(merit_c),
+                                 "viol_c": float(self.violation(val_c, lo_c, hi_c, scl_c)),
+                                 "mpjpe_c": float(res_c["mpjpe"]),
+                                 "accepted": False})
+                            if r1_active and recovery_achieved:
+                                it_rec["line_search"][-1]["feasibility_hold"] = bool(hold_ok)
+                        if merit_c < merit and hold_ok:
+                            z = cand
+                            accepted_step = True
+                            if it_rec is not None:
+                                it_rec["line_search"][-1]["accepted"] = True
+                            # stage 1: the step may have carried the state near pairs
+                            # outside the frozen candidate set; schedule a partial
+                            # refresh (fast families + carried extras) so later
+                            # linearizations see them. The uncapped success review
+                            # remains the correctness gate.
+                            self._refresh_counter += 1
+                            if merit_c < 0.5 * merit:
+                                trust = min(cfg.trust_radius_max, trust * cfg.expand_factor)
+                            break
                 if it_rec is not None:
                     it_rec["trust_after"] = float(trust)
                     it_rec["z_next"] = z.copy()
@@ -2435,7 +2715,9 @@ class FrameSolver:
                         it_rec["trust_after"] = float(trust)
                         it_rec["step_rejected"] = True
                     if trust < cfg.trust_radius_min:
-                        term_reason = "no_merit_step_trust_min"
+                        term_reason = ("no_recovery_step_trust_min"
+                                       if r1_active and phase == "recovery"
+                                       else "no_merit_step_trust_min")
                         break
 
             # budget exhausted / trust collapsed: report the ACTUAL iteration
@@ -2459,7 +2741,8 @@ class FrameSolver:
                     return self._result(False, best_z, it_done, used_slack, best_merit,
                                         qp_calls, trust, last_viol, last_names,
                                         status="task_quality", qp_status=last_qp_status,
-                                        term_reason=term_reason, iter_budget=max_iters)
+                                        term_reason=term_reason, iter_budget=max_iters,
+                                            recovery=_rec_facts())
                 ok, info = self.success_review(best_z, ctx)
                 review = info
                 if not ok:
@@ -2470,21 +2753,24 @@ class FrameSolver:
                                         qp_calls, trust, last_viol, last_names,
                                         status="review_failed", review=info,
                                         qp_status=last_qp_status,
-                                        term_reason=term_reason, iter_budget=max_iters)
+                                        term_reason=term_reason, iter_budget=max_iters,
+                                            recovery=_rec_facts())
                 if attempt_trace is not None:
                     attempt_trace["exit"].update(
                         {"accepted": True, "status": "solved"})
                 return self._result(True, best_z, it_done, used_slack, best_merit,
                                     qp_calls, trust, last_viol, last_names,
                                     qp_status=last_qp_status,
-                                    term_reason=term_reason, iter_budget=max_iters)
+                                    term_reason=term_reason, iter_budget=max_iters,
+                                            recovery=_rec_facts())
             if attempt_trace is not None:
                 attempt_trace["exit"].update(
                     {"accepted": False, "status": "infeasible"})
             return self._result(False, z, it_done, used_slack, float("inf"), qp_calls,
                                 trust, last_viol, last_names, status="infeasible",
                                 review=review, qp_status=last_qp_status,
-                                term_reason=term_reason, iter_budget=max_iters)
+                                term_reason=term_reason, iter_budget=max_iters,
+                                            recovery=_rec_facts())
         finally:
             if attempt_trace is not None:
                 # the trace pointers belong to THIS attempt only; a later
@@ -2493,15 +2779,18 @@ class FrameSolver:
                 self.qp_trace_arrays = None
                 self.last_slack_rows = None
                 self.last_qp_assembly = None
+                self._accept_scale_by_name = None
 
     def _result(self, accepted, z, it_done, used_slack, merit, qp_calls, trust,
                 last_viol, last_names, status=None, review=None,
                 qp_status: str = "", term_reason: str = "",
-                iter_budget: int = 0) -> FrameResult:
+                iter_budget: int = 0,
+                recovery: dict | None = None) -> FrameResult:
         """FrameResult with the exit evidence F0 requires (trust, last
         constraint, QP exit status, budget truncation, review outcome) and
         the verbatim loop-exit cause (review R4 -- the status label stays
-        historical)."""
+        historical).  ``recovery`` carries R1's explicit phase facts
+        (plan 7.5 item 5) without touching any historical field."""
         res = FrameResult(
             accepted, z, it_done, slack_used=used_slack,
             status=status or ("solved" if accepted else "max_iters"),
@@ -2511,7 +2800,7 @@ class FrameSolver:
             probe_rows=list(self.last_probe_rows),
             probe_truncated=list(self.last_probe_truncated),
             last_qp_status=str(qp_status), term_reason=str(term_reason),
-            iter_budget=int(iter_budget))
+            iter_budget=int(iter_budget), recovery=recovery)
         if review:
             res.diagnostics["review"] = review
         if self.last_truncated_ids:
