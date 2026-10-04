@@ -182,6 +182,19 @@
 - **测试 6 项**(新增 `tests/test_train24fix3_r2_anchor.py`):注册闭合(未知值/无 recovery/axis 三拒)+R2 解析;状态生命周期确定性测试(首帧无锚→采纳冻结→后续帧同一数组、**换坐标的采纳不改锚**、C2 关帧无锚不释放、区间外无锚、相邻区间换号释放+重建、双侧独立、t=0/C2 未启用/区间外采纳不建);`_frame_ctx` R2 锚替换/无参走原读;ctx 数组冻结锚;**真实 sub3 截断段(4 帧,开局深接触)**——R2 在首个采纳 C2 激活帧建锚、后续帧 ctx 携带逐位相同数组、诊断事件在册;**纯度:同段 R1 零状态零锚帧**(policy None)。全量 **340 → 346 passed + 1 skipped**(注册表连锁四处测试同步:profile 名单/历史 profile 意图限定/recovery 驱动 not_executed==["R2"]/evidence resolved 门双字段回填)。
 - **§7.6 项 6 的执行说明**:求解锚 vs 验证器锚起点差异由诊断 established.source_t/interval 与验证器认证区间对比承载(正式比较的报告含双侧);锚行阻塞走廊/C2/任务的新失败如实记录,不调容差不重设锚。
 
+## 0.9 提交单位 5b:R2 开发比较运行结果(2026-10-04,方案 §7.7;**R2 未过完整六段门,winner=None,按固定顺序下一候选=R3**)
+
+运行:同根 `recovery/R2/`(冻结 rev `7b1cef6`+复用补丁 `d1f7ad1`;干净树仅未跟踪 `.zcodeignore`),`--stage recovery --budget-min 480`。**R1 经 `_reusable_candidate` verbatim 复用**(记录 profile 回填旧行为默认后与 live resolved 全等+六段报告在册且 keep 集一致+R9 干净——重跑固定序不再重做 R1 的 8.7h;不可复用且已有产物=显式 SystemExit 拒绝覆盖,测试钉死)。实测 3.05h(预算内):ff ~4min+cf ~10min+六段 ~2h50m。
+
+- **五冻结帧**:5/5 采纳+5/5 完整审计过;**113 反事实 41/72 同 S1/R1**(行集合一致,预期);尖峰 10/10 拒、启用态全 norm_cut。
+- **六段 1/6 keep(仅 sub16,机理与 R1 同)**——**固定锚改变了失败形态但未过门**:
+  - **sub3@10 / sub8@26 / sub10@45 / sub12@110 全部 `state_constraints`**:固定锚把 R1 下能解到终点的 sub3(118 帧)/sub12(148 帧)分别压到 **11/118、111/148 帧早段求解拒绝**——区间锚行与走廊(regen band)/任务在参考自身运动下联合冲突(2026-09-15 负结果的"固定锚 vs 移动参考"形态在锚行版本复现);sub12 的最后违反行为 regen 走廊行(right_thumb~largebox 0.0120 > 0.008 上界)。
+  - **sub7 处理满 146 帧但终检死于速度骑界**(joint 12/base 1.8/7.0 的 µm 级类,同 R1 sub12)——锚漂类失败消失,速度边缘类浮现。
+  - sub16 保留(cert 右 0.833/接触 0.889/task p95 0.1056,与 R1 相当)。
+- **门**:base 1/6 未过;质量族 H/B/C/T 逐侧未过;机理族尖峰/启用过(GATED 重分类 sides=0 如实 False);完整性全过(R9 干净/profile 一致)。
+- **工具缺口如实记录**:报告行未携带 `regen_anchor` 诊断键(结果对象上有、行装配未提升)——锚事件取证在单位 6 修复,不影响本轮裁决(裁决只读 keep/质量/完整性)。
+- **裁决与下一步**:R2 `selected=False`——按 §7.4 固定顺序进入 **R3(=R2+0.049 界,唯一差异是数值界+1mm/s)**;锚-参考冲突是结构性形态,R3 的边际放松预期有限,但按预注册矩阵必须实测,不以预期替代运行。
+
 ## 0. 实施提交与测试
 
 | 提交 | 内容 |
@@ -207,6 +220,7 @@
 | `24cae93` | 提交单位 4a R1 可行性优先恢复实现(§0.6):recovery_policy 注册+phi 分族+恢复目标(mu/accept_scale 显式映射)+阶段机/接受式/可行后保持+FrameResult 恢复事实+`--stage recovery` 驱动;evidence 历史核验门按 §7.4 语义修正;测试 331→340+1s |
 | (本提交) | 提交单位 4b R1 开发比较结果(§0.7):1/6 keep(仅 sub16 首次保留)、sub3/sub7/sub12 被恢复相解到终点后死于手锚漂移终检(µm 塌缩=恢复目标问题的机理验证)、winner=None→按序进入 R2;预算超支 8.74h/8h 单独登记 |
 | (本提交) | 提交单位 5a R2 固定区间手锚实现(§0.8):RegenHandAnchorState(区间内数值不变/换号释放/唯一写路径=采纳)+regen_anchor_policy 注册(R2)+_frame_ctx/_run_sequential 接线+regen_anchor 诊断+ctx 冻结;测试 340→346+1s(状态生命周期/真实 sub3 截断段建锚不变/纯度零状态) |
+| (本提交) | 提交单位 5b R2 开发比较结果(§0.9):1/6 keep(sub16);固定锚把 sub3/sub12 压到早段 state_constraints(锚-参考冲突,11/118·111/148 帧)、sub7 转速度骑界终检;R1 verbatim 复用跳过 8.7h;winner=None→按序 R3;报告行缺 regen_anchor 键的工具缺口登记 |
 测试 262 → 288 passed + 1 skipped(阶段 A–C 完成时;`uv run --locked pytest tests/ -q` @ `84a7a7d`)→ **303 passed + 1 skipped**(Q1–Q4 后)→ **~~315~~ 316 passed + 1 skipped**(提交单位 2 后;订正见 §0.3)→ **328 passed + 1 skipped**(提交单位 3a 后)→ **331 passed + 1 skipped**(运行期修复后,单位 3b 运行时全量复验)→ **340 passed + 1 skipped**(提交单位 4a 后;新增 `tests/test_train24fix3_recovery_candidate.py` 8 项+continuation recovery 驱动 1 项,见 §0.6)。→ **346 passed + 1 skipped**(提交单位 5a 后;新增 `tests/test_train24fix3_r2_anchor.py` 6 项,见 §0.8)。288 档构成:`tests/test_train24fix3_profiles.py` 9 项(注册表矩阵/未知字段·非法值·非法继承拒绝、N0 默认=历史硬编码、逐帧门控仅 C2 激活帧、solve_qp 设置穿透 spy、trace 开/关纯度逐位、v2 记录 N0 回填/非 N0 携带拒绝、effective 记录携带 profile)+ `tests/test_train24fix3_numeric.py` 7 项(N0/N1 挂载=无 profile 逐位一致、N2 行变换 ξ 列纯 /B 且松弛列两表述同 −1、±INF 哨兵有限值比较、松弛罚权单位 10000·B 仅 C2 族、高精度同解与 s_m=B·s_norm、真实接受行 N2 下逐位不变、N3 mu 罚权仅 C2 松弛且缺 mu 显式错、tight N3≡N2)+ `tests/test_train24fix3_norm.py` 11 项(见 §4)。303 档新增 `tests/test_train24fix3_recovery.py` 15 项(见 §0.2)。316 档新增 `tests/test_train24fix3_formal.py` 13 项(见 §0.3)。328 档新增 `tests/test_train24fix3_continuation.py` 12 项(见 §0.4)。331 档=运行期修复两轮新增 3 项(锚漂场景 [T,43] 回归+范围变更仅重跑受影响种类+bootstrap 审计表,见 §0.4 运行期缺陷块)。
 
 首轮 baseline(`train24fix3_20261002_a7954e2/`)因驱动两处登记缺陷判 FAIL(fb/cf 重放本身已 ALL MATCH、integrity 干净):(1) 用 `closed_loop_metrics.sha256` 16 位截断变体比 F 清单 64 位摘要,必然假漂移——AGENTS 已记录的"跨工具哈希必须同源"事实的直接复演;(2) C 参照期望误写 6 NPZ(1/6 keep 轮仅 sub16 保留 1 个)。修复(`1147424`)后重跑为权威 baseline,首轮目录保留为失败尝试证据。

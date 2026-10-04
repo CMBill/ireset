@@ -484,7 +484,7 @@ uv run --locked python scripts/train24fix3_convergence.py --stage train24 --prof
 - [x] 原 D：S1/S2 六段均 0/6，按 §7.3 结束；局部合法性/重放表述仍须下项重验。
 - [x] Q：Q1–Q4 实施，10 个冻结帧/226 反事实完整重放两次、旧六段来源核验及验证记录订正完成；续行工作树/profile/预算登记。（2026-10-04 `train24fix3_recovery_20261003_258802c/evidence`：PASS,63min/240min;10 帧逐项同历史、226 反事实零差异 41/72·57/56、双跑重放全 ALL MATCH;详见验证记录 §0.5）
 - [x] P：10 个实际求解失败用例与两段锚漂两 pass 证据完成，动态 QP/锚身份可重放。（2026-10-04 同根 `failure_prefix/`：COMPLETE,13 身份项逐值全配、十个最后尝试均 `no_merit_step_trust_min`、sub16 右漂 0.0202m@t40/sub3 右漂 0.1278m、求解 ctx 手锚恒空;P 支出 ≈6.5h/登记上限 8h）
-- [ ] D+：R1–R3 按有限顺序完成或记录后继无需执行，形成 selection 或完整失败规格。（2026-10-04 R1 已完成比较：1/6 keep 仅 sub16、sub3/sub7/sub12 被恢复相解到终点后死于手锚漂移终检、winner=None——按序进入 R2；详见验证记录 §0.7；R1 运行超支 8.74h/8h 已登记）
+- [ ] D+：R1–R3 按有限顺序完成或记录后继无需执行，形成 selection 或完整失败规格。（2026-10-04 R1 已完成比较：1/6 keep 仅 sub16、sub3/sub7/sub12 被恢复相解到终点后死于手锚漂移终检、winner=None——按序进入 R2;详见验证记录 §0.7;R1 运行超支 8.74h/8h 已登记）（2026-10-04 R2 已完成比较:1/6 keep 仅 sub16、固定锚把 sub3/sub12 压到早段 state_constraints、sub7 转速度骑界终检、winner=None——按序进入 R3;详见验证记录 §0.9）
 - [ ] E：完整门/正式驱动已补齐；有 winner 时正式六段全部门与重复性通过，否则保持未进入。
 - [ ] F：固定 train24 三次运行与数量/保留/质量/覆盖/契约门形成裁决。
 - [ ] G：生产预算、clean manifest 和训练就绪标准的冻结要求已交接。
