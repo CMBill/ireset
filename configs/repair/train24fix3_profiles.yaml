@@ -79,3 +79,14 @@ profiles:
       never leaves the feasibility gate. No new hand anchors (R2/R3 only).
     base: S1
     recovery_policy: feasibility_first
+
+  R2:
+    description: >-
+      Recovery candidate 2 (plan 7.4/7.6): R1's feasibility-first recovery
+      with the FIXED-INTERVAL regen hand anchors -- within one original
+      reference interval the box-frame site coordinates of its first fully
+      adopted C2-active frame freeze as the interval's anchor, held
+      numerically invariant until the interval identity changes. Directly
+      targets the anchor-drift final-validation failures R1 exposed.
+    base: R1
+    regen_anchor_policy: fixed_interval

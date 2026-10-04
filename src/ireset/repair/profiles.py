@@ -33,13 +33,17 @@ PROFILE_SCHEMA = "train24fix3_profiles_v1"
 _SOLVER_FIELDS = {"polish", "eps_abs", "eps_rel", "max_iter", "scaling"}
 _PROFILE_FIELDS = {"description", "base", "solver", "c2_mode",
                    "c2_row_precondition", "c2_slack_penalty",
-                   "c2_norm_speed_mps", "recovery_policy"}
+                   "c2_norm_speed_mps", "recovery_policy",
+                   "regen_anchor_policy"}
 _C2_MODES = {"axis", "norm_cut"}
 _PRECONDITIONS = {"none", "divide_by_bound"}
 _SLACK_PENALTIES = {"legacy", "scaled_10000B", "mu"}
 #: plan 7.4/7.5: R1 = the feasibility-first recovery phase; None (default)
 #: keeps every historical N/S profile on the pure original path
 _RECOVERY_POLICIES = {None, "feasibility_first"}
+#: plan 7.4/7.6 (R2/R3 only): the fixed-interval regen hand anchors; None
+#: (default) builds NO anchor state and issues no extra machinery
+_ANCHOR_POLICIES = {None, "fixed_interval"}
 #: the certification entry gate the S bounds must stay strictly below (plan 7.1)
 _HAND_ENTRY_SPEED_MPS = 0.05
 
@@ -87,6 +91,11 @@ class C2Profile:
     #: original N/S behaviour everywhere (the default of every historical
     #: profile -- the registry version bump keeps their interpretation)
     recovery_policy: str | None = None
+    #: plan 7.4/7.6 (R2/R3 only): "fixed_interval" = the fixed-interval
+    #: regen hand anchors (RegenHandAnchorState); requires the R1 recovery
+    #: policy and the norm_cut mode (the registered R matrix).  None = no
+    #: anchor state at all (R1, every N/S profile, standard mode)
+    regen_anchor_policy: str | None = None
     description: str = ""
 
     def as_record(self) -> dict:
@@ -147,9 +156,19 @@ def _parse_profile(name: str, section: dict) -> C2Profile:
         # axis-mode recovery profile is an unregistered combination
         raise ValueError(f"{where}: recovery_policy requires c2_mode "
                          f"norm_cut (the R matrix is norm-based)")
+    anchor = section.get("regen_anchor_policy")
+    if anchor not in _ANCHOR_POLICIES:
+        raise ValueError(f"{where}: regen_anchor_policy must be "
+                         f"'fixed_interval' or omitted")
+    if anchor is not None and (recovery != "feasibility_first"
+                               or mode != "norm_cut"):
+        raise ValueError(f"{where}: regen_anchor_policy requires the R1 "
+                         f"recovery_policy on the norm_cut mode (the "
+                         f"registered R2/R3 matrix)")
     return C2Profile(name=name, solver=solver, c2_mode=mode,
                      c2_row_precondition=precond, c2_slack_penalty=penalty,
                      c2_norm_speed_mps=speed, recovery_policy=recovery,
+                     regen_anchor_policy=anchor,
                      description=str(section.get("description", "")))
 
 

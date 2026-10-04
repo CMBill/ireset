@@ -1563,11 +1563,14 @@ def _historical_norm_evidence(gate: Gate) -> dict:
         # and the live S1/S2 profiles must still carry exactly that default
         hist_resolved = dict(rep_prof.get("resolved") or {})
         gate.check(f"hist_{p}_resolved_frozen",
-                   {**hist_resolved, "recovery_policy": None}
+                   {**hist_resolved, "recovery_policy": None,
+                    "regen_anchor_policy": None}
                    == live[p].as_record()
-                   and live[p].recovery_policy is None,
+                   and live[p].recovery_policy is None
+                   and live[p].regen_anchor_policy is None,
                    "report profile record (+ the documented old-behavior "
-                   "default recovery_policy=None) == live resolved profile")
+                   "defaults recovery_policy/regen_anchor_policy=None) == "
+                   "live resolved profile")
         gate.check(f"hist_{p}_cf_dir_113",
                    len(list((RECOVERY_SRC_ROOT / "norm" / p / "cf").glob("cf_*.npz"))) == 113,
                    f"npz products under {RECOVERY_SRC_ROOT / 'norm' / p / 'cf'} "

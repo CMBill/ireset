@@ -70,9 +70,10 @@ def test_r1_registry_entry_and_closed_fields(tmp_path):
     assert r1.c2_row_precondition == s1.c2_row_precondition
     assert r1.c2_slack_penalty == s1.c2_slack_penalty == "mu"
     assert r1.solver == s1.solver
-    # every historical profile keeps the pure original path
+    # every historical profile keeps the pure original path (the R
+    # candidates are the only ones carrying a recovery policy)
     assert all(p.recovery_policy is None for n, p in profiles.items()
-               if n != "R1")
+               if n not in ("R1", "R2"))
 
     doc = yaml.safe_load(Path(get_profile.__globals__["PROFILES_YAML"]).read_text())
     base = dict(doc["profiles"])

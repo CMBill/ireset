@@ -243,6 +243,82 @@ class C2HandSpeedState:
         return False, "pull_in_exempt"
 
 
+class RegenHandAnchorState:
+    """R2/R3 fixed-interval regen hand anchors (train24fix3 plan 7.6).
+
+    The same discipline as :class:`C2HandSpeedState`: a pure function of
+    the ACCEPTED prefix and the INPUT reference schedule -- never of the
+    candidate being checked, never of the validator's own certification.
+    One instance per PASS (a suffix retry rebuilds it from the retry's own
+    accepted prefix); left and right sides are independent.
+
+    Semantics (plan 7.6 items 2/3): within ONE ORIGINAL reference interval
+    the anchor is NUMERICALLY INVARIANT -- it is the box-geom-frame three
+    site coordinates of the interval's FIRST fully adopted C2-active frame,
+    frozen at that adoption and never re-derived from ``prev_hand_local``.
+    The interval's first C2-active frame itself solves WITHOUT an anchor
+    (no out-of-interval coordinates are borrowed); ``t=0`` never anchors.
+    The anchor releases when the original reference interval ends or its
+    IDENTITY changes -- including a renumbering under an unchanged hold
+    mask -- and later re-establishes under the same rules.  Failed
+    solves/backtracks cannot touch it: only ``note_accepted`` (called from
+    the adoption path) writes state.
+    """
+
+    SIDES = (("l", "left_hand"), ("r", "right_hand"))
+
+    def __init__(self, ref_schedule: "ContactSchedule", T: int) -> None:
+        self._frame_iv: dict[str, list] = {}
+        for _side, eff in self.SIDES:
+            ids = [None] * T
+            ivs = [iv for iv in ref_schedule.intervals if iv.effector == eff]
+            for i, iv in enumerate(ivs):
+                for t in range(iv.start, iv.end):
+                    ids[t] = i
+            self._frame_iv[eff] = ids
+        self.anchor: dict[str, np.ndarray | None] = {eff: None for _s, eff in self.SIDES}
+        self.interval: dict[str, int | None] = {eff: None for _s, eff in self.SIDES}
+        self.source_t: dict[str, int | None] = {eff: None for _s, eff in self.SIDES}
+        self.events: list[dict] = []
+
+    def frame_anchor(self, side: str, t: int, c2_enabled: bool):
+        """The anchor the SOLVER sees for frame ``t``: the interval-fixed
+        anchor when this side's C2 rows are active this frame and one has
+        been established; None otherwise.  A release on interval change is
+        committed HERE (before any candidate of the frame is built)."""
+        eff = "left_hand" if side == "l" else "right_hand"
+        iv = self._frame_iv[eff][t]
+        if self.anchor[eff] is not None and iv != self.interval[eff]:
+            self.events.append({"t": t, "side": side, "event": "released",
+                                "reason": "interval_changed",
+                                "interval": self.interval[eff]})
+            self.anchor[eff], self.interval[eff], self.source_t[eff] = \
+                None, None, None
+        if not c2_enabled or iv is None:
+            return None
+        return self.anchor[eff]
+
+    def note_accepted(self, side: str, t: int, c2_enabled: bool,
+                      hand_local: np.ndarray) -> None:
+        """Post-adoption establishment (the ONLY write path): when this
+        side's C2 rows were active at the just-adopted frame and the frame
+        belongs to a reference interval that has no anchor yet, freeze the
+        ADOPTED state's box-frame site coordinates as this interval's
+        anchor.  ``t == 0`` never establishes."""
+        eff = "left_hand" if side == "l" else "right_hand"
+        if t == 0 or not c2_enabled:
+            return
+        iv = self._frame_iv[eff][t]
+        if iv is None or self.anchor[eff] is not None:
+            return
+        self.anchor[eff] = np.asarray(hand_local, dtype=float).copy()
+        self.interval[eff] = iv
+        self.source_t[eff] = t
+        self.events.append({"t": t, "side": side, "event": "established",
+                            "reason": "first_adopted_c2_frame",
+                            "interval": iv, "source_t": t})
+
+
 class ContactStateMachine:
     """Per-effector approach/hold/release with anchors committed on acceptance."""
 

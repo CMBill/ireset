@@ -37,6 +37,7 @@ from ireset.repair.context import (
     EFFECTORS,
     ContactStateMachine,
     ReferenceCondition,
+    RegenHandAnchorState,
     RepairConfig,
 )
 from ireset.repair.scp import FrameCheck, FrameContext, FrameSolver, solver_band_margin
@@ -545,12 +546,22 @@ class RepairPipeline:
         return out
 
     def _frame_ctx(self, t, prediction, condition, contacts, prev_local, prev_sole, z_prev,
-                   prev_scene_dist=None, c2_enable=None, c2_reason=None):
+                   prev_scene_dist=None, c2_enable=None, c2_reason=None,
+                   regen_hand_anchor=None):
         # Only anchors already LOCKED from accepted states constrain the solve
         # (plan 8.4): a first hold frame solves freely and its accepted state
         # provides the anchor afterwards.
+        # R2/R3 (plan 7.6 item 4): the FIXED-INTERVAL regen hand anchor
+        # REPLACES the contact-machine read for hands -- regen mode never
+        # locks contact hand anchors anyway, and every consumer (skip,
+        # tight/restoration, backtracking, the recovery proxy's relaxable
+        # rows, the independent audit) sees this one FrameContext, so they
+        # all see the same anchor rows.
         hand_anchor, foot_anchor = {}, {}
         for side, name in (("l", "left_hand"), ("r", "right_hand")):
+            if regen_hand_anchor is not None:
+                hand_anchor[side] = regen_hand_anchor.get(side)
+                continue
             hand_anchor[side] = contacts.anchors[name] if contacts.holding[name] else None
         for side, name in (("l", "left_foot"), ("r", "right_foot")):
             foot_anchor[side] = contacts.anchors[name] if contacts.holding[name] else None
@@ -827,6 +838,12 @@ class RepairPipeline:
         self._c2_diag = {"frames_on": {"l": 0, "r": 0},
                          "enable_events": [], "release_events": [],
                          "query_miss": [], "query_errors": []}
+        # R2/R3 (plan 7.6): the per-pass RegenHandAnchorState objects are
+        # kept here so the run diagnostics carry every pass's events -- the
+        # states themselves stay pass-local (a suffix retry rebuilds from
+        # its own prefix, never inheriting the previous pass's object)
+        self._anchor_states: list[RegenHandAnchorState] = []
+        self._anchor_frames = {"l": 0, "r": 0}
         if self.verbose:
             self.frame_log = []
         result = self._repair_trajectory(prediction, condition)
@@ -840,6 +857,14 @@ class RepairPipeline:
              "release_events": list(self._c2_diag["release_events"]),
              "query_miss": list(self._c2_diag["query_miss"]),
              "query_errors": list(self._c2_diag["query_errors"])})
+        result.diagnostics.setdefault(
+            "regen_anchor",
+            {"frames_anchored": dict(self._anchor_frames),
+             "established": [dict(e) for st in self._anchor_states
+                             for e in st.events if e["event"] == "established"],
+             "released": [dict(e) for st in self._anchor_states
+                          for e in st.events if e["event"] == "released"],
+             "policy": "fixed_interval" if self._anchor_states else None})
         result.diagnostics.setdefault("total_s", round(time.perf_counter() - t0, 3))
         return result
 
@@ -1167,6 +1192,18 @@ class RepairPipeline:
                                self.cfg.regen_hand_contact_gap_m)
               if self.cfg.regen_mode and self.cfg.regen_hand_speed_mps > 0.0
               else None)
+        # R2/R3 (plan 7.6): the fixed-interval regen hand anchors -- built
+        # ONLY under an explicit anchor policy; R1, every N/S profile,
+        # standard mode and C2-disarmed runs build NO state and issue no
+        # extra machinery.  One instance PER PASS: a suffix retry rebuilds
+        # its anchors from the retry's own retained prefix.
+        regen_anchors = None
+        if (self.cfg.regen_mode and self.cfg.regen_hand_speed_mps > 0.0
+                and c2 is not None
+                and self.solver.c2_profile is not None
+                and self.solver.c2_profile.regen_anchor_policy == "fixed_interval"):
+            regen_anchors = RegenHandAnchorState(condition.ref_schedule, T)
+            self._anchor_states.append(regen_anchors)
         prev_scene_dist: dict = {}
 
         for t in range(T):
@@ -1229,9 +1266,23 @@ class RepairPipeline:
                     elif was_on:
                         self._c2_diag["release_events"].append(
                             {"t": t, "side": side, "reason": why})
+            # R2/R3 (plan 7.6 item 4): the interval-fixed anchor is prepared
+            # BEFORE the ctx is built -- every candidate of this frame (skip,
+            # solve, backtrack, retry) sees the same anchor rows, and a
+            # failed candidate cannot alter the state (only note_accepted
+            # below, on the adoption path, writes it)
+            regen_hand_anchor = None
+            if regen_anchors is not None:
+                regen_hand_anchor = {}
+                for side in ("l", "r"):
+                    a = regen_anchors.frame_anchor(side, t, c2_enable[side])
+                    regen_hand_anchor[side] = a
+                    if a is not None:
+                        self._anchor_frames[side] += 1
             ctx = self._frame_ctx(t, prediction, condition, contacts, prev_local,
                                   prev_sole, z_prev, prev_scene_dist=prev_scene_dist,
-                                  c2_enable=c2_enable, c2_reason=c2_reason)
+                                  c2_enable=c2_enable, c2_reason=c2_reason,
+                                  regen_hand_anchor=regen_hand_anchor)
             self._snap("frame", t=t, pass_index=pass_index, ctx=ctx,
                        z_pred=z_pred, z_prev=z_prev, box=box, prediction=prediction)
 
@@ -1378,6 +1429,12 @@ class RepairPipeline:
             prev_local = {"l": self.ev.hand_local("l"), "r": self.ev.hand_local("r")}
             prev_sole = {"l": self.ev.site_positions(self.ev.sole_sites["l"]),
                          "r": self.ev.site_positions(self.ev.sole_sites["r"])}
+            if regen_anchors is not None:
+                # R2/R3 (plan 7.6 item 2): establish from the JUST-ADOPTED
+                # state -- the interval's first fully adopted C2-active frame
+                # freezes its box-frame coordinates for the whole interval
+                regen_anchors.note_accepted("l", t, c2_enable["l"], prev_local["l"])
+                regen_anchors.note_accepted("r", t, c2_enable["r"], prev_local["r"])
             if c2 is not None:
                 # C2 previous-frame input: the previous accepted FULL SCENE
                 # (robot AND box pose of frame t); see _collect_prev_scene_dist.

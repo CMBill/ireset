@@ -642,7 +642,9 @@ def test_stage_recovery_flow_and_refusal(tmp_path, monkeypatch):
 
     drv.stage_recovery(tmp_path)
     s = json.loads(drv.stage_summary_path(tmp_path, "recovery").read_text())
-    assert s["ok"] and s["winner"] == "R1" and s["not_executed"] == []
+    assert s["ok"] and s["winner"] == "R1"
+    # R2 is registered but the fixed order stops at the winner
+    assert s["not_executed"] == ["R2"]
     assert calls == ["ff:R1", "cf:R1", "sixseg:R1"]
     assert gate_calls == ["R1"]
     # the gate call carried the frozen demo list + the cf mechanism facts
