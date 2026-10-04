@@ -643,8 +643,8 @@ def test_stage_recovery_flow_and_refusal(tmp_path, monkeypatch):
     drv.stage_recovery(tmp_path)
     s = json.loads(drv.stage_summary_path(tmp_path, "recovery").read_text())
     assert s["ok"] and s["winner"] == "R1"
-    # R2 is registered but the fixed order stops at the winner
-    assert s["not_executed"] == ["R2"]
+    # R2/R3 are registered but the fixed order stops at the winner
+    assert s["not_executed"] == ["R2", "R3"]
     assert calls == ["ff:R1", "cf:R1", "sixseg:R1"]
     assert gate_calls == ["R1"]
     # the gate call carried the frozen demo list + the cf mechanism facts
@@ -698,14 +698,15 @@ def test_stage_recovery_reuses_prior_complete_candidate(tmp_path, monkeypatch):
     # first run: R1 executed (failed its gate), then R2
     drv.stage_recovery(tmp_path)
     assert calls == ["ff:R1", "cf:R1", "sixseg:R1",
-                     "ff:R2", "cf:R2", "sixseg:R2"]
-    # second run: both prior comparisons reused, nothing re-executed
+                     "ff:R2", "cf:R2", "sixseg:R2",
+                     "ff:R3", "cf:R3", "sixseg:R3"]
+    # second run: every prior comparison reused, nothing re-executed
     calls.clear()
     drv.stage_recovery(tmp_path)
     s2 = json.loads(drv.stage_summary_path(tmp_path, "recovery").read_text())
     assert calls == []
-    assert s2["comparisons"]["R1"]["reused"] is True
-    assert s2["comparisons"]["R2"]["reused"] is True
+    assert all(s2["comparisons"][n]["reused"] is True
+               for n in ("R1", "R2", "R3"))
     assert s2["winner"] is None
     # a drifted profile record: the prior comparison neither verifies for
     # reuse NOR may be overwritten -- an explicit refusal, never a silent

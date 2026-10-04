@@ -72,7 +72,13 @@ def test_r2_registry_and_closed_fields(tmp_path):
     assert r2.c2_norm_speed_mps == r1.c2_norm_speed_mps
     assert r1.regen_anchor_policy is None
     assert all(p.regen_anchor_policy is None for n, p in ps.items()
-               if n != "R2")
+               if n not in ("R2", "R3"))
+    # R3 = R2 + the registered S2 bound; that numeric bound is its ONLY
+    # delta (the finite matrix's last candidate)
+    r3 = ps["R3"]
+    assert r3.regen_anchor_policy == "fixed_interval"
+    assert r3.c2_norm_speed_mps == 0.049 == ps["S2"].c2_norm_speed_mps
+    assert r3.solver == r2.solver and r3.c2_slack_penalty == r2.c2_slack_penalty
 
     base = yaml.safe_load(PROFILES_YAML.read_text())["profiles"]
     cases = {

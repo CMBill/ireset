@@ -73,7 +73,7 @@ def test_r1_registry_entry_and_closed_fields(tmp_path):
     # every historical profile keeps the pure original path (the R
     # candidates are the only ones carrying a recovery policy)
     assert all(p.recovery_policy is None for n, p in profiles.items()
-               if n not in ("R1", "R2"))
+               if n not in ("R1", "R2", "R3"))
 
     doc = yaml.safe_load(Path(get_profile.__globals__["PROFILES_YAML"]).read_text())
     base = dict(doc["profiles"])

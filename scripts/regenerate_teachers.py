@@ -422,6 +422,12 @@ def main() -> None:
                # C2 (train24fix2): hand-speed-row enable/release/query facts,
                # cumulative over passes -- evidence, never a gate
                "c2_hand_speed": res.diagnostics.get("c2_hand_speed"),
+               # R2/R3 (train24fix3 plan 7.6): the fixed-interval regen hand
+               # anchors' established/released events -- evidence, never a
+               # gate (the 2026-10-04 R2 run exposed this row gap: the
+               # diagnostics existed on the result but never reached the
+               # report, hiding the anchor forensics)
+               "regen_anchor": res.diagnostics.get("regen_anchor"),
                # R6: the run-level TOTAL view (schema 2, every trajectory pass)
                # plus the per-pass event paths. The flat fields below describe
                # the FINAL pass only -- a reader must not add them to `cost`.

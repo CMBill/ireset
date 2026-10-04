@@ -90,3 +90,12 @@ profiles:
       targets the anchor-drift final-validation failures R1 exposed.
     base: R1
     regen_anchor_policy: fixed_interval
+
+  R3:
+    description: >-
+      Recovery candidate 3 (plan 7.4): R2's fixed-interval hand anchors with
+      the registered S2 bound 0.049 m/s (~1 mm/s under the validator's 0.05
+      entry gate) -- the ONLY delta from R2 is the numeric norm bound. The
+      final candidate of the finite R matrix.
+    base: R2
+    c2_norm_speed_mps: 0.049
