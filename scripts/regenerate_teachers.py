@@ -59,9 +59,16 @@ from experiment_provenance import provenance as provenance_snapshot
 from ireset.embodied.contact_sites import infer_reference_schedule
 from ireset.paths import DERIVED_DATA_DIR, PROJECT_ROOT, TEACHER_TRAJ_DIR
 from ireset.repair.config_io import MODES, load_mode_configs
-from ireset.repair.context import ReferenceCondition
+from ireset.repair.context import ReferenceCondition, RepairConfig
 from ireset.repair.pipeline import KPT_IDX, RepairPipeline
-from ireset.repair.validation import IndependentValidator
+from ireset.repair.validation import IndependentValidator, ValidationConfig
+from ireset.resctrl import (
+    DEFAULT_CPU_BUDGET,
+    apply_native_threads,
+    execution_record,
+    parallel_map,
+    resolve_workers,
+)
 from ireset.data.teacher import load_teacher_npz
 
 SCREEN = DERIVED_DATA_DIR / "screening" / "velocity_screen.json"
@@ -202,12 +209,12 @@ def rejection_evidence(diag: dict) -> dict:
     }
 
 
-def print_frame_log(pipe: RepairPipeline) -> None:
+def print_frame_log(records: list[dict]) -> None:
     """--verbose: one compact line per frame (last check call = the decided
     state) plus every failing endpoint/probe record with violating rows."""
     last_check: dict[int, dict] = {}
     failing: list[dict] = []
-    for rec in pipe.frame_log:
+    for rec in records:
         if rec["kind"] == "check":
             last_check[rec["t"]] = rec
             if rec.get("rows"):
@@ -232,6 +239,217 @@ def print_frame_log(pipe: RepairPipeline) -> None:
         for row in r.get("rows", []):
             print(f"       {row['pair']}: {row['val_m']*1e3:.3f}mm "
                   f"in [{row['lo_m']*1e3:.3f}, {row['hi_m']*1e3:.3f}]mm")
+
+
+class _DemoCtx:
+    """Per-demo execution settings shared by the serial loop and the
+    parallel workers (cpu_parallel_optimization_plan section 5: one demo =
+    one task; the segment-internal order -- per-frame adoption, SCP
+    iterations, cutting planes, line search, backtracking, suffix retry --
+    is untouched inside ``_process_demo``)."""
+
+    def __init__(self, *, frames: int, mode: str, min_hand_recall: float,
+                 min_ref_frames: int, out_dir: str) -> None:
+        self.frames = int(frames)
+        self.mode = mode
+        self.min_hand_recall = float(min_hand_recall)
+        self.min_ref_frames = int(min_ref_frames)
+        self.out_dir = Path(out_dir)
+
+
+def _process_demo(demo: str, *, pipe: RepairPipeline,
+                  validator: IndependentValidator, ctx: _DemoCtx) -> tuple[dict, bool, list]:
+    """Run ONE demo end-to-end (repair -> screening -> quality -> output).
+
+    Returns ``(row, keep, frame_log_slice)``; the slice is this demo's own
+    verbose frame_log (``repair_trajectory`` resets it per call, so demos
+    are naturally isolated). Emission (prints / frame_log file / summary
+    line) is the CALLER's job so the serial loop and the parallel parent
+    produce the identical stdout sequence in input order."""
+    out_dir = ctx.out_dir
+    t_segment = time.perf_counter()
+    t_pre = time.perf_counter()
+    src = TEACHER_TRAJ_DIR / f"{demo}_original.npz"
+    scene, human, fps = load_teacher_npz(src)
+    if ctx.frames:
+        scene, human = scene[: ctx.frames], human[: ctx.frames]
+    cond = ReferenceCondition(human, scene[:, 36:43],
+                              infer_reference_schedule(human, scene[:, 36:43]))
+    preprocess_s = time.perf_counter() - t_pre
+    t0 = time.perf_counter()
+    res = pipe.repair_trajectory(scene, cond)
+    wall = time.perf_counter() - t0
+    frame_log_slice = list(pipe.frame_log) if pipe.verbose else []
+    cost = res.diagnostics.get("cost") or {}
+    ms = cost.get("per_visit_ms") or {}
+    final_pass = next((p for p in cost.get("passes", [])
+                       if p["trajectory_pass"] == res.diagnostics.get(
+                           "trajectory_pass")), None)
+    n_processed = (final_pass or {}).get("processed_frame_visits", 0)
+    row = {"demo": demo, "T": int(scene.shape[0]), "fps": fps,
+           "accepted": bool(res.accepted), "status": res.status,
+           "wall_s": round(wall, 2),
+           "n_frames_processed": int(n_processed),
+           "ms_per_processed_frame": ms.get("mean_ms"),
+           "ms_per_processed_frame_p50": ms.get("p50_ms"),
+           "ms_per_processed_frame_p95": ms.get("p95_ms"),
+           "ms_per_processed_frame_max": ms.get("max_ms"),
+           "solve_frames_s": cost.get("solve_s"),
+           "final_validation_s": res.diagnostics.get("final_validation_s"),
+           "total_s": res.diagnostics.get("total_s"),
+           # nested timing relations (never summed again by the reader):
+           # total_s (repair call, incl. final validation) <= segment_wall_s
+           # (adds preprocessing, screening, quality stats and output)
+           "preprocess_s": round(preprocess_s, 3),
+           "segment_wall_s": None,          # filled after screening/output
+           # length-normalized legacy metric (kept for comparability; NOT
+           # a per-frame cost for early-rejected segments)
+           "ms_per_input_frame": round(wall * 1e3 / scene.shape[0], 1),
+           "t_fail": res.diagnostics.get("t_fail"),
+           "skip_reason": res.diagnostics.get("skip_reason"),
+           "final_stage": res.diagnostics.get("final_stage"),
+           "fallbacks": res.diagnostics.get("fallbacks"),
+           "slack_frames": res.diagnostics.get("slack_frames"),
+           # V1: candidate normalization accounting (checks / changed /
+           # budget failures / max delta / modified output frames) --
+           # facts about candidates, never a gate
+           "velocity_projection": res.diagnostics.get("velocity_projection"),
+           # C2 (train24fix2): hand-speed-row enable/release/query facts,
+           # cumulative over passes -- evidence, never a gate
+           "c2_hand_speed": res.diagnostics.get("c2_hand_speed"),
+           # R2/R3 (train24fix3 plan 7.6): the fixed-interval regen hand
+           # anchors' established/released events -- evidence, never a
+           # gate (the 2026-10-04 R2 run exposed this row gap: the
+           # diagnostics existed on the result but never reached the
+           # report, hiding the anchor forensics)
+           "regen_anchor": res.diagnostics.get("regen_anchor"),
+           # R6: the run-level TOTAL view (schema 2, every trajectory pass)
+           # plus the per-pass event paths. The flat fields below describe
+           # the FINAL pass only -- a reader must not add them to `cost`.
+           "cost": cost,
+           "cost_legacy_final_pass": {k: res.diagnostics.get(k) for k in (
+               "attempts", "qp_calls_total", "iterations_total",
+               "slack_attempts", "backtracks", "backtrack_probes",
+               "checks_total", "processed_frame_visits",
+               "unique_processed_frames", "input_frames", "skipped_frames",
+               "adopted_frames", "trajectory_pass")},
+           "screening_s": None,
+           "hand_recall_s": None,
+           "quality_stats_s": None,
+           "output_s": None}
+    if not res.accepted:
+        row["rejection"] = rejection_evidence(res.diagnostics)
+    if "first_attempt" in res.diagnostics:
+        fa = res.diagnostics["first_attempt"]
+        row["suffix_retry"] = {
+            "from_frame": res.diagnostics.get("suffix_retry_from"),
+            "first_attempt_t_fail": fa.get("t_fail"),
+            # the first pass was accepted (trajectory-level) but failed
+            # the independent validator: this summary + failed_checks
+            # describe that failure; the retry's own outcome is below
+            "first_attempt_validator": res.diagnostics.get("first_attempt_final"),
+            "first_attempt_failed_checks": res.diagnostics.get("failed_checks"),
+            "retry_failed_checks": res.diagnostics.get("final_retry_failed_checks"),
+            "first_attempt_solve_s": round(float(sum(fa.get("timings_s", []))), 3),
+            "first_attempt_rejection": {
+                "reason": fa.get("reason"),
+                "final_stage": fa.get("final_stage"),
+                "violated_rows": fa.get("violated_rows"),
+                "probe": fa.get("probe")},
+        }
+    keep = False
+    if res.accepted and res.trajectory is not None:
+        traj = res.trajectory
+        t_screen = time.perf_counter()
+        cov = hand_recall(validator, traj, cond)
+        row["hand_recall_s"] = round(time.perf_counter() - t_screen, 3)
+        row["screening_s"] = row["hand_recall_s"]
+        row["hand"] = cov
+        t_quality = time.perf_counter()
+        row["task_mpjpe"] = task_mpjpe_stats(pipe.ev, traj, cond)
+        row["quality_stats_s"] = round(time.perf_counter() - t_quality, 3)
+        recalls = [cov[f"{s}_hand_contact_recall"] for s in ("left", "right")
+                   if cov[f"{s}_hand_ref_frames"] >= ctx.min_ref_frames]
+        screened = all(r is None or r >= ctx.min_hand_recall for r in recalls) \
+            if recalls else False
+        grasping = len(recalls) > 0
+        row["hand_screen"] = ("pass" if screened and grasping else
+                              "no_reference_grasp" if not grasping else "fail")
+        keep = cov["validator_passed"] and screened and grasping
+        if keep and ctx.mode == "regen":
+            t_out = time.perf_counter()
+            np.savez(out_dir / f"{demo}.npz",
+                     qpos=to_teacher_layout(traj),
+                     human_joints=human, fps=fps)
+            row["output_s"] = round(time.perf_counter() - t_out, 3)
+    row["segment_wall_s"] = round(time.perf_counter() - t_segment, 3)
+    return row, keep, frame_log_slice
+
+
+def _emit_demo(demo: str, row: dict, frame_log_slice: list, *, verbose: bool,
+               out_dir: Path, keep: bool) -> None:
+    """Per-demo output emission, IDENTICAL for the serial loop and the
+    parallel parent (called in input order): verbose frame-log block +
+    file, then the summary line."""
+    if verbose:
+        print(f"[{demo}] frame log ({len(frame_log_slice)} records):")
+        print_frame_log(frame_log_slice)
+        log_path = out_dir / f"frame_log_{demo}.json"
+        log_path.write_text(json.dumps(frame_log_slice, indent=1, default=float))
+        row["frame_log"] = str(log_path)
+    print(f"[{demo}] accepted={row['accepted']} keep={keep} "
+          f"hand={row.get('hand', {}).get('intervals', '-')} "
+          f"contact={row.get('hand', {}).get('left_hand_contact_recall', '-')}/"
+          f"{row.get('hand', {}).get('right_hand_contact_recall', '-')} "
+          f"cert={row.get('hand', {}).get('left_hand_interval_recall', '-')}/"
+          f"{row.get('hand', {}).get('right_hand_interval_recall', '-')} "
+          f"task_p95={row.get('task_mpjpe', {}).get('p95', '-')} "
+          f"({row['ms_per_processed_frame']}ms/proc-f, "
+          f"{row['n_frames_processed']}/{row['T']} frames)")
+
+
+# -- cross-demo parallel workers (cpu_parallel_optimization_plan section 2) ----
+
+_W_CTX: _DemoCtx | None = None
+_W_PIPE: RepairPipeline | None = None
+_W_VALIDATOR: IndependentValidator | None = None
+
+
+def _worker_init(payload: dict) -> None:
+    """Per-PROCESS setup: thread limits first (the env was already set in
+    the parent before the pool; threadpoolctl re-limits whatever this
+    process loaded), then one persistent RepairPipeline + screening
+    validator -- MuJoCo data, OSQP usage, contact/anchor state and trace
+    are per-process and per-repair-call, never shared across tasks."""
+    apply_native_threads(payload["native_threads"])
+    rcfg = RepairConfig(**payload["reg_cfg"])
+    vcfg = ValidationConfig(**payload["vcfg"])
+    profile = None
+    if payload["profile_name"] is not None:
+        from ireset.repair.profiles import get_profile
+
+        profile = get_profile(payload["profile_name"])
+    pipe = RepairPipeline(cfg=rcfg, c2_profile=profile)
+    pipe.validator.cfg = vcfg
+    pipe.verbose = bool(payload["verbose"])
+    validator = IndependentValidator(cfg=vcfg)
+    if asdict(validator.cfg) != asdict(pipe.validator.cfg):
+        raise ValueError("worker screening validator config differs from "
+                         "the pipeline's (same guard as the serial path)")
+    global _W_CTX, _W_PIPE, _W_VALIDATOR
+    _W_CTX = _DemoCtx(frames=payload["frames"], mode=payload["mode"],
+                      min_hand_recall=payload["min_hand_recall"],
+                      min_ref_frames=payload["min_ref_frames"],
+                      out_dir=payload["out_dir"])
+    _W_PIPE = pipe
+    _W_VALIDATOR = validator
+
+
+def _worker_demo_task(demo: str) -> dict:
+    row, keep, frame_log_slice = _process_demo(
+        demo, pipe=_W_PIPE, validator=_W_VALIDATOR, ctx=_W_CTX)
+    return {"demo": demo, "row": row, "keep": bool(keep),
+            "frame_log": frame_log_slice}
 
 
 def main() -> None:
@@ -277,6 +495,17 @@ def main() -> None:
     ap.add_argument("--verbose", action="store_true",
                     help="per-frame hand_dist / corridor_upper / probe details "
                          "(printed summary + full frame_log in the report rows)")
+    ap.add_argument("--workers", default="1",
+                    help="1 (default) = the ORIGINAL serial path; an int N or "
+                         "'auto' runs demos in parallel processes (spawn, "
+                         "results and prints in input order). auto = "
+                         "min(physical cores, cpu budget, n demos)")
+    ap.add_argument("--cpu-budget", type=int, default=DEFAULT_CPU_BUDGET,
+                    help="max physical cores the parallel scheduler may use "
+                         "(plan: 16 default, 20 explicit)")
+    ap.add_argument("--native-threads", type=int, default=1,
+                    help="native thread pools per worker process (default 1; "
+                         "set BEFORE the pool so spawn children inherit it)")
     args = ap.parse_args()
 
     demos = args.demos if args.demos else registered_set(args.set)
@@ -347,6 +576,14 @@ def main() -> None:
     # thread state, and -- on a dirty tree -- the real patch plus the content
     # of untracked/modified code files. A default config or a diff hash alone
     # must never stand in for what the run actually used.
+    workers = resolve_workers(args.workers, args.cpu_budget, len(demos))
+    if workers > 1:
+        # cross-demo parallelism (cpu_parallel_optimization_plan section 2):
+        # the thread environment must exist BEFORE the pool is created
+        # (spawn children inherit it at exec time, i.e. before their first
+        # numeric import) and BEFORE the freeze record so the report's
+        # thread_env matches what the workers actually ran with
+        apply_native_threads(args.native_threads)
     effective = effective_record(
         pipe.cfg, pipe.validator.cfg, argv=sys.argv, mode=args.mode,
         validation_mode=args.validation_mode, demos=demos, frames=args.frames,
@@ -366,145 +603,67 @@ def main() -> None:
     }
     rows = []
     n_keep = 0
-    for demo in demos:
-        t_segment = time.perf_counter()
-        t_pre = time.perf_counter()
-        src = TEACHER_TRAJ_DIR / f"{demo}_original.npz"
-        scene, human, fps = load_teacher_npz(src)
-        if args.frames:
-            scene, human = scene[: args.frames], human[: args.frames]
-        cond = ReferenceCondition(human, scene[:, 36:43],
-                                  infer_reference_schedule(human, scene[:, 36:43]))
-        preprocess_s = time.perf_counter() - t_pre
-        t0 = time.perf_counter()
-        res = pipe.repair_trajectory(scene, cond)
-        wall = time.perf_counter() - t0
-        # stage 0 (2026-09-16): the old ms_per_frame divided the WHOLE wall
-        # time by the FULL clip length -- an early rejection amortized its
-        # per-frame cost over frames never processed. The per-visit statistics
-        # below come from the run-level cost view: all passes merged, from the
-        # unrounded series, never by averaging per-pass percentiles (R6). The
-        # final pass alone was the old (documented) semantics.
-        cost = res.diagnostics.get("cost") or {}
-        ms = cost.get("per_visit_ms") or {}
-        final_pass = next((p for p in cost.get("passes", [])
-                           if p["trajectory_pass"] == res.diagnostics.get(
-                               "trajectory_pass")), None)
-        n_processed = (final_pass or {}).get("processed_frame_visits", 0)
-        row = {"demo": demo, "T": int(scene.shape[0]), "fps": fps,
-               "accepted": bool(res.accepted), "status": res.status,
-               "wall_s": round(wall, 2),
-               "n_frames_processed": int(n_processed),
-               "ms_per_processed_frame": ms.get("mean_ms"),
-               "ms_per_processed_frame_p50": ms.get("p50_ms"),
-               "ms_per_processed_frame_p95": ms.get("p95_ms"),
-               "ms_per_processed_frame_max": ms.get("max_ms"),
-               "solve_frames_s": cost.get("solve_s"),
-               "final_validation_s": res.diagnostics.get("final_validation_s"),
-               "total_s": res.diagnostics.get("total_s"),
-               # nested timing relations (never summed again by the reader):
-               # total_s (repair call, incl. final validation) <= segment_wall_s
-               # (adds preprocessing, screening, quality stats and output)
-               "preprocess_s": round(preprocess_s, 3),
-               "segment_wall_s": None,          # filled after screening/output
-               # length-normalized legacy metric (kept for comparability; NOT
-               # a per-frame cost for early-rejected segments)
-               "ms_per_input_frame": round(wall * 1e3 / scene.shape[0], 1),
-               "t_fail": res.diagnostics.get("t_fail"),
-               "skip_reason": res.diagnostics.get("skip_reason"),
-               "final_stage": res.diagnostics.get("final_stage"),
-               "fallbacks": res.diagnostics.get("fallbacks"),
-               "slack_frames": res.diagnostics.get("slack_frames"),
-               # V1: candidate normalization accounting (checks / changed /
-               # budget failures / max delta / modified output frames) --
-               # facts about candidates, never a gate
-               "velocity_projection": res.diagnostics.get("velocity_projection"),
-               # C2 (train24fix2): hand-speed-row enable/release/query facts,
-               # cumulative over passes -- evidence, never a gate
-               "c2_hand_speed": res.diagnostics.get("c2_hand_speed"),
-               # R2/R3 (train24fix3 plan 7.6): the fixed-interval regen hand
-               # anchors' established/released events -- evidence, never a
-               # gate (the 2026-10-04 R2 run exposed this row gap: the
-               # diagnostics existed on the result but never reached the
-               # report, hiding the anchor forensics)
-               "regen_anchor": res.diagnostics.get("regen_anchor"),
-               # R6: the run-level TOTAL view (schema 2, every trajectory pass)
-               # plus the per-pass event paths. The flat fields below describe
-               # the FINAL pass only -- a reader must not add them to `cost`.
-               "cost": cost,
-               "cost_legacy_final_pass": {k: res.diagnostics.get(k) for k in (
-                   "attempts", "qp_calls_total", "iterations_total",
-                   "slack_attempts", "backtracks", "backtrack_probes",
-                   "checks_total", "processed_frame_visits",
-                   "unique_processed_frames", "input_frames", "skipped_frames",
-                   "adopted_frames", "trajectory_pass")},
-               "screening_s": None,
-               "hand_recall_s": None,
-               "quality_stats_s": None,
-               "output_s": None}
-        if not res.accepted:
-            row["rejection"] = rejection_evidence(res.diagnostics)
-        if "first_attempt" in res.diagnostics:
-            fa = res.diagnostics["first_attempt"]
-            row["suffix_retry"] = {
-                "from_frame": res.diagnostics.get("suffix_retry_from"),
-                "first_attempt_t_fail": fa.get("t_fail"),
-                # the first pass was accepted (trajectory-level) but failed
-                # the independent validator: this summary + failed_checks
-                # describe that failure; the retry's own outcome is below
-                "first_attempt_validator": res.diagnostics.get("first_attempt_final"),
-                "first_attempt_failed_checks": res.diagnostics.get("failed_checks"),
-                "retry_failed_checks": res.diagnostics.get("final_retry_failed_checks"),
-                "first_attempt_solve_s": round(float(sum(fa.get("timings_s", []))), 3),
-                "first_attempt_rejection": {
-                    "reason": fa.get("reason"),
-                    "final_stage": fa.get("final_stage"),
-                    "violated_rows": fa.get("violated_rows"),
-                    "probe": fa.get("probe")},
+    ctx = _DemoCtx(frames=args.frames, mode=args.mode,
+                   min_hand_recall=args.min_hand_recall,
+                   min_ref_frames=args.min_ref_frames, out_dir=str(out_dir))
+    def _serial_task(demo: str) -> dict:
+        # the ORIGINAL serial path: one shared pipeline, in-loop order --
+        # parallel_map(workers=1) is plain in-process iteration (no pool,
+        # no environment change), so behaviour matches the pre-parallel
+        # tool while the execution record stays uniform
+        row, keep, frame_log_slice = _process_demo(
+            demo, pipe=pipe, validator=validator, ctx=ctx)
+        return {"demo": demo, "row": row, "keep": bool(keep),
+                "frame_log": frame_log_slice}
+
+    def _collect(i: int, res: dict) -> None:
+        # called STRICTLY in input order as results arrive: the stdout
+        # sequence matches the serial run
+        nonlocal n_keep
+        rows.append(res["row"])
+        if res["keep"]:
+            n_keep += 1
+        _emit_demo(res["demo"], res["row"], res["frame_log"],
+                   verbose=args.verbose, out_dir=out_dir, keep=res["keep"])
+
+    if workers <= 1:
+        _, rep = parallel_map(_serial_task, demos, workers=1,
+                              requested_workers=args.workers,
+                              cpu_budget=args.cpu_budget,
+                              native_threads=args.native_threads,
+                              on_result=_collect)
+    else:
+        payload = {"reg_cfg": asdict(regen_cfg), "vcfg": asdict(vcfg),
+                   "profile_name": (profile.name if profile is not None else None),
+                   "frames": args.frames, "mode": args.mode,
+                   "min_hand_recall": args.min_hand_recall,
+                   "min_ref_frames": args.min_ref_frames,
+                   "out_dir": str(out_dir), "verbose": bool(args.verbose),
+                   "native_threads": args.native_threads}
+        try:
+            _, rep = parallel_map(
+                _worker_demo_task, demos, workers=workers,
+                requested_workers=args.workers, cpu_budget=args.cpu_budget,
+                native_threads=args.native_threads,
+                initializer=_worker_init, initargs=(payload,),
+                on_result=_collect)
+        except BaseException as exc:
+            # a crashed worker or a raising task = an INCOMPLETE batch:
+            # record it, keep the completed rows for forensics, exit non-
+            # zero (never a silent partial batch)
+            print(f"[parallel] batch INCOMPLETE after {len(rows)}/{len(demos)} "
+                  f"demos: {exc!r}", file=sys.stderr)
+            partial = {
+                "schema": 2, "set": args.set, "n_demos": len(demos),
+                "batch_status": "incomplete", "completed": len(rows),
+                "failed_at_index": len(rows), "error": repr(exc),
+                "effective": effective, "rows": rows,
             }
-        if args.verbose:
-            print(f"[{demo}] frame log ({len(pipe.frame_log)} records):")
-            print_frame_log(pipe)
-            log_path = out_dir / f"frame_log_{demo}.json"
-            log_path.write_text(json.dumps(pipe.frame_log, indent=1, default=float))
-            row["frame_log"] = str(log_path)
-        keep = False
-        if res.accepted and res.trajectory is not None:
-            traj = res.trajectory
-            t_screen = time.perf_counter()
-            cov = hand_recall(validator, traj, cond)
-            row["hand_recall_s"] = round(time.perf_counter() - t_screen, 3)
-            row["screening_s"] = row["hand_recall_s"]
-            row["hand"] = cov
-            t_quality = time.perf_counter()
-            row["task_mpjpe"] = task_mpjpe_stats(pipe.ev, traj, cond)
-            row["quality_stats_s"] = round(time.perf_counter() - t_quality, 3)
-            recalls = [cov[f"{s}_hand_contact_recall"] for s in ("left", "right")
-                       if cov[f"{s}_hand_ref_frames"] >= args.min_ref_frames]
-            screened = all(r is None or r >= args.min_hand_recall for r in recalls) \
-                if recalls else False
-            grasping = len(recalls) > 0
-            row["hand_screen"] = ("pass" if screened and grasping else
-                                  "no_reference_grasp" if not grasping else "fail")
-            keep = cov["validator_passed"] and screened and grasping
-            if keep and args.mode == "regen":
-                t_out = time.perf_counter()
-                np.savez(out_dir / f"{demo}.npz",
-                         qpos=to_teacher_layout(traj),
-                         human_joints=human, fps=fps)
-                row["output_s"] = round(time.perf_counter() - t_out, 3)
-                n_keep += 1
-        row["segment_wall_s"] = round(time.perf_counter() - t_segment, 3)
-        rows.append(row)
-        print(f"[{demo}] accepted={row['accepted']} keep={keep} "
-              f"hand={row.get('hand', {}).get('intervals', '-')} "
-              f"contact={row.get('hand', {}).get('left_hand_contact_recall', '-')}/"
-              f"{row.get('hand', {}).get('right_hand_contact_recall', '-')} "
-              f"cert={row.get('hand', {}).get('left_hand_interval_recall', '-')}/"
-              f"{row.get('hand', {}).get('right_hand_interval_recall', '-')} "
-              f"task_p95={row.get('task_mpjpe', {}).get('p95', '-')} "
-              f"({row['ms_per_processed_frame']}ms/proc-f, "
-              f"{row['n_frames_processed']}/{row['T']} frames)")
+            (out_dir / f"{args.mode}_report_{args.set}_{args.validation_mode}"
+             "_incomplete.json").write_text(json.dumps(partial, indent=1,
+                                                       default=float))
+            raise SystemExit(1) from exc
+    execution = execution_record(rep, len(demos))
 
     reg_cfg_pub = {k: v for k, v in asdict(regen_cfg).items()
                    if k in ("regen_mode", "regen_hand_contact_gap_m",
@@ -531,6 +690,11 @@ def main() -> None:
         "mode": args.mode,
         "validation_mode": args.validation_mode,
         "profile": profile_record,
+        # cpu_parallel_optimization_plan section 2: how THIS run was
+        # executed (serial/parallel, workers, threads, timings). Timing/
+        # execution metadata is on the comparison exclusion list; the
+        # algorithmic fields are not affected by this block.
+        "execution": execution,
         "min_hand_recall": args.min_hand_recall,
         "min_ref_frames": args.min_ref_frames,
         "regen_config": reg_cfg_pub,

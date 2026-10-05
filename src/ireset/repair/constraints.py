@@ -113,6 +113,23 @@ class FrameEvaluator:
         self._probe_fromto = np.zeros(6)
         self._probe_jac_buf = np.zeros((3, self.model.nv))
         self._motion_data = mujoco.MjData(self.model)
+        # state-keyed reuse (cpu_parallel_optimization_plan section 4): the
+        # main/probe data are written ONLY by forward/probe_forward (the
+        # sole writers of their qpos), so a repeated request for the exact
+        # same 43-dim state can skip mj_forward -- the derived arrays are
+        # still consistent with data.qpos. Distance queries are pure
+        # functions of the state, so per-state memoisation returns the
+        # identical float. ``state_cache=False`` disables both (test hook:
+        # bit-identity of the optimisation against the plain path).
+        self.state_cache = True
+        self._fwd_qpos: np.ndarray | None = None
+        self._probe_fwd_qpos: np.ndarray | None = None
+        self._dist_cache: dict = {}
+        self._probe_dist_cache: dict = {}
+        self.cache_stats = {"fwd_calls": 0, "fwd_skipped": 0,
+                            "dist_calls": 0, "dist_hits": 0,
+                            "probe_fwd_calls": 0, "probe_fwd_skipped": 0,
+                            "probe_dist_calls": 0, "probe_dist_hits": 0}
 
     # -- forward -----------------------------------------------------------
 
@@ -121,9 +138,20 @@ class FrameEvaluator:
         qpos[0:36] = z
         qpos[36:39] = box_pose[0:3]
         qpos[39:43] = box_pose[3:7]
+        self.cache_stats["fwd_calls"] += 1
+        if (self.state_cache and self._fwd_qpos is not None
+                and np.array_equal(self._fwd_qpos, qpos)):
+            # the data buffers already hold EXACTLY this state (forward is
+            # the only writer of data.qpos and nothing mutates the derived
+            # arrays in place) -- skipping mj_forward is value-identical
+            self.cache_stats["fwd_skipped"] += 1
+            return
         self.data.qpos = qpos
         mujoco.mj_forward(self.model, self.data)
         self._root_R = quat_to_mat_wxyz(z[3:7][None])[0]
+        if self.state_cache:
+            self._fwd_qpos = qpos
+            self._dist_cache = {}
 
     def probe_forward(self, q_robot: np.ndarray, box_pose: np.ndarray) -> None:
         """Forward the PROBE data to an interpolated mid state (F4)."""
@@ -131,9 +159,17 @@ class FrameEvaluator:
         qpos[0:36] = q_robot
         qpos[36:39] = box_pose[0:3]
         qpos[39:43] = box_pose[3:7]
+        self.cache_stats["probe_fwd_calls"] += 1
+        if (self.state_cache and self._probe_fwd_qpos is not None
+                and np.array_equal(self._probe_fwd_qpos, qpos)):
+            self.cache_stats["probe_fwd_skipped"] += 1
+            return
         self._probe_data.qpos = qpos
         mujoco.mj_forward(self.model, self._probe_data)
         self._probe_R = quat_to_mat_wxyz(np.asarray(q_robot[3:7], dtype=float)[None])[0]
+        if self.state_cache:
+            self._probe_fwd_qpos = qpos
+            self._probe_dist_cache = {}
 
     def motion_between(self, z_a: np.ndarray, box_a: np.ndarray,
                        z_b: np.ndarray, box_b: np.ndarray) -> float:
@@ -242,14 +278,39 @@ class FrameEvaluator:
         return np.einsum("ij,sjk->sik", R_g.T, self.site_jacobians_35(self.hand_sites[side]))
 
     def geom_distance(self, ga: int, gb: int, distmax: float = 1.0) -> tuple[float, np.ndarray]:
+        # pure function of the current main state -> per-state memoisation
+        # (cleared by forward on every state change); a hit returns copies,
+        # so callers keep the same mutate-your-own-copy contract as before
+        self.cache_stats["dist_calls"] += 1
+        if self.state_cache:
+            key = (ga, gb, distmax)
+            hit = self._dist_cache.get(key)
+            if hit is not None:
+                self.cache_stats["dist_hits"] += 1
+                return hit[0], hit[1].copy()
         d = mujoco.mj_geomDistance(self.model, self.data, ga, gb, distmax, self._fromto)
-        return float(d), self._fromto.copy()
+        out = (float(d), self._fromto.copy())
+        if self.state_cache:
+            # store an array the caller can never alias (the returned one
+            # stays exclusively the caller's, as before the cache existed)
+            self._dist_cache[(ga, gb, distmax)] = (out[0], out[1].copy())
+        return out
 
     def probe_geom_distance(self, ga: int, gb: int, distmax: float = 1.0) -> tuple[float, np.ndarray]:
         """Distance at the PROBE state (F4)."""
+        self.cache_stats["probe_dist_calls"] += 1
+        if self.state_cache:
+            key = (ga, gb, distmax)
+            hit = self._probe_dist_cache.get(key)
+            if hit is not None:
+                self.cache_stats["probe_dist_hits"] += 1
+                return hit[0], hit[1].copy()
         d = mujoco.mj_geomDistance(self.model, self._probe_data, ga, gb,
                                    distmax, self._probe_fromto)
-        return float(d), self._probe_fromto.copy()
+        out = (float(d), self._probe_fromto.copy())
+        if self.state_cache:
+            self._probe_dist_cache[(ga, gb, distmax)] = (out[0], out[1].copy())
+        return out
 
     def probe_box_frame(self) -> tuple[np.ndarray, np.ndarray]:
         """Box geom frame ``(R, x)`` of the PROBE state (F4).

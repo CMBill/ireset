@@ -292,11 +292,20 @@ def stage_baseline(root: Path) -> None:
 # stage B: trace (plan section 5)
 # ---------------------------------------------------------------------------
 
+#: subprocess thread budget (cpu_parallel_optimization_plan section 4):
+#: 8 preserves the historical formal-run environment byte-for-byte; the
+#: fixed-8 assumption is gone -- the driver flags can raise/lower it and
+#: forward a cross-demo worker count to the regeneration subprocess.
+_DRIVER_NATIVE_THREADS = 8
+_DRIVER_REGEN_WORKERS = "1"
+
+
 def _thread_env() -> dict:
     env = dict(os.environ)
-    env.update({k: "8" for k in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
-                                 "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS",
-                                 "VECLIB_MAXIMUM_THREADS")})
+    env.update({k: str(_DRIVER_NATIVE_THREADS) for k in
+                ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                 "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS",
+                 "VECLIB_MAXIMUM_THREADS")})
     return env
 
 
@@ -567,6 +576,9 @@ def _run_sixseg(profile_name: str | None, rq: Path, *, verbose: bool = False,
                f"train24fix3 formal run (profile {profile_name}, mode {mode})")]
     if profile_name is not None:
         cmd += ["--profile", profile_name]
+    if _DRIVER_REGEN_WORKERS != "1":
+        cmd += ["--workers", str(_DRIVER_REGEN_WORKERS),
+                "--native-threads", str(_DRIVER_NATIVE_THREADS)]
     if verbose:
         cmd += ["--verbose"]
     t0 = time.perf_counter()
@@ -2876,6 +2888,13 @@ def main() -> None:
                     help="profile name for sixseg/train24 (cross-checked "
                          "against the SELECTION summary before anything "
                          "runs -- a mismatched name is an explicit failure)")
+    ap.add_argument("--regen-workers", default="1",
+                    help="cross-demo worker count forwarded to the "
+                         "regeneration subprocess (cpu_parallel_optimization_"
+                         "plan; 1 = the original serial path)")
+    ap.add_argument("--native-threads", type=int, default=8,
+                    help="thread env for subprocess invocations (historical "
+                         "formal runs used 8)")
     ap.add_argument("--budget-min", type=float, default=None,
                     help="run-control budget in minutes for the budgeted "
                          "continuation stages (evidence 4h / failure-prefix "
@@ -2883,6 +2902,9 @@ def main() -> None:
                          "the deadline are recorded not_run_budget and the "
                          "stage ends INCOMPLETE -- never a partial pass")
     args = ap.parse_args()
+    global _DRIVER_NATIVE_THREADS, _DRIVER_REGEN_WORKERS
+    _DRIVER_NATIVE_THREADS = int(args.native_threads)
+    _DRIVER_REGEN_WORKERS = str(args.regen_workers)
     if args.stage in ("sixseg", "train24") and not args.profile:
         raise SystemExit(f"--profile is required for --stage {args.stage}")
     root = Path(args.out).resolve()

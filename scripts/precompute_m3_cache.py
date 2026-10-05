@@ -15,7 +15,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -25,9 +24,20 @@ import numpy as np
 from ireset.data.teacher import build_interaction_clip, schedule_to_cache
 from ireset.data.windows import CACHE_DIR, load_split_files
 from ireset.paths import TEACHER_TRAJ_DIR
+from ireset.resctrl import (
+    DEFAULT_CPU_BUDGET,
+    apply_native_threads,
+    execution_record,
+    parallel_map,
+    resolve_workers,
+)
 
 
-def process_file(name: str, force: bool) -> dict:
+def process_file(job: tuple[str, bool]) -> dict:
+    """One NPZ -> schedule cache row. The job is a single tuple so the
+    function stays a module-level picklable task for the spawn pool
+    (cpu_parallel_optimization_plan section 2)."""
+    name, force = job
     out = CACHE_DIR / "schedules" / f"{name}.npz"
     clip = build_interaction_clip(name)   # infers schedule when no cache hit
     if force or not out.exists():
@@ -42,9 +52,19 @@ def process_file(name: str, force: bool) -> dict:
     }
 
 
+def _worker_init(native_threads: int) -> None:
+    apply_native_threads(native_threads)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--workers", type=int, default=4,
+                    help="number of processes (spawn; results in input "
+                         "order). 1 = in-process serial")
+    ap.add_argument("--cpu-budget", type=int, default=DEFAULT_CPU_BUDGET,
+                    help="max physical cores for --workers auto")
+    ap.add_argument("--native-threads", type=int, default=1,
+                    help="native thread pools per worker process")
     ap.add_argument("--force", action="store_true", help="re-infer existing schedules")
     args = ap.parse_args()
 
@@ -52,8 +72,14 @@ def main() -> None:
     jobs = [f for files in all_files.values() for f in files]
     print(f"{len(jobs)} NPZ files across splits")
 
-    with ProcessPoolExecutor(max_workers=args.workers) as ex:
-        rows = list(ex.map(process_file, jobs, [args.force] * len(jobs), chunksize=8))
+    workers = resolve_workers(args.workers, args.cpu_budget, len(jobs))
+    rows, rep = parallel_map(process_file, [(f, args.force) for f in jobs],
+                             workers=workers, requested_workers=args.workers,
+                             cpu_budget=args.cpu_budget,
+                             native_threads=args.native_threads,
+                             initializer=_worker_init,
+                             initargs=(args.native_threads,))
+    print(json.dumps(execution_record(rep, len(jobs))))
 
     # train-split root statistics (all frames of all train clips)
     pos = []

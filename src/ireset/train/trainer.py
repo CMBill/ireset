@@ -11,6 +11,7 @@ self-contained.
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -23,6 +24,18 @@ from ireset.diffusion.generator import DiffusionG1
 from ireset.model.conditioner import ConditionEncoder
 from ireset.model.deterministic import DeterministicG1
 from ireset.train.losses import LossAssembler, LossWeights
+
+
+def _worker_thread_limits(worker_id: int) -> None:
+    """DataLoader worker boot (cpu_parallel_optimization_plan section 4):
+    each worker is I/O + tensor-preprocess only, so its native pools are
+    pinned to ONE thread -- outer batching provides the parallelism and
+    CPU workers never touch CUDA. Environment first (any library the
+    worker imports later), then torch for the already-imported runtime."""
+    for k in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+              "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        os.environ.setdefault(k, "1")
+    torch.set_num_threads(1)
 
 
 @dataclass
@@ -87,6 +100,7 @@ class Trainer:
             train_ds, batch_size=cfg.micro_batch, shuffle=True,
             num_workers=cfg.num_workers, generator=g, drop_last=True,
             persistent_workers=cfg.num_workers > 0,
+            worker_init_fn=_worker_thread_limits,
         )
         self.val_loader = DataLoader(
             val_ds, batch_size=cfg.micro_batch, shuffle=False,
