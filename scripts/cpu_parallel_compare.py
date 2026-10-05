@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 #: report-level keys that are pure provenance/timing and never algorithmic
 REPORT_EXCLUDED = {"freeze", "end", "provenance", "execution", "notes",
-                   "field_notes"}
+                   "field_notes", "git_rev"}
 #: row-level / nested keys pruned recursively (timings, paths, metadata)
 KEY_EXCLUDED = {"frame_log", "output_s", "timing_stats"}
 
@@ -42,11 +42,11 @@ def deep_compare(a, b, path: str, diffs: list, *, _prune=frozenset()):
     if isinstance(a, dict) and isinstance(b, dict):
         keys = (set(a) | set(b))
         for k in sorted(keys):
+            if k in _prune or k in KEY_EXCLUDED or _is_timing_key(k):
+                continue
             if k not in a or k not in b:
                 diffs.append(f"{path}.{k}: missing in "
                              f"{'baseline' if k not in a else 'candidate'}")
-                continue
-            if k in _prune or k in KEY_EXCLUDED or _is_timing_key(k):
                 continue
             deep_compare(a[k], b[k], f"{path}.{k}", diffs)
     elif isinstance(a, list) and isinstance(b, list):
@@ -83,7 +83,7 @@ def main() -> None:
     # effective: argv carries the new execution flags; everything else
     # (configs, profile, gate, demos, screening) must be identical
     for k in sorted(set(base.get("effective", {})) | set(cand.get("effective", {}))):
-        if k in ("argv",):
+        if k in ("argv", "note"):
             continue
         deep_compare(base["effective"].get(k), cand["effective"].get(k),
                      f"effective.{k}", diffs)
