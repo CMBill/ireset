@@ -13,7 +13,7 @@
 | 性能门:吞吐 ≥75% 理想上限 | **通过**(2.331× = 理想的 96.6%) |
 | 性能门:单段中位回退 ≤5%(缓存裁定) | **通过**(新串行/旧串行中位 1.007,合计 1.009×;逐段最大 1.015,sub7/sub8 反而 0.972/0.960) |
 | 已测登记:并行批量内单段中位 1.066(调度成本) | **超 5%,登记为已知权衡**(内存带宽争用;吞吐 2.31× 的代价;延迟敏感单段运行用缺省 --workers 1) |
-| 边界测试 12 项+全量套件 | **359 passed + 1 skipped**(基线 346+1s 净增 12,零回归) |
+| 边界测试 12 项+全量套件 | **359 passed + 1 skipped**(基线 346+1s 净增 12,零回归;终跑 955s 全绿) |
 | 性能门(§6.4):吞吐 ≥75% 理想上限 / 单段中位回退 ≤5% | 见 §5 |
 | 串行默认路径不变 | workers=1 经 parallel_map 串行分支=原共享管线路径;执行记录统一 |
 
@@ -88,6 +88,10 @@
 - `compare_vs_frozen.json` / `compare_serial_vs_frozen.json`(两次逐位对比,均 IDENTICAL)、`perf_gates.json`(吞吐/回退判定)
 - `run_stdout.log`/`run_time.log`(两次运行的完整 stdout 与 /usr/bin/time 峰值内存)
 - 复核命令:`uv run --locked python scripts/cpu_parallel_compare.py --baseline <冻结报告> --candidate <验收报告>`;`scripts/cpu_parallel_acceptance_summary.py --serial <冻结> --parallel <并行>`;三方分解脚本数字在 §5.1 表内可复算。
+
+## 7.1 全量套件一次既有瞬态失败的定位与修复(本轮终跑前)
+
+全量套件在优化后两次于 `test_report_contracts.py::test_regenerate_cli_report_has_effective_config` 失败,断言 `row["wall_s"] + 5e-3 >= row["total_s"]` 实测 `0.03 + 0.005 >= 0.035` 失败——**测试容差设计缺陷,非行为缺陷**:`wall_s` 为两位小数舍入字段,其 ±5ms 舍入半步恰好吞掉 5ms 容差,且二进制下 `0.03+0.005 < 0.035`(同款瞬态在提交 `89d2365` 的全量运行中已出现并记录"文件级复跑稳定");两次失败中底层计时差均在 5ms 契约内。修复=测试容差改为 `1e-2 + 1e-9`(吸收舍入半步与浮点表示,契约本身不变),修复后全量 **359+1s 全绿**(955s)。生产行为零改动。
 
 ## 8. 裁决
 
