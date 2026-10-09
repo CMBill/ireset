@@ -5,12 +5,16 @@ Each ``resources/data/omniretarget/robot-object/<demo>_<variant>.npz`` holds
 ``human_joints`` [T, 52, 3] in the same scene, and ``fps``. This module
 converts to the project convention and assembles :class:`InteractionClip`.
 
-Source vs target object trajectories: in this dataset both live in the NPZ
-scene (the upstream rot/trans augmentations move human, robot and box
-together, verified in the M0 pairing audit), so ``source_obj_pose`` and
-``target_obj_pose`` are both read from ``qpos[36:43]``. Keeping the two
-fields separate preserves the schema for future augmentations where they
-diverge (plan 4.4: such augmentations require teacher regeneration).
+Source vs target object trajectories: the M0 pairing audit and the A1
+re-verification (``derived/experiments/omniretarget_first/<run_id>/freeze/``,
+plan omniretarget_first_training_plan §4.3) show that the two scenes are
+NOT identical even for ``_original`` clips: the NPZ box equals the
+similarity-transformed PT box plus a per-demo constant offset, and rot/trans
+variants keep ``human_joints`` fixed while the robot scene (root and box)
+moves. ``qpos[36:43]`` is therefore the **target** scene box. Reading it
+into ``source_obj_pose`` as well is a known approximation retained only
+until the I1/I2 source-scene adapter lands; reference contact inference
+against the target box is offset by exactly that constant per-demo offset.
 """
 
 from __future__ import annotations
