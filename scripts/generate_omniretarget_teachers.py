@@ -8,9 +8,24 @@ oracle warm-start), then verify each output against the published teacher
 convert the checkout's MuJoCo [pos,quat] layout into the project scene
 convention.
 
-Read-only over resources/ and third_party/ (input hashes re-verified after
-the run). Raw upstream outputs are kept next to the converted copies. All
-expected demos keep a result row; failures never shrink the denominator.
+Run-integrity rules (A2 review fixes 5/6/7/10, 2026-10-09):
+
+* the upstream checkout identity is MEASURED (git rev + dirty state) and
+  must match the A1-frozen expected commit before anything runs; the env
+  lock hash and mujoco version are measured and recorded;
+* every invocation writes its own ``attempt_NNN`` directory and appends to
+  ``attempts_index.json`` — a ``--demos`` retry never overwrites prior
+  evidence, and ``expected_denominator`` stays the FULL frozen pilot list
+  so a partial retry reports INCOMPLETE, never a shrunken COMPLETE;
+* input hashes are recorded in the manifest (the comparison re-verifies
+  them against the on-disk files) in addition to the before/after
+  immutability check inside this run;
+* output directories must fully resolve under ``derived/`` (symlink targets
+  under resources/ are refused).
+
+Read-only over resources/ and third_party/. Raw upstream outputs are kept
+next to the converted copies. All frozen pilot demos keep a reconciled
+result; failures never shrink the denominator.
 
 Run: uv run --locked python scripts/generate_omniretarget_teachers.py \
        --freeze derived/experiments/omniretarget_first/<a1_run>/freeze \
@@ -31,8 +46,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import numpy as np
 
+from ireset.data import a2_integrity as integ
 from ireset.data import omniretarget_sources as orc
-from ireset.paths import OMOMO_NEW_DIR, PROJECT_ROOT, TEACHER_TRAJ_DIR
+from ireset.paths import OMOMO_NEW_DIR, PROJECT_ROOT, TEACHER_TRAJ_DIR, path_for_record
 
 HOLOSOMA_PACKAGE = (
     PROJECT_ROOT / "third_party" / "holosoma" / "src" / "holosoma_retargeting"
@@ -46,20 +62,10 @@ def pilot_demos_from_freeze(freeze_dir: Path) -> list[str]:
     return [e["demo"] for e in lists["teacher_pilot_train6_v1"]]
 
 
-def _sha(path: Path) -> str:
-    import hashlib
-
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
 def generate_one(
     demo: str,
     env_python: Path,
-    out_dir: Path,
+    attempt_dir: Path,
     data_path: Path,
 ) -> dict:
     """Run the upstream retargeting for one demo; -> per-demo result row."""
@@ -70,7 +76,7 @@ def generate_one(
         "--task-name", demo,
         "--data-format", "smplh",
         "--data-path", str(data_path),
-        "--save-dir", str(out_dir),
+        "--save-dir", str(attempt_dir),
         "--task-config.object-name", "largebox",
     ]
     proc = subprocess.run(
@@ -91,12 +97,12 @@ def generate_one(
         row["error"] = (proc.stderr or proc.stdout)[-2000:]
         return row
     try:
-        raw_path = out_dir / f"{demo}_original.npz"
+        raw_path = attempt_dir / f"{demo}_original.npz"
         pub_path = TEACHER_TRAJ_DIR / f"{demo}_original.npz"
         scene_u0, human_u0, fps_u0 = orc.load_teacher_scene(raw_path, "upstream_generated")
         scene_p, human_p, fps_p = orc.load_teacher_scene(pub_path, "published")
         binding = orc.check_binding(demo, scene_u0, human_u0, fps_u0, scene_p, human_p, fps_p)
-        conv_path = out_dir / f"{demo}_original_converted.npz"
+        conv_path = attempt_dir / f"{demo}_original_converted.npz"
         np.savez(
             conv_path,
             qpos=scene_u0,
@@ -105,15 +111,16 @@ def generate_one(
             source_type="upstream_generated",
             layout="project_scene_v1",
             provenance=json.dumps({
-                "demo": demo, "raw_file": raw_path.name, "raw_sha256": _sha(raw_path),
-                "published_sha256": _sha(pub_path),
+                "demo": demo, "raw_file": raw_path.name,
+                "raw_sha256": integ.sha256_file(raw_path),
+                "published_sha256": integ.sha256_file(pub_path),
                 "binding": binding.to_json_dict(),
             }),
         )
         row["status"] = "ok" if binding.passed else "binding_failed"
         row["binding"] = binding.to_json_dict()
-        row["raw_sha256"] = _sha(raw_path)
-        row["converted"] = str(conv_path.relative_to(PROJECT_ROOT))
+        row["raw_sha256"] = integ.sha256_file(raw_path)
+        row["converted"] = path_for_record(conv_path)
         row["T"] = int(scene_u0.shape[0])
     except Exception as exc:
         row["status"] = "postcheck_failed"
@@ -124,72 +131,103 @@ def generate_one(
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--freeze", type=Path, required=True,
-                    help="A1 freeze directory (frozen_lists.json)")
-    ap.add_argument("--out-dir", type=Path, required=True)
+                    help="A1 freeze directory (frozen_lists.json + assets.json)")
+    ap.add_argument("--out-dir", type=Path, required=True,
+                    help="U0 root directory (each run creates attempt_NNN inside)")
     ap.add_argument("--env-python", type=Path, default=DEFAULT_ENV_PYTHON)
     ap.add_argument("--data-path", type=Path, default=OMOMO_NEW_DIR)
     ap.add_argument("--demos", type=str, default=None,
-                    help="comma-separated override (dev retry of specific demos); "
-                         "the frozen pilot list remains the expected denominator")
+                    help="comma-separated retry scope (subset of the frozen pilot "
+                         "list); writes a NEW attempt, never overwrites")
     args = ap.parse_args()
 
-    demos = pilot_demos_from_freeze(args.freeze)
+    freeze = args.freeze.expanduser().resolve()
+    data_path = args.data_path.expanduser().resolve()
+    out_root = integ.guard_output_dir(args.out_dir)
+
+    pilot = pilot_demos_from_freeze(freeze)
+    scope = pilot
     if args.demos:
         wanted = [d.strip() for d in args.demos.split(",") if d.strip()]
-        unknown = [d for d in wanted if d not in demos]
+        unknown = [d for d in wanted if d not in pilot]
         if unknown:
             raise SystemExit(f"--demos outside frozen pilot list: {unknown}")
-        demos = wanted
-    out_dir = args.out_dir.expanduser().resolve()
-    data_path = args.data_path.expanduser().resolve()
-    # The upstream subprocess runs with cwd inside the pinned read-only
-    # checkout; a relative --save-dir would scatter outputs there (found in
-    # the first dev run). Refuse anything under the read-only roots.
-    for forbidden in (PROJECT_ROOT / "third_party", PROJECT_ROOT / "resources"):
-        if out_dir == forbidden or forbidden in out_dir.parents:
-            raise SystemExit(f"--out-dir must not live under {forbidden.name}/: {out_dir}")
-    out_dir.mkdir(parents=True, exist_ok=True)
+        scope = wanted
 
-    # Input immutability: hash the bound inputs before and after generation.
+    # Identity gate BEFORE any generation: measured checkout must equal the
+    # A1-frozen commit and be clean; env identity is recorded, not assumed.
+    freeze_assets = json.loads((freeze / "assets.json").read_text())
+    checkout = integ.verify_checkout_against_freeze(freeze_assets)
+    if not checkout["passed"]:
+        raise SystemExit(
+            f"upstream checkout identity check failed vs A1 freeze: {checkout}")
+    env = integ.measure_env_identity(args.env_python)
+    if env["env_mujoco_version"] is None:
+        raise SystemExit(f"env probe failed: {env['env_probe_error']}")
+
+    attempt_dir = integ.allocate_attempt(out_root)
+    attempt = attempt_dir.name
+
+    # Input immutability anchors: recorded in the manifest (the comparison
+    # re-verifies them later) AND checked before/after this run.
     inputs = {}
-    for demo in demos:
-        for key, p in (("npz", TEACHER_TRAJ_DIR / f"{demo}_original.npz"),
-                       ("pt", OMOMO_NEW_DIR / f"{demo}.pt")):
-            inputs[f"{demo}:{key}"] = _sha(p)
-    env_lock_sha = _sha(args.env_python.parents[2] / "uv.lock")
+    for demo in scope:
+        inputs[demo] = {
+            "npz": integ.sha256_file(TEACHER_TRAJ_DIR / f"{demo}_original.npz"),
+            "pt": integ.sha256_file(OMOMO_NEW_DIR / f"{demo}.pt"),
+        }
 
-    rows = [generate_one(d, args.env_python, out_dir, data_path) for d in demos]
+    rows = [generate_one(d, args.env_python, attempt_dir, data_path) for d in scope]
 
-    for demo in demos:
-        for key, p in (("npz", TEACHER_TRAJ_DIR / f"{demo}_original.npz"),
-                       ("pt", OMOMO_NEW_DIR / f"{demo}.pt")):
-            if inputs[f"{demo}:{key}"] != _sha(p):
-                for row in rows:
-                    if row["demo"] == demo and row["status"] == "ok":
-                        row["status"] = "input_mutated"
+    input_mutated = False
+    for demo in scope:
+        now = {
+            "npz": integ.sha256_file(TEACHER_TRAJ_DIR / f"{demo}_original.npz"),
+            "pt": integ.sha256_file(OMOMO_NEW_DIR / f"{demo}.pt"),
+        }
+        if now != inputs[demo]:
+            input_mutated = True
+            for row in rows:
+                if row["demo"] == demo and row["status"] == "ok":
+                    row["status"] = "input_mutated"
 
+    n_ok = sum(r["status"] == "ok" for r in rows)
     report = {
         "stage": "I0 U0 generation (plan §3.3/§10.1)",
         "timestamp": _dt.datetime.now().isoformat(timespec="seconds"),
-        "freeze": str(args.freeze),
-        "env_python": str(args.env_python),
-        "env_uv_lock_sha256": env_lock_sha,
-        "holosoma_checkout": "bccd4d7451640a2800ddc77e469d911a84f91994",
-        "expected": len(demos),
-        "n_ok": sum(r["status"] == "ok" for r in rows),
+        "freeze": path_for_record(freeze),
+        "attempt": attempt,
+        "attempt_scope": scope,
+        "expected_denominator": len(pilot),
+        "identity": {
+            "checkout": checkout,
+            "env": env,
+            "freeze_expected_commit": freeze_assets["upstream"]["expected_commit"],
+        },
+        "input_sha256": inputs,
+        "n_ok": n_ok,
         "n_binding_failed": sum(r["status"] == "binding_failed" for r in rows),
         "n_generation_failed": sum(r["status"] == "generation_failed" for r in rows),
         "n_postcheck_failed": sum(r["status"] == "postcheck_failed" for r in rows),
-        "input_mutated": any(r["status"] == "input_mutated" for r in rows),
+        "input_mutated": input_mutated,
         "total_wall_s": round(sum(r["wall_s"] for r in rows), 1),
         "rows": rows,
     }
-    out = out_dir / "generation_manifest.json"
+    out = attempt_dir / "generation_manifest.json"
     out.write_text(json.dumps(report, indent=2, ensure_ascii=False))
-    print(json.dumps({k: report[k] for k in report if not k.startswith("rows")}, indent=2))
-    print(f"manifest -> {out}")
-    ok = report["n_ok"] == report["expected"] and not report["input_mutated"]
-    print(f"generation: {'COMPLETE' if ok else 'INCOMPLETE'}")
+    integ.append_attempts_index(out_root, {
+        "attempt": attempt,
+        "scope": scope,
+        "expected_denominator": len(pilot),
+        "n_ok": n_ok,
+        "complete": (n_ok == len(pilot)) and not input_mutated,
+        "manifest": integ.manifest_path_record(out_root, attempt),
+    })
+    print(json.dumps({k: report[k] for k in report if k != "rows"}, indent=2))
+    print(f"manifest -> {path_for_record(out)}")
+    ok = n_ok == len(pilot) and not input_mutated
+    print(f"generation ({attempt}, scope {len(scope)}/{len(pilot)}): "
+          f"{'COMPLETE' if ok else 'INCOMPLETE'}")
     return 0 if ok else 1
 
 

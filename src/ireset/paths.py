@@ -28,3 +28,18 @@ TEACHER_MODELS_DIR = OMNIRETARGET_DIR / "models"
 DERIVED_DIR = PROJECT_ROOT / "derived"
 DERIVED_ROBOTS_DIR = DERIVED_DIR / "robots"
 DERIVED_DATA_DIR = DERIVED_DIR / "data"
+
+
+def path_for_record(p: Path) -> str:
+    """Record paths repo-relative when possible, resolved-absolute otherwise.
+
+    ``relative_to(PROJECT_ROOT)`` raises for anything outside the repo (an
+    out-of-project output directory, or a path that only reaches the repo
+    through a symlink target); those must record as absolute, never crash
+    the report write (A2 review fix 10, 2026-10-09).
+    """
+    rp = Path(p).expanduser()
+    try:
+        return str(rp.resolve().relative_to(PROJECT_ROOT))
+    except ValueError:
+        return str(rp.resolve())
