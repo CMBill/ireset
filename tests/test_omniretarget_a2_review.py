@@ -272,6 +272,17 @@ def test_penetration_max_comes_from_validator_adaptive_protocol(replayer):
 # --- review 5: artifact-level binding re-verification -------------------------
 
 
+def test_env_probe_keeps_venv_semantics():
+    # regression: resolve() followed the .venv/bin/python symlink to the bare
+    # uv-managed interpreter, breaking site-packages (probe: No module mujoco)
+    env = PROJECT_ROOT / "derived" / "upstream" / "holosoma_env" / ".venv" / "bin" / "python"
+    if not env.exists():
+        pytest.skip("independent upstream env not present")
+    ident = integ.measure_env_identity(env)
+    assert ident["env_mujoco_version"] is not None
+    assert ident["env_uv_lock_sha256"] is not None
+
+
 def _write_teacher_npz(path, layout, scene, human, fps):
     q = scene.copy()
     if layout == "published":            # stored [qw,qx,qy,qz,x,y,z] per freejoint

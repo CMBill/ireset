@@ -91,8 +91,14 @@ def verify_checkout_against_freeze(freeze_assets: dict, git_root: Path = HOLOSOM
 
 
 def measure_env_identity(env_python: Path) -> dict:
-    """Measured identity of the independent upstream uv environment."""
-    env_python = Path(env_python).expanduser().resolve()
+    """Measured identity of the independent upstream uv environment.
+
+    The interpreter path must stay UNRESOLVED: ``.venv/bin/python`` is a
+    symlink into the uv-managed CPython, and resolving it yields the bare
+    base interpreter without the venv's site-packages (pyvenv.cfg adjacency
+    broken) — the probe would then import nothing.
+    """
+    env_python = Path(env_python).expanduser().absolute()
     lock = env_python.parents[2] / "uv.lock"
     mujoco_version = subprocess.run(
         [str(env_python), "-c", "import mujoco; print(mujoco.__version__)"],
