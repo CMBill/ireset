@@ -518,6 +518,18 @@ def summarize_pairing(records: list[dict]) -> dict:
 # main
 # ---------------------------------------------------------------------------
 
+def path_for_record(p: Path) -> str:
+    """Repo-relative when inside PROJECT_ROOT, otherwise the absolute path.
+
+    A relative ``--out-root`` (resolved at entry) or an out-root outside the
+    repository must not crash the summary with ``relative_to`` ValueError.
+    """
+    try:
+        return str(p.relative_to(PROJECT_ROOT))
+    except ValueError:
+        return str(p.resolve())
+
+
 def resolve_freeze_dir(out_root: Path, run_id: str) -> tuple[Path, list[str]]:
     """Fresh attempt directory per run; never overwrite frozen evidence (review fix 1).
 
@@ -550,9 +562,12 @@ def main() -> int:
     args = ap.parse_args()
     t0 = time.time()
 
+    # Relative --out-root values are normalized once, against the current
+    # working directory, before any path math or recording happens.
+    out_root = args.out_root.expanduser().resolve()
     identity = run_identity(sys.argv)
     run_id = args.run_id or f"{_dt.date.today().strftime('%Y%m%d')}_{identity['git_short']}_a1"
-    run_dir, prior_attempts = resolve_freeze_dir(args.out_root, run_id)
+    run_dir, prior_attempts = resolve_freeze_dir(out_root, run_id)
     freeze_dir = run_dir / "freeze"
     freeze_dir.mkdir(parents=True, exist_ok=True)
     if prior_attempts:
@@ -623,7 +638,7 @@ def main() -> int:
     )
     summary = {
         "run_id": run_id,
-        "run_dir": str(run_dir.relative_to(PROJECT_ROOT)),
+        "run_dir": path_for_record(run_dir),
         "supersedes_runs": prior_attempts,
         "stage": "A1 freeze & pairing (plan §8)",
         "duration_s": round(time.time() - t0, 1),

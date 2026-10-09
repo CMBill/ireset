@@ -145,6 +145,47 @@ def test_evaluate_upstream_gate_requires_pinned_clean_commit():
     assert a1.evaluate_upstream_gate(None, None, exp)["match"] is False  # not a repo
 
 
+# --- fix 5: relative --out-root must not crash the summary ------------------------
+
+def test_path_for_record_inside_and_outside_project():
+    inside = a1.PROJECT_ROOT / "derived" / "x"
+    assert a1.path_for_record(inside) == "derived/x"
+    outside = Path("/tmp/someewhere_outside/rel_out")
+    rec = a1.path_for_record(outside)
+    assert rec == str(outside) and Path(rec).is_absolute()
+
+
+def test_cli_relative_out_root_writes_summary(tmp_path):
+    """Reported regression: relative --out-root raised ValueError at the
+    final summary write (relative_to against the absolute project root)."""
+    import subprocess
+
+    proc = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve().parents[1] / "scripts"
+                             / "omniretarget_freeze_pairing.py"),
+         "--out-root", "rel_out", "--run-id", "cli_smoke", "--skip-val31-pairing"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=600,
+    )
+    assert proc.returncode == 0, proc.stdout[-2000:] + proc.stderr[-2000:]
+    summary_path = tmp_path / "rel_out" / "cli_smoke" / "freeze" / "summary.json"
+    assert summary_path.is_file()
+    import json
+
+    summary = json.loads(summary_path.read_text())
+    assert summary["run_dir"].endswith("cli_smoke")  # absolute, outside the repo
+    assert all(summary["gates"].values())
+    # a second invocation must not overwrite the first run's evidence
+    proc2 = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve().parents[1] / "scripts"
+                             / "omniretarget_freeze_pairing.py"),
+         "--out-root", "rel_out", "--run-id", "cli_smoke", "--skip-val31-pairing"],
+        cwd=tmp_path, capture_output=True, text=True, timeout=600,
+    )
+    assert proc2.returncode == 0
+    second = tmp_path / "rel_out" / "cli_smoke.attempt_002" / "freeze" / "summary.json"
+    assert second.is_file() and summary_path.is_file()
+
+
 # --- fix 4: duplicate split entries -----------------------------------------------
 
 def test_split_verification_flags_duplicate_entries(tmp_path):
