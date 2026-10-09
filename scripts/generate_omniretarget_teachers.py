@@ -21,7 +21,10 @@ Run-integrity rules (A2 review fixes 5/6/7/10, 2026-10-09):
   them against the on-disk files) in addition to the before/after
   immutability check inside this run; round-3: the on-disk inputs and all
   A1-frozen asset files are additionally verified against the FREEZE hashes
-  and any mismatch stops the run before generation (review 3);
+  and any mismatch stops the run before generation (review 3); round-4:
+  the PT-side verification and the immutability anchors cover the ACTUAL
+  ``--data-path`` consumed by this run, and the consumed data_path is
+  recorded in the manifest (review 2);
 * the env binary must match its own lock's pinned mujoco version (a
   re-resolved environment behind an unchanged lock hash is refused);
 * the converted artifact's sha256 is recorded alongside the raw's, so the
@@ -180,11 +183,14 @@ def main() -> int:
     # Round-3 review fix 3: the inputs and the frozen assets are verified
     # against the A1 FREEZE (not merely re-recorded) — a mutated input or a
     # drifted asset must stop the run before any teacher is generated.
+    # Round-4 review fix 2: the PT side is verified at the ACTUAL --data-path
+    # this run consumes, not at the canonical directory — passing an
+    # alternate source dir must not pass a check anchored elsewhere.
     frozen_entries = json.loads(
         (freeze / "frozen_lists.json").read_text())["teacher_pilot_train6_v1"]
     freeze_inputs = integ.verify_inputs_against_freeze(
         [e for e in frozen_entries if e["demo"] in scope],
-        TEACHER_TRAJ_DIR, OMOMO_NEW_DIR)
+        TEACHER_TRAJ_DIR, data_path)
     bad_inputs = [d for d, r in freeze_inputs.items()
                   if not (r["npz_matches"] and r["pt_matches"])]
     if bad_inputs:
@@ -199,12 +205,13 @@ def main() -> int:
     attempt = attempt_dir.name
 
     # Input immutability anchors: recorded in the manifest (the comparison
-    # re-verifies them later) AND checked before/after this run.
+    # re-verifies them later) AND checked before/after this run. The PT side
+    # anchors the ACTUAL consumed data_path (round-4 review fix 2).
     inputs = {}
     for demo in scope:
         inputs[demo] = {
             "npz": integ.sha256_file(TEACHER_TRAJ_DIR / f"{demo}_original.npz"),
-            "pt": integ.sha256_file(OMOMO_NEW_DIR / f"{demo}.pt"),
+            "pt": integ.sha256_file(data_path / f"{demo}.pt"),
         }
 
     rows = [generate_one(d, args.env_python, attempt_dir, data_path) for d in scope]
@@ -213,7 +220,7 @@ def main() -> int:
     for demo in scope:
         now = {
             "npz": integ.sha256_file(TEACHER_TRAJ_DIR / f"{demo}_original.npz"),
-            "pt": integ.sha256_file(OMOMO_NEW_DIR / f"{demo}.pt"),
+            "pt": integ.sha256_file(data_path / f"{demo}.pt"),
         }
         if now != inputs[demo]:
             input_mutated = True
@@ -226,6 +233,7 @@ def main() -> int:
         "stage": "I0 U0 generation (plan §3.3/§10.1)",
         "timestamp": _dt.datetime.now().isoformat(timespec="seconds"),
         "freeze": path_for_record(freeze),
+        "data_path": path_for_record(data_path),   # the dir ACTUALLY consumed
         "attempt": attempt,
         "attempt_scope": scope,
         "expected_denominator": len(pilot),

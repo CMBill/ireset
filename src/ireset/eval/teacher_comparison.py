@@ -37,7 +37,11 @@ NEW in U0 relative to P (joint limits / velocities / penetration tolerance
 / hard contact checks), and the keyframe penetration violation ratio. All
 comparisons keep the full 6-demo denominator; missing or non-finite
 evidence (None / NaN / Inf, on every measured field — round-3 review fix
-1) forces ``incomplete`` (never a silent drop, never a KeyError).
+1) forces ``incomplete`` (never a silent drop, never a KeyError). The
+evidence check runs BEFORE the quality gates and every gate is hardened
+against deficient rows (round-4 review fix 3) — a None task error or a
+both-hands dict without keys yields ``incomplete``, not a TypeError or
+KeyError mid-computation; report serialization is None-safe as well.
 """
 
 from __future__ import annotations
@@ -110,12 +114,12 @@ class SideHandMetrics:
     def to_json(self) -> dict:
         return {
             "n_ref_frames": self.n_ref_frames,
-            "gap_p95_m": None if np.isnan(self.gap_p95_m) else round(self.gap_p95_m, 6),
-            "coverage": None if self.coverage is None else round(self.coverage, 4),
-            "valid_coverage": None if self.valid_coverage is None else round(self.valid_coverage, 4),
+            "gap_p95_m": _json_num(self.gap_p95_m),
+            "coverage": _json_num(self.coverage, 4),
+            "valid_coverage": _json_num(self.valid_coverage, 4),
             "certified_overlap_frames": self.certified_overlap_frames,
             "longest_certified_overlap": self.longest_certified_overlap,
-            "drift_max_m": None if self.drift_max_m is None else round(self.drift_max_m, 6),
+            "drift_max_m": _json_num(self.drift_max_m),
             "n_robot_intervals": self.n_robot_intervals,
             "n_robot_intervals_certified": self.n_robot_intervals_certified,
         }
@@ -132,9 +136,9 @@ class SideFootMetrics:
     def to_json(self) -> dict:
         return {
             "n_ref_frames": self.n_ref_frames,
-            "gap_p95_m": round(self.gap_p95_m, 6),
-            "speed_p95_mps": round(self.speed_p95_mps, 6),
-            "drift_max_m": round(self.drift_max_m, 6),
+            "gap_p95_m": _json_num(self.gap_p95_m),
+            "speed_p95_mps": _json_num(self.speed_p95_mps),
+            "drift_max_m": _json_num(self.drift_max_m),
             "n_speed_frames": self.n_speed_frames,
         }
 
@@ -171,16 +175,16 @@ class DemoMetrics:
         return {
             "demo": self.demo, "T": self.T, "fps": self.fps, "valid": self.valid,
             "error": self.error,
-            "penetration_max_m": None if np.isnan(self.penetration_max_m) else round(self.penetration_max_m, 6),
-            "penetration_violation_ratio": None if np.isnan(self.penetration_violation_ratio) else round(self.penetration_violation_ratio, 4),
+            "penetration_max_m": _json_num(self.penetration_max_m),
+            "penetration_violation_ratio": _json_num(self.penetration_violation_ratio, 4),
             "penetration_protocol": "validator_adaptive_slerp (violation ratio: keyframes only)",
-            "task_mpjpe_p95_m": None if np.isnan(self.task_mpjpe_p95_m) else round(self.task_mpjpe_p95_m, 6),
-            "box_ground_penetration_max_m": None if np.isnan(self.box_ground_penetration_max_m) else round(self.box_ground_penetration_max_m, 6),
+            "task_mpjpe_p95_m": _json_num(self.task_mpjpe_p95_m),
+            "box_ground_penetration_max_m": _json_num(self.box_ground_penetration_max_m),
             "foot": {k: (v.to_json() if v else None) for k, v in self.foot.items()},
             "hand": {k: (v.to_json() if v else None) for k, v in self.hand.items()},
             "both": self.both,
             "validator_status": self.validator_status,
-            "validator_worst": {k: round(v, 6) for k, v in self.validator_worst.items()},
+            "validator_worst": {k: _json_num(v) for k, v in self.validator_worst.items()},
             "validator_failed_checks": list(self.validator_failed_checks),
             "reference_intervals": [
                 {"eff": iv.effector, "start": iv.start, "end": iv.end, "sup": iv.support}
@@ -443,6 +447,17 @@ def _bad(x) -> bool:
         return True
 
 
+def _json_num(x, nd: int = 6):
+    """JSON-safe number: None for missing/non-finite (round-4 review fix 3).
+
+    ``round(None)``/``np.isnan(None)`` raise, so a deficient row (metric
+    set to None by a partial measurement) must not crash report
+    serialization — it serializes as null and the evidence gaps carry the
+    verdict instead.
+    """
+    return None if _bad(x) else round(float(x), nd)
+
+
 def _evidence_gaps(
     pilot: list[str], p: dict, u: dict, binding_passed: dict[str, bool],
 ) -> list[str]:
@@ -495,7 +510,17 @@ def evaluate_local_preferred(
     pilot: list[str], p: dict[str, DemoMetrics], u: dict[str, DemoMetrics],
     binding_passed: dict[str, bool],
 ) -> dict:
-    """Frozen §3.4 criteria. Returns the machine-readable gate record."""
+    """Frozen §3.4 criteria. Returns the machine-readable gate record.
+
+    Round-4 review fix 3: the EVIDENCE check runs before the quality gates
+    and the verdict is taken from it — a deficient row (None task error,
+    missing foot fields, a both-hands dict without keys) previously crashed
+    g2/g3/g4 mid-comparison (TypeError/KeyError) instead of yielding
+    ``incomplete``. The gate lambdas below stay in the record as diagnostics
+    and are hardened so they can never raise on the same deficient rows.
+    """
+    gaps = _evidence_gaps(pilot, p, u, binding_passed)
+    complete = not gaps
     gates: dict[str, dict] = {}
 
     def _avail(d) -> bool:
@@ -517,7 +542,9 @@ def evaluate_local_preferred(
             if not _avail(d):
                 rows[d] = False
                 continue
-            rows[d] = (u[d].task_mpjpe_p95_m <= p[d].task_mpjpe_p95_m + TASK_P95_MARGIN_M)
+            pt, ut = p[d].task_mpjpe_p95_m, u[d].task_mpjpe_p95_m
+            rows[d] = (False if _bad(pt) or _bad(ut)
+                       else bool(ut <= pt + TASK_P95_MARGIN_M))
         return {"per_demo": rows, "passed": all(rows.values())}
 
     def _g3() -> dict:
@@ -527,7 +554,12 @@ def evaluate_local_preferred(
                 rows[d] = {"passed": False, "penetration": False, "foot": {"unavailable": True}}
                 continue
             pm, um = p[d], u[d]
-            ok = um.penetration_max_m <= max(pm.penetration_max_m, PENETRATION_TOL_M) + COMPARE_TOL
+            if _bad(pm.penetration_max_m) or _bad(um.penetration_max_m):
+                pen_ok = False
+            else:
+                pen_ok = bool(um.penetration_max_m
+                              <= max(pm.penetration_max_m, PENETRATION_TOL_M) + COMPARE_TOL)
+            ok = pen_ok
             foot_detail = {}
             for s in HAND_SIDES:
                 pf, uf = pm.foot.get(s), um.foot.get(s)
@@ -538,13 +570,20 @@ def evaluate_local_preferred(
                     foot_detail[s] = "u0_missing_reference_frames"
                     ok = False
                     continue
+                if (_bad(pf.speed_p95_mps) or _bad(pf.gap_p95_m)
+                        or _bad(uf.speed_p95_mps) or _bad(uf.gap_p95_m)):
+                    # evidence gap fires for the same row; the gate record
+                    # must still be writable, not crash on None arithmetic
+                    foot_detail[s] = "foot_metric_not_finite"
+                    ok = False
+                    continue
                 s_ok = (
                     uf.speed_p95_mps <= max(pf.speed_p95_mps, FOOT_SPEED_STRICT_MPS) + COMPARE_TOL
                     and uf.gap_p95_m <= max(pf.gap_p95_m, FOOT_GAP_STRICT_M) + COMPARE_TOL
                 )
                 foot_detail[s] = bool(s_ok)
                 ok = ok and s_ok
-            rows[d] = {"passed": ok, "penetration": ok, "foot": foot_detail}
+            rows[d] = {"passed": ok, "penetration": pen_ok, "foot": foot_detail}
         return {"per_demo": rows,
                 "passed": all(r["passed"] for r in rows.values())}
 
@@ -560,12 +599,13 @@ def evaluate_local_preferred(
                 cov_gains.append(None)
                 gap_rels.append(None)
                 continue
-            if pb["valid_coverage"] is not None and ub["valid_coverage"] is not None:
-                cov_gains.append(100.0 * (ub["valid_coverage"] - pb["valid_coverage"]))
+            pvc, uvc = pb.get("valid_coverage"), ub.get("valid_coverage")
+            if not _bad(pvc) and not _bad(uvc):
+                cov_gains.append(100.0 * (uvc - pvc))
             else:
                 cov_gains.append(None)
-            pg, ug = pb["gap_series_p95_m"], ub["gap_series_p95_m"]
-            if pg is None or ug is None or pg <= 0:
+            pg, ug = pb.get("gap_series_p95_m"), ub.get("gap_series_p95_m")
+            if _bad(pg) or _bad(ug) or pg <= 0:
                 gap_rels.append(None)
             else:
                 gap_rels.append((pg - ug) / pg)
@@ -606,9 +646,9 @@ def evaluate_local_preferred(
             for s in HAND_SIDES:
                 for kind in ("hand", "foot"):
                     pa, ua = getattr(pm, kind).get(s), getattr(um, kind).get(s)
-                    if pa is None or pa.drift_max_m is None:
-                        continue        # no P reference frames for this side
-                    if ua is None or ua.drift_max_m is None:
+                    if pa is None or _bad(pa.drift_max_m):
+                        continue        # no P reference evidence for this side
+                    if ua is None or _bad(ua.drift_max_m):
                         ok = False
                         detail[f"{kind}_{s}"] = "u0_measurement_missing"
                         continue
@@ -625,12 +665,15 @@ def evaluate_local_preferred(
                     "u0_failed": list(um.validator_failed_checks),
                     "new": new_failures,
                 }
-            if (um.penetration_violation_ratio
-                    > pm.penetration_violation_ratio + COMPARE_TOL):
+            pr, ur = (pm.penetration_violation_ratio,
+                      um.penetration_violation_ratio)
+            if _bad(pr) or _bad(ur):
+                ok = False
+                detail["penetration_violation_ratio_missing"] = True
+            elif ur > pr + COMPARE_TOL:
                 ok = False
                 detail["penetration_violation_ratio_increased"] = {
-                    "p_ratio": pm.penetration_violation_ratio,
-                    "u0_ratio": um.penetration_violation_ratio,
+                    "p_ratio": pr, "u0_ratio": ur,
                 }
             rows[d] = {"passed": ok, "degradation": detail}
         return {
@@ -646,8 +689,6 @@ def evaluate_local_preferred(
     gates["g3_penetration_and_feet"] = _g3()
     gates["g4_hand_improvement"] = _g4()
     gates["g5_degradation"] = _g5()
-    gaps = _evidence_gaps(pilot, p, u, binding_passed)
-    complete = not gaps
     if not complete:
         verdict = "incomplete"
     elif all(g["passed"] for g in gates.values()):

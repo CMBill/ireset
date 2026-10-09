@@ -23,6 +23,14 @@ artifact defects are recorded instead of raised; and every invocation
 writes its own ``cmp/attempt_NNN/teacher_selection.json`` — prior verdict
 files are never overwritten, and a fresh ``--out`` directory is created.
 
+Round-4 additions (2026-10-09): the input reconciliation is THREE-WAY —
+current inputs vs the generation manifest (existing) AND current inputs vs
+the A1-FROZEN hashes — so a tampered input the manifest faithfully recorded
+still fails admission; an env probe that cannot launch (missing
+interpreter) is recorded, never raised; and the verdict's evidence check
+runs before the quality gates, so deficient rows yield ``incomplete``
+instead of a TypeError/KeyError mid-computation.
+
 P rows come from the published NPZ; U0 rows from the newest OK attempt
 artifact per demo. Every expected demo keeps a row on both sides;
 missing/invalid evidence forces ``incomplete`` (never a silent drop).
@@ -104,6 +112,23 @@ def admission_record(freeze: Path, u0_root: Path, pilot: list[str],
     freeze_assets = json.loads((freeze / "assets.json").read_text())
     checkout = integ.verify_checkout_against_freeze(freeze_assets)
     assets_check = integ.verify_assets_against_freeze(freeze_assets)
+
+    # Round-4 review fix 1: the third leg of the input reconciliation. The
+    # manifest comparison only proves "inputs now == inputs at generation";
+    # a tampered input that the generation manifest faithfully recorded
+    # passes that leg. The current inputs must ALSO match the A1-frozen
+    # hashes — this catches tampering even when consuming OLD attempts.
+    try:
+        frozen_entries = json.loads(
+            (freeze / "frozen_lists.json").read_text())["teacher_pilot_train6_v1"]
+        inputs_vs_freeze = integ.verify_inputs_against_freeze(
+            frozen_entries, TEACHER_TRAJ_DIR, OMOMO_NEW_DIR)
+        freeze_inputs_ok = all(
+            r["npz_matches"] and r["pt_matches"]
+            for r in inputs_vs_freeze.values()) and bool(inputs_vs_freeze)
+    except Exception as exc:  # noqa: BLE001 -- recorded admission failure
+        inputs_vs_freeze = {"error": f"{type(exc).__name__}: {exc}"}
+        freeze_inputs_ok = False
 
     coverage = integ.collect_u0_coverage(u0_root, pilot)
     inputs_ok = True
@@ -215,13 +240,16 @@ def admission_record(freeze: Path, u0_root: Path, pilot: list[str],
             "consistent": env_version_consistent,
         },
         "inputs_rehashed": {"all_match": inputs_ok, "by_demo": inputs_detail},
+        "inputs_vs_freeze": {"all_match": freeze_inputs_ok,
+                             "by_demo": inputs_vs_freeze},
         "artifact_chain": chain,
         "binding_recomputed": binding,
         "u0_coverage": {"missing": coverage["missing"],
                         "by_demo": {d: e["attempt"] for d, e in coverage["by_demo"].items()}},
         "passed": (checkout["passed"] and assets_check["passed"]
-                   and gen_checkout_ok and env_lock_consistent
-                   and env_version_consistent and inputs_ok and chain_ok
+                   and freeze_inputs_ok and gen_checkout_ok
+                   and env_lock_consistent and env_version_consistent
+                   and inputs_ok and chain_ok
                    and all(binding_passed.values())),
     }, binding_passed, coverage
 
@@ -290,6 +318,8 @@ def main() -> int:
             reasons.append("env_mujoco_version_inconsistent")
         if not admission["inputs_rehashed"]["all_match"]:
             reasons.append("input_hash_mismatch_vs_generation")
+        if not admission["inputs_vs_freeze"]["all_match"]:
+            reasons.append("input_hash_mismatch_vs_freeze")
         reasons += [f"artifact_chain_failed:{d}"
                     for d, r in admission["artifact_chain"].items() if not r["passed"]]
         reasons += [f"{d}:binding_recheck_failed"

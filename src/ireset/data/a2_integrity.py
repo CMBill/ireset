@@ -21,6 +21,13 @@ review fixes:
   caught); the raw->converted artifact chain is verified bit-exactly with
   the manifest's raw hash as anchor, and product defects are recorded as
   admission failures instead of exceptions.
+* round-4 additions (2026-10-09): the env probe that cannot launch at all
+  (missing interpreter, hung) is recorded as probe evidence instead of an
+  exception; the generation entry verifies the ACTUAL ``--data-path`` it
+  consumes (not just the canonical directory) against the freeze; the
+  comparison adds the third leg of the input reconciliation — current
+  inputs vs the A1-frozen hashes, so a tampered input that the generation
+  manifest faithfully recorded is still caught.
 """
 
 from __future__ import annotations
@@ -124,19 +131,26 @@ def measure_env_identity(env_python: Path) -> dict:
     """
     env_python = Path(env_python).expanduser().absolute()
     lock = env_python.parents[2] / "uv.lock"
-    mujoco_version = subprocess.run(
-        [str(env_python), "-c", "import mujoco; print(mujoco.__version__)"],
-        capture_output=True, text=True,
-    )
+    # round-4 review fix 4: a probe that cannot even LAUNCH (interpreter
+    # missing/not executable, hung) is recorded evidence, never an exception
+    # out of the comparison — the report must still be written as incomplete.
+    try:
+        probe = subprocess.run(
+            [str(env_python), "-c", "import mujoco; print(mujoco.__version__)"],
+            capture_output=True, text=True, timeout=60,
+        )
+        mujoco_version = probe.stdout.strip() if probe.returncode == 0 else None
+        probe_error = None if probe.returncode == 0 else probe.stderr[-500:]
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        mujoco_version = None
+        probe_error = f"probe launch failed: {type(exc).__name__}: {exc}"
     return {
         "env_python": str(env_python),
         "env_uv_lock_sha256": sha256_file(lock) if lock.is_file() else None,
-        "env_mujoco_version": (mujoco_version.stdout.strip()
-                               if mujoco_version.returncode == 0 else None),
+        "env_mujoco_version": mujoco_version,
         "env_lock_mujoco_version": (parse_lock_mujoco_version(lock.read_text())
                                     if lock.is_file() else None),
-        "env_probe_error": None if mujoco_version.returncode == 0
-                           else mujoco_version.stderr[-500:],
+        "env_probe_error": probe_error,
     }
 
 

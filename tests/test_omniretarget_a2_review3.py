@@ -368,13 +368,24 @@ def _build_u0_root(tmp_path, *, demos, gen_revision=None, gen_mujoco="3.10.0",
 
 
 def _admission(tmp_path, monkeypatch, u0, npz_dir, pt_dir, *, probe_mujoco="3.10.0",
-               probe_lock_version="3.10.0", probe_error=None):
+               probe_lock_version="3.10.0", probe_error=None, entries=None):
     import omniretarget_teacher_comparison as cmp_mod
 
     freeze = tmp_path / "freeze"; freeze.mkdir(exist_ok=True)
     expected = integ.read_checkout_identity()["holosoma_revision"]
     (freeze / "assets.json").write_text(json.dumps(
         {"upstream": {"expected_commit": expected}}))
+    # round-4: the comparison also reconciles current inputs against the
+    # A1-frozen hashes, so the fake freeze carries per-demo input hashes
+    # (default: the healthy on-disk values; counterexamples pass entries)
+    if entries is None:
+        entries = [
+            {"demo": d,
+             "npz_sha256": integ.sha256_file(npz_dir / f"{d}_original.npz"),
+             "pt_sha256": integ.sha256_file(pt_dir / f"{d}.pt")}
+            for d in PILOT]
+    (freeze / "frozen_lists.json").write_text(json.dumps(
+        {"teacher_pilot_train6_v1": entries}))
     monkeypatch.setattr(cmp_mod, "TEACHER_TRAJ_DIR", npz_dir)
     monkeypatch.setattr(cmp_mod, "OMOMO_NEW_DIR", pt_dir)
     monkeypatch.setattr(integ, "verify_assets_against_freeze",
@@ -495,7 +506,11 @@ def test_comparison_writes_isolated_attempts_and_creates_out_dir(
     (freeze / "assets.json").write_text(json.dumps(
         {"upstream": {"expected_commit": expected}}))
     (freeze / "frozen_lists.json").write_text(json.dumps(
-        {"teacher_pilot_train6_v1": [{"demo": d} for d in PILOT]}))
+        {"teacher_pilot_train6_v1": [
+            {"demo": d,
+             "npz_sha256": integ.sha256_file(npz_dir / f"{d}_original.npz"),
+             "pt_sha256": integ.sha256_file(pt_dir / f"{d}.pt")}
+            for d in PILOT]}))
     np.savez(freeze / "pairing_source_boxes.npz",
              **{d: np.zeros((5, 7)) for d in PILOT})
 
