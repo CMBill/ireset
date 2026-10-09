@@ -89,7 +89,8 @@ def run_identity(argv: list[str]) -> dict:
             untracked[rel] = pairing.sha256_hex(PROJECT_ROOT / rel)
     try:
         hs_rev = _git(["rev-parse", "HEAD"], cwd=HOLOSOMA_DIR)
-        hs_dirty = bool(_git(["status", "--porcelain"], cwd=HOLOSOMA_DIR))
+        # -uall: sparse checkout can hide untracked files from plain status
+        hs_dirty = bool(_git(["status", "--porcelain", "-uall"], cwd=HOLOSOMA_DIR))
     except subprocess.CalledProcessError:
         hs_rev, hs_dirty = None, None
     import mujoco
