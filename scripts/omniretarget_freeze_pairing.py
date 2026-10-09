@@ -32,6 +32,7 @@ import datetime as _dt
 import hashlib
 import json
 import pickle
+import re
 import subprocess
 import sys
 import time
@@ -168,11 +169,16 @@ def census_originals() -> tuple[dict, dict]:
     return report, frames
 
 
-def verify_split(frames: dict, census_reserve: set[str]) -> dict:
+def verify_split(frames: dict, census_reserve: set[str], split_dir: Path = SPLIT_DIR) -> dict:
     split_json = {
-        s: json.loads((SPLIT_DIR / f"{s}.json").read_text()) for s in ("train", "val", "test")
+        s: json.loads((split_dir / f"{s}.json").read_text()) for s in ("train", "val", "test")
     }
-    demo_sets = {s: set(j["demos"]) for s, j in split_json.items()}
+    # Duplicate entries would silently vanish in set(); check raw lists first.
+    entries = {s: list(j["demos"]) for s, j in split_json.items()}
+    duplicates = {
+        s: sorted({d for d in lst if lst.count(d) > 1}) for s, lst in entries.items()
+    }
+    demo_sets = {s: set(lst) for s, lst in entries.items()}
     union = demo_sets["train"] | demo_sets["val"] | demo_sets["test"]
     overlap = (
         (demo_sets["train"] & demo_sets["val"])
@@ -181,7 +187,7 @@ def verify_split(frames: dict, census_reserve: set[str]) -> dict:
     )
     on_disk = set(frames)
     manifest_reserve = set(
-        json.loads((SPLIT_DIR / "manifest.json").read_text())["unsupervised_reserve_no_teacher"]
+        json.loads((split_dir / "manifest.json").read_text())["unsupervised_reserve_no_teacher"]
     )
     per_split = {}
     for s, demos in demo_sets.items():
@@ -189,7 +195,9 @@ def verify_split(frames: dict, census_reserve: set[str]) -> dict:
         for d in sorted(demos):
             by_subj[pairing.subject_of(d)].append(d)
         per_split[s] = {
+            "entries": len(entries[s]),
             "demos": len(demos),
+            "duplicate_entries": duplicates[s],
             "subjects": sorted(by_subj),
             "demos_per_subject": {k: len(v) for k, v in sorted(by_subj.items())},
             "frames": int(sum(frames[d][0] for d in demos if d in frames)),
@@ -199,7 +207,9 @@ def verify_split(frames: dict, census_reserve: set[str]) -> dict:
             },
         }
     checks = {
-        "counts_250_31_31": [len(demo_sets[s]) for s in ("train", "val", "test")] == [250, 31, 31],
+        "counts_250_31_31": [len(entries[s]) for s in ("train", "val", "test")] == [250, 31, 31],
+        "no_duplicate_entries": all(not v for v in duplicates.values()),
+        "duplicate_entries": duplicates,
         "no_overlap": not overlap,
         "overlap_demos": sorted(overlap),
         "union_equals_disk": union == on_disk,
@@ -215,6 +225,7 @@ def verify_split(frames: dict, census_reserve: set[str]) -> dict:
     }
     passed = (
         checks["counts_250_31_31"]
+        and checks["no_duplicate_entries"]
         and checks["no_overlap"]
         and checks["union_equals_disk"]
         and checks["subjects_all_splits"]
@@ -308,12 +319,91 @@ def hash_tree(root: Path) -> dict[str, dict]:
     return out
 
 
+def collect_locked_asset_closure(
+    xml_paths: list[Path], urdf_path: Path, base_for_rel: Path = PROJECT_ROOT
+) -> dict[str, dict]:
+    """Hash every asset referenced by the locked models (review fix 2).
+
+    MuJoCo semantics: ``<mesh file=...>`` resolves against the XML's
+    ``compiler meshdir``; URDF ``filename=`` resolves against the URDF
+    directory. Returns {relpath: {bytes, sha256, referenced_by}}; a missing
+    referenced file is recorded with ``missing: true`` instead of hashing.
+    """
+    refs: dict[Path, set[str]] = {}
+    for xml in xml_paths:
+        text = xml.read_text()
+        m = re.search(r'meshdir="([^"]+)"', text)
+        meshdir = (xml.parent / m.group(1)).resolve() if m else xml.parent
+        for f in set(re.findall(r'file="([^"]+)"', text)):
+            p = Path(f) if f.startswith("/") else (meshdir / f)
+            refs.setdefault(p.resolve(), set()).add(xml.name)
+    for f in set(re.findall(r'filename="([^"]+)"', urdf_path.read_text())):
+        p = Path(f) if f.startswith("/") else (urdf_path.parent / f)
+        refs.setdefault(p.resolve(), set()).add(urdf_path.name)
+
+    out: dict[str, dict] = {}
+    for p in sorted(refs):
+        rel = str(p.relative_to(base_for_rel))
+        if p.is_file():
+            out[rel] = {"bytes": p.stat().st_size, "sha256": pairing.sha256_hex(p),
+                        "referenced_by": sorted(refs[p])}
+        else:
+            out[rel] = {"missing": True, "referenced_by": sorted(refs[p])}
+    return out
+
+
+def compare_tree_to_manifest(
+    tree: dict[str, dict], manifest_files: dict, prefix: str
+) -> dict:
+    """Compare a hashed tree against resources/manifest.json entries (review fix 3).
+
+    Both sides are keyed relative to ``prefix``; tree files outside the
+    prefix are flagged rather than silently ignored.
+    """
+    registered = {
+        k[len(prefix):]: v for k, v in manifest_files.items() if k.startswith(prefix)
+    }
+    tree_rel: dict[str, dict] = {}
+    mismatches = []
+    for k, meta in sorted(tree.items()):
+        if k.startswith(prefix):
+            tree_rel[k[len(prefix):]] = meta
+        else:
+            mismatches.append(f"outside_prefix:{k}")
+    for rel, meta in sorted(tree_rel.items()):
+        reg = registered.get(rel)
+        if reg is None:
+            mismatches.append(f"not_in_manifest:{rel}")
+        elif meta["sha256"] != reg.get("sha256") or meta["bytes"] != reg.get("bytes"):
+            mismatches.append(f"hash_or_size_mismatch:{rel}")
+    for rel in sorted(set(registered) - set(tree_rel)):
+        mismatches.append(f"missing_on_disk:{rel}")
+    return {
+        "tree_files": len(tree),
+        "manifest_files": len(registered),
+        "match": not mismatches,
+        "mismatches": mismatches,
+    }
+
+
+def evaluate_upstream_gate(revision: str | None, dirty: bool | None, expected: str) -> dict:
+    """Upstream checkout must sit at the pinned commit on a clean tree (review fix 3)."""
+    return {
+        "revision": revision,
+        "expected": expected,
+        "dirty": dirty,
+        "match": revision == expected and dirty is False,
+    }
+
+
 def audit_assets() -> dict:
     res_manifest = json.loads(RESOURCE_MANIFEST.read_text())
     archive = OMNIRETARGET_DIR / "robot-object.zip"
     archive_sha = pairing.sha256_hex(archive)
     with open(HEIGHT_DICT, "rb") as f:
         heights = {str(k): float(v) for k, v in sorted(pickle.load(f).items())}
+    manifest_files = res_manifest.get("files", {})
+    models_tree = hash_tree(OMNIRETARGET_DIR / "models")
     return {
         "published": {
             "revision": res_manifest["omniretarget"]["revision"],
@@ -322,8 +412,11 @@ def audit_assets() -> dict:
             "archive_sha256_matches_manifest": (
                 archive_sha == res_manifest["omniretarget"]["archive_sha256"]
             ),
-            "models": hash_tree(OMNIRETARGET_DIR / "models"),
+            "models": models_tree,
             "models_file_count_manifest": res_manifest["omniretarget"]["verified_model_files"],
+            "models_vs_manifest": compare_tree_to_manifest(
+                models_tree, manifest_files, "resources/data/omniretarget/models/"
+            ),
         },
         "upstream": {
             "url": res_manifest["holosoma"]["url"],
@@ -333,6 +426,13 @@ def audit_assets() -> dict:
             "subject_heights_m": heights,
         },
         "locked_g1": hash_tree(DERIVED_ROBOTS_DIR),
+        # Review fix 2: the locked XML meshes resolve into
+        # resources/robots/g1_holosoma/assets (outside the derived tree).
+        "locked_g1_asset_closure": collect_locked_asset_closure(
+            [DERIVED_ROBOTS_DIR / "g1_29dof_locked.xml",
+             DERIVED_ROBOTS_DIR / "g1_29dof_locked_w_largebox.xml"],
+            DERIVED_ROBOTS_DIR / "g1_29dof_locked.urdf",
+        ),
         "largebox": hash_tree(LARGEBOX_DIR),
     }
 
@@ -418,6 +518,25 @@ def summarize_pairing(records: list[dict]) -> dict:
 # main
 # ---------------------------------------------------------------------------
 
+def resolve_freeze_dir(out_root: Path, run_id: str) -> tuple[Path, list[str]]:
+    """Fresh attempt directory per run; never overwrite frozen evidence (review fix 1).
+
+    A crashed or partial run leaves a non-empty directory without
+    ``summary.json``; the next run allocates ``<run_id>.attempt_002`` and so
+    on instead of mixing files across runs. Prior attempt dirs are returned
+    so the summary can register what this run supersedes.
+    """
+    def non_empty(p: Path) -> bool:
+        return p.exists() and any(p.iterdir())
+
+    prior: list[str] = []
+    cand = out_root / run_id
+    while non_empty(cand):
+        prior.append(cand.name)
+        cand = out_root / f"{run_id}.attempt_{len(prior) + 1:03d}"
+    return cand, prior
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument(
@@ -433,8 +552,11 @@ def main() -> int:
 
     identity = run_identity(sys.argv)
     run_id = args.run_id or f"{_dt.date.today().strftime('%Y%m%d')}_{identity['git_short']}_a1"
-    freeze_dir = args.out_root / run_id / "freeze"
+    run_dir, prior_attempts = resolve_freeze_dir(args.out_root, run_id)
+    freeze_dir = run_dir / "freeze"
     freeze_dir.mkdir(parents=True, exist_ok=True)
+    if prior_attempts:
+        print(f"[a1] prior non-empty run dirs kept as evidence: {prior_attempts}")
 
     print(f"[a1] run_id={run_id} rev={identity['git_short']} dirty={identity['git_dirty']}")
     print(f"[a1] census: reading {312} original NPZ headers ...")
@@ -491,8 +613,18 @@ def main() -> int:
         **{demo: arr for demo, arr in sorted(source_boxes.items())},
     )
 
+    upstream_gate = evaluate_upstream_gate(
+        identity["holosoma_revision"], identity["holosoma_dirty"],
+        assets["upstream"]["expected_commit"],
+    )
+    models_check = assets["published"]["models_vs_manifest"]
+    closure_missing = sorted(
+        rel for rel, meta in assets["locked_g1_asset_closure"].items() if meta.get("missing")
+    )
     summary = {
         "run_id": run_id,
+        "run_dir": str(run_dir.relative_to(PROJECT_ROOT)),
+        "supersedes_runs": prior_attempts,
         "stage": "A1 freeze & pairing (plan §8)",
         "duration_s": round(time.time() - t0, 1),
         "gates": {
@@ -505,7 +637,19 @@ def main() -> int:
             "split_verification": split["passed"],
             "frozen_lists": lists["passed"],
             "assets_archive_matches_manifest": assets["published"]["archive_sha256_matches_manifest"],
+            "upstream_commit_pinned": upstream_gate["match"],
+            "published_models_match_manifest": (
+                models_check["match"]
+                and models_check["tree_files"] == assets["published"]["models_file_count_manifest"]
+            ),
+            "locked_asset_closure_complete": not closure_missing,
             "pairing_pilot6": sum_pilot["all_passed"],
+        },
+        "gate_evidence": {
+            "upstream": upstream_gate,
+            "models_vs_manifest": models_check,
+            "locked_asset_closure_missing": closure_missing,
+            "locked_asset_closure_files": len(assets["locked_g1_asset_closure"]),
         },
         "joint_names_locked_order": list(spec.joint_names),
         **summary_out,
