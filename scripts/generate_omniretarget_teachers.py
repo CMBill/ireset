@@ -19,7 +19,13 @@ Run-integrity rules (A2 review fixes 5/6/7/10, 2026-10-09):
   so a partial retry reports INCOMPLETE, never a shrunken COMPLETE;
 * input hashes are recorded in the manifest (the comparison re-verifies
   them against the on-disk files) in addition to the before/after
-  immutability check inside this run;
+  immutability check inside this run; round-3: the on-disk inputs and all
+  A1-frozen asset files are additionally verified against the FREEZE hashes
+  and any mismatch stops the run before generation (review 3);
+* the env binary must match its own lock's pinned mujoco version (a
+  re-resolved environment behind an unchanged lock hash is refused);
+* the converted artifact's sha256 is recorded alongside the raw's, so the
+  comparison can verify the full raw->converted chain (review 5);
 * output directories must fully resolve under ``derived/`` (symlink targets
   under resources/ are refused).
 
@@ -120,6 +126,7 @@ def generate_one(
         row["status"] = "ok" if binding.passed else "binding_failed"
         row["binding"] = binding.to_json_dict()
         row["raw_sha256"] = integ.sha256_file(raw_path)
+        row["converted_sha256"] = integ.sha256_file(conv_path)
         row["converted"] = path_for_record(conv_path)
         row["T"] = int(scene_u0.shape[0])
     except Exception as exc:
@@ -164,6 +171,29 @@ def main() -> int:
     env = integ.measure_env_identity(args.env_python)
     if env["env_mujoco_version"] is None:
         raise SystemExit(f"env probe failed: {env['env_probe_error']}")
+    if env["env_lock_mujoco_version"] != env["env_mujoco_version"]:
+        raise SystemExit(
+            "env binary drifted from its own lock: probed mujoco "
+            f"{env['env_mujoco_version']} vs lock-pinned "
+            f"{env['env_lock_mujoco_version']}")
+
+    # Round-3 review fix 3: the inputs and the frozen assets are verified
+    # against the A1 FREEZE (not merely re-recorded) — a mutated input or a
+    # drifted asset must stop the run before any teacher is generated.
+    frozen_entries = json.loads(
+        (freeze / "frozen_lists.json").read_text())["teacher_pilot_train6_v1"]
+    freeze_inputs = integ.verify_inputs_against_freeze(
+        [e for e in frozen_entries if e["demo"] in scope],
+        TEACHER_TRAJ_DIR, OMOMO_NEW_DIR)
+    bad_inputs = [d for d, r in freeze_inputs.items()
+                  if not (r["npz_matches"] and r["pt_matches"])]
+    if bad_inputs:
+        raise SystemExit(
+            f"inputs no longer match the A1-frozen hashes: {bad_inputs}")
+    freeze_assets_check = integ.verify_assets_against_freeze(freeze_assets)
+    if not freeze_assets_check["passed"]:
+        raise SystemExit(
+            f"A1-frozen assets drifted: {freeze_assets_check}")
 
     attempt_dir = integ.allocate_attempt(out_root)
     attempt = attempt_dir.name
@@ -203,6 +233,10 @@ def main() -> int:
             "checkout": checkout,
             "env": env,
             "freeze_expected_commit": freeze_assets["upstream"]["expected_commit"],
+        },
+        "freeze_verification": {
+            "inputs_vs_freeze": freeze_inputs,
+            "assets_vs_freeze": freeze_assets_check,
         },
         "input_sha256": inputs,
         "n_ok": n_ok,

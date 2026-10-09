@@ -108,7 +108,7 @@ def test_nan_task_and_missing_side_measurements_are_incomplete_not_complete():
     u_over = {PILOT[0]: {"task": float("nan")}}
     v, *_ = _run(u_over=u_over)
     assert v["verdict"] == "incomplete"
-    assert any("nan_task" in g for g in v["evidence_gaps"])
+    assert any("task_mpjpe_p95_m_not_finite" in g for g in v["evidence_gaps"])
 
     # reference support frames exist but the U0 foot measurement is absent
     u_over2 = {PILOT[1]: {"foot": False}}
@@ -325,8 +325,13 @@ def test_binding_recomputed_from_artifacts_catches_tampering(tmp_path):
 def _fake_freeze(tmp_path):
     freeze = tmp_path / "freeze"
     freeze.mkdir()
+    # round-3: the generation entry verifies inputs/assets against the
+    # freeze before running -- entries carry the (patched) hashes and the
+    # asset check is patched to a passing stub
     (freeze / "frozen_lists.json").write_text(json.dumps(
-        {"teacher_pilot_train6_v1": [{"demo": d} for d in PILOT]}))
+        {"teacher_pilot_train6_v1": [
+            {"demo": d, "npz_sha256": "fakehash", "pt_sha256": "fakehash"}
+            for d in PILOT]}))
     (freeze / "assets.json").write_text(json.dumps(
         {"upstream": {"expected_commit": integ.read_checkout_identity()["holosoma_revision"]}}))
     return freeze
@@ -349,7 +354,12 @@ def _run_generation(monkeypatch, tmp_path, freeze, out_dir, demos=None):
     monkeypatch.setattr(integ, "sha256_file", lambda p: "fakehash")
     monkeypatch.setattr(integ, "measure_env_identity",
                         lambda p: {"env_python": "x", "env_uv_lock_sha256": "locksha",
-                                   "env_mujoco_version": "3.10.0", "env_probe_error": None})
+                                   "env_mujoco_version": "3.10.0",
+                                   "env_lock_mujoco_version": "3.10.0",
+                                   "env_probe_error": None})
+    monkeypatch.setattr(integ, "verify_assets_against_freeze",
+                        lambda a, root=None: {"n_checked": 1, "mismatched": [],
+                                              "missing": [], "passed": True})
     argv = ["prog", "--freeze", str(freeze), "--out-dir", str(out_dir)]
     if demos:
         argv += ["--demos", demos]

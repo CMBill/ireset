@@ -13,6 +13,16 @@ against the generation manifest; and the U0-vs-P binding is recomputed
 bit-exactly from the converted and published NPZs. Any mismatch or any
 frozen pilot demo without an OK artifact forces ``incomplete``.
 
+Round-3 additions (2026-10-09): the A1-frozen ASSET hashes are re-verified;
+the GENERATION-time checkout recorded in each consumed attempt manifest is
+checked against the freeze; the env check adds the lock-pinned mujoco
+version and the actually-importable binary to the lock-sha comparison; the
+raw->converted artifact chain is verified bit-exactly per demo (robot
+labels cannot be rewritten between generation and comparison); per-demo
+artifact defects are recorded instead of raised; and every invocation
+writes its own ``cmp/attempt_NNN/teacher_selection.json`` — prior verdict
+files are never overwritten, and a fresh ``--out`` directory is created.
+
 P rows come from the published NPZ; U0 rows from the newest OK attempt
 artifact per demo. Every expected demo keeps a row on both sides;
 missing/invalid evidence forces ``incomplete`` (never a silent drop).
@@ -76,73 +86,142 @@ def measure_source(
 
 def admission_record(freeze: Path, u0_root: Path, pilot: list[str],
                      env_python: Path | None = None) -> dict:
-    """Artifact-level admission: identity, inputs, bindings (review fix 5)."""
+    """Artifact-level admission: identity, inputs, artifact chain, bindings.
+
+    Round-3 extensions (2026-10-09): the GENERATION-time checkout recorded
+    in each consumed attempt manifest is verified against the A1 freeze (a
+    wrong generation checkout behind a correct current checkout is caught);
+    the env check is three-way — lock sha recorded at generation vs lock on
+    disk now, mujoco version recorded at generation vs lock-pinned version
+    vs the version actually importable now (an unchanged lock with a drifted
+    binary, or a failed probe, fails admission); and the raw->converted
+    artifact chain is re-verified per demo (raw hash vs the generation
+    manifest, conversion recomputed bit-exactly), so robot labels cannot be
+    rewritten between generation and comparison. Every per-demo artifact
+    defect is RECORDED (never raised) and forces ``incomplete`` — a broken
+    NPZ must not crash the report (review fix 7).
+    """
     freeze_assets = json.loads((freeze / "assets.json").read_text())
     checkout = integ.verify_checkout_against_freeze(freeze_assets)
+    assets_check = integ.verify_assets_against_freeze(freeze_assets)
 
     coverage = integ.collect_u0_coverage(u0_root, pilot)
     inputs_ok = True
     inputs_detail: dict[str, dict] = {}
     env_lock_shas: set[str] = set()
+    env_versions: set[str] = set()
     env_pythons: set[str] = set()
+    gen_checkout: dict[str, dict] = {}
+    chain: dict[str, dict] = {}
     binding: dict[str, dict] = {}
     binding_passed: dict[str, bool] = {}
+    expected_commit = freeze_assets["upstream"]["expected_commit"]
     for demo, entry in sorted(coverage["by_demo"].items()):
-        manifest = integ.load_attempt_manifest(u0_root, entry["attempt"])
-        env_lock_shas.add(manifest.get("identity", {}).get("env", {}).get("env_uv_lock_sha256"))
-        env_pythons.add(manifest.get("identity", {}).get("env", {}).get("env_python"))
-        # inputs re-hashed NOW against what generation recorded
-        demo_inputs = integ.verify_inputs_against_manifest(
-            manifest, TEACHER_TRAJ_DIR, OMOMO_NEW_DIR)
-        row = demo_inputs.get(demo, {})
-        inputs_detail[demo] = {
-            "attempt": entry["attempt"],
-            "npz_matches": row.get("npz_matches"),
-            "pt_matches": row.get("pt_matches"),
+        attempt = entry["attempt"]
+        manifest = integ.load_attempt_manifest(u0_root, attempt)
+        ident = manifest.get("identity", {})
+        env_lock_shas.add(ident.get("env", {}).get("env_uv_lock_sha256"))
+        env_versions.add(ident.get("env", {}).get("env_mujoco_version"))
+        env_pythons.add(ident.get("env", {}).get("env_python"))
+        recorded_rev = ident.get("checkout", {}).get("holosoma_revision")
+        recorded_clean = not ident.get("checkout", {}).get("holosoma_dirty", True)
+        gen_checkout[demo] = {
+            "attempt": attempt,
+            "recorded_revision": recorded_rev,
+            "matches_freeze": recorded_rev == expected_commit,
+            "recorded_clean": recorded_clean,
         }
-        if not (row.get("npz_matches") and row.get("pt_matches")):
+        # inputs re-hashed NOW against what generation recorded; a missing
+        # file is an admission failure for this demo, not a crash
+        try:
+            demo_inputs = integ.verify_inputs_against_manifest(
+                manifest, TEACHER_TRAJ_DIR, OMOMO_NEW_DIR)
+            row = demo_inputs.get(demo, {})
+            inputs_detail[demo] = {
+                "attempt": attempt,
+                "npz_matches": row.get("npz_matches"),
+                "pt_matches": row.get("pt_matches"),
+            }
+            if not (row.get("npz_matches") and row.get("pt_matches")):
+                inputs_ok = False
+        except Exception as exc:  # noqa: BLE001 -- recorded admission failure
+            inputs_detail[demo] = {"attempt": attempt,
+                                   "error": f"{type(exc).__name__}: {exc}"}
             inputs_ok = False
+        # raw -> converted chain from the artifacts (review fix 5)
+        chain[demo] = integ.verify_artifact_chain(
+            u0_root, attempt, demo, integ.manifest_row_for(manifest, demo) or {})
         # binding recomputed from the artifacts on disk
-        check = integ.verify_binding_from_artifacts(
-            Path(entry["converted"]),
-            TEACHER_TRAJ_DIR / f"{demo}_original.npz",
-        )
-        binding[demo] = {
-            "recomputed": check.to_json_dict(),
-            "manifest_status": entry["manifest_status"],
-            "manifest_binding_passed": entry["manifest_binding_passed"],
-            "manifest_agrees": (entry["manifest_status"] == "ok"
-                                and entry["manifest_binding_passed"]),
-        }
-        binding_passed[demo] = check.passed
+        try:
+            check = integ.verify_binding_from_artifacts(
+                Path(entry["converted"]),
+                TEACHER_TRAJ_DIR / f"{demo}_original.npz",
+            )
+            binding[demo] = {
+                "recomputed": check.to_json_dict(),
+                "manifest_status": entry["manifest_status"],
+                "manifest_binding_passed": entry["manifest_binding_passed"],
+                "manifest_agrees": (entry["manifest_status"] == "ok"
+                                    and entry["manifest_binding_passed"]),
+            }
+            binding_passed[demo] = check.passed
+        except Exception as exc:  # noqa: BLE001 -- recorded admission failure
+            binding_passed[demo] = False
+            binding[demo] = {"recomputed": None,
+                             "error": f"{type(exc).__name__}: {exc}"}
     for demo in coverage["missing"]:
         binding_passed[demo] = False
         binding[demo] = {"recomputed": None, "note": "no OK artifact in any attempt"}
 
     # env probed NOW at the python the generation actually used (falling
     # back to the canonical independent env), compared against what the
-    # generation manifests recorded
+    # generation manifests recorded AND against the version the env's own
+    # lock pins (round-3 review fix 4)
     default_env = PROJECT_ROOT / "derived" / "upstream" / "holosoma_env" / ".venv" / "bin" / "python"
     env_python = Path(env_python) if env_python else Path(next(
         (p for p in env_pythons if p), str(default_env)))
     env_now = integ.measure_env_identity(env_python)
+    recorded_locks = sorted(x for x in env_lock_shas if x)
+    recorded_versions = sorted(x for x in env_versions if x)
     env_lock_consistent = (
         len(env_lock_shas) <= 1
         and None not in env_lock_shas
         and env_now["env_uv_lock_sha256"] in env_lock_shas
     )
+    env_version_consistent = (
+        len(env_versions) == 1
+        and None not in env_versions
+        and env_now["env_mujoco_version"] is not None
+        and env_now["env_mujoco_version"] in env_versions
+        and env_now["env_lock_mujoco_version"] == env_now["env_mujoco_version"]
+    )
+    gen_checkout_ok = all(
+        r["matches_freeze"] and r["recorded_clean"] for r in gen_checkout.values())
+    chain_ok = all(r["passed"] for r in chain.values()) if chain else False
     return {
         "checkout_vs_freeze": checkout,
+        "assets_vs_freeze": assets_check,
+        "generation_checkout": gen_checkout,
         "env_lock": {
             "measured_now": env_now["env_uv_lock_sha256"],
-            "recorded_at_generation": sorted(x for x in env_lock_shas if x),
+            "recorded_at_generation": recorded_locks,
             "consistent": env_lock_consistent,
         },
+        "env_mujoco": {
+            "probed_now": env_now["env_mujoco_version"],
+            "lock_pinned": env_now["env_lock_mujoco_version"],
+            "recorded_at_generation": recorded_versions,
+            "probe_error": env_now["env_probe_error"],
+            "consistent": env_version_consistent,
+        },
         "inputs_rehashed": {"all_match": inputs_ok, "by_demo": inputs_detail},
+        "artifact_chain": chain,
         "binding_recomputed": binding,
         "u0_coverage": {"missing": coverage["missing"],
                         "by_demo": {d: e["attempt"] for d, e in coverage["by_demo"].items()}},
-        "passed": (checkout["passed"] and env_lock_consistent and inputs_ok
+        "passed": (checkout["passed"] and assets_check["passed"]
+                   and gen_checkout_ok and env_lock_consistent
+                   and env_version_consistent and inputs_ok and chain_ok
                    and all(binding_passed.values())),
     }, binding_passed, coverage
 
@@ -159,6 +238,8 @@ def main() -> int:
     freeze = args.freeze.expanduser().resolve()
     u0_root = args.u0_dir.expanduser().resolve()
     out_dir = integ.guard_output_dir(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)   # round-3 fix 8: a fresh
+    # --out path is legal under derived/ and must not crash the report write
 
     lists = json.loads((freeze / "frozen_lists.json").read_text())
     pilot = [e["demo"] for e in lists["teacher_pilot_train6_v1"]]
@@ -191,16 +272,26 @@ def main() -> int:
 
     verdict = evaluate_local_preferred(pilot, p_metrics, u_metrics, binding_passed)
     # Admission failures are verdict-level: a wrong checkout, a drifted env
-    # lock, mutated inputs or a failed binding recheck must NEVER surface as
-    # local_preferred with complete evidence (review fix 5).
+    # (lock or binary), mutated inputs or assets, a broken artifact chain or
+    # a failed binding recheck must NEVER surface as local_preferred with
+    # complete evidence (review fixes 5 and 3/4).
     if not admission["passed"]:
         reasons = []
         if not admission["checkout_vs_freeze"]["passed"]:
             reasons.append("checkout_identity_mismatch")
+        if not admission["assets_vs_freeze"]["passed"]:
+            reasons.append("frozen_assets_drifted")
+        reasons += [f"generation_checkout:{d}"
+                    for d, r in admission["generation_checkout"].items()
+                    if not (r["matches_freeze"] and r["recorded_clean"])]
         if not admission["env_lock"]["consistent"]:
             reasons.append("env_lock_drift_vs_generation")
+        if not admission["env_mujoco"]["consistent"]:
+            reasons.append("env_mujoco_version_inconsistent")
         if not admission["inputs_rehashed"]["all_match"]:
             reasons.append("input_hash_mismatch_vs_generation")
+        reasons += [f"artifact_chain_failed:{d}"
+                    for d, r in admission["artifact_chain"].items() if not r["passed"]]
         reasons += [f"{d}:binding_recheck_failed"
                     for d, ok in binding_passed.items() if not ok]
         verdict["evidence_gaps"] = list(verdict["evidence_gaps"]) + [
@@ -219,6 +310,7 @@ def main() -> int:
             "env_mujoco_version": None,   # filled from the generation manifest below
             "generation_attempts": [a["attempt"] for a in integ.load_attempts(u0_root)],
         },
+        "comparison_attempt": None,       # filled below (isolated attempts)
         "u1": "not_applicable (not pre-registered this round, §3.3)",
         "metrics": {
             "P": {d: p_metrics[d].to_json() for d in pilot},
@@ -241,8 +333,20 @@ def main() -> int:
         selection["u0_identity"]["env_mujoco_version"] = (
             manifest.get("identity", {}).get("env", {}).get("env_mujoco_version"))
 
-    out = out_dir / "teacher_selection.json"
+    # Round-3 review fix 6: the comparison writes its own attempt directory
+    # — an older teacher_selection.json is never overwritten, and an
+    # interrupted run leaves the prior verdict untouched.
+    cmp_root = out_dir / "cmp"
+    attempt_dir = integ.allocate_attempt(cmp_root)
+    selection["comparison_attempt"] = attempt_dir.name
+    out = attempt_dir / "teacher_selection.json"
     out.write_text(json.dumps(selection, indent=2, ensure_ascii=False))
+    integ.append_attempts_index(cmp_root, {
+        "attempt": attempt_dir.name,
+        "verdict": selection["verdict"],
+        "complete_evidence": selection["verdict_record"]["complete_evidence"],
+        "report": path_for_record(out),
+    })
     print(json.dumps({k: verdict[k] for k in ("complete_evidence", "verdict")}, indent=2))
     for name, g in verdict["gates"].items():
         print(f"  {name}: {'PASS' if g['passed'] else 'FAIL'}")

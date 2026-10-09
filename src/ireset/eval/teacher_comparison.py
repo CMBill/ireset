@@ -31,10 +31,13 @@ protocol):
 
 Gates (§3.4 items 1-5): items 1-4 carry the frozen numeric bounds; item 5
 (no buying contact gains with larger penetration/drift/slip/task error) is
-enforced by ``g5_degradation`` over the drift family — the other families
-are already covered by g2/g3 — with a registered working margin. All
+enforced by ``g5_degradation`` over three families — within-interval hand
+and foot anchor drift (registered working margin), validator hard failures
+NEW in U0 relative to P (joint limits / velocities / penetration tolerance
+/ hard contact checks), and the keyframe penetration violation ratio. All
 comparisons keep the full 6-demo denominator; missing or non-finite
-evidence forces ``incomplete`` (never a silent drop, never a KeyError).
+evidence (None / NaN / Inf, on every measured field — round-3 review fix
+1) forces ``incomplete`` (never a silent drop, never a KeyError).
 """
 
 from __future__ import annotations
@@ -152,6 +155,11 @@ class DemoMetrics:
     both: dict = field(default_factory=dict)
     validator_status: str | None = None
     validator_worst: dict = field(default_factory=dict)
+    #: validator checks that FAILED for this source (round-3 review fix 2:
+    #: a U0 that newly fails a check P passed — joint limits, velocities,
+    #: hard contact checks — is a §3.4 item 3 degradation even when the
+    #: aggregate p95 gates still hold)
+    validator_failed_checks: list = field(default_factory=list)
     reference_intervals: list = field(default_factory=list)
     #: reference-interval frame counts per side, recorded even when the
     #: measurement itself is missing — that combination is exactly the
@@ -173,6 +181,7 @@ class DemoMetrics:
             "both": self.both,
             "validator_status": self.validator_status,
             "validator_worst": {k: round(v, 6) for k, v in self.validator_worst.items()},
+            "validator_failed_checks": list(self.validator_failed_checks),
             "reference_intervals": [
                 {"eff": iv.effector, "start": iv.start, "end": iv.end, "sup": iv.support}
                 for iv in self.reference_intervals
@@ -359,6 +368,8 @@ class TeacherQualityReplayer:
             box_ground_penetration_max_m=float(box_ground_pen),
             validator_status=rep.status,
             validator_worst={k: v.worst for k, v in rep.checks.items()},
+            validator_failed_checks=sorted(
+                k for k, v in rep.checks.items() if not v.passed),
             reference_intervals=ref_sched.intervals,
         )
 
@@ -416,6 +427,22 @@ class TeacherQualityReplayer:
         return m
 
 
+def _bad(x) -> bool:
+    """Missing or non-finite measurement (round-3 review fix 1).
+
+    ``isnan`` alone lets ``inf`` through and ``None`` crashed the checks;
+    every measured quantity below is decidable evidence, so None/NaN/Inf
+    all mean the comparison lacks evidence — ``incomplete``, never a
+    verdict on absent data.
+    """
+    if x is None:
+        return True
+    try:
+        return not bool(np.isfinite(x))
+    except (TypeError, ValueError):
+        return True
+
+
 def _evidence_gaps(
     pilot: list[str], p: dict, u: dict, binding_passed: dict[str, bool],
 ) -> list[str]:
@@ -438,20 +465,29 @@ def _evidence_gaps(
             gaps.append(f"{d}:binding_not_verified")
         if pm is None or um is None or not pm.valid or not um.valid:
             continue
-        for name in ("task_mpjpe_p95_m", "penetration_max_m", "penetration_violation_ratio"):
-            if np.isnan(getattr(um, name)) or np.isnan(getattr(pm, name)):
-                gaps.append(f"{d}:nan_{name}")
+        for name in ("task_mpjpe_p95_m", "penetration_max_m",
+                     "penetration_violation_ratio"):
+            for tag, m in (("P", pm), ("U0", um)):
+                if _bad(getattr(m, name)):
+                    gaps.append(f"{d}:{tag}_{name}_not_finite")
         for s in HAND_SIDES:
             if pm.ref_support_frames.get(s, 0) > 0:
                 for tag, m in (("P", pm), ("U0", um)):
                     f = m.foot.get(s)
-                    if f is None or np.isnan(f.speed_p95_mps) or np.isnan(f.gap_p95_m):
+                    if (f is None or _bad(f.speed_p95_mps) or _bad(f.gap_p95_m)
+                            or _bad(f.drift_max_m)):
                         gaps.append(f"{d}:{tag}_foot_{s}_missing_with_reference_frames")
             if pm.ref_grasp_frames.get(s, 0) > 0:
                 for tag, m in (("P", pm), ("U0", um)):
                     h = m.hand.get(s)
-                    if h is None or np.isnan(h.gap_p95_m):
+                    if (h is None or _bad(h.gap_p95_m) or _bad(h.coverage)
+                            or _bad(h.valid_coverage) or _bad(h.drift_max_m)):
                         gaps.append(f"{d}:{tag}_hand_{s}_missing_with_reference_frames")
+        for tag, m in (("P", pm), ("U0", um)):
+            if m.both.get("denominator_frames", 0) > 0 and (
+                    _bad(m.both.get("valid_coverage"))
+                    or _bad(m.both.get("gap_series_p95_m"))):
+                gaps.append(f"{d}:{tag}_both_hands_not_finite")
     return gaps
 
 
@@ -543,11 +579,21 @@ def evaluate_local_preferred(
         }
 
     def _g5() -> dict:
-        """§3.4 item 5 drift family: no drift-type degradation for gains.
+        """§3.4 item 5: no degradation of any family may buy the g4 gains.
 
-        Penetration / foot-slip / task-error regressions are already carried
-        by g3/g2; this gate holds the remaining family (within-interval hand
-        and foot anchor drift) with the registered margin above.
+        Families:
+
+        * drift — within-interval hand/foot anchor drift, registered margin
+          (the aggregate p95 gates of g2/g3 cannot see a drift that stays
+          inside the interval bounds);
+        * new hard failures — every validator check U0 FAILS that P PASSED
+          (joint limits, velocities, penetration tolerance, hard contact
+          checks). "P passed, U0 newly fails" is the §3.4 item 3 degradation
+          shape the aggregate gates miss;
+        * keyframe penetration violation ratio — U0 exceeding P's ratio by
+          more than the comparison tolerance (0% -> 100% is the extreme;
+          g3's max-penetration gate alone cannot see a mass change at a
+          depth below the max).
         """
         rows = {}
         for d in pilot:
@@ -570,10 +616,28 @@ def evaluate_local_preferred(
                         ok = False
                         detail[f"{kind}_{s}"] = {
                             "p_drift_m": pa.drift_max_m, "u0_drift_m": ua.drift_max_m}
-            rows[d] = {"passed": ok, "drift": detail}
+            new_failures = sorted(
+                set(um.validator_failed_checks) - set(pm.validator_failed_checks))
+            if new_failures:
+                ok = False
+                detail["new_validator_failures"] = {
+                    "p_failed": list(pm.validator_failed_checks),
+                    "u0_failed": list(um.validator_failed_checks),
+                    "new": new_failures,
+                }
+            if (um.penetration_violation_ratio
+                    > pm.penetration_violation_ratio + COMPARE_TOL):
+                ok = False
+                detail["penetration_violation_ratio_increased"] = {
+                    "p_ratio": pm.penetration_violation_ratio,
+                    "u0_ratio": um.penetration_violation_ratio,
+                }
+            rows[d] = {"passed": ok, "degradation": detail}
         return {
             "per_demo": rows, "margin_m": DRIFT_DEGRADATION_MARGIN_M,
-            "note": "drift family of §3.4 item 5; penetration/slip/task are gated by g3/g2",
+            "note": "§3.4 item 5: drift family + new validator hard failures "
+                    "+ keyframe penetration violation ratio; task/slip are "
+                    "additionally gated by g2/g3",
             "passed": all(r["passed"] for r in rows.values()),
         }
 
