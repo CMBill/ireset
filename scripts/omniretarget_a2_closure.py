@@ -183,14 +183,24 @@ def sub12_cost_basis(u0_root: Path, demo: str) -> dict:
 
 def load_merge_extra(path: Path | None) -> dict | None:
     """--diagnosis / --recovery-report merge: load + hash-pin an existing
-    result file; this entry never launches the work itself."""
+    result file; this entry never launches the work itself. The status is
+    read wherever the producer put it (diagnosis: ``verdict.status``;
+    comparison report: top-level ``verdict`` string)."""
     if path is None:
         return None
     p = Path(path).expanduser().resolve()
     if not p.is_file():
         raise SystemExit(f"merge input missing: {p}")
     data = json.loads(p.read_text())
-    status = (data.get("status") if isinstance(data, dict) else None) or "merged"
+    status = "merged"
+    if isinstance(data, dict):
+        v = data.get("verdict")
+        if isinstance(v, str):
+            status = v
+        elif isinstance(v, dict) and isinstance(v.get("status"), str):
+            status = v["status"]
+        elif isinstance(data.get("status"), str):
+            status = data["status"]
     return {"status": status, "source": path_for_record(p),
             "sha256": integ.sha256_file(p)}
 

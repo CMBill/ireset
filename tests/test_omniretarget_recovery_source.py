@@ -333,6 +333,15 @@ def test_admission_registration_leg_passes_when_everything_holds(
     reg = adm["source_registration"]
     assert reg["passed"] and reg["fresh_smoke_ok"]
     assert "ur_coverage" in adm and "u0_coverage" not in adm
+    # U0 mode keeps its admission byte-identical to the frozen baseline
+    # (§10.3): the registration key exists ONLY in UR mode — a None-valued
+    # key would make every fresh baseline comparison "differ" (caught live
+    # in the C2 merge run on 2026-10-10)
+    import omniretarget_teacher_comparison as cmp_mod
+    adm_u0, _, _ = cmp_mod.admission_record(
+        tmp_path / "freeze", ur, PILOT)
+    assert "source_registration" not in adm_u0
+    assert "u0_coverage" in adm_u0
 
 
 def test_admission_registration_leg_catches_drift_and_mixing(

@@ -473,7 +473,7 @@ def admission_record(freeze: Path, u0_root: Path, pilot: list[str],
                 "canonical_config_sha256")})
         source_reg["passed"] = (source_reg["passed"]
                                 and source_reg["fresh_smoke_ok"])
-    return {
+    admission = {
         "checkout_vs_freeze": checkout,
         "assets_vs_freeze": assets_check,
         "generation_checkout": gen_checkout,
@@ -497,14 +497,18 @@ def admission_record(freeze: Path, u0_root: Path, pilot: list[str],
         f"{source_label.lower()}_coverage": {
             "missing": coverage["missing"],
             "by_demo": {d: e["attempt"] for d, e in coverage["by_demo"].items()}},
-        "source_registration": source_reg,
         "passed": (checkout["passed"] and assets_check["passed"]
                    and freeze_inputs_ok and gen_checkout_ok
                    and env_lock_consistent and env_version_consistent
                    and inputs_ok and chain_ok
                    and all(binding_passed.values())
                    and (source_reg is None or source_reg["passed"])),
-    }, binding_passed, coverage
+    }
+    # U0 mode keeps its admission BYTE-IDENTICAL to the frozen baseline
+    # reports — the registration leg exists only in UR mode (§10.3)
+    if source_reg is not None:
+        admission["source_registration"] = source_reg
+    return admission, binding_passed, coverage
 
 
 def main() -> int:

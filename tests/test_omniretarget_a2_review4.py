@@ -332,7 +332,7 @@ def test_generation_gate_verifies_the_actual_data_path(tmp_path, monkeypatch):
     monkeypatch.setattr(integ, "DERIVED_DIR", tmp_path)
     monkeypatch.setattr(
         gen, "generate_one",
-        lambda demo, env_python, attempt_dir, data_path: (
+        lambda demo, env_python, attempt_dir, data_path, **kw: (
             calls.append((demo, str(data_path))),
             {"demo": demo, "argv": [], "cwd": "", "exit_code": 0, "wall_s": 0.1,
              "config": "fake", "status": "ok", "binding": {"passed": True},

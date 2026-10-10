@@ -344,7 +344,7 @@ def _run_generation(monkeypatch, tmp_path, freeze, out_dir, demos=None):
     # tmp outputs: the derived-root guard must follow the patched root
     monkeypatch.setattr(integ, "DERIVED_DIR", tmp_path)
 
-    def fake_generate_one(demo, env_python, attempt_dir, data_path):
+    def fake_generate_one(demo, env_python, attempt_dir, data_path, **kw):
         calls.append((demo, attempt_dir.name))
         return {"demo": demo, "argv": [], "cwd": "", "exit_code": 0, "wall_s": 0.1,
                 "config": "fake", "status": "ok", "binding": {"passed": True},
