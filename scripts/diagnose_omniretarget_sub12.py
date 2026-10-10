@@ -54,7 +54,7 @@ HOLOSOMA_PACKAGE = (
 )
 DEFAULT_ENV_PYTHON = PROJECT_ROOT / "derived" / "upstream" / "holosoma_env" / ".venv" / "bin" / "python"
 CHILD_DRIVER = PROJECT_ROOT / "scripts" / "_omniretarget_diagnostic_child.py"
-RETARGETER_FILE = HOLOSOMA_PACKAGE / "src" / "holosoma_retargeting" / "src" / "interaction_mesh_retargeter.py"
+RETARGETER_FILE = HOLOSOMA_PACKAGE / "src" / "interaction_mesh_retargeter.py"
 
 #: §5.5 two-run consistency: identical key arrays + rho agreement
 RHO_AGREEMENT = 1e-6
