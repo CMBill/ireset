@@ -805,8 +805,10 @@ def reverify_verdict_record(report: dict, u_side: str = "U0") -> dict:
     Admission-side gaps (``admission:*``, appended by the comparison entry
     after the evaluation) are excluded from the gap comparison: this leg
     re-derives the METRICS verdict; the admission verdict is verified
-    separately (an admission failure legitimately forces ``incomplete``
-    over metrics-complete evidence, never the reverse).
+    separately. The demotion of a metrics-complete verdict to ``incomplete``
+    is accepted only when the report's own admission actually FAILED
+    (round-4 review fix 2) — with admission passed, the recorded verdict
+    and completeness must match the re-derivation exactly.
     """
     pilot = list(report.get("pilot") or [])
     metrics = report.get("metrics") or {}
@@ -828,11 +830,30 @@ def reverify_verdict_record(report: dict, u_side: str = "U0") -> dict:
     if not rederived["complete_evidence"] and bool(
             vr.get("complete_evidence")):
         problems.append("complete_evidence_contradicts_metrics")
+    # round-4 review fix 2 (2026-10-10): the admission-forced demotion to
+    # ``incomplete`` is legitimate ONLY when admission actually FAILED (the
+    # comparison entry demotes a metrics-complete verdict exactly then,
+    # appending admission:* gaps). With admission PASSED, an ``incomplete``
+    # claim over metrics-complete evidence used to hide the recomputed
+    # verdict behind unverifiable admission:* gaps — the verdict and the
+    # completeness flag must now match the re-derivation EXACTLY, and an
+    # admission:* gap without an admission failure is itself a problem.
+    admission_failed = (report.get("admission") or {}).get("passed") is False
+    admission_gaps = [g for g in (vr.get("evidence_gaps") or [])
+                      if str(g).startswith("admission:")]
     if rederived["verdict"] == "incomplete":
         if top != "incomplete":
             problems.append("verdict_contradicts_metrics")
-    elif top not in (rederived["verdict"], "incomplete"):
-        problems.append("verdict_not_supported_by_gates")
+    elif admission_failed:
+        if top != "incomplete":
+            problems.append("verdict_not_supported_by_gates")
+    else:
+        if top != rederived["verdict"]:
+            problems.append("verdict_not_supported_by_gates")
+        if bool(vr.get("complete_evidence")) != rederived["complete_evidence"]:
+            problems.append("complete_evidence_not_reproducible")
+        if admission_gaps:
+            problems.append("admission_gap_without_admission_failure")
     rec_gates = vr.get("gates") or {}
     rg = rederived["gates"]
     for name, gate in rg.items():

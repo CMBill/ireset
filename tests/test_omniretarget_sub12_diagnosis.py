@@ -104,11 +104,13 @@ _DEFAULT = object()
 
 def _run(label: str, snapshot: Path, *, frame=171, ordinal=4,
          category="supports_step03_candidate", rho=0.25, outcome=None,
-         timed_out=False, launch_error=None, failure=_DEFAULT):
+         timed_out=False, launch_error=None, failure=_DEFAULT,
+         status="optimal", max_violation=1e-9):
     if failure is _DEFAULT:
         failure = {"failing_frame_idx": frame, "ordinal_in_frame": ordinal,
                    "phase_one": {"category": category, "rho": rho,
-                                 "status": "optimal",
+                                 "status": status,
+                                 "max_violation": max_violation,
                                  "soc_t": 0.2, "dqa_shape": [36],
                                  "n_kept_constraints": 66,
                                  "n_soc_constraints": 1,
@@ -208,9 +210,9 @@ def test_decide_terminal_non_candidate_rows(two_snaphots):
     assert v["status"] == "no_recovery_candidate:rho_exceeds_candidate_range"
     v = diag.decide_diagnosis({"equal": True},
                               [_run("r1", a, category="retained_infeasible",
-                                    rho=None),
+                                    rho=None, status="infeasible"),
                                _run("r2", b, category="retained_infeasible",
-                                    rho=None)])
+                                    rho=None, status="infeasible")])
     assert v["status"] == "no_recovery_candidate:retained_infeasible"
     v = diag.decide_diagnosis({"equal": True},
                               [_run("r1", a, rho=0.1,

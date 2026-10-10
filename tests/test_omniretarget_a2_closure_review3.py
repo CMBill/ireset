@@ -103,10 +103,12 @@ def _clean_ur_report(tmp_path) -> dict:
      ["metric_evidence_gaps_not_reproducible"], []),
     # an admission-side gap is EXCLUDED from the metrics comparison (the
     # producer appends those after the evaluation; the admission verdict
-    # itself is verified by its own legs)
+    # itself is verified by its own legs) — but since round 4 an
+    # admission:* gap on a report whose admission PASSED is itself flagged
     (lambda r: r["verdict_record"]["evidence_gaps"]
         .append("admission:checkout_identity_mismatch"),
-     [], ["metric_evidence_gaps_not_reproducible"]),
+     ["admission_gap_without_admission_failure"],
+     ["metric_evidence_gaps_not_reproducible"]),
 ])
 def test_reverify_report_rederives_verdict_gates_and_evidence(
         tmp_path, tamper, markers, forbidden):

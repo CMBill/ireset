@@ -233,9 +233,25 @@ def _canonical_npz(path: Path, seed: int):
     np.savez(path, c=rng.normal(size=798), b=rng.normal(size=949))
 
 
-def _write_full_snapshot(path: Path, seed: int = 7):
+def _canonical_failure(*, rho=0.2486138173835237, soc_t=0.2, n_kept=66):
+    """The genuine child shape: category ALWAYS consistent with the facts
+    (round-4 review fix 1 re-derives it through classify_phase_one) and
+    ``max_violation`` present whenever status is optimal."""
+    return {"failing_frame_idx": 171, "ordinal_in_frame": 5,
+            "phase_one": {
+                "category": "supports_step03_candidate",
+                "rho": rho, "status": "optimal", "max_violation": 3.5e-17,
+                "soc_t": soc_t, "dqa_shape": [36],
+                "n_kept_constraints": n_kept, "n_soc_constraints": 1,
+                "soc_t_matches_step_size": True}}
+
+
+def _write_full_snapshot(path: Path, seed: int = 7, *, failure=None):
     """Complete snapshot: the REQUIRED artifact set (context arrays incl.
-    q_a_indices, canonical b AND c, P/A dumps) — round-3 review fix 3."""
+    q_a_indices, canonical b AND c, P/A dumps) — round-3 review fix 3 —
+    PLUS the on-disk run-fact jsons (failure_meta.json / child_summary.json
+    carrying the same failure dict) the round-4 disk-reconciliation leg
+    compares the record against."""
     path.mkdir(parents=True, exist_ok=True)
     _ctx_npz(path / "failure_context.npz", seed)
     _canonical_npz(path / "failure_canonical.npz", seed + 1)
@@ -246,6 +262,12 @@ def _write_full_snapshot(path: Path, seed: int = 7):
     np.savez(path / "failure_canonical_A.npz",
              data=rng.normal(size=41), indices=np.arange(5),
              indptr=np.arange(6), shape=[949, 798])
+    if failure is None:
+        failure = _canonical_failure()
+    (path / "failure_meta.json").write_text(
+        json.dumps({"identity": {}, "failure": failure}))
+    (path / "child_summary.json").write_text(
+        json.dumps({"failure": failure, "outcome": "x"}))
 
 
 def _diag_run(snapshot: Path, *, rho=0.2486138173835237, soc_t=0.2,
@@ -253,14 +275,8 @@ def _diag_run(snapshot: Path, *, rho=0.2486138173835237, soc_t=0.2,
     return {"label": "r", "snapshot": str(snapshot), "timed_out": False,
             "launch_error": None,
             "summary": {"outcome": "RuntimeError: CVXPY solve failed",
-                        "failure": {
-                            "failing_frame_idx": 171, "ordinal_in_frame": 5,
-                            "phase_one": {
-                                "category": "supports_step03_candidate",
-                                "rho": rho, "status": "optimal", "soc_t": soc_t,
-                                "dqa_shape": [36], "n_kept_constraints": n_kept,
-                                "n_soc_constraints": 1,
-                                "soc_t_matches_step_size": True}}}}
+                        "failure": _canonical_failure(
+                            rho=rho, soc_t=soc_t, n_kept=n_kept)}}
 
 
 @pytest.fixture()
@@ -652,13 +668,16 @@ def _recovery_report(tmp_path, *, verdict="no_quality_gain",
 def _diagnosis_file(tmp_path, baseline_snapshot: Path, *, rho=0.2486138173835237):
     """A diagnosis record backed by REAL on-disk snapshots (round-3 review
     fix 2: verify re-hashes the artifacts and re-derives the §5.5 verdict
-    from the run records — flags alone no longer pass)."""
+    from the run records — flags alone no longer pass; round-4: the on-disk
+    failure_meta/child_summary carry the same failure dict the record
+    claims)."""
     import diagnose_omniretarget_sub12 as diag
     tmp_path = Path(tmp_path)
     tmp_path.mkdir(parents=True, exist_ok=True)
+    failure = _canonical_failure(rho=rho)
     sa, sb = tmp_path / "snap_a", tmp_path / "snap_b"
-    _write_full_snapshot(sa)
-    _write_full_snapshot(sb)
+    _write_full_snapshot(sa, failure=failure)
+    _write_full_snapshot(sb, failure=failure)
     eval_runs = [_diag_run(sa, rho=rho), _diag_run(sb, rho=rho)]
     verdict = diag.decide_diagnosis({"equal": True}, eval_runs)
     diag_json = {
@@ -850,7 +869,8 @@ def test_canonical_base_argv_exposes_extra_flags():
 # --- fix 11: generation retry cap + UR budget --------------------------------
 
 def _run_generation_ur(monkeypatch, tmp_path, freeze, out_dir, prereg,
-                       *, prior_rows=None, prior_wall=0.0, demo_results=None):
+                       *, prior_rows=None, prior_wall=0.0, demo_results=None,
+                       demos=None, manifest_text=None):
     import generate_omniretarget_teachers as gen
     calls = []
     monkeypatch.setattr(integ, "DERIVED_DIR", tmp_path)
@@ -892,14 +912,28 @@ def _run_generation_ur(monkeypatch, tmp_path, freeze, out_dir, prereg,
     if prior_rows is not None:
         att = out_dir / "attempt_001"
         att.mkdir(parents=True, exist_ok=True)
-        (att / "generation_manifest.json").write_text(json.dumps({
-            "rows": prior_rows, "total_wall_s": prior_wall}))
+        (att / "generation_manifest.json").write_text(
+            manifest_text if manifest_text is not None else json.dumps({
+                "rows": prior_rows, "total_wall_s": prior_wall}))
         (out_dir / integ.ATTEMPTS_INDEX).write_text(json.dumps(
             {"attempts": [{"attempt": "attempt_001",
                            "preregistration_sha256": "shaReg"}]}))
-    monkeypatch.setattr(sys, "argv", [
-        "prog", "--freeze", str(freeze), "--out-dir", str(out_dir),
-        "--source-record", str(prereg)])
+    elif manifest_text is not None:
+        # round-4 review fix 4: an index-registered attempt with an
+        # unreadable manifest (corrupt json / missing file) must stop the
+        # run before generation, not read as zero history
+        att = out_dir / "attempt_001"
+        att.mkdir(parents=True, exist_ok=True)
+        if manifest_text != "__missing__":
+            (att / "generation_manifest.json").write_text(manifest_text)
+        (out_dir / integ.ATTEMPTS_INDEX).write_text(json.dumps(
+            {"attempts": [{"attempt": "attempt_001",
+                           "preregistration_sha256": "shaReg"}]}))
+    argv = ["prog", "--freeze", str(freeze), "--out-dir", str(out_dir),
+            "--source-record", str(prereg)]
+    if demos is not None:
+        argv += ["--demos", demos]
+    monkeypatch.setattr(sys, "argv", argv)
     return gen.main(), calls
 
 

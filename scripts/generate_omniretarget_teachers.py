@@ -94,7 +94,8 @@ UR_COMPARISON_RESERVE_S = 600
 UR_GENERATION_BUDGET_S = UR_TOTAL_BUDGET_S - UR_COMPARISON_RESERVE_S
 
 
-def _prior_run_facts(out_root: Path, scope: list[str]) -> tuple[dict, float]:
+def _prior_run_facts(out_root: Path,
+                     scope: list[str]) -> tuple[dict, float, list[str]]:
     """Actual-invocation history and cumulative wall time already recorded
     in this root — the retry cap and the UR budget gate are enforced ACROSS
     invocations, not per call (the first round happily launched a third
@@ -106,15 +107,24 @@ def _prior_run_facts(out_root: Path, scope: list[str]) -> tuple[dict, float]:
     conservatively), never failures alone, and each entry carries the prior
     status so the retry justification (a retry is legitimate only after a
     FAILED run) is auditable in the skipped row.
+
+    Round-4 review fix 4: an attempt REGISTERED in the index whose manifest
+    cannot be read is NOT silently skipped history — the invocation count
+    and the cumulative budget are unknowable over unreadable rows, so the
+    error is returned and the caller must stop BEFORE any generation
+    (unreadable history must never be treated as zero history).
     """
     prior_calls: dict[str, list[dict]] = {}
     prior_wall_s = 0.0
+    history_errors: list[str] = []
     if not (out_root / integ.ATTEMPTS_INDEX).is_file():
-        return prior_calls, prior_wall_s
+        return prior_calls, prior_wall_s, history_errors
     for att in integ.load_attempts(out_root):
         try:
             manifest = integ.load_attempt_manifest(out_root, att["attempt"])
-        except Exception:  # noqa: BLE001 -- unreadable history: skip, not crash
+        except Exception as exc:  # noqa: BLE001 -- history unreadable
+            history_errors.append(
+                f"{att.get('attempt')}:{type(exc).__name__}")
             continue
         prior_wall_s += float(manifest.get("total_wall_s") or 0.0)
         for row in manifest.get("rows", []):
@@ -125,7 +135,7 @@ def _prior_run_facts(out_root: Path, scope: list[str]) -> tuple[dict, float]:
                 continue          # no subprocess was launched for this row
             prior_calls.setdefault(row["demo"], []).append(
                 {"attempt": att["attempt"], "status": status})
-    return prior_calls, prior_wall_s
+    return prior_calls, prior_wall_s, history_errors
 
 
 def pilot_demos_from_freeze(freeze_dir: Path) -> list[str]:
@@ -322,6 +332,18 @@ def main() -> int:
         unknown = [d for d in wanted if d not in pilot]
         if unknown:
             raise SystemExit(f"--demos outside frozen pilot list: {unknown}")
+        # round-4 review fix 3: one demo twice in a single invocation would
+        # bypass the per-demo invocation cap (the cap history is read once
+        # before the loop, so `--demos A,A` after a failure used to launch
+        # TWO more calls = three actual invocations); the sanctioned retry
+        # path is re-invoking this entry, whose history the cap reads
+        dups = sorted({d for d in wanted if wanted.count(d) > 1})
+        if dups:
+            raise SystemExit(
+                f"duplicate demo in --demos: {dups} — each demo may appear "
+                "once per invocation; the retry path is re-running the "
+                "entry (the invocation cap counts ACTUAL calls across the "
+                "root, §6.2)")
         scope = wanted
 
     # Identity gate BEFORE any generation: measured checkout must equal the
@@ -372,6 +394,22 @@ def main() -> int:
         ensure_single_registration(out_root,
                                    source_record["preregistration_sha256"])
 
+    # review fix 11 + round-3 review fixes 4/5 + round-4 review fix 4: the
+    # invocation history is read BEFORE this run allocates its attempt, and
+    # unreadable history STOPS the run — an attempt registered in the index
+    # whose manifest cannot be read makes the invocation count and the UR
+    # cumulative budget unknowable, and generating over it would silently
+    # restart the root's past as zero.
+    prior_calls, prior_wall_s, history_errors = _prior_run_facts(
+        out_root, scope)
+    if history_errors:
+        raise SystemExit(
+            f"history_incomplete: prior attempt manifest(s) unreadable under "
+            f"{out_root}: {history_errors} — the per-demo invocation cap "
+            "(§6.2) and the UR cumulative budget are unknowable over "
+            "unreadable history; refusing to generate (unreadable history "
+            "is not zero history)")
+
     attempt_dir = integ.allocate_attempt(out_root)
     attempt = attempt_dir.name
 
@@ -395,7 +433,6 @@ def main() -> int:
     # (>=, not >) and caps the CURRENT call's timeout at the remaining
     # budget — a 5s-remaining call used to launch with the default 1800s
     # timeout and blow the 3h experiment budget.
-    prior_calls, prior_wall_s = _prior_run_facts(out_root, scope)
     rows = []
     spent = 0.0
     for d in scope:
@@ -449,6 +486,11 @@ def main() -> int:
                 UR_GENERATION_BUDGET_S - prior_wall_s - spent, 1)
         rows.append(row)
         spent += float(row.get("wall_s") or 0.0)
+        # round-4 review fix 3: count THIS run's actual invocations too —
+        # the cap must hold across the root AND within one invocation
+        # (defense in depth behind the --demos duplicate rejection)
+        prior_calls.setdefault(d, []).append(
+            {"attempt": attempt, "status": row.get("status")})
 
     input_mutated = False
     for demo in scope:

@@ -76,6 +76,31 @@ REQUIRED_CANONICAL_KEYS = ("b", "c")
 REQUIRED_ARTIFACTS = ("failure_context.npz", "failure_canonical.npz",
                       "failure_canonical_P.npz", "failure_canonical_A.npz")
 
+#: §5.5 categories that are STRUCTURAL — the phase-one helper names them
+#: directly at its own early exits; they are not derivable from
+#: status/rho/max_violation through :func:`classify_phase_one`
+STRUCTURAL_PHASE1_STATUSES = {
+    "not_single_soc": "phase1_not_single_soc",
+    "soc_x_not_variable": "phase1_soc_x_not_variable",
+    "phase1_solver_error": "phase1_solver_error",
+}
+
+
+def _rederive_phase1_category(p: dict) -> str:
+    """Re-derive the §5.5 category from the phase-one FACTS.
+
+    Round-4 review fix 1 (2026-10-10): the recorded ``category`` string is a
+    claim like any other recorded flag — editing ``phase_one.status`` to
+    ``infeasible`` or ``max_violation`` to 1.0/NaN while KEEPING the old
+    category used to still yield ``supports_step03_candidate``, both in the
+    live aggregation and in the re-derivation (which replayed the same
+    recorded category). The classification is re-called on the facts.
+    """
+    status = p.get("status")
+    if status in STRUCTURAL_PHASE1_STATUSES:
+        return STRUCTURAL_PHASE1_STATUSES[status]
+    return classify_phase_one(status, p.get("rho"), p.get("max_violation"))
+
 
 def _load_json(path: Path) -> dict:
     return json.loads(Path(path).read_text())
@@ -195,6 +220,12 @@ def decide_diagnosis(control: dict, runs: list[dict]) -> dict:
     must EXIST on both runs before any equality counts — ``both_missing``
     used to read as equal, so deleting required keys from BOTH snapshots
     still produced ``supports_step03_candidate`` over absent evidence.
+
+    Round-4 review fix 1 (2026-10-10): the per-run §5.5 category is
+    RE-DERIVED from the phase-one facts (status/rho/max_violation through
+    :func:`classify_phase_one`); a recorded ``category`` that contradicts
+    its own facts is an internally inconsistent record and yields
+    ``diagnostic_incomplete``, never a supporting verdict.
     """
     if not control.get("equal", False):
         return {"status": "control_not_equivalent",
@@ -268,8 +299,26 @@ def decide_diagnosis(control: dict, runs: list[dict]) -> dict:
         (h0[k] is None and h1[k] is None) or h0[k] == h1[k] for k in h0)
     p0 = f0.get("phase_one", {}) or {}
     p1 = f1.get("phase_one", {}) or {}
-    cats = [p.get("category") or f"phase1_{p.get('status', 'missing')}"
-            for p in (p0, p1)]
+    # round-4 review fix 1: classify from the FACTS, then cross-check the
+    # recorded label — a category contradicting its own status/rho/
+    # max_violation is an internally inconsistent record
+    cats: list[str] = []
+    cat_problems: list[str] = []
+    for run, p in zip(failed, (p0, p1)):
+        derived = _rederive_phase1_category(p)
+        cats.append(derived)
+        if p.get("category") != derived:
+            cat_problems.append(
+                f"{run['label']}:recorded={p.get('category')!r}:"
+                f"derived={derived!r}")
+    if cat_problems:
+        return {"status": "diagnostic_incomplete",
+                "problems": [f"phase1_category_not_reproducible:{m}"
+                             for m in cat_problems],
+                "note": "a recorded phase_one category contradicts its own "
+                        "status/rho/max_violation (re-derived through "
+                        "classify_phase_one); the §5.5 table needs "
+                        "self-consistent facts, not recorded labels"}
     rho0, rho1 = p0.get("rho"), p1.get("rho")
     rho_agree = (rho0 is not None and rho1 is not None
                  and abs(rho0 - rho1) <= RHO_AGREEMENT)
@@ -340,8 +389,10 @@ def verify_diagnosis_record(diag: dict) -> dict:
     The re-derivation rebuilds the two run records (label / snapshot /
     failure) and re-runs :func:`decide_diagnosis` — which re-hashes the
     snapshot files, re-compares the captured arrays, re-checks the required
-    evidence and re-dispatches the §5.5 table — and additionally compares
-    the RECORDED per-run artifact hashes against the files on disk now.
+    evidence, re-derives the §5.5 categories from the phase-one facts
+    (round-4 fix 1) and re-dispatches the §5.5 table — and additionally
+    compares the RECORDED per-run artifact hashes and run FACTS (the whole
+    failure dict incl. phase_one) against the files on disk now.
     Used by G0 ``register-recovery`` and by the closure C2 merge
     verification.
     """
@@ -424,6 +475,30 @@ def verify_diagnosis_record(diag: dict) -> dict:
                 if rec_hashes.get(side) != now:
                     problems.append(
                         f"artifact_hashes_drifted_vs_disk:{side}")
+            # round-4 review fix 1: the per-run FACTS in the record must be
+            # the facts on DISK — the child wrote the same failure meta to
+            # failure_meta.json AND child_summary.json; a record whose
+            # phase_one (status/rho/max_violation/category) no longer matches
+            # its own snapshot jsons must not verify as registration evidence
+            for side, run in zip(("run1", "run2"), runs):
+                snap = _recorded_path(run["snapshot"])
+                fm = snap / "failure_meta.json"
+                cs = snap / "child_summary.json"
+                if not (fm.is_file() and cs.is_file()):
+                    problems.append(f"run_facts_missing_on_disk:{side}")
+                    continue
+                try:
+                    disk_meta_failure = _load_json(fm).get("failure")
+                    disk_summary_failure = _load_json(cs).get("failure")
+                except Exception as exc:  # noqa: BLE001 -- recorded, blocked
+                    problems.append(
+                        f"run_facts_unreadable:{side}:{type(exc).__name__}")
+                    continue
+                if run.get("failure") != disk_meta_failure:
+                    problems.append(f"run_facts_drifted_vs_disk:{side}:meta")
+                if run.get("failure") != disk_summary_failure:
+                    problems.append(
+                        f"run_facts_drifted_vs_disk:{side}:summary")
     elif status == "not_run":
         problems.append("diagnosis_not_run")
     return {"verified": not problems, "problems": problems,
