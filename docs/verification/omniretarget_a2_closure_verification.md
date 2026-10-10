@@ -2,7 +2,8 @@
 
 日期：2026-10-10。方案：[A2 收口与有限恢复实现方案](../plans/omniretarget_a2_closure_plan.md)（提交 `e487eb3`）。
 实现提交：C0/C1+D0 `a39d763`、NaN 对照修复 `420afbf`、UR `360556d`、对照修复 `880bff8`、
-审阅 13 项缺口修复 `efece4a`（§11）、**审阅第三轮 6 项缺口修复 `6d7f257`（§12）**。
+审阅 13 项缺口修复 `efece4a`（§11）、审阅第三轮 6 项缺口修复 `6d7f257`（§12）、
+**边界复验第四轮 4 项缺口修复 `ee363cd`（§13）**。
 运行根：`derived/experiments/omniretarget_first/20261010_a39d763_a2_closure/`。
 
 ## 0. 结论摘要
@@ -34,6 +35,14 @@ sha `5ca7960c…`）；测试 484→506 passed + 1 skipped。详见 §11。
 no_quality_gain、g1/g2 过、g3/g4/g5 败），诊断记录**从盘上产物重哈希+按 runs 重推**（supports_
 step03_candidate/帧 171/序号 5/rho 0.2486138173835237 逐位）；本轮 C0 快照
 `baseline/snapshots/attempt_003`（干净树 rev `6d7f257`）。测试 506→**532 passed + 1 skipped**。
+
+**边界复验第四轮 4 项缺口修复（2026-10-10，提交 `ee363cd`）后第三次重跑**：UR `no_quality_gain`、
+暂停生产与训练 `not_ready` 仍全部成立；权威 C2 更替为 `decisions/attempt_008`（sha `dcc72460…`，
+本记录 §13）——诊断核验自此**从 phase_one 事实（status/rho/max_violation）重调 classify_phase_one
+并与盘上 failure_meta/child_summary 逐位对账**（重推 supports_step03_candidate/帧 171/序号 5/
+rho 0.2486138173835237 逐位），报告重推的 incomplete 豁免**以 admission 实际失败为条件**（准入
+通过时裁决与 complete_evidence 严格匹配）；本轮 C0 快照 `baseline/snapshots/attempt_004`（干净树
+rev `ee363cd`）、新鲜比较 `baseline/cmp/attempt_008`。测试 532→**547 passed + 1 skipped**。
 
 ## 1. 基线锚点核对（§1.1）
 
@@ -126,15 +135,16 @@ attempt_001/002 因 §5.4 配置快照缺陷作废保留为证据）：
 `admission.source_registration` 差异、registration 被正确阻断。修复为仅 UR 模式携带该键
 （§10.3"旧 CLI 无新参数时与基线一致"），回归断言入 `tests/test_omniretarget_recovery_source.py`。
 
-## 6. C2：收口（decisions/attempt_004；**权威已更替为第三轮复核 attempt_007，见 §12**）
+## 6. C2：收口（decisions/attempt_004；**权威已更替为第四轮复核 attempt_008，见 §12/§13**）
 
 `--diagnosis` + `--recovery-report` 哈希钉住汇入，`a2_closure.json`（sha `8b346fa569ee04c0…`）：
 `baseline_verdict=incomplete`（原报告路径/哈希不变）、`diagnosis=supports_step03_candidate`、
 `recovery=no_quality_gain`、`training=not_ready`、`registration_status.complete=true`。
 【复核轮订正：本轮汇入只记录了当时的文件哈希、未核验证据链（审阅缺口 6），且其引用的
 `baseline/baseline_evidence.json` 已被同日更晚的收口调用覆盖（缺口 1）。该记录保留为历史证据，
-权威 C2 以 §12 的 attempt_007（sha `043b0121…`，证据链核验+裁决/门/证据重推全过）为准；
-§11 的 attempt_006（sha `5ca7960c…`）为第二轮复核证据。】
+权威 C2 以 §13 的 attempt_008（sha `dcc72460…`，证据链核验+裁决/门/证据重推+phase_one 事实
+重推与盘上运行事实对账全过）为准；§12 的 attempt_007（sha `043b0121…`）与 §11 的
+attempt_006（sha `5ca7960c…`）为第二/三轮复核证据，度量与裁决逐位一致。】
 按 §7.4 行 2 与 §12：当前候选停止，不追加候选；W1（weak_motion_only、接触损失 0、每模型
 ≤4k）的 A3/B/C 执行方案为下一阶段的独立预注册文档，本轮不实现、不启动任何训练。
 
@@ -148,6 +158,8 @@ attempt_001/002 因 §5.4 配置快照缺陷作废保留为证据）：
 | UR 六段生成 | 915.0s | ≤3h（单段 ≤30min：实测最长 306.95s） |
 | UR 比较 | 16.2s | 预留内 |
 | Phase I 每次求解 | 0.03s | ≤60s |
+| 第三轮复核 C2 重跑（attempt_007） | 18.3s | 预留内 |
+| 第四轮复核 C2 重跑（attempt_008） | 18.5s | 预留内 |
 | GPU 训练 | 0（未创建） | 0 |
 | 新产物 | <2GiB | 起步上限 2GiB |
 
@@ -162,13 +174,20 @@ attempt_001/002 因 §5.4 配置快照缺陷作废保留为证据）：
   §11 的语义强化更新三份既有测试的夹具（canonical 文件+形状字段/argv 烟测替身/快照路径）；
   **第三轮新增 `tests/test_omniretarget_a2_closure_review3.py` 26 项**（报告重推 9 变体含
   admission:* 豁免语义+裁决位置一致/诊断盘上重哈希+flags-only 拒/必需证据 4 删法+可选键放行/
-  重试上限按实际调用 3 形态/预算耗尽边界+超时封顶/argv 截断 4 例含 CLI 落盘）。
+  重试上限按实际调用 3 形态/预算耗尽边界+超时封顶/argv 截断 4 例含 CLI 落盘）；
+  **第四轮新增 `tests/test_omniretarget_a2_closure_review4.py` 15 项**（phase_one 事实与记录
+  category 矛盾四变体/结构性状态重推恰合/记录-盘上运行事实对账三方向[记录篡改·盘上篡改·
+  jsons 缺失]/CLI 汇入拦截/admission 通过禁压制完整裁决+admission 失败压制仍合法+干净报告
+  重推恰合/重复 demo 生成前拒绝+单段 scope 正常/不可读历史两变体[损坏 json·缺文件]停止+
+  可读历史正常重试）。
 - 既有测试适配两处：`generate_one` 新增可选 `extra_argv` kwarg，review/review4 的 fake 签名
   加 `**kw`（行为断言不变）；第三轮按新语义更新 review2/report 夹具（UR 报告经真实评估自洽
   构建、诊断记录带盘上快照与 runs、生成重试场景改"失败后有理由重试"）与 sub12 快照夹具
-  （补 P/A 文件）。
-- 全量（第三轮实测）：**532 passed + 1 skipped**（`uv run --locked pytest tests/ -q`，1038s；
-  第二轮 506/首轮 484 passed + 1 skipped）。
+  （补 P/A 文件）；第四轮按新语义更新 review2 夹具（`_canonical_failure` 统一记录/盘上
+  failure_meta+child_summary 同源、生成 harness 增 demos/manifest_text）与 sub12 夹具
+  （`_run` 增 status/max_violation，retained_infeasible 行改真 infeasible 状态）。
+- 全量（第四轮实测）：**547 passed + 1 skipped**（`uv run --locked pytest tests/ -q`，1008s；
+  第三轮 532/第二轮 506/首轮 484 passed + 1 skipped）。
 
 ## 9. 未运行/超出本轮范围
 
@@ -222,6 +241,17 @@ attempt_001/002 因 §5.4 配置快照缺陷作废保留为证据）：
     方案 §11 中含"终检/比较时间"，生成侧必须预留比较份额再谈耗尽。重试上限同理按**实际
     调用数**而非失败数计（1 失败+1 成功=2 次调用，第三次越权；skipped 行无调用不计数；
     成功后的重试无理由须拒绝）。
+12. **（第四轮）派生结论不能作核验锚**：phase_one 的 `category` 是从 status/rho/max_violation
+    派生的结论字符串——重推若仍读它，等于把"记录声称的结论"当"事实"复述一遍（status 改
+    infeasible/max_violation 改 1.0 或 NaN 而保留 supports 曾同时骗过 G0 与 C2 的重推腿）。
+    正确形态是重调 `classify_phase_one` 于事实三元组+结构性状态显式映射，并把整个 failure
+    字典与盘上 failure_meta.json/child_summary.json（子进程亲手写的两份同源事实）逐位对账。
+13. **（第四轮）豁免必须以"实际失败"为条件、不可读历史必须停止**：admission 压制完整裁决
+    （metrics 完整但 verdict 记 incomplete）是合法方向，但仅当报告自身 admission.passed=False
+    ——准入通过时该豁免等于允许无证据降级（错误登记"证据不足"）。同理，索引登记但 manifest
+    不可读的历史不是零历史：调用次数与预算在不可读数据上不可知，"静默跳过=清零重跑"会把
+    重试上限与 3h 预算同时架空；重复项（--demos A,A）在计数器只读一次的循环里同样绕开上限
+    ——计数类核验的门必须在消费点（生成前/每次调用后）而非只在读入点。
 
 ## 11. 独立审阅 13 项缺口修复轮（2026-10-10，提交 `efece4a`）
 
@@ -325,3 +355,51 @@ supports_step03_candidate/171/5/0.2486138173835237 逐位，**报告重推腿**
 不受本轮影响、未重跑（本轮修复全部在核验侧；生成侧重试/预算规则为事前规则不追溯，权威 UR
 根本身未触发任何 skipped 行）。测试 506→**532 passed + 1 skipped**（新增 26 项
 `tests/test_omniretarget_a2_closure_review3.py`）。
+
+## 13. 边界复验第四轮 4 项缺口修复（2026-10-10，提交 `ee363cd`）
+
+第四轮边界复验确认权威结果成立（156 项相关测试通过；12 条 P/UR 度量及质量门、真实诊断与
+C2 核验一致），但另发现 4 项缺口（1 P1+3 P2）；全部修复后按修正协议重跑权威 C2。
+**裁决不变：原 U0 `incomplete`；UR `no_quality_gain`（complete_evidence=true）；训练
+`not_ready`；W1 A3/B/C 另立预注册。**
+
+**修复清单（编号=审阅项）**：
+①**[P1] Phase I 分类仍直接信任记录值**——把一个运行的 `phase_one.status` 改为 `infeasible`、
+或 `max_violation` 改 1.0/NaN 而保留 `category`，诊断核验与 C2 仍过、G0 仍可登记候选（重推
+读的还是 category，且未与盘上 failure_meta/child_summary 对账）。现 `decide_diagnosis` 的
+§5.5 分类**从事实三元组重调 `classify_phase_one`**（结构性早退状态 not_single_soc/
+soc_x_not_variable/phase1_solver_error 显式映射，其余全走纯分类器），记录 category 与重推矛盾
+=内部不一致记录→`diagnostic_incomplete`（`phase1_category_not_reproducible:*` 带记录值与重推
+值）；`verify_diagnosis_record` 增**盘上运行事实对账腿**——记录的整个 failure 字典（phase_one
+在内）须与快照目录的 failure_meta.json 与 child_summary.json（子进程亲手写的两份同源事实）
+逐位相等，任一侧篡改/缺失/不可读即 `run_facts_drifted_vs_disk`/`run_facts_missing_on_disk`/
+`run_facts_unreadable`。
+②**[P2] admission 通过时仍允许压制完整裁决**——真实 UR 报告 admission.passed=True；把两处
+裁决改 incomplete、complete_evidence 改 False、再添 admission:* 缺口，C2 仍过（重推明确得到
+完整 no_quality_gain）。现 `reverify_verdict_record` 的 incomplete 豁免**以报告自身
+admission.passed=False 为条件**：准入通过时裁决与 complete_evidence 须与重推**严格相等**
+（`verdict_not_supported_by_gates`/`complete_evidence_not_reproducible`），且准入通过的报告带
+admission:* 缺口本身即问题（`admission_gap_without_admission_failure`）；admission 实际失败的
+合法压制形态（verdict=incomplete+complete=False+admission 缺口）不受影响。
+③**[P2] 重复 demo 突破实际调用上限**——一次失败后 `--demos A,A` 再调两次（共 3 次实际调用；
+prior_calls 只在循环前读一次，当前调用不计入后续检查）。现 `--demos` 解析即拒绝重复项
+（生成前 SystemExit，不分配 attempt），且每次实际 `generate_one` 调用后即时更新
+prior_calls（上限在循环内持续成立，纵深防御）。
+④**[P2] 不可读历史被当作零次数零成本**——attempts_index 正常保留已登记 attempt 但 manifest
+损坏时静默跳过历史：CLI 复现六段全部再次调用、exit 0、prior_wall_s_in_root=0。现
+`_prior_run_facts` 返回 `history_errors`，主入口在**分配 attempt 之前**以 `history_incomplete`
+停止（调用次数与累计预算在不可读数据上不可知；不可读≠零）。
+
+**修正协议重跑（干净树 rev `ee363cd`，全部预期裁决，18.5s）**：C0 快照
+`baseline/snapshots/attempt_004`（身份稳定、tracked diff=空哈希、passed）+新鲜比较
+`baseline/cmp/attempt_008`（sha `227e631f…`）与 attempt_007 新鲜比较逐位一致（排除
+timestamp/comparison_attempt/cost_s 差异 []）；C2 终局 **`decisions/attempt_008`（sha
+`dcc72460a8bc3ef8…`）**——与 attempt_007 逐字段一致（唯一差异=新快照哈希指针）：merge 全过，
+诊断核验腿（含新增事实重推+盘上运行事实对账）verified=true 且重推
+supports_step03_candidate/帧 171/序号 5/rho 0.2486138173835237 逐位，报告重推腿
+`verdict_reverification.problems=[]`（严格匹配下重推 no_quality_gain、complete=true）；
+training 未满足门仍指向 local_preferred 缺失+W1 A3/B/C 前置。costs.json 累计五次调用。
+UR 生成（generation/attempt_001，n_ok=6，915s）与 UR 比较（recovery/cmp/attempt_002）证据
+不受本轮影响、未重跑（修复在核验侧+生成侧事前规则；权威 UR 根 manifest 全部可读、无重复
+scope、未触发任何 skipped 行——新门在其上预验为空）。测试 532→**547 passed + 1 skipped**
+（新增 15 项 `tests/test_omniretarget_a2_closure_review4.py`）。
