@@ -78,6 +78,34 @@ CHILD_DRIVER = PROJECT_ROOT / "scripts" / "_omniretarget_diagnostic_child.py"
 UR_STEP_SIZE = 0.3
 #: §11 budget: a single generation may not exceed 30 min
 GENERATION_TIMEOUT_S = 1800
+#: §6.2 retry policy made structural (review fix 11, 2026-10-10): after TWO
+#: failed same-config runs of a demo already recorded in this root, no
+#: third subprocess call — the skipped row records the prior attempts
+MAX_FAILED_RUNS_PER_DEMO = 2
+#: §11 budget: the whole UR experiment may not exceed 3h of generation wall
+UR_TOTAL_BUDGET_S = 3 * 3600
+
+
+def _prior_run_facts(out_root: Path, scope: list[str]) -> tuple[dict, float]:
+    """Failed-run history and cumulative wall time already recorded in this
+    root — the retry cap and the UR budget gate are enforced ACROSS
+    invocations, not per call (the first round happily launched a third
+    same-config attempt after two recorded failures)."""
+    prior_failed: dict[str, list[str]] = {}
+    prior_wall_s = 0.0
+    if not (out_root / integ.ATTEMPTS_INDEX).is_file():
+        return prior_failed, prior_wall_s
+    for att in integ.load_attempts(out_root):
+        try:
+            manifest = integ.load_attempt_manifest(out_root, att["attempt"])
+        except Exception:  # noqa: BLE001 -- unreadable history: skip, not crash
+            continue
+        prior_wall_s += float(manifest.get("total_wall_s") or 0.0)
+        for row in manifest.get("rows", []):
+            if (row.get("demo") in scope
+                    and row.get("status") not in (None, "ok")):
+                prior_failed.setdefault(row["demo"], []).append(att["attempt"])
+    return prior_failed, prior_wall_s
 
 
 def pilot_demos_from_freeze(freeze_dir: Path) -> list[str]:
@@ -333,8 +361,40 @@ def main() -> int:
 
     extra_argv = (["--retargeter.step-size", str(UR_STEP_SIZE)]
                   if source_record else None)
-    rows = [generate_one(d, args.env_python, attempt_dir, data_path,
-                         extra_argv=extra_argv) for d in scope]
+    # review fix 11: per-demo retry cap across the root + the UR cumulative
+    # budget — both enforced BEFORE the subprocess call, with the reason in
+    # the row (a third call after two recorded same-config failures, or a
+    # call past the 3h experiment budget, must never happen silently)
+    prior_failed, prior_wall_s = _prior_run_facts(out_root, scope)
+    rows = []
+    spent = 0.0
+    for d in scope:
+        if len(prior_failed.get(d, [])) >= MAX_FAILED_RUNS_PER_DEMO:
+            rows.append({
+                "demo": d, "argv": None, "cwd": str(HOLOSOMA_PACKAGE),
+                "exit_code": None, "wall_s": 0.0,
+                "status": "skipped_retry_cap",
+                "prior_failed_attempts": prior_failed[d],
+                "reason": f"{MAX_FAILED_RUNS_PER_DEMO} failed same-config "
+                          "runs already recorded in this root; retry "
+                          "policy exhausted (§6.2) — no further attempt "
+                          "without a new registration",
+            })
+            continue
+        if source_record and prior_wall_s + spent > UR_TOTAL_BUDGET_S:
+            rows.append({
+                "demo": d, "argv": None, "cwd": str(HOLOSOMA_PACKAGE),
+                "exit_code": None, "wall_s": 0.0,
+                "status": "skipped_budget",
+                "cumulative_wall_s": round(prior_wall_s + spent, 1),
+                "reason": "UR cumulative generation budget (§11, 3h) "
+                          "exhausted before this demo",
+            })
+            continue
+        row = generate_one(d, args.env_python, attempt_dir, data_path,
+                           extra_argv=extra_argv)
+        rows.append(row)
+        spent += float(row.get("wall_s") or 0.0)
 
     input_mutated = False
     for demo in scope:
@@ -373,6 +433,10 @@ def main() -> int:
         "n_postcheck_failed": sum(r["status"] == "postcheck_failed" for r in rows),
         "input_mutated": input_mutated,
         "n_timeout": sum(r["status"] == "timeout" for r in rows),
+        "n_skipped_retry_cap": sum(r["status"] == "skipped_retry_cap"
+                                   for r in rows),
+        "n_skipped_budget": sum(r["status"] == "skipped_budget" for r in rows),
+        "prior_wall_s_in_root": round(prior_wall_s, 1),
         "total_wall_s": round(sum(r["wall_s"] for r in rows), 1),
         "rows": rows,
     }

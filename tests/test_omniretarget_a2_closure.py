@@ -202,7 +202,8 @@ def test_fresh_comparison_match_ignores_only_run_scoped_fields():
 def _verification(**over):
     v = {"anchors_passed": True, "fresh_matches": True,
          "known_gaps": KNOWN_GAPS, "unexpected_gaps": [],
-         "report_violations": [], "consumption_violations": []}
+         "report_violations": [], "consumption_violations": [],
+         "identity_stable": True, "checkout_passed": True}
     v.update(over)
     return v
 
@@ -374,11 +375,13 @@ def test_cli_normal_registration_exit0_and_reports_written(tmp_path,
     assert rec["registration_status"]["complete"] is True
     assert rec["baseline"]["verdict"] == "incomplete"
     assert rec["training"]["status"] == "not_ready"
-    be = json.loads((out / "baseline" / "baseline_evidence.json").read_text())
+    be = json.loads((out / "baseline" / "snapshots" / "attempt_001"
+                      / "baseline_evidence.json").read_text())
     assert be["passed"] is True
     assert be["known_gaps"] == KNOWN_GAPS
     assert be["unexpected_gaps"] == []
-    ev = json.loads((out / "baseline" / "evidence_files.json").read_text())
+    ev = json.loads((out / "baseline" / "snapshots" / "attempt_001"
+                      / "evidence_files.json").read_text())
     assert ev["u0_evidence"]["sub12_teacher"]["missing"] is True
     assert ev["consumed_data_path"]["recorded_in_manifest"] is False
     assert set(ev["published_teachers"]) == set(PILOT)
@@ -400,7 +403,8 @@ def test_cli_unexpected_gap_blocks_registration_nonzero(tmp_path, monkeypatch):
     assert rec["registration_status"]["complete"] is False
     assert "unexpected_evidence_gap" in rec["registration_status"][
         "blocking_reasons"]
-    be = json.loads((out / "baseline" / "baseline_evidence.json").read_text())
+    be = json.loads((out / "baseline" / "snapshots" / "attempt_001"
+                      / "baseline_evidence.json").read_text())
     assert be["passed"] is False
     assert "admission:input_hash_mismatch_vs_freeze" in be["unexpected_gaps"]
 

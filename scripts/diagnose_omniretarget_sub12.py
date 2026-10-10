@@ -46,7 +46,8 @@ import numpy as np
 
 from _omniretarget_diagnostic_child import classify_phase_one
 from ireset.data import a2_integrity as integ
-from ireset.paths import OMOMO_NEW_DIR, PROJECT_ROOT, path_for_record
+from ireset.paths import (OMOMO_NEW_DIR, PROJECT_ROOT, TEACHER_TRAJ_DIR,
+                          path_for_record)
 
 HOLOSOMA_PACKAGE = (
     PROJECT_ROOT / "third_party" / "holosoma" / "src" / "holosoma_retargeting"
@@ -103,20 +104,74 @@ def compare_control(control_raw: Path, registered_raw: Path,
 
 
 def _arrays_equal(npz_a: Path, npz_b: Path, keys: list[str]) -> dict:
+    """Two-run npz comparison over ``keys``.
+
+    A key missing on BOTH sides is consistent evidence (``both_missing``,
+    counted as equal); missing on ONE side is a difference — tampering the
+    second run's arrays or dropping a key the first run saved is caught,
+    while first-round snapshots that predate a key stay comparable.
+    """
     out: dict = {}
     if not (npz_a.is_file() and npz_b.is_file()):
         return {"all_equal": False, "missing": True}
     a, b = np.load(npz_a), np.load(npz_b)
     for k in keys:
-        if k not in a or k not in b:
-            out[k] = "missing"
-        else:
+        in_a, in_b = k in a, k in b
+        if in_a and in_b:
             out[k] = bool(np.array_equal(a[k], b[k]))
-    return {"all_equal": all(v is True for v in out.values()), "per_key": out}
+        elif in_a or in_b:
+            out[k] = False
+        else:
+            out[k] = "both_missing"
+    return {"all_equal": all(v is True or v == "both_missing"
+                             for v in out.values()), "per_key": out}
+
+
+def _snapshot_artifact_hashes(snapshot: Path) -> dict:
+    """File-level SHA-256 of the deterministic failure artifacts (review fix
+    5): the context npz and the canonical Clarabel dumps. failure_meta.json
+    is excluded — it embeds solve timings, so two healthy runs never hash
+    it identically; its deterministic fields are compared separately."""
+    out: dict = {}
+    for name in ("failure_context.npz", "failure_canonical.npz",
+                 "failure_canonical_P.npz", "failure_canonical_A.npz"):
+        p = Path(snapshot) / name
+        out[name] = _hash_or_none(p)
+    return out
+
+
+def _compare_canonical(run_a: Path, run_b: Path) -> dict:
+    """Compare the canonical Clarabel objective/rhs vectors of the two runs
+    (``c`` for conic data; first-round dumps only saved ``b`` — the
+    objective-serializer defect — and stay comparable on the keys they have)."""
+    pa, pb = Path(run_a) / "failure_canonical.npz", Path(run_b) / "failure_canonical.npz"
+    if not (pa.is_file() and pb.is_file()):
+        return {"equal": False, "missing": True}
+    a, b = np.load(pa), np.load(pb)
+    out: dict = {}
+    for k in ("c", "q", "b"):
+        in_a, in_b = k in a, k in b
+        if in_a and in_b:
+            out[k] = bool(np.array_equal(a[k], b[k]))
+        elif in_a or in_b:
+            out[k] = False
+        else:
+            out[k] = "both_missing"
+    return {"equal": all(v is True or v == "both_missing"
+                         for v in out.values()), "per_key": out}
 
 
 def decide_diagnosis(control: dict, runs: list[dict]) -> dict:
-    """Aggregate the §5.5 verdict. Pure; counterexample-testable."""
+    """Aggregate the §5.5 verdict. Pure; counterexample-testable.
+
+    Review fix 5 (2026-10-10): two-run consistency is verified on the FULL
+    captured evidence — the five context arrays AND ``q_a_indices`` /
+    ``q_a_nominal`` (variable-column mapping), the canonical Clarabel
+    objective/rhs vectors, the file-level SHA-256 of the deterministic
+    snapshot artifacts, and the problem shape (SOC t, dqa shape, kept
+    constraint count). Editing the second run's canonical ``b`` or column
+    mapping previously still yielded ``supports_step03_candidate``.
+    """
     if not control.get("equal", False):
         return {"status": "control_not_equivalent",
                 "reason": control.get("reason"),
@@ -149,14 +204,18 @@ def decide_diagnosis(control: dict, runs: list[dict]) -> dict:
                         "produced usable evidence (§11 stop)"}
     # both runs failed with captured context: determinism first
     f0, f1 = (r["summary"]["failure"] for r in failed)
+    snap0, snap1 = Path(failed[0]["snapshot"]), Path(failed[1]["snapshot"])
     same_frame = f0.get("failing_frame_idx", f0.get("frame_idx")) == \
         f1.get("failing_frame_idx", f1.get("frame_idx"))
     same_ordinal = f0.get("ordinal_in_frame") == f1.get("ordinal_in_frame")
     ctx_equal = _arrays_equal(
-        Path(failed[0]["snapshot"]) / "failure_context.npz",
-        Path(failed[1]["snapshot"]) / "failure_context.npz",
+        snap0 / "failure_context.npz", snap1 / "failure_context.npz",
         ["q_locked", "q_a_n_last", "q_t_last", "target_laplacian",
-         "obj_pts_local"])
+         "obj_pts_local", "q_a_indices", "q_a_nominal"])
+    canonical_equal = _compare_canonical(snap0, snap1)
+    h0, h1 = _snapshot_artifact_hashes(snap0), _snapshot_artifact_hashes(snap1)
+    hashes_equal = all(
+        (h0[k] is None and h1[k] is None) or h0[k] == h1[k] for k in h0)
     p0 = f0.get("phase_one", {}) or {}
     p1 = f1.get("phase_one", {}) or {}
     cats = [p.get("category") or f"phase1_{p.get('status', 'missing')}"
@@ -164,6 +223,9 @@ def decide_diagnosis(control: dict, runs: list[dict]) -> dict:
     rho0, rho1 = p0.get("rho"), p1.get("rho")
     rho_agree = (rho0 is not None and rho1 is not None
                  and abs(rho0 - rho1) <= RHO_AGREEMENT)
+    shape_keys = ("soc_t", "dqa_shape", "n_kept_constraints",
+                  "n_soc_constraints", "soc_t_matches_step_size")
+    shape_equal = all(p0.get(k) == p1.get(k) for k in shape_keys)
     rec: dict = {
         "failing_frame_run1": f0.get("failing_frame_idx", f0.get("frame_idx")),
         "failing_frame_run2": f1.get("failing_frame_idx", f1.get("frame_idx")),
@@ -171,13 +233,22 @@ def decide_diagnosis(control: dict, runs: list[dict]) -> dict:
         "ordinal_run2": f1.get("ordinal_in_frame"),
         "same_frame": bool(same_frame), "same_ordinal": bool(same_ordinal),
         "key_arrays_equal": ctx_equal,
+        "canonical_vectors_equal": canonical_equal,
+        "artifact_sha256": {"run1": h0, "run2": h1,
+                            "equal": bool(hashes_equal)},
+        "problem_shape": {k: [p0.get(k), p1.get(k)] for k in shape_keys},
+        "problem_shape_equal": bool(shape_equal),
         "phase1_categories": cats,
         "rho_run1": rho0, "rho_run2": rho1, "rho_agreement": bool(rho_agree),
     }
-    if not (same_frame and same_ordinal and ctx_equal.get("all_equal")):
+    consistent = (same_frame and same_ordinal and ctx_equal.get("all_equal")
+                  and canonical_equal.get("equal") and hashes_equal
+                  and shape_equal)
+    if not consistent:
         rec.update(status="nondeterministic",
-                   note="two runs disagree on the failure context; no "
-                        "recovery candidate (§5.3 step 3)")
+                   note="two runs disagree on the failure context or its "
+                        "captured evidence; no recovery candidate "
+                        "(§5.3 step 3)")
         return rec
     if all(c == "supports_step03_candidate" for c in cats) and rho_agree:
         rec.update(status="supports_step03_candidate",
@@ -204,6 +275,61 @@ def decide_diagnosis(control: dict, runs: list[dict]) -> dict:
                note="finite-recovery hypothesis not supported; U0 stop line "
                     "stands (§6.1)")
     return rec
+
+
+def verify_diagnosis_record(diag: dict) -> dict:
+    """Verify a diagnosis_run.json AS merge/registration evidence (review
+    fixes 5/6, 2026-10-10): the recorded verdict must be backed by the
+    recorded facts, and the parent baseline-evidence hash it registered
+    against must still resolve to the file on disk.
+
+    Pure over the loaded record (counterexample-testable); used by G0
+    ``register-recovery`` and by the closure C2 merge verification.
+    """
+    problems: list[str] = []
+    verdict = diag.get("verdict", {})
+    status = verdict.get("status")
+    control = (diag.get("control") or {}).get("comparison") or {}
+    if not control.get("equal"):
+        problems.append("control_not_equivalent")
+    parent = diag.get("baseline") or {}
+    parent_path = parent.get("baseline_evidence")
+    if parent_path:
+        pp = Path(parent_path)
+        pp = pp if pp.is_absolute() else PROJECT_ROOT / pp
+        if not pp.is_file():
+            problems.append("parent_baseline_missing")
+        elif integ.sha256_file(pp) != parent.get("baseline_evidence_sha256"):
+            problems.append("parent_baseline_drifted")
+    else:
+        problems.append("parent_baseline_not_recorded")
+    if status == "supports_step03_candidate":
+        for key, val in (("same_frame", True), ("same_ordinal", True),
+                         ("rho_agreement", True)):
+            if verdict.get(key) is not val:
+                problems.append(f"{key}_not_holds")
+        if not (verdict.get("key_arrays_equal") or {}).get("all_equal"):
+            problems.append("key_arrays_not_equal")
+        if not (verdict.get("canonical_vectors_equal") or {}).get("equal"):
+            problems.append("canonical_vectors_missing_or_unequal")
+        if not (verdict.get("artifact_sha256") or {}).get("equal"):
+            problems.append("artifact_sha256_missing_or_unequal")
+        if not verdict.get("problem_shape_equal"):
+            problems.append("problem_shape_missing_or_unequal")
+        cats = verdict.get("phase1_categories") or []
+        if not cats or not all(c == "supports_step03_candidate" for c in cats):
+            problems.append("phase1_categories_not_supporting")
+        rho = verdict.get("rho_run1")
+        if not (isinstance(rho, (int, float))
+                and 0.2 + 1e-6 < rho <= 0.3 - 1e-6):
+            problems.append("rho_outside_candidate_window")
+    elif status == "not_run":
+        problems.append("diagnosis_not_run")
+    return {"verified": not problems, "problems": problems,
+            "status": status,
+            "facts": {k: verdict.get(k) for k in
+                      ("failing_frame_run1", "ordinal_run1", "rho_run1",
+                       "rho_run2")}}
 
 
 def run_child(env_python: Path, demo: str, data_path: Path, save_dir: Path,
@@ -281,21 +407,81 @@ def diagnose(args) -> int:
     freeze_dir = _recorded_path(
         ev["a1_freeze"]["frozen_lists.json"]["path"]).parent
 
-    # ---- identity gates --------------------------------------------------
+    # ---- FULL pre-admission (review fix 4, 2026-10-10) ------------------
+    # a failed C0, drifted assets, missing/tampered inputs at the ACTUAL
+    # --data-path, or an env that drifted from what the consumed attempts
+    # recorded must block BEFORE any child process is launched — the first
+    # round only checked selection/checkout/env-probe and ran three
+    # subprocesses against evidence it had never re-admitted.
+    blocked: list[str] = []
+    pre: dict = {}
+    if not selection_ok:
+        blocked.append("authoritative_selection_drifted")
+    if baseline.get("passed") is not True:
+        blocked.append("baseline_c0_not_passed")
+    if not baseline.get("identity", {}).get("stable_during_run", False):
+        blocked.append("baseline_identity_unstable")
     checkout = integ.verify_checkout_against_freeze(
         _load_json(freeze_dir / "assets.json"))
+    pre["checkout"] = {"passed": checkout["passed"]}
+    if not checkout["passed"]:
+        blocked.append("upstream_checkout_mismatch")
+    try:
+        assets_check = integ.verify_assets_against_freeze(
+            _load_json(freeze_dir / "assets.json"))
+        pre["assets"] = {"passed": assets_check["passed"]}
+        if not assets_check["passed"]:
+            blocked.append("frozen_assets_drifted")
+    except Exception as exc:  # noqa: BLE001 -- recorded, blocked
+        pre["assets"] = {"error": f"{type(exc).__name__}: {exc}"}
+        blocked.append("frozen_assets_check_failed")
     env = integ.measure_env_identity(args.env_python)
     env_ok = (env["env_mujoco_version"] is not None
               and env["env_mujoco_version"] == env["env_lock_mujoco_version"])
-
-    blocked: list[str] = []
-    if not selection_ok:
-        blocked.append("authoritative_selection_drifted")
-    if not checkout["passed"]:
-        blocked.append("upstream_checkout_mismatch")
+    pre["env_probe"] = env
     if not env_ok:
         blocked.append(f"env_probe_failed:{env.get('env_probe_error')
                                              or env['env_mujoco_version']}")
+    data_path = Path(args.data_path).expanduser().resolve()
+    scope_demos = sorted({args.control_demo, args.demo})
+    try:
+        frozen_entries = [e for e in _load_json(
+            freeze_dir / "frozen_lists.json")["teacher_pilot_train6_v1"]
+            if e["demo"] in scope_demos]
+        inputs_check = integ.verify_inputs_against_freeze(
+            frozen_entries, TEACHER_TRAJ_DIR, data_path)
+        pre["inputs_vs_freeze"] = inputs_check
+        bad = [d for d, r in inputs_check.items()
+               if not (r.get("npz_matches") and r.get("pt_matches"))]
+        if bad:
+            blocked.append(f"inputs_vs_freeze_failed:{bad}")
+    except Exception as exc:  # noqa: BLE001 -- recorded, blocked
+        pre["inputs_vs_freeze"] = {"error": f"{type(exc).__name__}: {exc}"}
+        blocked.append(f"inputs_vs_freeze_error:{type(exc).__name__}")
+    # the env the consumed U0 attempts recorded vs the env measured now
+    try:
+        u0_root = _recorded_path(
+            ev["u0_evidence"]["attempts_index"]["path"]).parent
+        recorded_envs = []
+        for att in integ.load_attempts(u0_root):
+            ident = integ.load_attempt_manifest(
+                u0_root, att["attempt"]).get("identity", {}).get("env", {})
+            recorded_envs.append(ident)
+        pre["env_recorded_at_generation"] = recorded_envs
+        lock_shas = {e.get("env_uv_lock_sha256") for e in recorded_envs}
+        versions = {e.get("env_mujoco_version") for e in recorded_envs}
+        env_consistent = (
+            len(lock_shas) == 1 and None not in lock_shas
+            and env["env_uv_lock_sha256"] in lock_shas
+            and len(versions) == 1 and None not in versions
+            and env["env_mujoco_version"] in versions)
+        if not env_consistent:
+            blocked.append("env_drifted_vs_generation")
+    except Exception as exc:  # noqa: BLE001 -- recorded, blocked
+        pre["env_recorded_at_generation"] = {
+            "error": f"{type(exc).__name__}: {exc}"}
+        blocked.append("generation_env_record_unavailable")
+
     idx_common = {"purpose": "sub12 limited diagnosis",
                   "control_demo": args.control_demo, "demo": args.demo,
                   "baseline_evidence": path_for_record(baseline_evidence_path),
@@ -303,9 +489,11 @@ def diagnose(args) -> int:
                       integ.sha256_file(baseline_evidence_path)}
     if blocked:
         # a blocked diagnosis still allocates its own attempt and writes an
-        # explicit record (never a crash with no report on disk)
+        # explicit record (never a crash with no report on disk); ZERO
+        # child processes are launched on blocked evidence
         attempt_dir = integ.allocate_attempt(out_root)
         summary = {"status": "diagnostic_incomplete", "blocked": blocked,
+                   "preconditions": pre,
                    "timestamp": _dt.datetime.now().isoformat(timespec="seconds")}
         (attempt_dir / "diagnosis_run.json").write_text(json.dumps(
             summary, indent=2, ensure_ascii=False))
@@ -317,17 +505,41 @@ def diagnose(args) -> int:
         return 2
 
     retargeter_sha = integ.sha256_file(RETARGETER_FILE)
-    data_path = Path(args.data_path).expanduser().resolve()
 
-    # §9 structure: attempt_001 = control + diagnosis run 1;
-    # attempt_002 = diagnosis run 2 (the concluding verdict lives there)
+    # §9 structure (review fix 4): the control equivalence is CONFIRMED
+    # before ANY sub12 subprocess is launched — attempt_001 = control only;
+    # a non-equivalent control ends the diagnosis there with zero sub12
+    # calls; attempt_002 = sub12 run 1; attempt_003 = sub12 run 2 (the
+    # concluding verdict lives there).
+    def _final_summary(verdict, control_cmp, runs, attempts):
+        return {
+            "stage": "D0 sub12 limited diagnosis (closure plan §5)",
+            "timestamp": _dt.datetime.now().isoformat(timespec="seconds"),
+            "attempts": attempts,
+            "baseline": {
+                "baseline_evidence": path_for_record(baseline_evidence_path),
+                "baseline_evidence_sha256":
+                    integ.sha256_file(baseline_evidence_path),
+                "evidence_files": path_for_record(evidence_files_path),
+                "authoritative_selection": path_for_record(selection_path),
+                "authoritative_selection_sha256": selection_now,
+                "authoritative_selection_still_pinned": selection_ok,
+            },
+            "preconditions": pre,
+            "identity": {"checkout": checkout, "env": env,
+                         "retargeter_sha256": retargeter_sha,
+                         "child_driver_sha256": integ.sha256_file(CHILD_DRIVER),
+                         "data_path": path_for_record(data_path)},
+            "control": control_cmp,
+            "runs": runs,
+            "verdict": verdict,
+            "wall_s": round(time.time() - t0, 1),
+        }
+
     att1 = integ.allocate_attempt(out_root)
     control = run_child(args.env_python, args.control_demo, data_path,
                         att1 / "control", att1 / "control", retargeter_sha,
                         args.run_timeout_s)
-    run1 = run_child(args.env_python, args.demo, data_path,
-                     att1 / "sub12_run1", att1 / "sub12_run1",
-                     retargeter_sha, args.run_timeout_s)
     reg_raw_info = (ev.get("u0_evidence", {}).get("attempt_001", {})
                     .get(args.control_demo, {}).get("raw", {}))
     control_cmp = {"run": {k: v for k, v in control.items()
@@ -339,50 +551,53 @@ def diagnose(args) -> int:
     else:
         control_cmp["comparison"] = {"equal": False,
                                      "reason": "no registered raw artifact"}
+    integ.append_attempts_index(out_root, {
+        **idx_common, "attempt": att1.name, "purpose": "sub16 control",
+        "control_equal": control_cmp["comparison"].get("equal"),
+        "report": path_for_record(att1 / "control" / "child_summary.json")})
+    if not control_cmp["comparison"].get("equal"):
+        verdict = decide_diagnosis(control_cmp["comparison"], [])
+        out_json = att1 / "diagnosis_run.json"
+        out_json.write_text(json.dumps(
+            _final_summary(verdict, control_cmp, [],
+                           {"control": att1.name, "runs": []}),
+            indent=2, ensure_ascii=False, default=str))
+        integ.append_attempts_index(out_root, {
+            **idx_common, "attempt": att1.name, "purpose": "sub16 control",
+            "status": verdict["status"],
+            "report": path_for_record(out_json)})
+        print(json.dumps(verdict, indent=2, ensure_ascii=False, default=str))
+        print(f"diagnosis -> {path_for_record(out_json)}")
+        return 2
 
     att2 = integ.allocate_attempt(out_root)
+    run1 = run_child(args.env_python, args.demo, data_path,
+                     att2 / "sub12_run1", att2 / "sub12_run1",
+                     retargeter_sha, args.run_timeout_s)
+    att3 = integ.allocate_attempt(out_root)
     run2 = run_child(args.env_python, args.demo, data_path,
-                     att2 / "sub12_run2", att2 / "sub12_run2",
+                     att3 / "sub12_run2", att3 / "sub12_run2",
                      retargeter_sha, args.run_timeout_s)
 
     verdict = decide_diagnosis(control_cmp["comparison"], [run1, run2])
-    summary = {
-        "stage": "D0 sub12 limited diagnosis (closure plan §5)",
-        "timestamp": _dt.datetime.now().isoformat(timespec="seconds"),
-        "attempts": {"control_and_run1": att1.name, "run2": att2.name},
-        "baseline": {
-            "baseline_evidence": path_for_record(baseline_evidence_path),
-            "baseline_evidence_sha256":
-                integ.sha256_file(baseline_evidence_path),
-            "evidence_files": path_for_record(evidence_files_path),
-            "authoritative_selection": path_for_record(selection_path),
-            "authoritative_selection_sha256": selection_now,
-            "authoritative_selection_still_pinned": selection_ok,
-        },
-        "identity": {"checkout": checkout, "env": env,
-                     "retargeter_sha256": retargeter_sha,
-                     "child_driver_sha256": integ.sha256_file(CHILD_DRIVER),
-                     "data_path": path_for_record(data_path)},
-        "control": control_cmp,
-        "runs": [{k: v for k, v in r.items() if k != "summary"}
-                 | {"failure": (r.get("summary") or {}).get("failure"),
-                    "outcome": (r.get("summary") or {}).get("outcome"),
-                    "frames_completed": (r.get("summary") or {})
-                    .get("frames_completed")}
-                 for r in (run1, run2)],
-        "verdict": verdict,
-        "wall_s": round(time.time() - t0, 1),
-    }
-    out_json = att2 / "diagnosis_run.json"
+    runs = [{k: v for k, v in r.items() if k != "summary"}
+            | {"failure": (r.get("summary") or {}).get("failure"),
+               "outcome": (r.get("summary") or {}).get("outcome"),
+               "frames_completed": (r.get("summary") or {})
+               .get("frames_completed")}
+            for r in (run1, run2)]
+    summary = _final_summary(
+        verdict, control_cmp, runs,
+        {"control": att1.name, "run1": att2.name, "run2": att3.name})
+    out_json = att3 / "diagnosis_run.json"
     out_json.write_text(json.dumps(summary, indent=2, ensure_ascii=False,
                                    default=str))
     integ.append_attempts_index(out_root, {
-        "attempt": att1.name, "purpose": "sub16 control + sub12 diagnosis 1",
-        "control_equal": control_cmp["comparison"].get("equal"),
+        **idx_common, "attempt": att2.name, "purpose": "sub12 diagnosis 1",
         "run1_outcome": (run1.get("summary") or {}).get("outcome"),
-        "report": path_for_record(att1 / "sub12_run1" / "child_summary.json")})
+        "report": path_for_record(att2 / "sub12_run1" / "child_summary.json")})
     integ.append_attempts_index(out_root, {
-        "attempt": att2.name, "purpose": "sub12 diagnosis 2",
+        **idx_common, "attempt": att3.name, "purpose": "sub12 diagnosis 2",
         "status": verdict["status"],
         "report": path_for_record(out_json)})
     print(json.dumps(verdict, indent=2, ensure_ascii=False, default=str))
@@ -419,7 +634,15 @@ PREREG_FIELDS = {
 
 
 def register_recovery(args) -> int:
-    """G0: exclusive-create preregistration.json (§6.2/§9)."""
+    """G0: exclusive-create preregistration.json (§6.2/§9).
+
+    Review fix 5 (2026-10-10): the referenced diagnosis is VERIFIED as
+    evidence, not just status-read — the recorded verdict must be backed by
+    the recorded facts (control equivalence, two-run consistency over the
+    extended evidence, rho in the candidate window) and its parent baseline
+    hash must still resolve. A status string alone no longer registers a
+    candidate.
+    """
     diag_path = Path(args.from_diagnosis).expanduser().resolve()
     if not diag_path.is_file():
         raise SystemExit(f"diagnosis summary missing: {diag_path}")
@@ -429,6 +652,11 @@ def register_recovery(args) -> int:
             "refusing to register: diagnosis status is "
             f"{diag.get('verdict', {}).get('status')!r}; the single 0.3 "
             "candidate is registrable only from supports_step03_candidate")
+    verification = verify_diagnosis_record(diag)
+    if not verification["verified"]:
+        raise SystemExit(
+            "refusing to register: the diagnosis record does not verify as "
+            f"evidence: {verification['problems']}")
     out_root = integ.guard_output_dir(args.out)
     out_root.mkdir(parents=True, exist_ok=True)
     gen_root = out_root / "generation"
@@ -451,6 +679,11 @@ def register_recovery(args) -> int:
                 ev["authoritative_selection"]["sha256"],
             "diagnosis": path_for_record(diag_path),
             "diagnosis_sha256": integ.sha256_file(diag_path),
+        },
+        "diagnosis_verification": {
+            "verified": verification["verified"],
+            "problems": verification["problems"],
+            "facts": verification["facts"],
         },
         "expected_demos": pilot,
         "expected_denominator": len(pilot),

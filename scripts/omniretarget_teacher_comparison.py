@@ -154,17 +154,66 @@ def _recompute_config_diff(full: dict) -> dict:
             for k in sorted(set(fd) | set(fr)) if fd.get(k) != fr.get(k)}
 
 
-def _fresh_config_smoke(env_python: Path, prereg: dict) -> dict:
-    """Comparison-time upstream config smoke (§7.3): the CURRENT env must
-    still parse the override to the registered step size and hash."""
+#: per-row argv metadata masked when comparing two rows' command lines
+_ARGV_META_FLAGS = ("--task-name", "--save-dir")
+
+
+def _normalized_argv(argv: list[str]) -> list[str]:
+    out, skip = [], False
+    for tok in argv:
+        if skip:
+            skip = False
+            continue
+        if tok in _ARGV_META_FLAGS:
+            skip = True
+            continue
+        out.append(tok)
+    return out
+
+
+def _canonical_base_argv(recorded: list[str]) -> list[str]:
+    """The canonical U0 generation command with this row's metadata — the
+    default side of the argv-bound smoke (review fix 2).
+
+    The recorded argv's own values are reused for task-name/data-path/
+    save-dir (per-demo run metadata, stripped from the canonical hash), so
+    the base differs from the recorded command ONLY when the recorded
+    command carries extra flags or non-template values — exactly what the
+    diff must expose.
+    """
+    def val(flag: str, default: str = "") -> str:
+        return (recorded[recorded.index(flag) + 1]
+                if flag in recorded else default)
+    return ["--task-type", "object_interaction",
+            "--task-name", val("--task-name"),
+            "--data-format", "smplh",
+            "--data-path", val("--data-path"),
+            "--save-dir", val("--save-dir"),
+            "--task-config.object-name", "largebox"]
+
+
+def _argv_config_smoke(env_python: Path, argv: list[str]) -> dict:
+    """Comparison-time config smoke over the argv the generation manifest
+    ACTUALLY recorded (review fix 2, 2026-10-10).
+
+    The first round smoked a freshly CONSTRUCTED argv while only checking
+    that the step-size string appears in the consumed argv — adding
+    ``--retargeter.penetration-tolerance 0.1`` to the real command changed
+    the parsed constraints yet passed admission, and editing BOTH manifest
+    configs consistently never tripped the canonical-hash check (nothing
+    re-derived the hash from the actual command). The smoke now parses the
+    recorded argv against the CANONICAL base command: the parsed diff must
+    be exactly the single registered difference and the canonical hash must
+    equal the recorded one — an extra flag shows on the recorded side only
+    and fails the single-difference leg (deriving the default from the
+    recorded argv itself would hide it on both sides).
+    """
     child = Path(__file__).resolve().parent / "_omniretarget_diagnostic_child.py"
     cmd = [str(env_python), str(child), "--mode", "config-smoke",
-           "--demo", prereg["expected_demos"][0],
-           "--data-path", "derived/upstream/holosoma_env",
-           "--save-dir", "derived/upstream/holosoma_env/_smoke_no_write",
            "--holosoma-package",
            "third_party/holosoma/src/holosoma_retargeting/holosoma_retargeting",
-           "--step-size", "0.3"]
+           "--argv-json", json.dumps(list(argv)),
+           "--base-argv-json", json.dumps(_canonical_base_argv(list(argv)))]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if proc.returncode != 0:
@@ -178,11 +227,17 @@ def _fresh_config_smoke(env_python: Path, prereg: dict) -> dict:
 
 
 def _source_registration_record(gen_root: Path, coverage: dict,
-                                prereg: dict, prereg_sha_now: str) -> dict:
+                                prereg: dict, prereg_sha_now: str,
+                                env_python: Path | None = None) -> dict:
     """Per-consumed-attempt registration reconciliation (§7.3): every
     attempt backing a consumed demo must belong to THIS preregistration,
-    with a single-field config diff, the step-size flag in every consumed
-    row's argv, and full parsed configs on record."""
+    with a single-field config diff, consistent step-size argv across the
+    consumed rows, and — review fix 2 — a REAL config parse of every
+    consumed row's recorded argv whose canonical hash matches the recorded
+    one (the verification is bound to the actual generation command, never
+    to a stand-in argv or a flag-string presence check)."""
+    step_to = prereg["single_config_difference"]["retargeter.step_size"]["to"]
+    single_diff = {"retargeter.step_size": [0.2, step_to]}
     by_attempt: dict[str, set] = {}
     for demo, entry in coverage["by_demo"].items():
         by_attempt.setdefault(entry["attempt"], set()).add(demo)
@@ -203,32 +258,79 @@ def _source_registration_record(gen_root: Path, coverage: dict,
         full = sr.get("config_smoke_full") or {}
         rec["recomputed_config_diff"] = _recompute_config_diff(full)
         rec["single_difference_holds"] = (
-            rec["recomputed_config_diff"]
-            == {"retargeter.step_size": [0.2, prereg[
-                "single_config_difference"]["retargeter.step_size"]["to"]]})
+            rec["recomputed_config_diff"] == single_diff)
+        rec["recorded_canonical_config_sha256"] = (
+            sr.get("config_smoke", {}).get("canonical_config_sha256"))
         bad_argv = []
+        normalized: dict[str, list[str]] = {}
         for demo in demos:
             row = integ.manifest_row_for(manifest, demo) or {}
-            argv = row.get("argv") or []
+            argv = list(row.get("argv") or [])
+            normalized[demo] = _normalized_argv(argv)
             has_flag = ("--retargeter.step-size" in argv)
-            step_val = None
-            if has_flag:
-                step_val = argv[argv.index("--retargeter.step-size") + 1]
-            if not has_flag or step_val != str(
-                    prereg["single_config_difference"]
-                    ["retargeter.step_size"]["to"]):
+            step_val = argv[argv.index("--retargeter.step-size") + 1] \
+                if has_flag else None
+            if not has_flag or step_val != str(step_to):
                 bad_argv.append(demo)
         rec["argv_step_size_ok"] = not bad_argv
         rec["argv_step_size_bad_demos"] = bad_argv
-        rec["recorded_canonical_config_sha256"] = (
-            sr.get("config_smoke", {}).get("canonical_config_sha256"))
+        rec["argv_consistent_across_rows"] = (
+            len({tuple(v) for v in normalized.values()}) <= 1)
+        # the real gate: parse each consumed row's ACTUAL recorded argv and
+        # require the registered single difference + the recorded hash
+        argv_smoke: dict[str, dict] = {}
+        if env_python is not None:
+            for demo in sorted(demos):
+                row = integ.manifest_row_for(manifest, demo) or {}
+                smoke = _argv_config_smoke(env_python, list(row.get("argv")
+                                                            or []))
+                smoke["matches_registration"] = (
+                    "error" not in smoke
+                    and smoke.get("diff") == single_diff
+                    and smoke.get("step_size_default") == 0.2
+                    and smoke.get("step_size_recovery") == step_to
+                    and smoke.get("canonical_config_sha256")
+                    == rec["recorded_canonical_config_sha256"])
+                argv_smoke[demo] = smoke
+        rec["argv_smoke"] = argv_smoke
+        rec["argv_smoke_ok"] = bool(argv_smoke) and all(
+            s.get("matches_registration") for s in argv_smoke.values())
         per_attempt[attempt] = rec
     passed = all(
         r["identity_matches"] and r["single_difference_holds"]
-        and r["argv_step_size_ok"] and r["step_size"] == 0.3
+        and r["argv_step_size_ok"] and r["argv_consistent_across_rows"]
+        and (not r["argv_smoke"] or r["argv_smoke_ok"])
+        and r["step_size"] == 0.3
         for r in per_attempt.values()) and bool(per_attempt)
     return {"preregistration_sha256_now": prereg_sha_now,
             "per_attempt": per_attempt, "passed": passed}
+
+
+def _assert_plain_u0_root(u0_root: Path) -> None:
+    """``--u0-dir`` must never consume a UR generation root (review fix 3,
+    2026-10-10): the mode is chosen by CLI flags only, and a UR directory
+    passed there previously sailed through admission with the registration
+    leg entirely skipped, producing a full verdict labeled "U0". Any
+    registration marker in the attempts index, or any manifest carrying a
+    ``source_record``, refuses the run."""
+    for att in integ.load_attempts(u0_root):
+        if att.get("preregistration_sha256") or att.get("experiment_id"):
+            raise SystemExit(
+                f"attempt {att.get('attempt')} carries a recovery "
+                "registration; a UR generation root must be compared via "
+                "--generated-dir/--source-record, never --u0-dir")
+    for att in integ.load_attempts(u0_root):
+        try:
+            manifest = integ.load_attempt_manifest(u0_root, att["attempt"])
+        except Exception:  # noqa: BLE001 -- unresolvable manifest: refuse
+            raise SystemExit(
+                f"attempt {att.get('attempt')} manifest unreadable; a UR "
+                "root cannot be consumed in --u0-dir mode") from None
+        if manifest.get("source_record") is not None:
+            raise SystemExit(
+                f"attempt {att.get('attempt')} manifest records a recovery "
+                "source_record; a UR generation root must be compared via "
+                "--generated-dir/--source-record, never --u0-dir")
 
 
 def admission_record(freeze: Path, u0_root: Path, pilot: list[str],
@@ -457,22 +559,16 @@ def admission_record(freeze: Path, u0_root: Path, pilot: list[str],
     source_reg = None
     if source_record is not None:
         prereg, prereg_sha_now = source_record
-        source_reg = _source_registration_record(u0_root, coverage, prereg,
-                                                 prereg_sha_now)
-        source_reg["fresh_smoke"] = _fresh_config_smoke(env_python, prereg)
-        recorded_shas = {r["recorded_canonical_config_sha256"]
-                         for r in source_reg["per_attempt"].values()}
-        source_reg["fresh_smoke_ok"] = (
-            "error" not in source_reg["fresh_smoke"]
-            and source_reg["fresh_smoke"].get("step_size_recovery") == 0.3
-            and source_reg["fresh_smoke"].get("step_size_default") == 0.2
-            and source_reg["fresh_smoke"].get("diff")
-            == {"retargeter.step_size": [0.2, 0.3]}
-            and len(recorded_shas) == 1
-            and recorded_shas == {source_reg["fresh_smoke"].get(
-                "canonical_config_sha256")})
-        source_reg["passed"] = (source_reg["passed"]
-                                and source_reg["fresh_smoke_ok"])
+        source_reg = _source_registration_record(
+            u0_root, coverage, prereg, prereg_sha_now, env_python=env_python)
+        # review fix 2: the registration leg is only as strong as the
+        # argv-bound smokes — at least one consumed row's actual recorded
+        # command must have been re-parsed in the CURRENT environment
+        smoked = any(bool(r["argv_smoke"])
+                     for r in source_reg["per_attempt"].values())
+        source_reg["argv_smoke_any"] = bool(smoked)
+        if not smoked:
+            source_reg["passed"] = False
     admission = {
         "checkout_vs_freeze": checkout,
         "assets_vs_freeze": assets_check,
@@ -531,6 +627,11 @@ def main() -> int:
 
     freeze = args.freeze.expanduser().resolve()
     u0_root = (args.u0_dir or args.generated_dir).expanduser().resolve()
+    if args.u0_dir is not None:
+        # review fix 3: refuse a UR generation root in plain U0 mode BEFORE
+        # anything else runs — the registration leg would be silently
+        # skipped and the report would label the recovery source "U0"
+        _assert_plain_u0_root(u0_root)
     out_dir = integ.guard_output_dir(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)   # round-3 fix 8: a fresh
     # --out path is legal under derived/ and must not crash the report write
@@ -605,6 +706,23 @@ def main() -> int:
                     for d, r in admission["artifact_chain"].items() if not r["passed"]]
         reasons += [f"{d}:binding_recheck_failed"
                     for d, ok in binding_passed.items() if not ok]
+        # review fix 12 (2026-10-10): a failed registration/config
+        # reconciliation leg must surface in evidence_gaps — the UR verdict
+        # previously went incomplete+complete_evidence=false with an EMPTY
+        # gap list, so nothing named WHY
+        source_reg = admission.get("source_registration")
+        if source_reg is not None and not source_reg.get("passed"):
+            reasons.append("source_registration_reconciliation_failed")
+            for att, r in source_reg.get("per_attempt", {}).items():
+                if not r.get("identity_matches"):
+                    reasons.append(f"source_registration:{att}:identity")
+                if not r.get("single_difference_holds"):
+                    reasons.append(f"source_registration:{att}:config_diff")
+                if not r.get("argv_consistent_across_rows"):
+                    reasons.append(
+                        f"source_registration:{att}:argv_inconsistent")
+                if r.get("argv_smoke") and not r.get("argv_smoke_ok"):
+                    reasons.append(f"source_registration:{att}:argv_smoke")
         verdict["evidence_gaps"] = list(verdict["evidence_gaps"]) + [
             f"admission:{r}" for r in reasons]
         verdict["complete_evidence"] = False

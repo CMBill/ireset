@@ -311,8 +311,8 @@ def _admission(tmp_path, monkeypatch, ur, npz_dir, pt_dir, *,
         "env_mujoco_version": "3.10.0", "env_lock_mujoco_version": "3.10.0",
         "env_probe_error": None})
     if smoke is not None:
-        monkeypatch.setattr(cmp_mod, "_fresh_config_smoke",
-                            lambda p, r: copy.deepcopy(smoke))
+        monkeypatch.setattr(cmp_mod, "_argv_config_smoke",
+                            lambda p, argv: copy.deepcopy(smoke))
     adm, binding, coverage = cmp_mod.admission_record(
         freeze, ur, PILOT,
         source_record=(copy.deepcopy(PREREG), prereg_sha),
@@ -320,18 +320,16 @@ def _admission(tmp_path, monkeypatch, ur, npz_dir, pt_dir, *,
     return adm
 
 
-FRESH_OK = {"diff": {"retargeter.step_size": [0.2, 0.3]},
-            "step_size_default": 0.2, "step_size_recovery": 0.3,
-            "canonical_config_sha256": "c" * 64}
-
-
 def test_admission_registration_leg_passes_when_everything_holds(
         tmp_path, monkeypatch):
     ur, npz_dir, pt_dir = _build_ur_root(tmp_path)
     adm = _admission(tmp_path, monkeypatch, ur, npz_dir, pt_dir,
-                     smoke=FRESH_OK)
+                     smoke=SMOKE_OK)
     reg = adm["source_registration"]
-    assert reg["passed"] and reg["fresh_smoke_ok"]
+    assert reg["passed"] and reg["argv_smoke_any"]
+    per = reg["per_attempt"]["attempt_001"]
+    assert per["argv_smoke_ok"] and per["argv_consistent_across_rows"]
+    assert all(s["matches_registration"] for s in per["argv_smoke"].values())
     assert "ur_coverage" in adm and "u0_coverage" not in adm
     # U0 mode keeps its admission byte-identical to the frozen baseline
     # (§10.3): the registration key exists ONLY in UR mode — a None-valued
@@ -349,7 +347,7 @@ def test_admission_registration_leg_catches_drift_and_mixing(
     # preregistration file drifted after generation (sha mismatch)
     ur, npz_dir, pt_dir = _build_ur_root(tmp_path)
     adm = _admission(tmp_path / "a", monkeypatch, ur, npz_dir, pt_dir,
-                     prereg_sha="shaOTHER", smoke=FRESH_OK)
+                     prereg_sha="shaOTHER", smoke=SMOKE_OK)
     assert not adm["source_registration"]["passed"]
     assert not any(r["identity_matches"]
                    for r in adm["source_registration"]["per_attempt"].values())
@@ -360,7 +358,7 @@ def test_admission_registration_leg_catches_drift_and_mixing(
     ur2, npz2, pt2 = _build_ur_root(tmp_path / "b",
                                     manifest_mutate=two_fields)
     adm2 = _admission(tmp_path / "b", monkeypatch, ur2, npz2, pt2,
-                      smoke=FRESH_OK)
+                      smoke=SMOKE_OK)
     assert not adm2["source_registration"]["per_attempt"]["attempt_001"][
         "single_difference_holds"]
     assert not adm2["source_registration"]["passed"]
@@ -370,29 +368,33 @@ def test_admission_registration_leg_catches_drift_and_mixing(
     ur3, npz3, pt3 = _build_ur_root(tmp_path / "c",
                                     manifest_mutate=drop_flag)
     adm3 = _admission(tmp_path / "c", monkeypatch, ur3, npz3, pt3,
-                      smoke=FRESH_OK)
+                      smoke=SMOKE_OK)
     per = adm3["source_registration"]["per_attempt"]["attempt_001"]
     assert per["argv_step_size_bad_demos"] == [PILOT[0]]
     assert not adm3["source_registration"]["passed"]
     # a plain U0 attempt mixed into the UR root
     ur4, npz4, pt4 = _build_ur_root(tmp_path / "d", omit_source_record=True)
     adm4 = _admission(tmp_path / "d", monkeypatch, ur4, npz4, pt4,
-                      smoke=FRESH_OK)
+                      smoke=SMOKE_OK)
     assert not adm4["source_registration"]["passed"]
-    # the fresh comparison-time smoke failing or disagreeing
-    for i, bad_smoke in enumerate(({"error": "probe launch failed"},
-                                   {"diff": {"retargeter.step_size":
-                                             [0.2, 0.3]},
-                                    "step_size_default": 0.2,
-                                    "step_size_recovery": 0.2,
-                                    "canonical_config_sha256": "c" * 64},
-                                   FRESH_OK | {"canonical_config_sha256":
-                                               "d" * 64})):
+    # an argv-bound smoke failing, disagreeing with the registered single
+    # difference, or not reproducing the recorded canonical hash
+    for i, bad_smoke in enumerate((
+            {"error": "probe launch failed"},
+            {"diff": {"retargeter.step_size": [0.2, 0.3],
+                      "retargeter.penetration_tolerance": [0.05, 0.1]},
+             "step_size_default": 0.2, "step_size_recovery": 0.3,
+             "canonical_config_sha256": "c" * 64},
+            {"diff": {"retargeter.step_size": [0.2, 0.3]},
+             "step_size_default": 0.2, "step_size_recovery": 0.2,
+             "canonical_config_sha256": "c" * 64},
+            SMOKE_OK | {"canonical_config_sha256": "d" * 64})):
         base = tmp_path / f"e{i}"
         ur5, npz5, pt5 = _build_ur_root(base)
         adm5 = _admission(base, monkeypatch, ur5, npz5, pt5,
                           smoke=bad_smoke)
-        assert not adm5["source_registration"]["fresh_smoke_ok"], bad_smoke
+        per5 = adm5["source_registration"]["per_attempt"]["attempt_001"]
+        assert not per5["argv_smoke_ok"], bad_smoke
         assert not adm5["source_registration"]["passed"]
 
 
@@ -400,7 +402,7 @@ def test_admission_forces_incomplete_when_registration_fails(tmp_path,
                                                              monkeypatch):
     ur, npz_dir, pt_dir = _build_ur_root(tmp_path, prereg_sha="shaOTHER")
     adm = _admission(tmp_path, monkeypatch, ur, npz_dir, pt_dir,
-                     smoke=FRESH_OK)
+                     smoke=SMOKE_OK)
     assert adm["passed"] is False
 
 
@@ -423,8 +425,13 @@ class _FakeReplayer:
 def test_cli_ur_mode_labels_report_and_writes_verdict(tmp_path, monkeypatch):
     import omniretarget_teacher_comparison as cmp_mod
     monkeypatch.setattr(integ, "DERIVED_DIR", tmp_path / "derived")
+    # the manifest must pin the REAL preregistration hash for the
+    # registration leg to pass
+    prereg_path = tmp_path / "preregistration.json"
+    prereg_path.write_text(json.dumps(PREREG))
     ur, npz_dir, pt_dir = _build_ur_root(
-        tmp_path, demos=PILOT[:-1])          # five demos; sixth missing
+        tmp_path, demos=PILOT[:-1],
+        prereg_sha=integ.sha256_file(prereg_path))   # five demos; sixth missing
     # the sixth demo still needs its PUBLISHED inputs on disk: the missing
     # demo's inputs are reconciled at the canonical dir (round-6 invariant)
     scene6 = np.zeros((4, 43)); scene6[:, 3] = 1.0
@@ -451,17 +458,14 @@ def test_cli_ur_mode_labels_report_and_writes_verdict(tmp_path, monkeypatch):
         "env_python": "envy", "env_uv_lock_sha256": "locksha",
         "env_mujoco_version": "3.10.0", "env_lock_mujoco_version": "3.10.0",
         "env_probe_error": None})
-    monkeypatch.setattr(cmp_mod, "_fresh_config_smoke",
-                        lambda p, r: copy.deepcopy(FRESH_OK))
+    monkeypatch.setattr(cmp_mod, "_argv_config_smoke",
+                        lambda p, argv: copy.deepcopy(SMOKE_OK))
     monkeypatch.setattr(cmp_mod, "TeacherQualityReplayer", _FakeReplayer)
     out = tmp_path / "derived" / "recovery"
-    argv = ["prog", "--freeze", str(freeze), "--generated-dir", str(ur),
-            "--source-record", "unused", "--out", str(out)]
-    monkeypatch.setattr(sys, "argv", argv)
-    # --source-record file must exist and pin the registration
-    prereg_path = tmp_path / "preregistration.json"
-    prereg_path.write_text(json.dumps(PREREG))
-    argv[argv.index("unused")] = str(prereg_path)
+    monkeypatch.setattr(sys, "argv",
+                        ["prog", "--freeze", str(freeze), "--generated-dir",
+                         str(ur), "--source-record", str(prereg_path),
+                         "--out", str(out)])
     rc = cmp_mod.main()
     assert rc == 0
     report = json.loads(
@@ -471,7 +475,88 @@ def test_cli_ur_mode_labels_report_and_writes_verdict(tmp_path, monkeypatch):
     assert f"{PILOT[-1]}:UR_invalid" in report["verdict_record"]["evidence_gaps"]
     assert report["ur_identity"]["source_id"] == "upstream_recovery_step03_v1"
     assert "u0_identity" not in report
-    assert report["admission"]["source_registration"]["passed"] is False or True
+    assert report["admission"]["source_registration"]["passed"] is True
+
+
+def test_cli_u0_mode_refuses_a_ur_generation_root(tmp_path, monkeypatch):
+    """Review fix 3: the mode is not just a label — a UR root passed to
+    ``--u0-dir`` previously produced a full verdict with the registration
+    leg silently skipped."""
+    import omniretarget_teacher_comparison as cmp_mod
+    monkeypatch.setattr(integ, "DERIVED_DIR", tmp_path / "derived")
+    ur, npz_dir, pt_dir = _build_ur_root(tmp_path)
+    freeze = tmp_path / "freeze"; freeze.mkdir()
+    expected = integ.read_checkout_identity()["holosoma_revision"]
+    (freeze / "assets.json").write_text(json.dumps(
+        {"upstream": {"expected_commit": expected}}))
+    (freeze / "frozen_lists.json").write_text(json.dumps(
+        {"teacher_pilot_train6_v1": [
+            {"demo": d,
+             "npz_sha256": integ.sha256_file(npz_dir / f"{d}_original.npz"),
+             "pt_sha256": integ.sha256_file(pt_dir / f"{d}.pt")}
+            for d in PILOT]}))
+    monkeypatch.setattr(sys, "argv",
+                        ["prog", "--freeze", str(freeze), "--u0-dir",
+                         str(ur), "--out", str(tmp_path / "derived" / "x")])
+    with pytest.raises(SystemExit, match="recovery"):
+        cmp_mod.main()
+    # the index marker alone is enough; a manifest-carried source_record is
+    # caught too even when the index entry was scrubbed
+    idx_path = ur / integ.ATTEMPTS_INDEX
+    idx = json.loads(idx_path.read_text())
+    idx["attempts"] = [{"attempt": "attempt_001"}]
+    idx_path.write_text(json.dumps(idx))
+    with pytest.raises(SystemExit, match="source_record"):
+        cmp_mod.main()
+
+
+def test_registration_failure_lands_in_evidence_gaps(tmp_path, monkeypatch):
+    """Review fix 12: a failed registration/config reconciliation leg must
+    be NAMED in evidence_gaps — incomplete + complete_evidence=false with an
+    empty gap list hid the reason."""
+    import omniretarget_teacher_comparison as cmp_mod
+    monkeypatch.setattr(integ, "DERIVED_DIR", tmp_path / "derived")
+    # the manifest pins a DIFFERENT registration sha than the prereg file
+    ur, npz_dir, pt_dir = _build_ur_root(tmp_path, prereg_sha="shaOTHER")
+    freeze = tmp_path / "freeze"; freeze.mkdir()
+    expected = integ.read_checkout_identity()["holosoma_revision"]
+    (freeze / "assets.json").write_text(json.dumps(
+        {"upstream": {"expected_commit": expected}}))
+    (freeze / "frozen_lists.json").write_text(json.dumps(
+        {"teacher_pilot_train6_v1": [
+            {"demo": d,
+             "npz_sha256": integ.sha256_file(npz_dir / f"{d}_original.npz"),
+             "pt_sha256": integ.sha256_file(pt_dir / f"{d}.pt")}
+            for d in PILOT]}))
+    np.savez(freeze / "pairing_source_boxes.npz",
+             **{d: np.zeros((4, 7)) for d in PILOT})
+    monkeypatch.setattr(cmp_mod, "TEACHER_TRAJ_DIR", npz_dir)
+    monkeypatch.setattr(cmp_mod, "OMOMO_NEW_DIR", pt_dir)
+    monkeypatch.setattr(integ, "verify_assets_against_freeze",
+                        lambda assets: {"passed": True})
+    monkeypatch.setattr(integ, "measure_env_identity", lambda p: {
+        "env_python": "envy", "env_uv_lock_sha256": "locksha",
+        "env_mujoco_version": "3.10.0", "env_lock_mujoco_version": "3.10.0",
+        "env_probe_error": None})
+    monkeypatch.setattr(cmp_mod, "_argv_config_smoke",
+                        lambda p, argv: copy.deepcopy(SMOKE_OK))
+    monkeypatch.setattr(cmp_mod, "TeacherQualityReplayer", _FakeReplayer)
+    prereg_path = tmp_path / "preregistration.json"
+    prereg_path.write_text(json.dumps(PREREG))
+    out = tmp_path / "derived" / "recovery2"
+    monkeypatch.setattr(sys, "argv",
+                        ["prog", "--freeze", str(freeze), "--generated-dir",
+                         str(ur), "--source-record", str(prereg_path),
+                         "--out", str(out)])
+    rc = cmp_mod.main()
+    assert rc == 0
+    report = json.loads(
+        (out / "cmp" / "attempt_001" / "teacher_selection.json").read_text())
+    gaps = report["verdict_record"]["evidence_gaps"]
+    assert report["verdict"] == "incomplete"
+    assert report["verdict_record"]["complete_evidence"] is False
+    assert "admission:source_registration_reconciliation_failed" in gaps
+    assert "admission:source_registration:attempt_001:identity" in gaps
 
 
 def test_cli_arg_groups_are_mutually_exclusive(monkeypatch, tmp_path):

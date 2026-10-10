@@ -121,12 +121,15 @@ def split_gaps(evidence_gaps: list[str],
     return {"known": known, "unexpected": unexpected}
 
 
-def check_report_invariants(report: dict, expected_pilot: list[str]) -> dict:
+def check_report_invariants(report: dict, expected_pilot: list[str],
+                            u_side: str = "U0") -> dict:
     """Structural invariants of a comparison report used as closure evidence.
 
     Rejects the §10.1 counterexamples: a shrunken denominator (pilot trimmed
     to the five measurable demos), a dropped row, a verdict word outside the
-    frozen vocabulary, or an evidence/verdict disagreement.
+    frozen vocabulary, or an evidence/verdict disagreement. ``u_side`` names
+    the generated-source metrics key ("U0" for baseline comparisons, "UR"
+    for recovery reports merged at C2).
     """
     violations: list[str] = []
     pilot = report.get("pilot")
@@ -134,7 +137,7 @@ def check_report_invariants(report: dict, expected_pilot: list[str]) -> dict:
         violations.append(
             f"pilot_mismatch:{pilot}!={expected_pilot}")
     metrics = report.get("metrics", {})
-    for side in ("P", "U0"):
+    for side in ("P", u_side):
         rows = metrics.get(side, {})
         if sorted(rows) != sorted(expected_pilot):
             violations.append(f"rows_missing_or_extra:{side}:"
@@ -156,12 +159,20 @@ def check_report_invariants(report: dict, expected_pilot: list[str]) -> dict:
 
 def check_consumption(attempts_index: list[dict], coverage: dict,
                       pilot: list[str], known_missing=KNOWN_MISSING_DEFAULT,
+                      attempt_scopes: dict[str, list[str]] | None = None,
+                      manifest_rows: dict[str, list[dict]] | None = None,
                       ) -> dict:
     """Current U0 consumption map vs the facts the baseline registered (§3.1
     item 5): the five measurable demos still consume ``attempt_001``, the
     known-missing demo has no OK artifact in ANY attempt, and the two
     historical failed attempts are still retained (evidence is never
     garbage-collected into a shrunken denominator).
+
+    Review fix (2026-10-10): retention is verified on the ROWS, not just on
+    the attempt-directory names — each retained attempt's manifest must still
+    carry a row for every demo its index entry declares in scope, so deleting
+    one of sub12's two registered failure rows shrinks the stop line's cost
+    basis and is caught here (``failure_record_dropped``).
     """
     violations: list[str] = []
     names = [a.get("attempt") for a in attempts_index]
@@ -176,6 +187,24 @@ def check_consumption(attempts_index: list[dict], coverage: dict,
         if by_demo.get(demo, {}).get("attempt") != "attempt_001":
             violations.append(f"consumption_changed:{demo}:"
                               f"{by_demo.get(demo, {}).get('attempt')}")
+    if attempt_scopes is not None and manifest_rows is not None:
+        for att, scope in sorted(attempt_scopes.items()):
+            rows = manifest_rows.get(att)
+            if rows is None:
+                violations.append(f"manifest_rows_unavailable:{att}")
+                continue
+            have = {r.get("demo") for r in rows}
+            dropped = sorted(set(scope) - have)
+            if dropped:
+                violations.append(f"failure_record_dropped:{att}:{dropped}")
+        # the stop line's cost basis: every known-missing demo must still
+        # carry at least one registered failure row somewhere
+        for demo in known_missing:
+            n_failed = sum(
+                1 for rows in manifest_rows.values() for r in rows
+                if r.get("demo") == demo and r.get("status") != "ok")
+            if n_failed < 1:
+                violations.append(f"cost_basis_empty:{demo}")
     return {"violations": violations, "passed": not violations,
             "attempts_retained": names,
             "consumed_from_attempt_001": sorted(
@@ -213,6 +242,34 @@ def summarize_quality_evidence(report: dict) -> dict:
     }
 
 
+def _training_unmet(recovery_status: str | None) -> list[str]:
+    """Why training stays ``not_ready`` — the reasons must MATCH the merged
+    recovery state (review fix 13, 2026-10-10): once a complete six-demo
+    ``no_quality_gain`` exists, "no source has produced a complete verdict"
+    is false; what actually gates training is the absence of a
+    ``local_preferred`` source and of the W1 A3/B/C prerequisite plan.
+    """
+    if recovery_status == "no_quality_gain":
+        return [
+            "no teacher source has reached local_preferred; the complete "
+            "no_quality_gain verdict (UR recovery) authorizes at most the "
+            "W1 weak-supervision diagnostic, never train24 labels "
+            "(parent plan §3.4)",
+            "W1 A3/B/C weak-supervision diagnosis requires its own "
+            "preregistered plan and has not been started (parent §3.6)",
+            "train24/T1 small-batch entry requires its own plan and "
+            "prerequisites (parent plan §3.4-§3.6)",
+        ]
+    return [
+        "formal A2 verdict is incomplete (known gap: no valid U0 "
+        "artifact for sub12_largebox_082)",
+        "no source experiment has produced a complete six-demo "
+        "local_preferred or no_quality_gain verdict",
+        "W1/T1/train24 small-batch entry requires its own plan and "
+        "prerequisites (parent plan §3.4-§3.6)",
+    ]
+
+
 def build_closure_record(
     *,
     baseline: dict,
@@ -228,13 +285,22 @@ def build_closure_record(
     consistent evidence — it is not, and must not be usable as, a teacher
     source verdict. The training block is pinned to ``not_ready`` here: this
     round registers a stop line, it never opens a training entry.
+
+    Review fix 7 (2026-10-10): the registration inherits EVERY C0 failure
+    condition — an unstable repo identity during the run or a failed
+    upstream-checkout check blocks it exactly like an anchor mismatch (the
+    CLI passes both legs into ``verification``).
     """
     unexpected = verification.get("unexpected_gaps") or []
     violations = (verification.get("report_violations")
                   or []) + (verification.get("consumption_violations") or [])
+    identity_stable = verification.get("identity_stable", False)
+    checkout_passed = verification.get("checkout_passed", False)
     ok = (not unexpected and not violations
           and verification.get("anchors_passed", False)
-          and verification.get("fresh_matches", False))
+          and verification.get("fresh_matches", False)
+          and identity_stable and checkout_passed)
+    recovery_rec = recovery or {"status": "not_registered"}
     record = {
         "stage": "C1 U0 stop-line registration (closure plan §4)",
         "baseline": baseline,
@@ -248,17 +314,10 @@ def build_closure_record(
         },
         "quality_evidence": quality_evidence,
         "diagnosis": diagnosis or {"status": "not_run"},
-        "recovery": recovery or {"status": "not_registered"},
+        "recovery": recovery_rec,
         "training": {
             "status": "not_ready",
-            "unmet": [
-                "formal A2 verdict is incomplete (known gap: no valid U0 "
-                "artifact for sub12_largebox_082)",
-                "no source experiment has produced a complete six-demo "
-                "local_preferred or no_quality_gain verdict",
-                "W1/T1/train24 small-batch entry requires its own plan and "
-                "prerequisites (parent plan §3.4-§3.6)",
-            ],
+            "unmet": _training_unmet(recovery_rec.get("status")),
         },
         "baseline_verdict_unchanged": True,
         "registration_status": {
@@ -266,7 +325,9 @@ def build_closure_record(
             "blocking_reasons": (["unexpected_evidence_gap"] if unexpected else [])
             + (violations if violations else [])
             + ([] if verification.get("anchors_passed", False) else ["plan_anchor_mismatch"])
-            + ([] if verification.get("fresh_matches", False) else ["fresh_comparison_differs"]),
+            + ([] if verification.get("fresh_matches", False) else ["fresh_comparison_differs"])
+            + ([] if identity_stable else ["identity_unstable_during_run"])
+            + ([] if checkout_passed else ["upstream_checkout_mismatch"]),
         },
     }
     return record
@@ -306,6 +367,7 @@ def render_markdown(record: dict) -> str:
         "",
         "## 状态",
         f"- **training = {record['training']['status']}**",
+        f"- training 未满足门：{'；'.join(record['training']['unmet'])}",
         f"- diagnosis = {record['diagnosis']['status']}",
         f"- recovery = {record['recovery']['status']}",
         f"- registration_status.complete = "

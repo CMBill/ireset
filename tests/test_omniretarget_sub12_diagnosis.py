@@ -74,7 +74,13 @@ def _ctx_npz(path: Path, seed: int):
              q_a_n_last=rng.normal(size=29),
              q_t_last=rng.normal(size=43),
              target_laplacian=rng.normal(size=30),
-             obj_pts_local=rng.normal(size=(10, 3)))
+             obj_pts_local=rng.normal(size=(10, 3)),
+             q_a_indices=np.arange(-7, 29))
+
+
+def _canonical_npz(path: Path, seed: int):
+    rng = np.random.default_rng(seed)
+    np.savez(path, c=rng.normal(size=798), b=rng.normal(size=949))
 
 
 _DEFAULT = object()
@@ -86,7 +92,11 @@ def _run(label: str, snapshot: Path, *, frame=171, ordinal=4,
     if failure is _DEFAULT:
         failure = {"failing_frame_idx": frame, "ordinal_in_frame": ordinal,
                    "phase_one": {"category": category, "rho": rho,
-                                 "status": "optimal"}}
+                                 "status": "optimal",
+                                 "soc_t": 0.2, "dqa_shape": [36],
+                                 "n_kept_constraints": 66,
+                                 "n_soc_constraints": 1,
+                                 "soc_t_matches_step_size": True}}
     return {"label": label, "snapshot": str(snapshot), "timed_out": timed_out,
             "launch_error": launch_error,
             "summary": None if (timed_out or launch_error) else {
@@ -100,8 +110,11 @@ def two_snaphots(tmp_path):
     sa.mkdir()
     sb.mkdir()
     _ctx_npz(sa / "failure_context.npz", 7)
+    _canonical_npz(sa / "failure_canonical.npz", 11)
     np.savez(sb / "failure_context.npz",
              **{k: v for k, v in np.load(sa / "failure_context.npz").items()})
+    np.savez(sb / "failure_canonical.npz",
+             **{k: v for k, v in np.load(sa / "failure_canonical.npz").items()})
     return sa, sb
 
 

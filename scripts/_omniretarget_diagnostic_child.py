@@ -188,14 +188,22 @@ def phase_one(problem, step_size: float, orig_solve) -> dict:
 
 
 def _save_sparse_problem(problem, out_npz: Path) -> dict:
-    """Canonical Clarabel data of the original problem (§5.4), best effort."""
+    """Canonical Clarabel data of the original problem (§5.4), best effort.
+
+    Review fix 5 (2026-10-10): the conic data dict carries the objective as
+    ``c`` (the first round read ``q`` and saved NO objective vector), and
+    the dimension fields are taken from the matrices when the solver data
+    dict omits ``n_var``/``n_eq``/``n_ineq`` (the first round recorded -1
+    and -2 — present in the retained attempt_003/004 snapshots as defect
+    evidence).
+    """
     import scipy.sparse as sp
     try:
         data, _chain, _inv = problem.get_problem_data("CLARABEL")
     except Exception as exc:  # noqa: BLE001
         return {"error": f"{type(exc).__name__}: {exc}"}
     arrays = {}
-    for key in ("q", "b"):
+    for key in ("c", "q", "b"):     # conic solvers say c; older paths say q
         if key in data and data[key] is not None:
             arrays[key] = np.asarray(data[key], dtype=float)
     rec: dict = {"arrays": sorted(arrays), "matrices": {}}
@@ -209,8 +217,18 @@ def _save_sparse_problem(problem, out_npz: Path) -> dict:
         rec["matrices"][key] = {"file": path.name, "shape": list(m.shape),
                                 "nnz": int(m.nnz)}
     np.savez(out_npz, **arrays)
-    rec["n_variables"] = int(data.get("n_var", -1))
-    rec["n_constraints"] = int(data.get("n_eq", -1) + data.get("n_ineq", -1))
+    p_shape = rec["matrices"].get("P", {}).get("shape")
+    a_shape = rec["matrices"].get("A", {}).get("shape")
+    n_var = data.get("n_var")
+    if "n_eq" in data or "n_ineq" in data:
+        n_row = int(data.get("n_eq") or 0) + int(data.get("n_ineq") or 0)
+    elif a_shape:
+        n_row = int(a_shape[0])
+    else:
+        n_row = -1
+    rec["n_variables"] = int(n_var if n_var is not None
+                             else (p_shape[0] if p_shape else -1))
+    rec["n_constraints"] = int(n_row)
     return rec
 
 
@@ -288,11 +306,21 @@ def run_wrapped_generation(args) -> int:
             solve_rows.append(row)
 
     def _find_retarget_motion_frame():
-        tb = sys.exc_info()[2]
-        while tb is not None:
-            if tb.tb_frame.f_code.co_name == "retarget_motion":
-                return tb.tb_frame
-            tb = tb.tb_next
+        """The retarget_motion frame — via the CALLER stack, never the
+        exception traceback (review fix 8, 2026-10-10).
+
+        The failure is captured inside wrapped_ssi while the original
+        exception is in flight: retarget_motion is its CALLER and has not
+        unwound, so it is on the f_back chain — but it is NOT on the
+        exception's own traceback (that only runs from wrapped_ssi DOWN into
+        the solver). The first round walked the traceback, found nothing,
+        and saved no prefix_debug.npz in either sub12 run.
+        """
+        frame = sys._getframe(1)          # the caller of this helper
+        while frame is not None:
+            if frame.f_code.co_name == "retarget_motion":
+                return frame
+            frame = frame.f_back
         return None
 
     def wrapped_ssi(self, **kwargs):
@@ -385,6 +413,11 @@ def run_wrapped_generation(args) -> int:
                 meta["prefix_frames"] = int(prefix.shape[0])
                 meta["failing_frame_idx"] = int(
                     rm_frame.f_locals.get("i", row["frame_idx"]))
+        if "failing_frame_idx" not in meta:
+            # the zero-based failing frame is ALWAYS recorded — the ssi row
+            # saw it directly even if the caller-frame walk ever fails again
+            meta["failing_frame_idx"] = int(row["frame_idx"])
+            meta["prefix_capture"] = "retarget_motion_frame_not_found"
         try:
             np.savez(snap_dir / "failure_context.npz", **arr)
             if prefix is not None:
@@ -489,31 +522,41 @@ def _flatten(d, prefix: str = "") -> dict:
     return out
 
 
-def config_smoke(argv: list[str]) -> dict:
+def config_smoke(argv: list[str], base_argv: list[str] | None = None) -> dict:
     """Parse the REAL upstream config API (tyro) — never trust that a flag
     string merely appears in argv (closure plan §7.1).
 
-    Returns the default-argv parse and this-argv parse, their dotted diff
-    minus per-demo run metadata, and a canonical metadata-stripped sha256 of
-    the effective config (stable across demos/save dirs, so generation and
-    comparison can compare hashes across processes).
+    ``base_argv`` is the CANONICAL base command (the U0 generation template
+    with this row's metadata); the diff is base-parse vs recorded-argv
+    parse. Deriving the default side from the recorded argv itself (same
+    argv minus the step flag) HIDES extra flags — they sit on both sides of
+    the diff (review fix 2, caught live: ``--retargeter.penetration-
+    tolerance 0.1`` added to the consumed argv still diffed single-field).
+
+    Returns both parses, their dotted diff minus per-demo run metadata, and
+    a canonical metadata-stripped sha256 of the effective config (stable
+    across demos/save dirs, so generation and comparison can compare
+    hashes across processes).
     """
     import hashlib
 
     import tyro
     from holosoma_retargeting.config_types.retargeting import RetargetingConfig
 
-    default_argv, skip_next = [], False
-    for a in argv:
-        if skip_next:
-            skip_next = False
-            continue
-        if a == "--retargeter.step-size":
-            skip_next = True
-            continue
-        default_argv.append(a)
-    cfg_default = _jsonable(tyro.cli(RetargetingConfig, args=default_argv))
-    cfg_recovery = _jsonable(tyro.cli(RetargetingConfig, args=argv))
+    if base_argv is None:
+        # legacy derivation (no base provided): the same argv minus the
+        # step-size flag — only correct for argv the caller itself built
+        base_argv, skip_next = [], False
+        for a in argv:
+            if skip_next:
+                skip_next = False
+                continue
+            if a == "--retargeter.step-size":
+                skip_next = True
+                continue
+            base_argv.append(a)
+    cfg_default = _jsonable(tyro.cli(RetargetingConfig, args=list(base_argv)))
+    cfg_recovery = _jsonable(tyro.cli(RetargetingConfig, args=list(argv)))
     fd = {k: v for k, v in _flatten(cfg_default).items()
           if k not in CONFIG_RUN_METADATA_KEYS}
     fr = {k: v for k, v in _flatten(cfg_recovery).items()
@@ -542,6 +585,19 @@ def run_config_smoke(args) -> int:
     src_root = ho_package.parent
     if str(src_root) not in sys.path:
         sys.path.insert(0, str(src_root))
+    if args.argv_json:
+        # comparison-time registration leg (review fix 2, 2026-10-10): the
+        # smoke parses the argv the generation manifest ACTUALLY recorded —
+        # never a freshly constructed stand-in. The interpreter/script
+        # prefix is stripped; flags start at the first "--" token.
+        recorded = json.loads(args.argv_json)
+        argv = recorded[recorded.index(next(
+            t for t in recorded if t.startswith("--"))):]
+        base = (json.loads(args.base_argv_json)
+                if args.base_argv_json else None)
+        print(json.dumps(config_smoke(argv, base_argv=base), indent=2,
+                         ensure_ascii=False))
+        return 0
     argv = ["--task-type", "object_interaction",
             "--task-name", args.demo,
             "--data-format", "smplh",
@@ -606,6 +662,15 @@ def main() -> int:
                     help="pinned sha256 of interaction_mesh_retargeter.py")
     ap.add_argument("--step-size", type=float, default=0.3,
                     help="config-smoke only: the recovery step size")
+    ap.add_argument("--argv-json", default=None,
+                    help="config-smoke only: JSON list — parse THIS recorded "
+                         "generation argv instead of constructing a stand-in")
+    ap.add_argument("--base-argv-json", default=None,
+                    help="config-smoke only: JSON list — the canonical base "
+                         "command the recorded argv must diff against (the "
+                         "default side of the diff; without it the default "
+                         "is derived from the recorded argv itself, which "
+                         "hides extra flags)")
     ap.add_argument("--skip-config-dump", action="store_true")
     args = ap.parse_args()
     if args.mode == "self-test":

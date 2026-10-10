@@ -5,12 +5,16 @@ ORGANIZES evidence and decisions — it reuses the existing comparison entry
 for the fresh comparison (never re-implements the quality gates), reuses
 ``a2_integrity`` for every integrity leg, and writes:
 
-* ``baseline/baseline_evidence.json``  — C0: plan-§1.1 anchor hashes, run
-  identity (start+end), fresh comparison report + bit-comparison vs the
-  authoritative report, known-vs-new gap split, consumption-map checks;
-* ``baseline/evidence_files.json``     — the file inventory (paths, sizes,
-  full SHA-256) of everything this closure reasons over, with sub12's
-  teacher recorded as explicitly MISSING (no empty NPZ, no fake hash);
+* ``baseline/snapshots/attempt_NNN/baseline_evidence.json`` — C0: plan-§1.1
+  anchor hashes, run identity (start+end), fresh comparison report +
+  bit-comparison vs the authoritative report, known-vs-new gap split,
+  consumption-map checks. Attempt-scoped and NEVER overwritten (review fix
+  1: the first round's fixed-path snapshot was rewritten by every later
+  call, dangling the D0/G0 parent hash references);
+* ``baseline/snapshots/attempt_NNN/evidence_files.json``    — the file
+  inventory (paths, sizes, full SHA-256) of everything this closure reasons
+  over, with sub12's teacher recorded as explicitly MISSING (no empty NPZ,
+  no fake hash);
 * ``decisions/attempt_NNN/a2_closure.{json,md}`` — C1: the stop-line record
   whose statuses stay separated (baseline verdict incomplete / training
   not_ready / registration_status ≠ source verdict).
@@ -39,6 +43,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from ireset.data import a2_integrity as integ
 from ireset.eval import a2_closure as a2c
@@ -59,6 +64,8 @@ BEHAVIOR_CODE = [
     "scripts/omniretarget_a2_closure.py",
     "scripts/omniretarget_teacher_comparison.py",
     "scripts/generate_omniretarget_teachers.py",
+    "scripts/diagnose_omniretarget_sub12.py",
+    "scripts/_omniretarget_diagnostic_child.py",
     "src/ireset/eval/a2_closure.py",
     "src/ireset/eval/teacher_comparison.py",
     "src/ireset/data/a2_integrity.py",
@@ -71,7 +78,12 @@ BEHAVIOR_CODE = [
 
 
 def measure_repo_identity() -> dict:
-    """Measured main-repo identity: rev, dirty state, untracked file hashes."""
+    """Measured main-repo identity: rev, dirty state, untracked file hashes
+    AND the tracked-content diff hash (review fix 10, 2026-10-10: the status
+    line list only says a file is modified — the same "M file" line with two
+    different contents compared identity-equal; the diff hash pins the
+    CONTENT of the dirty tree)."""
+    import hashlib as _hashlib
     def run(*a: str) -> str:
         return subprocess.run(["git", "-C", str(PROJECT_ROOT), *a],
                               capture_output=True, text=True,
@@ -83,11 +95,15 @@ def measure_repo_identity() -> dict:
         rel: (integ.sha256_file(PROJECT_ROOT / rel)
               if (PROJECT_ROOT / rel).is_file() else "missing")
         for rel in untracked}
+    tracked_diff = run("diff", "HEAD")
     return {
         "git_rev": run("rev-parse", "HEAD").strip(),
         "dirty": bool(status.strip()),
         "status_lines": status.strip().splitlines()[:20],
         "untracked_files": untracked_hashes,
+        "tracked_diff_sha256": _hashlib.sha256(
+            tracked_diff.encode()).hexdigest(),
+        "tracked_diff_bytes": len(tracked_diff.encode()),
     }
 
 
@@ -205,6 +221,139 @@ def load_merge_extra(path: Path | None) -> dict | None:
             "sha256": integ.sha256_file(p)}
 
 
+def verify_merge_chain(diagnosis_path: Path | None,
+                       recovery_path: Path | None,
+                       prereg_path: Path | None,
+                       anchors: dict, pilot: list[str]) -> dict:
+    """C2 merge evidence-chain verification (review fix 6, 2026-10-10).
+
+    Registering a merged UR verdict used to record only the CURRENT file
+    hashes — a report with ``admission.passed=false`` / incomplete evidence
+    / an empty denominator still registered as long as the top-level verdict
+    said ``no_quality_gain``. Now every merged piece is verified against the
+    chain that produced it:
+
+    * preregistration: the recovery report's ``ur_identity`` must pin THIS
+      file's hash, and the file must still hash to the diagnosis hash it
+      registered (the registered parent stays intact on disk);
+    * the merged diagnosis is either the registered parent itself or a
+      post-fix reconfirmation whose verdict/failing frame/ordinal/rho AGREE
+      with the registered one;
+    * the recovery report passes the structural report invariants on the UR
+      metrics side, and a ``no_quality_gain``/``local_preferred`` verdict is
+      accepted only with complete evidence, a passed admission and an empty
+      missing list;
+    * the preregistration's authoritative-selection anchor equals the
+      anchor-measured baseline report.
+
+    Any problem blocks the closure registration (the reasons land in the
+    decision record and the exit code goes non-zero).
+    """
+    from diagnose_omniretarget_sub12 import verify_diagnosis_record
+    problems: list[str] = []
+    rec: dict = {"checked": []}
+
+    diag_data: dict | None = None
+    if diagnosis_path is not None:
+        diag_data = json.loads(Path(diagnosis_path).read_text())
+        rec["diagnosis_verification"] = verify_diagnosis_record(diag_data)
+        rec["checked"].append("diagnosis")
+        if not rec["diagnosis_verification"]["verified"]:
+            problems += [f"diagnosis:{p}" for p in
+                         rec["diagnosis_verification"]["problems"]]
+
+    if recovery_path is not None:
+        rec["checked"].append("recovery")
+        report = json.loads(Path(recovery_path).read_text())
+        prereg = None
+        if prereg_path is None:
+            problems.append("recovery:preregistration_not_provided")
+        else:
+            pp = Path(prereg_path).expanduser().resolve()
+            if not pp.is_file():
+                problems.append("recovery:preregistration_missing")
+            else:
+                prereg_sha = integ.sha256_file(pp)
+                prereg = json.loads(pp.read_text())
+                rec["preregistration"] = {"path": path_for_record(pp),
+                                          "sha256": prereg_sha}
+                if report.get("ur_identity", {}).get(
+                        "preregistration_sha256") != prereg_sha:
+                    problems.append("recovery:report_not_bound_to_prereg")
+                parent = prereg.get("parent", {})
+                raw = parent.get("diagnosis")
+                dpath = None
+                if raw:
+                    dp = Path(raw).expanduser()
+                    dpath = dp if dp.is_absolute() else PROJECT_ROOT / dp
+                registered_intact = (
+                    dpath is not None and dpath.is_file()
+                    and integ.sha256_file(dpath)
+                    == parent.get("diagnosis_sha256"))
+                rec["registered_parent_intact"] = bool(registered_intact)
+                if not registered_intact:
+                    problems.append("recovery:registered_diagnosis_drifted")
+                sel_anchor = anchors["anchors"]["authoritative_selection"][
+                    "measured_sha256"]
+                if parent.get("authoritative_selection_sha256") != sel_anchor:
+                    problems.append("recovery:prereg_anchor_mismatch")
+                # the merged diagnosis: the registered parent itself, or a
+                # reconfirmation that agrees with it
+                if diag_data is not None and registered_intact:
+                    reg_diag = json.loads(dpath.read_text())
+                    merged_sha = integ.sha256_file(Path(diagnosis_path))
+                    rec["merged_is_registered_diagnosis"] = (
+                        merged_sha == parent.get("diagnosis_sha256"))
+                    if not rec["merged_is_registered_diagnosis"]:
+                        reg_v, merged_v = (reg_diag.get("verdict", {}),
+                                           diag_data.get("verdict", {}))
+                        agree = (reg_v.get("status")
+                                 == merged_v.get("status")
+                                 == "supports_step03_candidate")
+                        for key in ("failing_frame_run1", "ordinal_run1"):
+                            if reg_v.get(key) != merged_v.get(key):
+                                agree = False
+                                problems.append(
+                                    f"diagnosis:reconfirmation_{key}_differs")
+                        r0, r1 = reg_v.get("rho_run1"), merged_v.get("rho_run1")
+                        if not (isinstance(r0, (int, float))
+                                and isinstance(r1, (int, float))
+                                and abs(r0 - r1) <= 1e-6):
+                            agree = False
+                            problems.append(
+                                "diagnosis:reconfirmation_rho_differs")
+                        rec["reconfirmation_agrees"] = bool(agree)
+                        if not agree and not any(
+                                p.startswith("diagnosis:reconfirmation")
+                                for p in problems):
+                            problems.append(
+                                "diagnosis:reconfirmation_verdict_differs")
+        inv = a2c.check_report_invariants(report, pilot, u_side="UR")
+        rec["report_invariants"] = inv
+        if not inv["passed"]:
+            problems += [f"recovery:{v}" for v in inv["violations"]]
+        verdict = report.get("verdict")
+        admission_passed = bool(report.get("admission", {}).get("passed"))
+        complete = bool(report.get("verdict_record", {}).get(
+            "complete_evidence"))
+        missing = list(report.get("admission", {}).get("ur_coverage", {})
+                       .get("missing", []))
+        rec["recovery_report_facts"] = {
+            "verdict": verdict, "admission_passed": admission_passed,
+            "complete_evidence": complete, "missing": missing}
+        if verdict in ("no_quality_gain", "local_preferred"):
+            if not complete:
+                problems.append(f"recovery:{verdict}_without_complete_evidence")
+            if not admission_passed:
+                problems.append(f"recovery:{verdict}_with_failed_admission")
+            if missing:
+                problems.append(f"recovery:{verdict}_with_missing_demos:"
+                                f"{missing}")
+    rec["problems"] = problems
+    rec["passed"] = not problems
+    return rec
+
+
 def run_closure(args, comparison_runner=run_fresh_comparison) -> int:
     t0 = time.time()
     freeze = args.freeze.expanduser().resolve()
@@ -243,9 +392,22 @@ def run_closure(args, comparison_runner=run_fresh_comparison) -> int:
                           known_missing=baseline_missing)
     invariants = a2c.check_report_invariants(fresh, pilot)
     coverage = integ.collect_u0_coverage(u0_root, pilot)
+    attempts_index = integ.load_attempts(u0_root)
+    # review fix 9: retention verified on the manifest ROWS — the attempt
+    # scopes the index declares must still have their rows (deleting one of
+    # sub12's two registered failure rows shrinks the cost basis)
+    attempt_scopes = {a["attempt"]: list(a.get("scope") or [])
+                      for a in attempts_index}
+    manifest_rows = {}
+    for att in attempt_scopes:
+        try:
+            manifest_rows[att] = integ.load_attempt_manifest(
+                u0_root, att).get("rows", [])
+        except Exception:  # noqa: BLE001 -- recorded as a consumption gap
+            manifest_rows[att] = None
     consumption = a2c.check_consumption(
-        integ.load_attempts(u0_root), coverage, pilot,
-        known_missing=baseline_missing)
+        attempts_index, coverage, pilot, known_missing=baseline_missing,
+        attempt_scopes=attempt_scopes, manifest_rows=manifest_rows)
 
     identity_end = measure_repo_identity()
     identity_stable = (identity_start == identity_end)
@@ -276,8 +438,12 @@ def run_closure(args, comparison_runner=run_fresh_comparison) -> int:
                    and consumption["passed"] and checkout["passed"]
                    and identity_stable),
     }
-    baseline_path = out_root / "baseline" / "baseline_evidence.json"
-    baseline_path.parent.mkdir(parents=True, exist_ok=True)
+    # review fix 1: the C0 snapshot is attempt-scoped and IMMUTABLE — later
+    # invocations never rewrite it, so a D0/G0/C2 parent hash stays resolvable
+    # (the first round's fixed-path snapshot was overwritten by every later
+    # call and the D0 parent reference 83287703… silently dangled)
+    snapshot_dir = integ.allocate_attempt(out_root / "baseline" / "snapshots")
+    baseline_path = snapshot_dir / "baseline_evidence.json"
     baseline_path.write_text(json.dumps(baseline_evidence, indent=2,
                                         ensure_ascii=False))
 
@@ -291,8 +457,19 @@ def run_closure(args, comparison_runner=run_fresh_comparison) -> int:
                 "canonical-dir fallback is the anchor the comparison's "
                 "recorded_in_manifest=false legs reconciled against (§3.2)",
     }
-    (out_root / "baseline" / "evidence_files.json").write_text(
+    (snapshot_dir / "evidence_files.json").write_text(
         json.dumps(inv, indent=2, ensure_ascii=False))
+
+    # ---- C2 merge evidence-chain verification (review fix 6) ------------
+    merge_verification = None
+    if args.diagnosis is not None or args.recovery_report is not None:
+        if args.recovery_report is not None and args.preregistration is None:
+            raise SystemExit("--recovery-report requires --preregistration "
+                             "(the merged verdict is registered only against "
+                             "its own preregistration chain)")
+        merge_verification = verify_merge_chain(
+            args.diagnosis, args.recovery_report, args.preregistration,
+            anchors, pilot)
 
     # ---- C1: stop-line registration ------------------------------------
     quality = a2c.summarize_quality_evidence(authoritative)
@@ -325,6 +502,12 @@ def run_closure(args, comparison_runner=run_fresh_comparison) -> int:
         diagnosis=load_merge_extra(args.diagnosis),
         recovery=load_merge_extra(args.recovery_report),
     )
+    if merge_verification is not None:
+        record["merge_verification"] = merge_verification
+        if not merge_verification["passed"]:
+            record["registration_status"]["complete"] = False
+            record["registration_status"]["blocking_reasons"] += [
+                f"merge_chain:{p}" for p in merge_verification["problems"]]
     decisions = out_root / "decisions"
     attempt_dir = integ.allocate_attempt(decisions)
     json_path = attempt_dir / "a2_closure.json"
@@ -338,8 +521,19 @@ def run_closure(args, comparison_runner=run_fresh_comparison) -> int:
         "report": path_for_record(json_path),
     })
 
-    costs = {"stage_wall_s": round(time.time() - t0, 1)}
-    (out_root / "costs.json").write_text(json.dumps(costs, indent=2))
+    # review fix 11: costs accumulate per invocation (the fixed-path file
+    # kept only the LATEST call's wall time)
+    costs_path = out_root / "costs.json"
+    if costs_path.is_file():
+        prev = json.loads(costs_path.read_text())
+        entries = (prev.get("invocations") if isinstance(prev, dict) else None)
+        if entries is None and "stage_wall_s" in prev:
+            entries = [prev]     # legacy single-shot shape
+    else:
+        entries = []
+    entries = entries + [{"timestamp": _dt.datetime.now().isoformat(
+        timespec="seconds"), "stage_wall_s": round(time.time() - t0, 1)}]
+    costs_path.write_text(json.dumps({"invocations": entries}, indent=2))
 
     print(a2c.render_markdown(record))
     print(f"a2_closure -> {path_for_record(json_path)}")
@@ -380,10 +574,14 @@ def main() -> int:
     ap.add_argument("--out", type=Path, required=True,
                     help="closure run root (must resolve under derived/)")
     ap.add_argument("--diagnosis", type=Path, default=None,
-                    help="optional: merge an existing D0 diagnosis result")
+                    help="optional: merge an existing D0 diagnosis result "
+                         "(verified against the registration chain)")
     ap.add_argument("--recovery-report", type=Path, default=None,
-                    help="optional: merge an existing UR result (prereg "
-                         "identity verified by the UR entries, not here)")
+                    help="optional: merge an existing UR result — requires "
+                         "--preregistration; the chain is verified, not "
+                         "just hash-recorded")
+    ap.add_argument("--preregistration", type=Path, default=None,
+                    help="UR preregistration.json backing --recovery-report")
     args = ap.parse_args()
     return run_closure(args)
 
