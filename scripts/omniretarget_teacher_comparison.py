@@ -31,6 +31,17 @@ interpreter) is recorded, never raised; and the verdict's evidence check
 runs before the quality gates, so deficient rows yield ``incomplete``
 instead of a TypeError/KeyError mid-computation.
 
+Round-5 additions (2026-10-10): BOTH PT-side legs of the input
+reconciliation (manifest and freeze) anchor the data path each consumed
+attempt RECORDED consuming (manifest ``data_path``, round-4 generation
+entry) — a run over a freeze-identical alternate dir that later drifted
+previously passed admission because both legs hashed the untouched
+canonical OMOMO dir. Legacy manifests (pre round-4) never recorded the
+path; they fall back to the canonical dir and are labeled
+``recorded_in_manifest: false``. The both-hands denominator is verified
+for existence, validity and P/U0 agreement (missing/None is deleted
+evidence → ``incomplete``, never "zero reference frames").
+
 P rows come from the published NPZ; U0 rows from the newest OK attempt
 artifact per demo. Every expected demo keeps a row on both sides;
 missing/invalid evidence forces ``incomplete`` (never a silent drop).
@@ -92,6 +103,17 @@ def measure_source(
     return out
 
 
+def _pt_dir_from_record(recorded: str) -> Path:
+    """The PT dir a generation manifest recorded consuming.
+
+    ``path_for_record`` writes repo-relative paths for dirs inside the
+    project and absolute paths otherwise; undo exactly that (never trust
+    the recorded string to be absolute).
+    """
+    p = Path(recorded).expanduser()
+    return p if p.is_absolute() else PROJECT_ROOT / p
+
+
 def admission_record(freeze: Path, u0_root: Path, pilot: list[str],
                      env_python: Path | None = None) -> dict:
     """Artifact-level admission: identity, inputs, artifact chain, bindings.
@@ -108,31 +130,27 @@ def admission_record(freeze: Path, u0_root: Path, pilot: list[str],
     rewritten between generation and comparison. Every per-demo artifact
     defect is RECORDED (never raised) and forces ``incomplete`` — a broken
     NPZ must not crash the report (review fix 7).
+
+    Round-5 review fix 1 (2026-10-10): both PT-side legs (manifest and
+    freeze) anchor the data path each consumed attempt RECORDED consuming
+    (``manifest["data_path"]``, written by the round-4 generation entry).
+    Pre-fix, both hashed the canonical OMOMO dir, so a generation over a
+    freeze-identical ALTERNATE dir that later drifted passed admission.
+    Legacy manifests (pre round-4) never recorded the path; for those the
+    legs anchor the canonical dir and the attempt is labeled
+    ``recorded_in_manifest: false`` — the strongest evidence a legacy
+    manifest admits (its ``input_sha256`` still pins the consumed bytes
+    against the canonical-dir check).
     """
     freeze_assets = json.loads((freeze / "assets.json").read_text())
     checkout = integ.verify_checkout_against_freeze(freeze_assets)
     assets_check = integ.verify_assets_against_freeze(freeze_assets)
 
-    # Round-4 review fix 1: the third leg of the input reconciliation. The
-    # manifest comparison only proves "inputs now == inputs at generation";
-    # a tampered input that the generation manifest faithfully recorded
-    # passes that leg. The current inputs must ALSO match the A1-frozen
-    # hashes — this catches tampering even when consuming OLD attempts.
-    try:
-        frozen_entries = json.loads(
-            (freeze / "frozen_lists.json").read_text())["teacher_pilot_train6_v1"]
-        inputs_vs_freeze = integ.verify_inputs_against_freeze(
-            frozen_entries, TEACHER_TRAJ_DIR, OMOMO_NEW_DIR)
-        freeze_inputs_ok = all(
-            r["npz_matches"] and r["pt_matches"]
-            for r in inputs_vs_freeze.values()) and bool(inputs_vs_freeze)
-    except Exception as exc:  # noqa: BLE001 -- recorded admission failure
-        inputs_vs_freeze = {"error": f"{type(exc).__name__}: {exc}"}
-        freeze_inputs_ok = False
-
     coverage = integ.collect_u0_coverage(u0_root, pilot)
     inputs_ok = True
     inputs_detail: dict[str, dict] = {}
+    data_paths: dict[str, dict] = {}   # attempt -> the PT dir it consumed
+    pt_dirs: dict[str, Path] = {}      # label -> dir, for the freeze leg
     env_lock_shas: set[str] = set()
     env_versions: set[str] = set()
     env_pythons: set[str] = set()
@@ -156,14 +174,30 @@ def admission_record(freeze: Path, u0_root: Path, pilot: list[str],
             "matches_freeze": recorded_rev == expected_commit,
             "recorded_clean": recorded_clean,
         }
-        # inputs re-hashed NOW against what generation recorded; a missing
-        # file is an admission failure for this demo, not a crash
+        # round-5 review fix 1: the PT side anchors the data path THIS
+        # attempt recorded consuming; legacy manifests fall back to the
+        # canonical dir and are labeled as such
+        recorded_dp = manifest.get("data_path")
+        pt_dir = (_pt_dir_from_record(str(recorded_dp)) if recorded_dp
+                  else OMOMO_NEW_DIR)
+        if attempt not in data_paths:
+            label = path_for_record(pt_dir)
+            data_paths[attempt] = {
+                "pt_dir": label,
+                "recorded_in_manifest": bool(recorded_dp),
+            }
+            pt_dirs.setdefault(label, pt_dir)
+        # inputs re-hashed NOW at the recorded data path against what
+        # generation recorded; a missing file is an admission failure for
+        # this demo, not a crash
         try:
             demo_inputs = integ.verify_inputs_against_manifest(
-                manifest, TEACHER_TRAJ_DIR, OMOMO_NEW_DIR)
+                manifest, TEACHER_TRAJ_DIR, pt_dir)
             row = demo_inputs.get(demo, {})
             inputs_detail[demo] = {
                 "attempt": attempt,
+                "data_path": data_paths[attempt]["pt_dir"],
+                "data_path_recorded": bool(recorded_dp),
                 "npz_matches": row.get("npz_matches"),
                 "pt_matches": row.get("pt_matches"),
             }
@@ -171,6 +205,8 @@ def admission_record(freeze: Path, u0_root: Path, pilot: list[str],
                 inputs_ok = False
         except Exception as exc:  # noqa: BLE001 -- recorded admission failure
             inputs_detail[demo] = {"attempt": attempt,
+                                   "data_path": data_paths[attempt]["pt_dir"],
+                                   "data_path_recorded": bool(recorded_dp),
                                    "error": f"{type(exc).__name__}: {exc}"}
             inputs_ok = False
         # raw -> converted chain from the artifacts (review fix 5)
@@ -197,6 +233,52 @@ def admission_record(freeze: Path, u0_root: Path, pilot: list[str],
     for demo in coverage["missing"]:
         binding_passed[demo] = False
         binding[demo] = {"recomputed": None, "note": "no OK artifact in any attempt"}
+
+    # Round-4 review fix 1 + round-5 fix 1: the third leg of the input
+    # reconciliation — current inputs vs the A1-FROZEN hashes — so a
+    # tampered input the generation manifest faithfully recorded still
+    # fails admission, hashed at EVERY data path the consumed attempts
+    # actually recorded (plus the canonical dir for legacy manifests): the
+    # manifest comparison only proves "inputs now == inputs at generation".
+    try:
+        frozen_entries = json.loads(
+            (freeze / "frozen_lists.json").read_text())["teacher_pilot_train6_v1"]
+        by_dir: dict[str, dict] = {}
+        for label, d in sorted(pt_dirs.items()):
+            try:
+                by_dir[label] = integ.verify_inputs_against_freeze(
+                    frozen_entries, TEACHER_TRAJ_DIR, d)
+            except Exception as exc:  # noqa: BLE001 -- recorded, not raised
+                by_dir[label] = {"error": f"{type(exc).__name__}: {exc}"}
+
+        def _dir_ok(res: dict) -> bool:
+            return (bool(res) and "error" not in res
+                    and all(r.get("npz_matches") and r.get("pt_matches")
+                            for r in res.values()))
+
+        freeze_inputs_ok = bool(by_dir) and all(_dir_ok(r) for r in by_dir.values())
+        if len(by_dir) == 1:
+            merged = next(iter(by_dir.values()))
+        else:
+            bad = [r for r in by_dir.values() if "error" in r]
+            if bad:
+                merged = {"error": "; ".join(r["error"] for r in bad)}
+            else:
+                merged = {
+                    demo: {"npz_matches": all(
+                               r.get(demo, {}).get("npz_matches")
+                               for r in by_dir.values()),
+                           "pt_matches": all(
+                               r.get(demo, {}).get("pt_matches")
+                               for r in by_dir.values())}
+                    for demo in sorted({d for r in by_dir.values() for d in r})
+                }
+        inputs_vs_freeze = {"all_match": freeze_inputs_ok,
+                            "by_demo": merged, "by_dir": by_dir}
+    except Exception as exc:  # noqa: BLE001 -- recorded admission failure
+        inputs_vs_freeze = {"all_match": False,
+                            "error": f"{type(exc).__name__}: {exc}"}
+        freeze_inputs_ok = False
 
     # env probed NOW at the python the generation actually used (falling
     # back to the canonical independent env), compared against what the
@@ -240,8 +322,8 @@ def admission_record(freeze: Path, u0_root: Path, pilot: list[str],
             "consistent": env_version_consistent,
         },
         "inputs_rehashed": {"all_match": inputs_ok, "by_demo": inputs_detail},
-        "inputs_vs_freeze": {"all_match": freeze_inputs_ok,
-                             "by_demo": inputs_vs_freeze},
+        "inputs_vs_freeze": inputs_vs_freeze,
+        "data_paths": data_paths,
         "artifact_chain": chain,
         "binding_recomputed": binding,
         "u0_coverage": {"missing": coverage["missing"],

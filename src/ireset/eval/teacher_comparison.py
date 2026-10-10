@@ -42,6 +42,12 @@ evidence check runs BEFORE the quality gates and every gate is hardened
 against deficient rows (round-4 review fix 3) — a None task error or a
 both-hands dict without keys yields ``incomplete``, not a TypeError or
 KeyError mid-computation; report serialization is None-safe as well.
+Round-5 additions (2026-10-10): the both-hands common denominator is
+verified for existence, validity and P/U0 AGREEMENT — the denominator is
+decided by the shared (binding-verified) human reference, so a missing or
+None ``denominator_frames`` is deleted evidence (gap → ``incomplete``),
+never "zero reference frames", and P and U0 disagreeing on it is an
+evidence gap too.
 """
 
 from __future__ import annotations
@@ -447,6 +453,25 @@ def _bad(x) -> bool:
         return True
 
 
+def _both_denominator(m) -> int | None:
+    """Both-hands common denominator frames: present, finite, non-negative.
+
+    Round-5 review fix 2: ``both.get("denominator_frames", 0)`` read a
+    MISSING key as "no both-grasp reference frames" (and the value None
+    raised TypeError in ``> 0``) — a U0 row with the field deleted kept
+    ``complete_evidence`` while g4 silently counted the demo as no-gain,
+    so the remaining demos' gains could still carry ``local_preferred``.
+    The denominator is decided by the SHARED human reference
+    (binding-verified), so it is decidable evidence: missing/None/
+    non-finite/negative is a gap, and P and U0 must agree on it exactly.
+    """
+    v = m.both.get("denominator_frames")
+    if _bad(v):
+        return None
+    v = int(v)
+    return v if v >= 0 else None
+
+
 def _json_num(x, nd: int = 6):
     """JSON-safe number: None for missing/non-finite (round-4 review fix 3).
 
@@ -499,10 +524,15 @@ def _evidence_gaps(
                             or _bad(h.valid_coverage) or _bad(h.drift_max_m)):
                         gaps.append(f"{d}:{tag}_hand_{s}_missing_with_reference_frames")
         for tag, m in (("P", pm), ("U0", um)):
-            if m.both.get("denominator_frames", 0) > 0 and (
-                    _bad(m.both.get("valid_coverage"))
-                    or _bad(m.both.get("gap_series_p95_m"))):
+            denom = _both_denominator(m)
+            if denom is None:
+                gaps.append(f"{d}:{tag}_both_denominator_missing_or_invalid")
+            elif denom > 0 and (_bad(m.both.get("valid_coverage"))
+                                or _bad(m.both.get("gap_series_p95_m"))):
                 gaps.append(f"{d}:{tag}_both_hands_not_finite")
+        p_den, u_den = _both_denominator(pm), _both_denominator(um)
+        if p_den is not None and u_den is not None and p_den != u_den:
+            gaps.append(f"{d}:both_denominator_disagreement_p{p_den}_u0_{u_den}")
     return gaps
 
 
@@ -595,7 +625,11 @@ def evaluate_local_preferred(
                 gap_rels.append(None)
                 continue
             pb, ub = p[d].both, u[d].both
-            if pb.get("denominator_frames", 0) == 0 or ub.get("denominator_frames", 0) == 0:
+            p_den, u_den = _both_denominator(p[d]), _both_denominator(u[d])
+            if not p_den or not u_den:
+                # None (missing/invalid denominator — the evidence gap fires
+                # and forces incomplete) or 0 (no both-grasp reference
+                # frames): the demo contributes no gain vote either way
                 cov_gains.append(None)
                 gap_rels.append(None)
                 continue
