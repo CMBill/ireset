@@ -146,6 +146,12 @@ def check_report_invariants(report: dict, expected_pilot: list[str],
     if verdict not in _VERDICTS:
         violations.append(f"verdict_out_of_vocabulary:{verdict}")
     vr = report.get("verdict_record", {})
+    # round-3 review fix 1: the report carries the verdict TWICE (top level
+    # and inside the verdict record); editing only one location used to pass
+    # every structural check
+    if vr.get("verdict") != verdict:
+        violations.append(f"verdict_locations_disagree:{verdict}"
+                          f"!={vr.get('verdict')}")
     gaps = vr.get("evidence_gaps", [])
     if bool(vr.get("complete_evidence")) != (not gaps):
         violations.append("complete_evidence_disagrees_with_gaps")

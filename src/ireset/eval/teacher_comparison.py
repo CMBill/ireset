@@ -746,3 +746,130 @@ def evaluate_local_preferred(
         verdict = "no_quality_gain"
     return {"gates": gates, "evidence_gaps": gaps,
             "complete_evidence": complete, "verdict": verdict}
+
+
+def demo_metrics_from_json(row: dict) -> DemoMetrics:
+    """Rebuild a :class:`DemoMetrics` from its serialized ``to_json`` row.
+
+    Round-3 review fix 1 (2026-10-10): the C2 merge re-derives the verdict
+    from the metrics/binding a report itself carries, so a serialized row
+    must load back into the dataclass the evaluation consumes. ``None``
+    measurements stay ``None`` — ``_bad`` treats them exactly like the
+    non-finite values they were serialized from, so a deficient row
+    re-derives the same ``incomplete`` it originally produced.
+    """
+    foot = {}
+    for s, f in (row.get("foot") or {}).items():
+        foot[s] = None if f is None else SideFootMetrics(**{
+            k: f.get(k) for k in ("n_ref_frames", "gap_p95_m",
+                                  "speed_p95_mps", "drift_max_m",
+                                  "n_speed_frames")})
+    hand = {}
+    for s, h in (row.get("hand") or {}).items():
+        hand[s] = None if h is None else SideHandMetrics(**{
+            k: h.get(k) for k in ("n_ref_frames", "gap_p95_m", "coverage",
+                                  "valid_coverage",
+                                  "certified_overlap_frames",
+                                  "longest_certified_overlap",
+                                  "drift_max_m", "n_robot_intervals",
+                                  "n_robot_intervals_certified")})
+    return DemoMetrics(
+        demo=row.get("demo"), T=row.get("T", -1),
+        fps=row.get("fps", float("nan")), valid=bool(row.get("valid")),
+        error=row.get("error"),
+        penetration_max_m=row.get("penetration_max_m"),
+        penetration_violation_ratio=row.get("penetration_violation_ratio"),
+        task_mpjpe_p95_m=row.get("task_mpjpe_p95_m"),
+        box_ground_penetration_max_m=row.get("box_ground_penetration_max_m"),
+        foot=foot, hand=hand, both=dict(row.get("both") or {}),
+        validator_status=row.get("validator_status"),
+        validator_worst=dict(row.get("validator_worst") or {}),
+        validator_failed_checks=list(row.get("validator_failed_checks") or []),
+        ref_support_frames=dict(row.get("ref_support_frames") or {}),
+        ref_grasp_frames=dict(row.get("ref_grasp_frames") or {}))
+
+
+def reverify_verdict_record(report: dict, u_side: str = "U0") -> dict:
+    """Re-derive the verdict record from a report's OWN metric rows and
+    binding map (round-3 review fix 1, 2026-10-10).
+
+    The closure merge used to trust the recorded ``complete_evidence`` flag
+    and the top-level verdict string: a tampered report whose verdict said
+    ``local_preferred`` over failing gates, whose two verdict locations
+    disagreed, or whose binding/metric rows were invalidated while the
+    recorded flags stayed ``True`` still registered. The gates, the metric
+    evidence gaps, the completeness flag and the verdict are now RE-COMPUTED
+    from the report's ``metrics``/``binding`` with the same frozen
+    evaluation and must agree with what the report claims.
+
+    Admission-side gaps (``admission:*``, appended by the comparison entry
+    after the evaluation) are excluded from the gap comparison: this leg
+    re-derives the METRICS verdict; the admission verdict is verified
+    separately (an admission failure legitimately forces ``incomplete``
+    over metrics-complete evidence, never the reverse).
+    """
+    pilot = list(report.get("pilot") or [])
+    metrics = report.get("metrics") or {}
+    p = {d: demo_metrics_from_json(r)
+         for d, r in (metrics.get("P") or {}).items()}
+    u = {d: demo_metrics_from_json(r)
+         for d, r in (metrics.get(u_side) or {}).items()}
+    binding = {d: bool(v) for d, v in (report.get("binding") or {}).items()}
+    rederived = evaluate_local_preferred(pilot, p, u, binding, u_label=u_side)
+    vr = report.get("verdict_record") or {}
+    top = report.get("verdict")
+    problems: list[str] = []
+    if top != vr.get("verdict"):
+        problems.append("verdict_locations_disagree")
+    rec_gaps = [g for g in (vr.get("evidence_gaps") or [])
+                if not str(g).startswith("admission:")]
+    if rec_gaps != rederived["evidence_gaps"]:
+        problems.append("metric_evidence_gaps_not_reproducible")
+    if not rederived["complete_evidence"] and bool(
+            vr.get("complete_evidence")):
+        problems.append("complete_evidence_contradicts_metrics")
+    if rederived["verdict"] == "incomplete":
+        if top != "incomplete":
+            problems.append("verdict_contradicts_metrics")
+    elif top not in (rederived["verdict"], "incomplete"):
+        problems.append("verdict_not_supported_by_gates")
+    rec_gates = vr.get("gates") or {}
+    rg = rederived["gates"]
+    for name, gate in rg.items():
+        rec_gate = rec_gates.get(name) or {}
+        if rec_gate.get("passed") != gate["passed"]:
+            problems.append(f"gate_passed_not_reproducible:{name}")
+        if name in ("g1_identity_and_availability", "g2_task_mpjpe"):
+            if (rec_gate.get("per_demo") or {}) != gate["per_demo"]:
+                problems.append(f"gate_rows_not_reproducible:{name}")
+        elif name == "g3_penetration_and_feet":
+            for d, row in gate["per_demo"].items():
+                rec_row = (rec_gate.get("per_demo") or {}).get(d) or {}
+                for key in ("passed", "penetration", "foot"):
+                    if rec_row.get(key) != row[key]:
+                        problems.append(
+                            f"gate_rows_not_reproducible:{name}:{d}:{key}")
+        elif name == "g4_hand_improvement":
+            for key in ("n_coverage_gain_demos", "n_gap_drop_demos"):
+                if rec_gate.get(key) != gate[key]:
+                    problems.append(
+                        f"gate_rows_not_reproducible:{name}:{key}")
+        elif name == "g5_degradation":
+            for d, row in gate["per_demo"].items():
+                rec_row = (rec_gate.get("per_demo") or {}).get(d) or {}
+                if rec_row.get("passed") != row["passed"]:
+                    problems.append(
+                        f"gate_rows_not_reproducible:{name}:{d}:passed")
+    return {
+        "problems": problems,
+        "recomputed": {
+            "verdict": rederived["verdict"],
+            "complete_evidence": rederived["complete_evidence"],
+            "evidence_gaps": rederived["evidence_gaps"],
+            "gate_passed": {k: v["passed"] for k, v in rg.items()},
+            "n_coverage_gain_demos":
+                rg["g4_hand_improvement"]["n_coverage_gain_demos"],
+            "n_gap_drop_demos":
+                rg["g4_hand_improvement"]["n_gap_drop_demos"],
+        },
+    }

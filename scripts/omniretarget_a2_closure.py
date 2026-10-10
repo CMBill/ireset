@@ -332,6 +332,15 @@ def verify_merge_chain(diagnosis_path: Path | None,
         rec["report_invariants"] = inv
         if not inv["passed"]:
             problems += [f"recovery:{v}" for v in inv["violations"]]
+        # round-3 review fix 1: the verdict/gates/evidence-completeness are
+        # RE-DERIVED from the report's own metric rows and binding map — a
+        # tampered verdict over failing gates, disagreeing verdict
+        # locations, or invalidated rows behind intact flags must not merge
+        from ireset.eval.teacher_comparison import reverify_verdict_record
+        rever = reverify_verdict_record(report, u_side="UR")
+        rec["verdict_reverification"] = rever
+        if rever["problems"]:
+            problems += [f"recovery:{p}" for p in rever["problems"]]
         verdict = report.get("verdict")
         admission_passed = bool(report.get("admission", {}).get("passed"))
         complete = bool(report.get("verdict_record", {}).get(

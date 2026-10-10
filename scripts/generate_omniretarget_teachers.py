@@ -78,23 +78,39 @@ CHILD_DRIVER = PROJECT_ROOT / "scripts" / "_omniretarget_diagnostic_child.py"
 UR_STEP_SIZE = 0.3
 #: §11 budget: a single generation may not exceed 30 min
 GENERATION_TIMEOUT_S = 1800
-#: §6.2 retry policy made structural (review fix 11, 2026-10-10): after TWO
-#: failed same-config runs of a demo already recorded in this root, no
-#: third subprocess call — the skipped row records the prior attempts
-MAX_FAILED_RUNS_PER_DEMO = 2
-#: §11 budget: the whole UR experiment may not exceed 3h of generation wall
+#: §6.2 retry policy made structural (review fix 11, 2026-10-10; round-3
+#: review fix 4): ONE normal run plus AT MOST one justified retry = at most
+#: TWO actual subprocess invocations per demo in this root — counted by
+#: ACTUAL CALLS (any non-skipped row), never by failures alone: one failed
+#: run plus one success previously authorized a third call. Skipped rows
+#: (``skipped_*``) record no call and never count.
+MAX_INVOCATIONS_PER_DEMO = 2
+#: §11 budget: the whole UR experiment may not exceed 3h, and that budget
+#: COVERS generation + the final comparison ("预留终检/比较时间") — the
+#: generation loop may only spend what remains after reserving the
+#: comparison time
 UR_TOTAL_BUDGET_S = 3 * 3600
+UR_COMPARISON_RESERVE_S = 600
+UR_GENERATION_BUDGET_S = UR_TOTAL_BUDGET_S - UR_COMPARISON_RESERVE_S
 
 
 def _prior_run_facts(out_root: Path, scope: list[str]) -> tuple[dict, float]:
-    """Failed-run history and cumulative wall time already recorded in this
-    root — the retry cap and the UR budget gate are enforced ACROSS
+    """Actual-invocation history and cumulative wall time already recorded
+    in this root — the retry cap and the UR budget gate are enforced ACROSS
     invocations, not per call (the first round happily launched a third
-    same-config attempt after two recorded failures)."""
-    prior_failed: dict[str, list[str]] = {}
+    same-config attempt after two recorded failures).
+
+    Round-3 review fix 4: the cap counts REAL calls (every row whose status
+    is not ``skipped*`` — ok, generation_failed, binding_failed, timeout,
+    postcheck_failed, input_mutated, and unknown/None statuses
+    conservatively), never failures alone, and each entry carries the prior
+    status so the retry justification (a retry is legitimate only after a
+    FAILED run) is auditable in the skipped row.
+    """
+    prior_calls: dict[str, list[dict]] = {}
     prior_wall_s = 0.0
     if not (out_root / integ.ATTEMPTS_INDEX).is_file():
-        return prior_failed, prior_wall_s
+        return prior_calls, prior_wall_s
     for att in integ.load_attempts(out_root):
         try:
             manifest = integ.load_attempt_manifest(out_root, att["attempt"])
@@ -102,10 +118,14 @@ def _prior_run_facts(out_root: Path, scope: list[str]) -> tuple[dict, float]:
             continue
         prior_wall_s += float(manifest.get("total_wall_s") or 0.0)
         for row in manifest.get("rows", []):
-            if (row.get("demo") in scope
-                    and row.get("status") not in (None, "ok")):
-                prior_failed.setdefault(row["demo"], []).append(att["attempt"])
-    return prior_failed, prior_wall_s
+            if row.get("demo") not in scope:
+                continue
+            status = row.get("status")
+            if str(status).startswith("skipped"):
+                continue          # no subprocess was launched for this row
+            prior_calls.setdefault(row["demo"], []).append(
+                {"attempt": att["attempt"], "status": status})
+    return prior_calls, prior_wall_s
 
 
 def pilot_demos_from_freeze(freeze_dir: Path) -> list[str]:
@@ -190,9 +210,15 @@ def generate_one(
     attempt_dir: Path,
     data_path: Path,
     extra_argv: list[str] | None = None,
-    timeout_s: int = GENERATION_TIMEOUT_S,
+    timeout_s: int | None = GENERATION_TIMEOUT_S,
 ) -> dict:
-    """Run the upstream retargeting for one demo; -> per-demo result row."""
+    """Run the upstream retargeting for one demo; -> per-demo result row.
+
+    ``timeout_s=None`` keeps the §11 single-generation default (the budget
+    gate caps this at the remaining UR budget when it passes a value).
+    """
+    if timeout_s is None:
+        timeout_s = GENERATION_TIMEOUT_S
     t0 = time.time()
     cmd = [
         str(env_python), "examples/robot_retarget.py",
@@ -361,38 +387,66 @@ def main() -> int:
 
     extra_argv = (["--retargeter.step-size", str(UR_STEP_SIZE)]
                   if source_record else None)
-    # review fix 11: per-demo retry cap across the root + the UR cumulative
-    # budget — both enforced BEFORE the subprocess call, with the reason in
-    # the row (a third call after two recorded same-config failures, or a
-    # call past the 3h experiment budget, must never happen silently)
-    prior_failed, prior_wall_s = _prior_run_facts(out_root, scope)
+    # review fix 11 + round-3 review fixes 4/5: per-demo invocation cap
+    # across the root (one normal run + at most one JUSTIFIED retry — a
+    # retry after a SUCCESS has no justification) and the UR cumulative
+    # budget with a comparison reserve; both enforced BEFORE the subprocess
+    # call, with the reason in the row. The budget stops at EXHAUSTION
+    # (>=, not >) and caps the CURRENT call's timeout at the remaining
+    # budget — a 5s-remaining call used to launch with the default 1800s
+    # timeout and blow the 3h experiment budget.
+    prior_calls, prior_wall_s = _prior_run_facts(out_root, scope)
     rows = []
     spent = 0.0
     for d in scope:
-        if len(prior_failed.get(d, [])) >= MAX_FAILED_RUNS_PER_DEMO:
+        prior = prior_calls.get(d, [])
+        if len(prior) >= MAX_INVOCATIONS_PER_DEMO:
             rows.append({
                 "demo": d, "argv": None, "cwd": str(HOLOSOMA_PACKAGE),
                 "exit_code": None, "wall_s": 0.0,
                 "status": "skipped_retry_cap",
-                "prior_failed_attempts": prior_failed[d],
-                "reason": f"{MAX_FAILED_RUNS_PER_DEMO} failed same-config "
-                          "runs already recorded in this root; retry "
-                          "policy exhausted (§6.2) — no further attempt "
-                          "without a new registration",
+                "prior_invocations": prior,
+                "reason": f"{MAX_INVOCATIONS_PER_DEMO} actual generation "
+                          "invocations already recorded in this root "
+                          "(§6.2: one normal run + at most one justified "
+                          "retry) — no further attempt without a new "
+                          "registration",
             })
             continue
-        if source_record and prior_wall_s + spent > UR_TOTAL_BUDGET_S:
+        if (len(prior) == 1 and prior[0]["status"] == "ok"):
             rows.append({
                 "demo": d, "argv": None, "cwd": str(HOLOSOMA_PACKAGE),
                 "exit_code": None, "wall_s": 0.0,
-                "status": "skipped_budget",
-                "cumulative_wall_s": round(prior_wall_s + spent, 1),
-                "reason": "UR cumulative generation budget (§11, 3h) "
-                          "exhausted before this demo",
+                "status": "skipped_retry_cap",
+                "prior_invocations": prior,
+                "reason": "the prior run of this demo already SUCCEEDED; a "
+                          "retry is justified only after a failed run "
+                          "(§6.2) — regenerate via a new registration, not "
+                          "a same-config re-run",
             })
             continue
+        call_timeout = None
+        if source_record:
+            cumulative = prior_wall_s + spent
+            remaining = UR_GENERATION_BUDGET_S - cumulative
+            if remaining <= 0:
+                rows.append({
+                    "demo": d, "argv": None, "cwd": str(HOLOSOMA_PACKAGE),
+                    "exit_code": None, "wall_s": 0.0,
+                    "status": "skipped_budget",
+                    "cumulative_wall_s": round(cumulative, 1),
+                    "reason": "UR cumulative budget (§11, 3h incl. "
+                              f"{UR_COMPARISON_RESERVE_S}s comparison "
+                              "reserve) exhausted before this demo",
+                })
+                continue
+            call_timeout = int(min(GENERATION_TIMEOUT_S, remaining))
         row = generate_one(d, args.env_python, attempt_dir, data_path,
-                           extra_argv=extra_argv)
+                           extra_argv=extra_argv, timeout_s=call_timeout)
+        if call_timeout is not None:
+            row["budget_timeout_s"] = call_timeout
+            row["budget_remaining_s"] = round(
+                UR_GENERATION_BUDGET_S - prior_wall_s - spent, 1)
         rows.append(row)
         spent += float(row.get("wall_s") or 0.0)
 

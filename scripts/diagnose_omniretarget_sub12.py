@@ -60,6 +60,22 @@ RETARGETER_FILE = HOLOSOMA_PACKAGE / "src" / "interaction_mesh_retargeter.py"
 #: §5.5 two-run consistency: identical key arrays + rho agreement
 RHO_AGREEMENT = 1e-6
 
+#: Required snapshot evidence (round-3 review fix 3, 2026-10-10): a §5.5
+#: verdict needs ALL of these present on BOTH runs before any equality
+#: counts — a key missing from both sides used to read as ``both_missing``
+#: == equal, so deleting ``q_a_indices`` / the canonical objective ``c`` /
+#: the P and A dumps from BOTH snapshots still yielded
+#: ``supports_step03_candidate`` over absent evidence. ``q_a_nominal``
+#: stays OPTIONAL (first-round snapshots predate it); pre-fix snapshots
+#: whose canonical dump only saved ``b`` are historical defect evidence and
+#: fail the required set by design.
+REQUIRED_CTX_ARRAYS = ("q_locked", "q_a_n_last", "q_t_last",
+                       "target_laplacian", "obj_pts_local", "q_a_indices")
+OPTIONAL_CTX_ARRAYS = ("q_a_nominal",)
+REQUIRED_CANONICAL_KEYS = ("b", "c")
+REQUIRED_ARTIFACTS = ("failure_context.npz", "failure_canonical.npz",
+                      "failure_canonical_P.npz", "failure_canonical_A.npz")
+
 
 def _load_json(path: Path) -> dict:
     return json.loads(Path(path).read_text())
@@ -107,9 +123,11 @@ def _arrays_equal(npz_a: Path, npz_b: Path, keys: list[str]) -> dict:
     """Two-run npz comparison over ``keys``.
 
     A key missing on BOTH sides is consistent evidence (``both_missing``,
-    counted as equal); missing on ONE side is a difference — tampering the
-    second run's arrays or dropping a key the first run saved is caught,
-    while first-round snapshots that predate a key stay comparable.
+    counted as equal) — this is only legitimate for OPTIONAL keys
+    (``q_a_nominal``); REQUIRED keys are existence-checked by
+    ``decide_diagnosis`` BEFORE this comparison runs, so a required key
+    absent from both snapshots never reaches the ``both_missing == equal``
+    branch. Missing on ONE side is always a difference.
     """
     out: dict = {}
     if not (npz_a.is_file() and npz_b.is_file()):
@@ -171,6 +189,12 @@ def decide_diagnosis(control: dict, runs: list[dict]) -> dict:
     snapshot artifacts, and the problem shape (SOC t, dqa shape, kept
     constraint count). Editing the second run's canonical ``b`` or column
     mapping previously still yielded ``supports_step03_candidate``.
+
+    Round-3 review fix 3 (2026-10-10): the REQUIRED evidence (context
+    arrays incl. ``q_a_indices``, canonical ``b`` AND ``c``, the P/A dumps)
+    must EXIST on both runs before any equality counts — ``both_missing``
+    used to read as equal, so deleting required keys from BOTH snapshots
+    still produced ``supports_step03_candidate`` over absent evidence.
     """
     if not control.get("equal", False):
         return {"status": "control_not_equivalent",
@@ -202,16 +226,42 @@ def decide_diagnosis(control: dict, runs: list[dict]) -> dict:
                 "problems": problems,
                 "note": "a run neither failed at the original solver nor "
                         "produced usable evidence (§11 stop)"}
-    # both runs failed with captured context: determinism first
-    f0, f1 = (r["summary"]["failure"] for r in failed)
+    # both runs failed with captured context: required evidence FIRST
+    # (round-3 review fix 3) — equality over absent evidence is not
+    # evidence; a both-missing key is only legal for the OPTIONAL set
     snap0, snap1 = Path(failed[0]["snapshot"]), Path(failed[1]["snapshot"])
+    missing_required: list[str] = []
+    for run, snap in zip(failed, (snap0, snap1)):
+        for name in REQUIRED_ARTIFACTS:
+            if not (snap / name).is_file():
+                missing_required.append(f"{run['label']}:{name}")
+        if (snap / "failure_context.npz").is_file():
+            with np.load(snap / "failure_context.npz") as z:
+                for k in REQUIRED_CTX_ARRAYS:
+                    if k not in z.files:
+                        missing_required.append(
+                            f"{run['label']}:failure_context:{k}")
+        if (snap / "failure_canonical.npz").is_file():
+            with np.load(snap / "failure_canonical.npz") as z:
+                for k in REQUIRED_CANONICAL_KEYS:
+                    if k not in z.files:
+                        missing_required.append(
+                            f"{run['label']}:failure_canonical:{k}")
+    if missing_required:
+        return {"status": "diagnostic_incomplete",
+                "problems": [f"missing_required_evidence:{m}"
+                             for m in missing_required],
+                "note": "a §5.5 verdict requires the full captured evidence "
+                        "on both runs; a key missing from BOTH sides is "
+                        "absent evidence, not consistent evidence"}
+    # determinism first
+    f0, f1 = (r["summary"]["failure"] for r in failed)
     same_frame = f0.get("failing_frame_idx", f0.get("frame_idx")) == \
         f1.get("failing_frame_idx", f1.get("frame_idx"))
     same_ordinal = f0.get("ordinal_in_frame") == f1.get("ordinal_in_frame")
     ctx_equal = _arrays_equal(
         snap0 / "failure_context.npz", snap1 / "failure_context.npz",
-        ["q_locked", "q_a_n_last", "q_t_last", "target_laplacian",
-         "obj_pts_local", "q_a_indices", "q_a_nominal"])
+        list(REQUIRED_CTX_ARRAYS) + list(OPTIONAL_CTX_ARRAYS))
     canonical_equal = _compare_canonical(snap0, snap1)
     h0, h1 = _snapshot_artifact_hashes(snap0), _snapshot_artifact_hashes(snap1)
     hashes_equal = all(
@@ -279,12 +329,21 @@ def decide_diagnosis(control: dict, runs: list[dict]) -> dict:
 
 def verify_diagnosis_record(diag: dict) -> dict:
     """Verify a diagnosis_run.json AS merge/registration evidence (review
-    fixes 5/6, 2026-10-10): the recorded verdict must be backed by the
-    recorded facts, and the parent baseline-evidence hash it registered
-    against must still resolve to the file on disk.
+    fixes 5/6, 2026-10-10; round-3 review fix 2): the recorded verdict must
+    be backed by the recorded facts, the parent baseline-evidence hash it
+    registered against must still resolve to the file on disk, and — new —
+    the verdict must be RE-DERIVABLE from the run records plus the snapshot
+    artifacts ON DISK. The recorded pass flags alone prove nothing: editing
+    run 2's canonical ``b`` while keeping the recorded hashes previously
+    passed both G0 and C2, because nothing re-read the artifacts.
 
-    Pure over the loaded record (counterexample-testable); used by G0
-    ``register-recovery`` and by the closure C2 merge verification.
+    The re-derivation rebuilds the two run records (label / snapshot /
+    failure) and re-runs :func:`decide_diagnosis` — which re-hashes the
+    snapshot files, re-compares the captured arrays, re-checks the required
+    evidence and re-dispatches the §5.5 table — and additionally compares
+    the RECORDED per-run artifact hashes against the files on disk now.
+    Used by G0 ``register-recovery`` and by the closure C2 merge
+    verification.
     """
     problems: list[str] = []
     verdict = diag.get("verdict", {})
@@ -303,6 +362,7 @@ def verify_diagnosis_record(diag: dict) -> dict:
             problems.append("parent_baseline_drifted")
     else:
         problems.append("parent_baseline_not_recorded")
+    rederived_info: dict = {}
     if status == "supports_step03_candidate":
         for key, val in (("same_frame", True), ("same_ordinal", True),
                          ("rho_agreement", True)):
@@ -323,10 +383,52 @@ def verify_diagnosis_record(diag: dict) -> dict:
         if not (isinstance(rho, (int, float))
                 and 0.2 + 1e-6 < rho <= 0.3 - 1e-6):
             problems.append("rho_outside_candidate_window")
+        # round-3 review fix 2: re-derive from the run records + the
+        # snapshot artifacts on disk — the flags above are claims, not
+        # evidence
+        runs = diag.get("runs") or []
+        if len(runs) != 2:
+            problems.append("runs_not_recorded_for_reverification")
+        elif any(not r.get("snapshot") for r in runs):
+            problems.append("snapshot_not_recorded_for_reverification")
+        else:
+            rebuilt = [{"label": r.get("label"),
+                        "timed_out": r.get("timed_out"),
+                        "launch_error": r.get("launch_error"),
+                        "snapshot": r.get("snapshot"),
+                        "summary": {"failure": r.get("failure"),
+                                    "outcome": r.get("outcome")}}
+                       for r in runs]
+            rederived = decide_diagnosis(control, rebuilt)
+            rederived_info = {
+                "status": rederived.get("status"),
+                "failing_frame_run1": rederived.get("failing_frame_run1"),
+                "ordinal_run1": rederived.get("ordinal_run1"),
+                "rho_run1": rederived.get("rho_run1"),
+            }
+            if rederived.get("status") != status:
+                problems.append("status_not_reproducible_from_artifacts")
+            for key in ("failing_frame_run1", "ordinal_run1"):
+                if rederived.get(key) != verdict.get(key):
+                    problems.append(f"{key}_not_reproducible")
+            r0, r1 = rederived.get("rho_run1"), verdict.get("rho_run1")
+            if not (isinstance(r0, (int, float))
+                    and isinstance(r1, (int, float))
+                    and abs(r0 - r1) <= RHO_AGREEMENT):
+                problems.append("rho_not_reproducible")
+            # the recorded per-run artifact hashes vs the files on disk NOW
+            rec_hashes = verdict.get("artifact_sha256") or {}
+            for side, run in zip(("run1", "run2"), runs):
+                now = _snapshot_artifact_hashes(
+                    _recorded_path(run["snapshot"]))
+                if rec_hashes.get(side) != now:
+                    problems.append(
+                        f"artifact_hashes_drifted_vs_disk:{side}")
     elif status == "not_run":
         problems.append("diagnosis_not_run")
     return {"verified": not problems, "problems": problems,
             "status": status,
+            "rederived": rederived_info,
             "facts": {k: verdict.get(k) for k in
                       ("failing_frame_run1", "ordinal_run1", "rho_run1",
                        "rho_run2")}}

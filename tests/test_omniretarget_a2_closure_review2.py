@@ -31,6 +31,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from ireset.data import a2_integrity as integ  # noqa: E402
 from ireset.eval import a2_closure as a2c  # noqa: E402
+from ireset.eval import teacher_comparison as tcmp  # noqa: E402
+from ireset.eval.teacher_comparison import (  # noqa: E402
+    DemoMetrics, SideFootMetrics, SideHandMetrics,
+)
 
 PILOT = ["subA_largebox_001", "subB_largebox_002", "subC_largebox_003",
          "subD_largebox_004", "subE_largebox_005", "subF_largebox_006"]
@@ -229,6 +233,21 @@ def _canonical_npz(path: Path, seed: int):
     np.savez(path, c=rng.normal(size=798), b=rng.normal(size=949))
 
 
+def _write_full_snapshot(path: Path, seed: int = 7):
+    """Complete snapshot: the REQUIRED artifact set (context arrays incl.
+    q_a_indices, canonical b AND c, P/A dumps) — round-3 review fix 3."""
+    path.mkdir(parents=True, exist_ok=True)
+    _ctx_npz(path / "failure_context.npz", seed)
+    _canonical_npz(path / "failure_canonical.npz", seed + 1)
+    rng = np.random.default_rng(seed + 2)
+    np.savez(path / "failure_canonical_P.npz",
+             data=rng.normal(size=37), indices=np.arange(5),
+             indptr=np.arange(6), shape=[798, 798])
+    np.savez(path / "failure_canonical_A.npz",
+             data=rng.normal(size=41), indices=np.arange(5),
+             indptr=np.arange(6), shape=[949, 798])
+
+
 def _diag_run(snapshot: Path, *, rho=0.2486138173835237, soc_t=0.2,
               n_kept=66):
     return {"label": "r", "snapshot": str(snapshot), "timed_out": False,
@@ -247,12 +266,8 @@ def _diag_run(snapshot: Path, *, rho=0.2486138173835237, soc_t=0.2,
 @pytest.fixture()
 def two_snapshots(tmp_path):
     sa, sb = tmp_path / "snap_a", tmp_path / "snap_b"
-    sa.mkdir(parents=True, exist_ok=True)
-    sb.mkdir(parents=True, exist_ok=True)
-    _ctx_npz(sa / "failure_context.npz", 7)
-    _ctx_npz(sb / "failure_context.npz", 7)
-    _canonical_npz(sa / "failure_canonical.npz", 11)
-    _canonical_npz(sb / "failure_canonical.npz", 11)
+    _write_full_snapshot(sa)
+    _write_full_snapshot(sb)
     return sa, sb
 
 
@@ -286,17 +301,28 @@ def test_decide_catches_tampered_canonical_or_mapping(two_snapshots):
     assert not bad3["problem_shape_equal"]
 
 
+def _saved_run(r: dict) -> dict:
+    """The shape diagnose() writes into diagnosis_run.json: the failure
+    dict lives at the TOP level of each run record, not under "summary"."""
+    s = r["summary"]
+    return {"label": r["label"], "snapshot": r["snapshot"],
+            "timed_out": r["timed_out"], "launch_error": r["launch_error"],
+            "failure": s["failure"], "outcome": s["outcome"],
+            "frames_completed": 171}
+
+
 def test_verify_diagnosis_record_checks_backing_and_parent(two_snapshots,
                                                             tmp_path):
     import diagnose_omniretarget_sub12 as diag
     a, b = two_snapshots
-    verdict = diag.decide_diagnosis({"equal": True},
-                                    [_diag_run(a), _diag_run(b)])
+    eval_runs = [_diag_run(a), _diag_run(b)]
+    verdict = diag.decide_diagnosis({"equal": True}, eval_runs)
     baseline = tmp_path / "baseline_evidence.json"
     baseline.write_text("{}")
     good = {
         "verdict": verdict,
         "control": {"comparison": {"equal": True}},
+        "runs": [_saved_run(r) for r in eval_runs],
         "baseline": {"baseline_evidence": str(baseline),
                      "baseline_evidence_sha256":
                          integ.sha256_file(baseline)},
@@ -555,11 +581,50 @@ def test_cli_snapshots_are_attempt_scoped_and_immutable(tmp_path,
     assert len(costs["invocations"]) == 2     # fix 11: costs accumulate
 
 
+def _ur_metric_row(d, *, valid=True, pen=0.03, task=0.075, drift=0.4,
+                   ratio=0.2, failed_checks=("velocities",)):
+    """A synthetic UR-side row: decisively WORSE than P on penetration /
+    drift / violation-ratio with a new validator hard failure, comparable
+    on task — the no_quality_gain shape (g2 pass, g3/g4/g5 fail)."""
+    if not valid:
+        return DemoMetrics(demo=d, T=-1, fps=float("nan"), valid=False,
+                           error="no OK UR artifact")
+    return DemoMetrics(
+        demo=d, T=100, fps=30.0, valid=True,
+        penetration_max_m=pen, penetration_violation_ratio=ratio,
+        task_mpjpe_p95_m=task, box_ground_penetration_max_m=0.0,
+        foot={"l": SideFootMetrics(10, 0.001, 0.01, 0.01, 9),
+              "r": SideFootMetrics(10, 0.001, 0.01, 0.01, 9)},
+        hand={"l": SideHandMetrics(10, 0.005, 0.5, 0.5, 5, 5, drift, 1, 1),
+              "r": SideHandMetrics(10, 0.005, 0.5, 0.5, 5, 5, drift, 1, 1)},
+        both={"denominator_frames": 10, "valid_coverage": 0.5,
+              "gap_series_p95_m": 0.01},
+        validator_failed_checks=list(failed_checks),
+        ref_support_frames={"l": 10, "r": 10},
+        ref_grasp_frames={"l": 10, "r": 10})
+
+
 def _recovery_report(tmp_path, *, verdict="no_quality_gain",
                      admission_passed=True, complete=True, missing=None,
                      prereg_sha="shaReg", drop_row=False):
+    """A UR report whose verdict record is BUILT by the real evaluation over
+    synthetic metrics (round-3 review fix 1: the merge re-derives gates from
+    the metrics, so a hand-written gates dict no longer passes); the
+    claimed ``verdict`` stays overridable — that is exactly the tamper the
+    re-derivation must catch."""
     tmp_path = Path(tmp_path)
     tmp_path.mkdir(parents=True, exist_ok=True)
+    p_rows = {d: _ur_metric_row(d, pen=0.002, task=0.07, drift=0.05,
+                                ratio=0.05, failed_checks=())
+              for d in PILOT}
+    u_rows = {d: _ur_metric_row(d, valid=d not in (missing or []))
+              for d in PILOT}
+    binding = {d: d not in (missing or []) for d in PILOT}
+    vr = tcmp.evaluate_local_preferred(PILOT, p_rows, u_rows, binding,
+                                       u_label="UR")
+    if not complete:
+        vr["complete_evidence"] = False
+    vr["verdict"] = verdict
     report = {
         "stage": "UR", "timestamp": "t", "pilot": PILOT, "p_revision": "r",
         "comparison_attempt": "attempt_001",
@@ -568,14 +633,12 @@ def _recovery_report(tmp_path, *, verdict="no_quality_gain",
                                       "by_demo": {d: "attempt_001"
                                                   for d in PILOT}}},
         "metrics": {
-            "P": {d: {"demo": d, "valid": True} for d in PILOT},
-            "UR": {d: ({"demo": d, "valid": False}
-                       if d in (missing or []) else {"demo": d, "valid": True})
+            "P": {d: p_rows[d].to_json() for d in PILOT},
+            "UR": {d: u_rows[d].to_json()
                    for d in (PILOT[:-1] if drop_row else PILOT)},
         },
-        "binding": {d: d not in (missing or []) for d in PILOT},
-        "verdict_record": {"complete_evidence": complete, "verdict": verdict,
-                           "gates": {}, "evidence_gaps": []},
+        "binding": binding,
+        "verdict_record": vr,
         "verdict": verdict, "cost_s": 1.0,
         "ur_identity": {"experiment_id": "a2_recovery_step03_v1",
                         "source_id": "upstream_recovery_step03_v1",
@@ -587,29 +650,28 @@ def _recovery_report(tmp_path, *, verdict="no_quality_gain",
 
 
 def _diagnosis_file(tmp_path, baseline_snapshot: Path, *, rho=0.2486138173835237):
+    """A diagnosis record backed by REAL on-disk snapshots (round-3 review
+    fix 2: verify re-hashes the artifacts and re-derives the §5.5 verdict
+    from the run records — flags alone no longer pass)."""
+    import diagnose_omniretarget_sub12 as diag
     tmp_path = Path(tmp_path)
     tmp_path.mkdir(parents=True, exist_ok=True)
-    diag = {
-        "stage": "D0", "verdict": {
-            "status": "supports_step03_candidate",
-            "failing_frame_run1": 171, "failing_frame_run2": 171,
-            "ordinal_run1": 5, "ordinal_run2": 5,
-            "same_frame": True, "same_ordinal": True,
-            "key_arrays_equal": {"all_equal": True},
-            "canonical_vectors_equal": {"equal": True},
-            "artifact_sha256": {"equal": True},
-            "problem_shape_equal": True,
-            "phase1_categories": ["supports_step03_candidate",
-                                  "supports_step03_candidate"],
-            "rho_run1": rho, "rho_run2": rho, "rho_agreement": True},
+    sa, sb = tmp_path / "snap_a", tmp_path / "snap_b"
+    _write_full_snapshot(sa)
+    _write_full_snapshot(sb)
+    eval_runs = [_diag_run(sa, rho=rho), _diag_run(sb, rho=rho)]
+    verdict = diag.decide_diagnosis({"equal": True}, eval_runs)
+    diag_json = {
+        "stage": "D0", "verdict": verdict,
         "control": {"comparison": {"equal": True}},
+        "runs": [_saved_run(r) for r in eval_runs],
         "baseline": {
             "baseline_evidence": str(baseline_snapshot),
             "baseline_evidence_sha256":
                 integ.sha256_file(baseline_snapshot)},
     }
     p = tmp_path / "diagnosis_run.json"
-    p.write_text(json.dumps(diag))
+    p.write_text(json.dumps(diag_json))
     return p
 
 
@@ -869,14 +931,18 @@ def test_generation_retry_cap_skips_the_third_call(tmp_path, monkeypatch):
                    [-1].read_text())
     row0 = next(r for r in m["rows"] if r["demo"] == PILOT[0])
     assert row0["status"] == "skipped_retry_cap"
-    assert row0["prior_failed_attempts"] == ["attempt_001", "attempt_001"]
+    assert row0["prior_invocations"] == [
+        {"attempt": "attempt_001", "status": "generation_failed"},
+        {"attempt": "attempt_001", "status": "timeout"}]
     assert m["n_skipped_retry_cap"] == 1
 
 
 def test_generation_ur_budget_gate_skips_past_3h(tmp_path, monkeypatch):
     freeze, prereg = _ur_freeze(tmp_path)
     out_dir = tmp_path / "ur2"
-    prior = [{"demo": PILOT[0], "status": "ok"}]
+    # one prior FAILED run (a success would hit the retry-justification
+    # skip first — a retry is legitimate only after a failure)
+    prior = [{"demo": PILOT[0], "status": "generation_failed"}]
     rc, calls = _run_generation_ur(monkeypatch, tmp_path, freeze, out_dir,
                                    prereg, prior_rows=prior,
                                    prior_wall=3 * 3600 + 1)

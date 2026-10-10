@@ -157,6 +157,35 @@ def _recompute_config_diff(full: dict) -> dict:
 #: per-row argv metadata masked when comparing two rows' command lines
 _ARGV_META_FLAGS = ("--task-name", "--save-dir")
 
+#: the value-taking flags a generation row must parse cleanly — a row whose
+#: command line is TRUNCATED (a flag dangling at the end without its value)
+#: must fail registration as a parse error, never crash the comparison
+#: (round-3 review fix 6, 2026-10-10)
+_ARGV_VALUE_FLAGS = ("--task-type", "--task-name", "--data-format",
+                     "--data-path", "--save-dir",
+                     "--task-config.object-name", "--retargeter.step-size")
+
+
+def _argv_flag_value(argv: list[str], flag: str) -> str | None:
+    """Value of ``flag`` in a recorded argv — ``None`` when the flag is
+    absent OR dangles at the end without a value. A truncated command line
+    previously raised IndexError straight out of admission and no report
+    was written at all."""
+    try:
+        i = argv.index(flag)
+    except ValueError:
+        return None
+    return argv[i + 1] if i + 1 < len(argv) else None
+
+
+def _argv_parse_error(argv: list[str]) -> str | None:
+    """Structural parse check of a recorded command line: every known
+    value-taking flag must actually carry a value."""
+    for flag in _ARGV_VALUE_FLAGS:
+        if flag in argv and _argv_flag_value(argv, flag) is None:
+            return f"dangling_flag:{flag}"
+    return None
+
 
 def _normalized_argv(argv: list[str]) -> list[str]:
     out, skip = [], False
@@ -179,11 +208,12 @@ def _canonical_base_argv(recorded: list[str]) -> list[str]:
     save-dir (per-demo run metadata, stripped from the canonical hash), so
     the base differs from the recorded command ONLY when the recorded
     command carries extra flags or non-template values — exactly what the
-    diff must expose.
+    diff must expose. A dangling metadata flag reads as an empty value
+    (the row's own parse error is reported separately, never a crash).
     """
     def val(flag: str, default: str = "") -> str:
-        return (recorded[recorded.index(flag) + 1]
-                if flag in recorded else default)
+        v = _argv_flag_value(recorded, flag)
+        return default if v is None else v
     return ["--task-type", "object_interaction",
             "--task-name", val("--task-name"),
             "--data-format", "smplh",
@@ -262,18 +292,27 @@ def _source_registration_record(gen_root: Path, coverage: dict,
         rec["recorded_canonical_config_sha256"] = (
             sr.get("config_smoke", {}).get("canonical_config_sha256"))
         bad_argv = []
+        parse_errors: dict[str, str] = {}
         normalized: dict[str, list[str]] = {}
         for demo in demos:
             row = integ.manifest_row_for(manifest, demo) or {}
             argv = list(row.get("argv") or [])
             normalized[demo] = _normalized_argv(argv)
-            has_flag = ("--retargeter.step-size" in argv)
-            step_val = argv[argv.index("--retargeter.step-size") + 1] \
-                if has_flag else None
-            if not has_flag or step_val != str(step_to):
+            # round-3 review fix 6: a truncated command line (a flag
+            # dangling at the end without its value) is a per-row PARSE
+            # ERROR recorded in the reconciliation — never an IndexError
+            # that crashes the comparison before any report is written
+            err = _argv_parse_error(argv)
+            if err is not None:
+                parse_errors[demo] = err
+                bad_argv.append(demo)
+                continue
+            step_val = _argv_flag_value(argv, "--retargeter.step-size")
+            if step_val != str(step_to):
                 bad_argv.append(demo)
         rec["argv_step_size_ok"] = not bad_argv
         rec["argv_step_size_bad_demos"] = bad_argv
+        rec["argv_parse_errors"] = parse_errors
         rec["argv_consistent_across_rows"] = (
             len({tuple(v) for v in normalized.values()}) <= 1)
         # the real gate: parse each consumed row's ACTUAL recorded argv and
@@ -281,6 +320,13 @@ def _source_registration_record(gen_root: Path, coverage: dict,
         argv_smoke: dict[str, dict] = {}
         if env_python is not None:
             for demo in sorted(demos):
+                if demo in parse_errors:
+                    # a structurally unparseable row never reaches the
+                    # child (the real tyro parse would only fail the same
+                    # way); the parse error itself is the recorded reason
+                    argv_smoke[demo] = {
+                        "error": f"argv_parse_error:{parse_errors[demo]}"}
+                    continue
                 row = integ.manifest_row_for(manifest, demo) or {}
                 smoke = _argv_config_smoke(env_python, list(row.get("argv")
                                                             or []))
@@ -721,6 +767,9 @@ def main() -> int:
                 if not r.get("argv_consistent_across_rows"):
                     reasons.append(
                         f"source_registration:{att}:argv_inconsistent")
+                for demo, err in (r.get("argv_parse_errors") or {}).items():
+                    reasons.append(
+                        f"source_registration:{att}:argv_parse:{demo}:{err}")
                 if r.get("argv_smoke") and not r.get("argv_smoke_ok"):
                     reasons.append(f"source_registration:{att}:argv_smoke")
         verdict["evidence_gaps"] = list(verdict["evidence_gaps"]) + [

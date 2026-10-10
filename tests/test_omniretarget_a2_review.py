@@ -337,7 +337,8 @@ def _fake_freeze(tmp_path):
     return freeze
 
 
-def _run_generation(monkeypatch, tmp_path, freeze, out_dir, demos=None):
+def _run_generation(monkeypatch, tmp_path, freeze, out_dir, demos=None,
+                    results=None):
     import generate_omniretarget_teachers as gen
 
     calls = []
@@ -346,8 +347,10 @@ def _run_generation(monkeypatch, tmp_path, freeze, out_dir, demos=None):
 
     def fake_generate_one(demo, env_python, attempt_dir, data_path, **kw):
         calls.append((demo, attempt_dir.name))
+        status = (results or {}).get(demo, "ok")
         return {"demo": demo, "argv": [], "cwd": "", "exit_code": 0, "wall_s": 0.1,
-                "config": "fake", "status": "ok", "binding": {"passed": True},
+                "config": "fake", "status": status,
+                "binding": {"passed": status == "ok"},
                 "error": None, "converted": f"{attempt_dir.name}/{demo}_converted.npz"}
 
     monkeypatch.setattr(gen, "generate_one", fake_generate_one)
@@ -370,8 +373,12 @@ def _run_generation(monkeypatch, tmp_path, freeze, out_dir, demos=None):
 def test_retry_writes_new_attempt_and_keeps_full_denominator(tmp_path, monkeypatch):
     freeze = _fake_freeze(tmp_path)
     out_dir = tmp_path / "u0"
-    rc1, calls1 = _run_generation(monkeypatch, tmp_path, freeze, out_dir)
-    assert rc1 == 0 and len(calls1) == 6
+    # the retried demo FAILED its first run — under §6.2 (one normal run +
+    # at most one JUSTIFIED retry) only a failed run justifies a retry;
+    # a succeeded demo is skipped as an unjustified re-run instead
+    rc1, calls1 = _run_generation(monkeypatch, tmp_path, freeze, out_dir,
+                                  results={PILOT[0]: "generation_failed"})
+    assert rc1 == 1 and len(calls1) == 6
     first_manifest = json.loads(
         (out_dir / "attempt_001" / "generation_manifest.json").read_text())
     assert first_manifest["expected_denominator"] == 6

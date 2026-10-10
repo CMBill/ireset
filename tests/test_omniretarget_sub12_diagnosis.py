@@ -83,6 +83,22 @@ def _canonical_npz(path: Path, seed: int):
     np.savez(path, c=rng.normal(size=798), b=rng.normal(size=949))
 
 
+def _write_snapshot(path: Path, seed: int):
+    """A COMPLETE snapshot: the required artifact set of round-3 review
+    fix 3 (context arrays incl. q_a_indices, canonical b AND c, the P/A
+    dumps) — the §5.5 verdict is only decidable on full evidence."""
+    path.mkdir(parents=True, exist_ok=True)
+    _ctx_npz(path / "failure_context.npz", seed)
+    _canonical_npz(path / "failure_canonical.npz", seed + 1)
+    rng = np.random.default_rng(seed + 2)
+    np.savez(path / "failure_canonical_P.npz",
+             data=rng.normal(size=798 * 798 % 97),
+             indices=np.arange(5), indptr=np.arange(6), shape=[798, 798])
+    np.savez(path / "failure_canonical_A.npz",
+             data=rng.normal(size=949 * 798 % 89),
+             indices=np.arange(5), indptr=np.arange(6), shape=[949, 798])
+
+
 _DEFAULT = object()
 
 
@@ -107,14 +123,8 @@ def _run(label: str, snapshot: Path, *, frame=171, ordinal=4,
 @pytest.fixture()
 def two_snaphots(tmp_path):
     sa, sb = tmp_path / "snap_a", tmp_path / "snap_b"
-    sa.mkdir()
-    sb.mkdir()
-    _ctx_npz(sa / "failure_context.npz", 7)
-    _canonical_npz(sa / "failure_canonical.npz", 11)
-    np.savez(sb / "failure_context.npz",
-             **{k: v for k, v in np.load(sa / "failure_context.npz").items()})
-    np.savez(sb / "failure_canonical.npz",
-             **{k: v for k, v in np.load(sa / "failure_canonical.npz").items()})
+    _write_snapshot(sa, 7)
+    _write_snapshot(sb, 7)      # same seeds: bit-identical evidence
     return sa, sb
 
 
@@ -147,10 +157,10 @@ def test_decide_nondeterministic_on_frame_ordinal_or_array_mismatch(
                               [_run("r1", a), _run("r2", b, ordinal=5)])
     assert v["status"] == "nondeterministic"
     sc = tmp_path / "snap_c"
-    sc.mkdir()
-    np.savez(sc / "failure_context.npz",
-             **{k: v + 1e-3
-                for k, v in np.load(a / "failure_context.npz").items()})
+    _write_snapshot(sc, 7)
+    ctx = {k: v + 1e-3
+           for k, v in np.load(a / "failure_context.npz").items()}
+    np.savez(sc / "failure_context.npz", **ctx)
     v = diag.decide_diagnosis({"equal": True},
                               [_run("r1", a), _run("r2", sc)])
     assert v["status"] == "nondeterministic"
