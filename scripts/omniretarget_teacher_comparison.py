@@ -61,6 +61,17 @@ missing/invalid evidence forces ``incomplete`` (never a silent drop).
 Fixed-input ``box_ground`` conflicts are recorded separately (§7.3). U1 is
 not pre-registered in this round -> ``not_applicable`` (§3.3).
 
+UR mode (closure plan §7.3, 2026-10-10): ``--generated-dir`` +
+``--source-record`` (mutually exclusive with ``--u0-dir``) compares P vs
+the preregistered recovery source UR — the report labels the source UR
+(metrics key, evidence gaps, gate fields), never "U0". Admission gains a
+registration/config reconciliation leg: every consumed attempt's manifest
+must pin the CURRENT preregistration hash, the recorded full parsed
+configs must re-diff to EXACTLY the single registered difference, every
+consumed row's argv must carry the step-size override, and a FRESH
+upstream config smoke must reproduce step_size 0.3 + the canonical config
+hash (argv/config strings in the manifest are never trusted alone).
+
 Run: uv run --locked python scripts/omniretarget_teacher_comparison.py \
        --freeze <a1_run>/freeze --u0-dir <a2_run>/teacher_pilot/u0 \
        --out <a2_run>/teacher_pilot
@@ -71,13 +82,19 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import subprocess
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import numpy as np
+
+from _omniretarget_diagnostic_child import (  # main-env-safe (lazy cvxpy)
+    CONFIG_RUN_METADATA_KEYS, _flatten,
+)
 
 from ireset.data import a2_integrity as integ
 from ireset.data import omniretarget_sources as orc
@@ -127,8 +144,97 @@ def _pt_dir_from_record(recorded: str) -> Path:
     return p if p.is_absolute() else PROJECT_ROOT / p
 
 
+def _recompute_config_diff(full: dict) -> dict:
+    """Re-diff the manifest's FULL parsed configs (never trust the summary)."""
+    fd = {k: v for k, v in _flatten(full.get("default", {})).items()
+          if k not in CONFIG_RUN_METADATA_KEYS}
+    fr = {k: v for k, v in _flatten(full.get("recovery", {})).items()
+          if k not in CONFIG_RUN_METADATA_KEYS}
+    return {k: [fd.get(k), fr.get(k)]
+            for k in sorted(set(fd) | set(fr)) if fd.get(k) != fr.get(k)}
+
+
+def _fresh_config_smoke(env_python: Path, prereg: dict) -> dict:
+    """Comparison-time upstream config smoke (§7.3): the CURRENT env must
+    still parse the override to the registered step size and hash."""
+    child = Path(__file__).resolve().parent / "_omniretarget_diagnostic_child.py"
+    cmd = [str(env_python), str(child), "--mode", "config-smoke",
+           "--demo", prereg["expected_demos"][0],
+           "--data-path", "derived/upstream/holosoma_env",
+           "--save-dir", "derived/upstream/holosoma_env/_smoke_no_write",
+           "--holosoma-package",
+           "third_party/holosoma/src/holosoma_retargeting/holosoma_retargeting",
+           "--step-size", "0.3"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if proc.returncode != 0:
+            return {"error": (proc.stderr or proc.stdout)[-500:]}
+        smoke = json.loads(proc.stdout)
+        return {k: smoke[k] for k in ("diff", "step_size_default",
+                                      "step_size_recovery",
+                                      "canonical_config_sha256")}
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+def _source_registration_record(gen_root: Path, coverage: dict,
+                                prereg: dict, prereg_sha_now: str) -> dict:
+    """Per-consumed-attempt registration reconciliation (§7.3): every
+    attempt backing a consumed demo must belong to THIS preregistration,
+    with a single-field config diff, the step-size flag in every consumed
+    row's argv, and full parsed configs on record."""
+    by_attempt: dict[str, set] = {}
+    for demo, entry in coverage["by_demo"].items():
+        by_attempt.setdefault(entry["attempt"], set()).add(demo)
+    per_attempt: dict[str, dict] = {}
+    for attempt, demos in sorted(by_attempt.items()):
+        manifest = integ.load_attempt_manifest(gen_root, attempt)
+        sr = manifest.get("source_record", {})
+        rec = {
+            "consumed_demos": sorted(demos),
+            "experiment_id": sr.get("experiment_id"),
+            "source_id": sr.get("source_id"),
+            "identity_matches": (
+                sr.get("preregistration_sha256") == prereg_sha_now
+                and sr.get("experiment_id") == prereg["experiment_id"]
+                and sr.get("source_id") == prereg["source_id"]),
+            "step_size": sr.get("step_size"),
+        }
+        full = sr.get("config_smoke_full") or {}
+        rec["recomputed_config_diff"] = _recompute_config_diff(full)
+        rec["single_difference_holds"] = (
+            rec["recomputed_config_diff"]
+            == {"retargeter.step_size": [0.2, prereg[
+                "single_config_difference"]["retargeter.step_size"]["to"]]})
+        bad_argv = []
+        for demo in demos:
+            row = integ.manifest_row_for(manifest, demo) or {}
+            argv = row.get("argv") or []
+            has_flag = ("--retargeter.step-size" in argv)
+            step_val = None
+            if has_flag:
+                step_val = argv[argv.index("--retargeter.step-size") + 1]
+            if not has_flag or step_val != str(
+                    prereg["single_config_difference"]
+                    ["retargeter.step_size"]["to"]):
+                bad_argv.append(demo)
+        rec["argv_step_size_ok"] = not bad_argv
+        rec["argv_step_size_bad_demos"] = bad_argv
+        rec["recorded_canonical_config_sha256"] = (
+            sr.get("config_smoke", {}).get("canonical_config_sha256"))
+        per_attempt[attempt] = rec
+    passed = all(
+        r["identity_matches"] and r["single_difference_holds"]
+        and r["argv_step_size_ok"] and r["step_size"] == 0.3
+        for r in per_attempt.values()) and bool(per_attempt)
+    return {"preregistration_sha256_now": prereg_sha_now,
+            "per_attempt": per_attempt, "passed": passed}
+
+
 def admission_record(freeze: Path, u0_root: Path, pilot: list[str],
-                     env_python: Path | None = None) -> dict:
+                     env_python: Path | None = None,
+                     source_record: tuple[dict, str] | None = None,
+                     source_label: str = "U0") -> dict:
     """Artifact-level admission: identity, inputs, artifact chain, bindings.
 
     Round-3 extensions (2026-10-09): the GENERATION-time checkout recorded
@@ -348,6 +454,25 @@ def admission_record(freeze: Path, u0_root: Path, pilot: list[str],
     gen_checkout_ok = all(
         r["matches_freeze"] and r["recorded_clean"] for r in gen_checkout.values())
     chain_ok = all(r["passed"] for r in chain.values()) if chain else False
+    source_reg = None
+    if source_record is not None:
+        prereg, prereg_sha_now = source_record
+        source_reg = _source_registration_record(u0_root, coverage, prereg,
+                                                 prereg_sha_now)
+        source_reg["fresh_smoke"] = _fresh_config_smoke(env_python, prereg)
+        recorded_shas = {r["recorded_canonical_config_sha256"]
+                         for r in source_reg["per_attempt"].values()}
+        source_reg["fresh_smoke_ok"] = (
+            "error" not in source_reg["fresh_smoke"]
+            and source_reg["fresh_smoke"].get("step_size_recovery") == 0.3
+            and source_reg["fresh_smoke"].get("step_size_default") == 0.2
+            and source_reg["fresh_smoke"].get("diff")
+            == {"retargeter.step_size": [0.2, 0.3]}
+            and len(recorded_shas) == 1
+            and recorded_shas == {source_reg["fresh_smoke"].get(
+                "canonical_config_sha256")})
+        source_reg["passed"] = (source_reg["passed"]
+                                and source_reg["fresh_smoke_ok"])
     return {
         "checkout_vs_freeze": checkout,
         "assets_vs_freeze": assets_check,
@@ -369,27 +494,39 @@ def admission_record(freeze: Path, u0_root: Path, pilot: list[str],
         "data_paths": data_paths,
         "artifact_chain": chain,
         "binding_recomputed": binding,
-        "u0_coverage": {"missing": coverage["missing"],
-                        "by_demo": {d: e["attempt"] for d, e in coverage["by_demo"].items()}},
+        f"{source_label.lower()}_coverage": {
+            "missing": coverage["missing"],
+            "by_demo": {d: e["attempt"] for d, e in coverage["by_demo"].items()}},
+        "source_registration": source_reg,
         "passed": (checkout["passed"] and assets_check["passed"]
                    and freeze_inputs_ok and gen_checkout_ok
                    and env_lock_consistent and env_version_consistent
                    and inputs_ok and chain_ok
-                   and all(binding_passed.values())),
+                   and all(binding_passed.values())
+                   and (source_reg is None or source_reg["passed"])),
     }, binding_passed, coverage
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--freeze", type=Path, required=True, help="A1 freeze dir")
-    ap.add_argument("--u0-dir", type=Path, required=True,
-                    help="I0 U0 root dir (attempts_index.json)")
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--u0-dir", type=Path,
+                     help="I0 U0 root dir (attempts_index.json)")
+    src.add_argument("--generated-dir", type=Path,
+                     help="UR generation root (attempts_index.json); "
+                          "requires --source-record")
+    ap.add_argument("--source-record", type=Path, default=None,
+                    help="UR preregistration.json (closure plan §7.3)")
     ap.add_argument("--out", type=Path, required=True, help="teacher_pilot output dir")
     args = ap.parse_args()
+    if bool(args.generated_dir) != bool(args.source_record):
+        raise SystemExit("--generated-dir and --source-record must be used "
+                         "together (and never with --u0-dir)")
     t0 = time.time()
 
     freeze = args.freeze.expanduser().resolve()
-    u0_root = args.u0_dir.expanduser().resolve()
+    u0_root = (args.u0_dir or args.generated_dir).expanduser().resolve()
     out_dir = integ.guard_output_dir(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)   # round-3 fix 8: a fresh
     # --out path is legal under derived/ and must not crash the report write
@@ -398,7 +535,21 @@ def main() -> int:
     pilot = [e["demo"] for e in lists["teacher_pilot_train6_v1"]]
     source_boxes = load_source_boxes(freeze)
 
-    admission, binding_passed, coverage = admission_record(freeze, u0_root, pilot)
+    source_record = None
+    source_label = "U0"
+    if args.source_record is not None:
+        prereg = json.loads(args.source_record.expanduser().resolve().read_text())
+        if (prereg.get("experiment_id") != "a2_recovery_step03_v1"
+                or list(prereg.get("expected_demos", [])) != pilot):
+            raise SystemExit("preregistration identity mismatch vs the "
+                             f"frozen pilot: {args.source_record}")
+        source_record = (prereg,
+                         integ.sha256_file(args.source_record.expanduser().resolve()))
+        source_label = "UR"
+
+    admission, binding_passed, coverage = admission_record(
+        freeze, u0_root, pilot, source_record=source_record,
+        source_label=source_label)
 
     def load_p(demo):
         return orc.load_teacher_scene(TEACHER_TRAJ_DIR / f"{demo}_original.npz", "published")
@@ -412,7 +563,7 @@ def main() -> int:
     print(f"[a2] replaying P (published) on {len(pilot)} demos ...")
     replayer = TeacherQualityReplayer()
     p_metrics = measure_source(replayer, pilot, load_p, source_boxes)
-    print("[a2] replaying U0 (generated) ...")
+    print(f"[a2] replaying {source_label} (generated) ...")
     u_metrics = {}
     for demo in pilot:
         if demo in u0_by_demo:
@@ -421,9 +572,10 @@ def main() -> int:
         else:
             u_metrics[demo] = DemoMetrics(
                 demo, -1, float("nan"), valid=False,
-                error="no OK U0 artifact in any attempt")
+                error=f"no OK {source_label} artifact in any attempt")
 
-    verdict = evaluate_local_preferred(pilot, p_metrics, u_metrics, binding_passed)
+    verdict = evaluate_local_preferred(pilot, p_metrics, u_metrics,
+                                       binding_passed, u_label=source_label)
     # Admission failures are verdict-level: a wrong checkout, a drifted env
     # (lock or binary), mutated inputs or assets, a broken artifact chain or
     # a failed binding recheck must NEVER surface as local_preferred with
@@ -454,7 +606,10 @@ def main() -> int:
         verdict["complete_evidence"] = False
         verdict["verdict"] = "incomplete"
     selection = {
-        "stage": "A2 teacher source comparison (plan §3.3-§3.4)",
+        "stage": (f"A2 teacher source comparison (plan §3.3-§3.4; "
+                  f"{source_label} = {source_record[0]['source_id']})"
+                  if source_record else
+                  "A2 teacher source comparison (plan §3.3-§3.4)"),
         "timestamp": _dt.datetime.now().isoformat(timespec="seconds"),
         "pilot": pilot,
         "p_revision": "135259130158f1cb1799e4ab9b6566c938285fc9",
@@ -469,7 +624,7 @@ def main() -> int:
         "u1": "not_applicable (not pre-registered this round, §3.3)",
         "metrics": {
             "P": {d: p_metrics[d].to_json() for d in pilot},
-            "U0": {d: u_metrics[d].to_json() for d in pilot},
+            source_label: {d: u_metrics[d].to_json() for d in pilot},
         },
         "binding": binding_passed,
         "verdict_record": verdict,
@@ -487,6 +642,17 @@ def main() -> int:
         manifest = integ.load_attempt_manifest(u0_root, attempts[-1]["attempt"])
         selection["u0_identity"]["env_mujoco_version"] = (
             manifest.get("identity", {}).get("env", {}).get("env_mujoco_version"))
+    if source_record is not None:
+        # the UR report must not label the recovery source "U0": move the
+        # identity block to its registered name and pin the registration
+        selection["ur_identity"] = selection.pop("u0_identity")
+        selection["ur_identity"].update({
+            "experiment_id": source_record[0]["experiment_id"],
+            "source_id": source_record[0]["source_id"],
+            "preregistration_sha256": source_record[1],
+            "step_size": source_record[0][
+                "single_config_difference"]["retargeter.step_size"]["to"],
+        })
 
     # Round-3 review fix 6: the comparison writes its own attempt directory
     # — an older teacher_selection.json is never overwritten, and an

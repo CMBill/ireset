@@ -219,8 +219,6 @@ def run_wrapped_generation(args) -> int:
 
     ho_package = Path(args.holosoma_package)
     entry = ho_package / "examples" / "robot_retarget.py"
-    retargeter_mod_file = (ho_package / "src" / "holosoma_retargeting" /
-                           "src" / "interaction_mesh_retargeter.py")
     # mirror the official entry: checkout src_root at sys.path[0] BEFORE the
     # first holosoma_retargeting import, so the pinned checkout code is what
     # runs (and what we wrap)
@@ -432,7 +430,7 @@ def run_wrapped_generation(args) -> int:
             import tyro
             from holosoma_retargeting.config_types.retargeting import (
                 RetargetingConfig)
-            cfg = tyro.cli(RetargetingConfig, argv=sys.argv[1:])
+            cfg = tyro.cli(RetargetingConfig, args=sys.argv[1:])
             effective_cfg = _jsonable(cfg)
         except Exception as exc:  # noqa: BLE001
             effective_cfg = {"error": f"{type(exc).__name__}: {exc}"}
@@ -472,6 +470,87 @@ def run_wrapped_generation(args) -> int:
         summary, indent=2, default=_jsonable))
     print(f"[child] outcome={outcome} failure_captured={failure is not None}")
     return rc
+
+
+#: per-demo run metadata excluded when diffing two effective configs
+#: (closure plan §6.2: task name / read-write paths only — optimization,
+#: initialization, assets and scene settings are never excluded)
+CONFIG_RUN_METADATA_KEYS = {"task_name", "save_dir", "data_path"}
+
+
+def _flatten(d, prefix: str = "") -> dict:
+    out = {}
+    for k, v in d.items():
+        key = f"{prefix}.{k}" if prefix else str(k)
+        if isinstance(v, dict):
+            out.update(_flatten(v, key))
+        else:
+            out[key] = v
+    return out
+
+
+def config_smoke(argv: list[str]) -> dict:
+    """Parse the REAL upstream config API (tyro) — never trust that a flag
+    string merely appears in argv (closure plan §7.1).
+
+    Returns the default-argv parse and this-argv parse, their dotted diff
+    minus per-demo run metadata, and a canonical metadata-stripped sha256 of
+    the effective config (stable across demos/save dirs, so generation and
+    comparison can compare hashes across processes).
+    """
+    import hashlib
+
+    import tyro
+    from holosoma_retargeting.config_types.retargeting import RetargetingConfig
+
+    default_argv, skip_next = [], False
+    for a in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if a == "--retargeter.step-size":
+            skip_next = True
+            continue
+        default_argv.append(a)
+    cfg_default = _jsonable(tyro.cli(RetargetingConfig, args=default_argv))
+    cfg_recovery = _jsonable(tyro.cli(RetargetingConfig, args=argv))
+    fd = {k: v for k, v in _flatten(cfg_default).items()
+          if k not in CONFIG_RUN_METADATA_KEYS}
+    fr = {k: v for k, v in _flatten(cfg_recovery).items()
+          if k not in CONFIG_RUN_METADATA_KEYS}
+    diff = {k: [fd.get(k), fr.get(k)]
+            for k in sorted(set(fd) | set(fr)) if fd.get(k) != fr.get(k)}
+    canonical = json.dumps(fr, sort_keys=True, ensure_ascii=False)
+    return {
+        "default": cfg_default,
+        "recovery": cfg_recovery,
+        "diff": diff,
+        "step_size_default": fd.get("retargeter.step_size"),
+        "step_size_recovery": fr.get("retargeter.step_size"),
+        "canonical_config_sha256": hashlib.sha256(
+            canonical.encode()).hexdigest(),
+    }
+
+
+def run_config_smoke(args) -> int:
+    # same import resolution as the official entry: checkout src_root at
+    # sys.path[0] before the first holosoma_retargeting import
+    ho_package = Path(args.holosoma_package or
+                      (Path(__file__).resolve().parents[1] / "third_party"
+                       / "holosoma" / "src" / "holosoma_retargeting"
+                       / "holosoma_retargeting"))
+    src_root = ho_package.parent
+    if str(src_root) not in sys.path:
+        sys.path.insert(0, str(src_root))
+    argv = ["--task-type", "object_interaction",
+            "--task-name", args.demo,
+            "--data-format", "smplh",
+            "--data-path", args.data_path,
+            "--save-dir", args.save_dir,
+            "--task-config.object-name", "largebox",
+            "--retargeter.step-size", str(args.step_size)]
+    print(json.dumps(config_smoke(argv), indent=2, ensure_ascii=False))
+    return 0
 
 
 def run_self_test() -> int:
@@ -515,7 +594,8 @@ def run_self_test() -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--mode", choices=("generation", "self-test"),
+    ap.add_argument("--mode", choices=("generation", "self-test",
+                                       "config-smoke"),
                     default="generation")
     ap.add_argument("--demo")
     ap.add_argument("--data-path")
@@ -524,10 +604,14 @@ def main() -> int:
     ap.add_argument("--holosoma-package")
     ap.add_argument("--retargeter-sha256",
                     help="pinned sha256 of interaction_mesh_retargeter.py")
+    ap.add_argument("--step-size", type=float, default=0.3,
+                    help="config-smoke only: the recovery step size")
     ap.add_argument("--skip-config-dump", action="store_true")
     args = ap.parse_args()
     if args.mode == "self-test":
         return run_self_test()
+    if args.mode == "config-smoke":
+        return run_config_smoke(args)
     return run_wrapped_generation(args)
 
 

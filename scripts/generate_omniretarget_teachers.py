@@ -36,6 +36,16 @@ Read-only over resources/ and third_party/. Raw upstream outputs are kept
 next to the converted copies. All frozen pilot demos keep a reconciled
 result; failures never shrink the denominator.
 
+UR mode (closure plan §7.1-§7.2, 2026-10-10): ``--source-record`` selects
+the preregistered recovery source ``upstream_recovery_step03_v1`` — the
+SINGLE registered difference ``retargeter.step_size: 0.2 -> 0.3`` is
+verified through a REAL upstream config parse (tyro smoke; a flag string
+appearing in argv proves nothing — tyro 1.x renamed ``argv=`` to ``args=``
+and silently ignores the old kwarg), every attempt in the root must belong
+to the same registration, per-demo generation gets a wall-clock timeout,
+and the manifest records the registration identity + the effective-config
+diff. Without ``--source-record`` the entry keeps the exact U0 semantics.
+
 Run: uv run --locked python scripts/generate_omniretarget_teachers.py \
        --freeze derived/experiments/omniretarget_first/<a1_run>/freeze \
        --out-dir derived/experiments/omniretarget_first/<a2_run>/teacher_pilot/u0
@@ -64,6 +74,10 @@ HOLOSOMA_PACKAGE = (
     / "holosoma_retargeting"
 )
 DEFAULT_ENV_PYTHON = PROJECT_ROOT / "derived" / "upstream" / "holosoma_env" / ".venv" / "bin" / "python"
+CHILD_DRIVER = PROJECT_ROOT / "scripts" / "_omniretarget_diagnostic_child.py"
+UR_STEP_SIZE = 0.3
+#: §11 budget: a single generation may not exceed 30 min
+GENERATION_TIMEOUT_S = 1800
 
 
 def pilot_demos_from_freeze(freeze_dir: Path) -> list[str]:
@@ -71,11 +85,84 @@ def pilot_demos_from_freeze(freeze_dir: Path) -> list[str]:
     return [e["demo"] for e in lists["teacher_pilot_train6_v1"]]
 
 
+def run_config_smoke(env_python: Path, demo: str, data_path: Path,
+                     step_size: float) -> dict:
+    """Real upstream config parse via the child driver (§7.1): tyro must
+    actually APPLY ``--retargeter.step-size`` — a flag string appearing in
+    argv proves nothing (tyro 1.x silently ignores the legacy ``argv=``
+    kwarg, caught live by this smoke on 2026-10-10)."""
+    cmd = [str(env_python), str(CHILD_DRIVER), "--mode", "config-smoke",
+           "--demo", demo, "--data-path", str(data_path),
+           "--save-dir", str(data_path.parent / "_smoke_no_write"),
+           "--holosoma-package", str(HOLOSOMA_PACKAGE),
+           "--step-size", str(step_size)]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if proc.returncode != 0:
+        raise SystemExit(f"config smoke failed: {(proc.stderr or proc.stdout)[-1500:]}")
+    return json.loads(proc.stdout)
+
+
+def load_source_record(path: Path, pilot: list[str], env_python: Path,
+                       data_path: Path) -> dict:
+    """Load + verify the UR preregistration BEFORE any generation (§6.2/§7.1).
+
+    Identity, the single registered difference, the parent hashes and the
+    REAL config-parse diff are all verified here; a drifted preregistration
+    or a config smoke that does not reproduce exactly the one registered
+    difference refuses to run.
+    """
+    prereg = json.loads(Path(path).read_text())
+    if (prereg.get("experiment_id") != "a2_recovery_step03_v1"
+            or prereg.get("source_id") != "upstream_recovery_step03_v1"
+            or prereg.get("single_config_difference")
+            != {"retargeter.step_size": {"from": 0.2, "to": UR_STEP_SIZE}}
+            or list(prereg.get("expected_demos", [])) != pilot):
+        raise SystemExit(
+            f"preregistration identity mismatch vs the frozen pilot: {path}")
+    parent = prereg.get("parent", {})
+    for key in ("authoritative_selection", "diagnosis"):
+        rel, want = parent.get(key), parent.get(f"{key}_sha256")
+        p = Path(rel) if rel else None
+        if not p or not p.is_file() or integ.sha256_file(p) != want:
+            raise SystemExit(f"preregistration parent {key} hash mismatch: {rel}")
+    smoke = run_config_smoke(env_python, pilot[0], data_path, UR_STEP_SIZE)
+    if (smoke["diff"] != {"retargeter.step_size": [0.2, UR_STEP_SIZE]}
+            or smoke["step_size_default"] != 0.2
+            or smoke["step_size_recovery"] != UR_STEP_SIZE):
+        raise SystemExit(
+            "config smoke does not reproduce the single registered "
+            f"difference: {smoke['diff']}")
+    return {"prereg": prereg,
+            "preregistration": path_for_record(Path(path)),
+            "preregistration_sha256": integ.sha256_file(Path(path)),
+            "config_smoke": {k: smoke[k] for k in
+                             ("diff", "step_size_default", "step_size_recovery",
+                              "canonical_config_sha256")},
+            "config_smoke_full": {k: smoke[k] for k in ("default", "recovery")}}
+
+
+def ensure_single_registration(out_root: Path, prereg_sha: str) -> None:
+    """§7.2: every attempt already in this root must belong to the SAME
+    registration — a UR root cannot mix registrations (and never mixes in
+    plain U0 attempts, which carry no preregistration sha)."""
+    if not (out_root / integ.ATTEMPTS_INDEX).is_file():
+        return
+    for att in integ.load_attempts(out_root):
+        prev = att.get("preregistration_sha256")
+        if prev is None or prev != prereg_sha:
+            raise SystemExit(
+                f"attempt {att.get('attempt')} does not belong to this "
+                "registration; a UR root cannot mix registrations or "
+                "include unregistered attempts")
+
+
 def generate_one(
     demo: str,
     env_python: Path,
     attempt_dir: Path,
     data_path: Path,
+    extra_argv: list[str] | None = None,
+    timeout_s: int = GENERATION_TIMEOUT_S,
 ) -> dict:
     """Run the upstream retargeting for one demo; -> per-demo result row."""
     t0 = time.time()
@@ -87,23 +174,37 @@ def generate_one(
         "--data-path", str(data_path),
         "--save-dir", str(attempt_dir),
         "--task-config.object-name", "largebox",
-    ]
-    proc = subprocess.run(
-        cmd, cwd=HOLOSOMA_PACKAGE, capture_output=True, text=True
-    )
+    ] + list(extra_argv or [])
+    try:
+        proc = subprocess.run(
+            cmd, cwd=HOLOSOMA_PACKAGE, capture_output=True, text=True,
+            timeout=timeout_s,
+        )
+        exit_code, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
+        timed_out = False
+    except subprocess.TimeoutExpired as exc:
+        exit_code, timed_out = None, True
+        stdout = exc.stdout if isinstance(exc.stdout, str) else ""
+        stderr = exc.stderr if isinstance(exc.stderr, str) else ""
     row = {
         "demo": demo,
         "argv": cmd,
         "cwd": str(HOLOSOMA_PACKAGE),
-        "exit_code": proc.returncode,
+        "exit_code": exit_code,
         "wall_s": round(time.time() - t0, 2),
         "config": "upstream defaults: joint_limits/obj_non_penetration/foot_sticking on, "
-                  "visualize/debug off, augmentation off (reference-only init)",
+                  "visualize/debug off, augmentation off (reference-only init)"
+                  + (f"; UR override: retargeter.step_size={UR_STEP_SIZE}"
+                     if extra_argv else ""),
         "status": None, "binding": None, "error": None,
     }
-    if proc.returncode != 0:
+    if timed_out:
+        row["status"] = "timeout"
+        row["error"] = (stderr or stdout)[-2000:]
+        return row
+    if exit_code != 0:
         row["status"] = "generation_failed"
-        row["error"] = (proc.stderr or proc.stdout)[-2000:]
+        row["error"] = (stderr or stdout)[-2000:]
         return row
     try:
         raw_path = attempt_dir / f"{demo}_original.npz"
@@ -149,6 +250,11 @@ def main() -> int:
     ap.add_argument("--demos", type=str, default=None,
                     help="comma-separated retry scope (subset of the frozen pilot "
                          "list); writes a NEW attempt, never overwrites")
+    ap.add_argument("--source-record", type=Path, default=None,
+                    help="UR preregistration.json (closure plan §7.1); the "
+                         "single registered difference "
+                         "retargeter.step_size 0.2->0.3 is applied and "
+                         "verified; omit for the original U0 semantics")
     args = ap.parse_args()
 
     freeze = args.freeze.expanduser().resolve()
@@ -201,6 +307,17 @@ def main() -> int:
         raise SystemExit(
             f"A1-frozen assets drifted: {freeze_assets_check}")
 
+    # UR mode: the preregistration is verified (identity, single difference,
+    # parent hashes, REAL config-parse smoke) before anything runs, and an
+    # existing attempts index in this root must belong to the SAME
+    # registration — a mixed root is refused (§7.1/§7.2).
+    source_record = None
+    if args.source_record is not None:
+        source_record = load_source_record(args.source_record, pilot,
+                                           args.env_python, data_path)
+        ensure_single_registration(out_root,
+                                   source_record["preregistration_sha256"])
+
     attempt_dir = integ.allocate_attempt(out_root)
     attempt = attempt_dir.name
 
@@ -214,7 +331,10 @@ def main() -> int:
             "pt": integ.sha256_file(data_path / f"{demo}.pt"),
         }
 
-    rows = [generate_one(d, args.env_python, attempt_dir, data_path) for d in scope]
+    extra_argv = (["--retargeter.step-size", str(UR_STEP_SIZE)]
+                  if source_record else None)
+    rows = [generate_one(d, args.env_python, attempt_dir, data_path,
+                         extra_argv=extra_argv) for d in scope]
 
     input_mutated = False
     for demo in scope:
@@ -252,9 +372,24 @@ def main() -> int:
         "n_generation_failed": sum(r["status"] == "generation_failed" for r in rows),
         "n_postcheck_failed": sum(r["status"] == "postcheck_failed" for r in rows),
         "input_mutated": input_mutated,
+        "n_timeout": sum(r["status"] == "timeout" for r in rows),
         "total_wall_s": round(sum(r["wall_s"] for r in rows), 1),
         "rows": rows,
     }
+    if source_record:
+        report["source_record"] = {
+            "experiment_id": source_record["prereg"]["experiment_id"],
+            "source_id": source_record["prereg"]["source_id"],
+            "preregistration": source_record["preregistration"],
+            "preregistration_sha256": source_record["preregistration_sha256"],
+            "step_size": UR_STEP_SIZE,
+            "config_smoke": source_record["config_smoke"],
+            # FULL parsed configs: the comparison RE-COMPUTES the single-
+            # difference claim from these instead of trusting the summary
+            "config_smoke_full": source_record["config_smoke_full"],
+        }
+        report["stage"] = ("UR recovery generation (closure plan §7, "
+                           + source_record["prereg"]["experiment_id"] + ")")
     out = attempt_dir / "generation_manifest.json"
     out.write_text(json.dumps(report, indent=2, ensure_ascii=False))
     integ.append_attempts_index(out_root, {
@@ -264,6 +399,10 @@ def main() -> int:
         "n_ok": n_ok,
         "complete": (n_ok == len(pilot)) and not input_mutated,
         "manifest": integ.manifest_path_record(out_root, attempt),
+        **({"preregistration_sha256":
+            source_record["preregistration_sha256"],
+            "experiment_id": source_record["prereg"]["experiment_id"]}
+           if source_record else {}),
     })
     print(json.dumps({k: report[k] for k in report if k != "rows"}, indent=2))
     print(f"manifest -> {path_for_record(out)}")

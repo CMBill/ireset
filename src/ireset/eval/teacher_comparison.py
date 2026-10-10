@@ -495,6 +495,7 @@ def _json_num(x, nd: int = 6):
 
 def _evidence_gaps(
     pilot: list[str], p: dict, u: dict, binding_passed: dict[str, bool],
+    u_label: str = "U0",
 ) -> list[str]:
     """Every way the comparison can lack decisive evidence (§3.4).
 
@@ -506,7 +507,7 @@ def _evidence_gaps(
     gaps: list[str] = []
     for d in pilot:
         pm, um = p.get(d), u.get(d)
-        for tag, m in (("P", pm), ("U0", um)):
+        for tag, m in (("P", pm), (u_label, um)):
             if m is None:
                 gaps.append(f"{d}:{tag}_row_missing")
             elif not m.valid:
@@ -517,23 +518,23 @@ def _evidence_gaps(
             continue
         for name in ("task_mpjpe_p95_m", "penetration_max_m",
                      "penetration_violation_ratio"):
-            for tag, m in (("P", pm), ("U0", um)):
+            for tag, m in (("P", pm), (u_label, um)):
                 if _bad(getattr(m, name)):
                     gaps.append(f"{d}:{tag}_{name}_not_finite")
         for s in HAND_SIDES:
             if pm.ref_support_frames.get(s, 0) > 0:
-                for tag, m in (("P", pm), ("U0", um)):
+                for tag, m in (("P", pm), (u_label, um)):
                     f = m.foot.get(s)
                     if (f is None or _bad(f.speed_p95_mps) or _bad(f.gap_p95_m)
                             or _bad(f.drift_max_m)):
                         gaps.append(f"{d}:{tag}_foot_{s}_missing_with_reference_frames")
             if pm.ref_grasp_frames.get(s, 0) > 0:
-                for tag, m in (("P", pm), ("U0", um)):
+                for tag, m in (("P", pm), (u_label, um)):
                     h = m.hand.get(s)
                     if (h is None or _bad(h.gap_p95_m) or _bad(h.coverage)
                             or _bad(h.valid_coverage) or _bad(h.drift_max_m)):
                         gaps.append(f"{d}:{tag}_hand_{s}_missing_with_reference_frames")
-        for tag, m in (("P", pm), ("U0", um)):
+        for tag, m in (("P", pm), (u_label, um)):
             denom = _both_denominator(m)
             if denom is None:
                 gaps.append(f"{d}:{tag}_both_denominator_missing_or_invalid")
@@ -542,13 +543,14 @@ def _evidence_gaps(
                 gaps.append(f"{d}:{tag}_both_hands_not_finite")
         p_den, u_den = _both_denominator(pm), _both_denominator(um)
         if p_den is not None and u_den is not None and p_den != u_den:
-            gaps.append(f"{d}:both_denominator_disagreement_p{p_den}_u0_{u_den}")
+            gaps.append(f"{d}:both_denominator_disagreement"
+                        f"_p{p_den}_{u_label.lower()}_{u_den}")
     return gaps
 
 
 def evaluate_local_preferred(
     pilot: list[str], p: dict[str, DemoMetrics], u: dict[str, DemoMetrics],
-    binding_passed: dict[str, bool],
+    binding_passed: dict[str, bool], u_label: str = "U0",
 ) -> dict:
     """Frozen §3.4 criteria. Returns the machine-readable gate record.
 
@@ -559,7 +561,9 @@ def evaluate_local_preferred(
     ``incomplete``. The gate lambdas below stay in the record as diagnostics
     and are hardened so they can never raise on the same deficient rows.
     """
-    gaps = _evidence_gaps(pilot, p, u, binding_passed)
+    # u_label only names the source in gaps/fields/reasons (the UR
+    # comparison reports P vs UR); the quality computation is untouched
+    gaps = _evidence_gaps(pilot, p, u, binding_passed, u_label=u_label)
     complete = not gaps
     gates: dict[str, dict] = {}
 
@@ -607,7 +611,7 @@ def evaluate_local_preferred(
                     foot_detail[s] = "no_reference_support_frames"
                     continue
                 if uf is None or uf.n_ref_frames == 0:
-                    foot_detail[s] = "u0_missing_reference_frames"
+                    foot_detail[s] = f"{u_label.lower()}_missing_reference_frames"
                     ok = False
                     continue
                 if (_bad(pf.speed_p95_mps) or _bad(pf.gap_p95_m)
@@ -694,19 +698,20 @@ def evaluate_local_preferred(
                         continue        # no P reference evidence for this side
                     if ua is None or _bad(ua.drift_max_m):
                         ok = False
-                        detail[f"{kind}_{s}"] = "u0_measurement_missing"
+                        detail[f"{kind}_{s}"] = f"{u_label.lower()}_measurement_missing"
                         continue
                     if ua.drift_max_m > pa.drift_max_m + DRIFT_DEGRADATION_MARGIN_M:
                         ok = False
                         detail[f"{kind}_{s}"] = {
-                            "p_drift_m": pa.drift_max_m, "u0_drift_m": ua.drift_max_m}
+                            "p_drift_m": pa.drift_max_m,
+                            f"{u_label.lower()}_drift_m": ua.drift_max_m}
             new_failures = sorted(
                 set(um.validator_failed_checks) - set(pm.validator_failed_checks))
             if new_failures:
                 ok = False
                 detail["new_validator_failures"] = {
                     "p_failed": list(pm.validator_failed_checks),
-                    "u0_failed": list(um.validator_failed_checks),
+                    f"{u_label.lower()}_failed": list(um.validator_failed_checks),
                     "new": new_failures,
                 }
             pr, ur = (pm.penetration_violation_ratio,
@@ -717,7 +722,7 @@ def evaluate_local_preferred(
             elif ur > pr + COMPARE_TOL:
                 ok = False
                 detail["penetration_violation_ratio_increased"] = {
-                    "p_ratio": pr, "u0_ratio": ur,
+                    "p_ratio": pr, f"{u_label.lower()}_ratio": ur,
                 }
             rows[d] = {"passed": ok, "degradation": detail}
         return {
