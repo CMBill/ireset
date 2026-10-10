@@ -2,7 +2,7 @@
 
 日期：2026-10-10。方案：[A2 收口与有限恢复实现方案](../plans/omniretarget_a2_closure_plan.md)（提交 `e487eb3`）。
 实现提交：C0/C1+D0 `a39d763`、NaN 对照修复 `420afbf`、UR `360556d`、对照修复 `880bff8`、
-**审阅 13 项缺口修复 `efece4a`（§11）**。
+审阅 13 项缺口修复 `efece4a`（§11）、**审阅第三轮 6 项缺口修复 `6d7f257`（§12）**。
 运行根：`derived/experiments/omniretarget_first/20261010_a39d763_a2_closure/`。
 
 ## 0. 结论摘要
@@ -25,8 +25,15 @@ A3/B/C 执行方案另立预注册文档。
 **独立审阅 13 项缺口修复轮（2026-10-10，提交 `efece4a`）后按修正协议重跑**：裁决与度量逐位
 不变；权威证据更替为 `baseline/snapshots/attempt_001`（C0，sha `b1fb3e6a…`）、
 `diagnosis/attempt_007`（D0 复跑，prefix/canonical 补齐，rho 三组独立逐位一致）、
-`recovery/cmp/attempt_002`（UR 强腿复跑）、`decisions/attempt_006`（C2 终局，证据链核验全过，
-sha `5ca7960c…`）；测试 484→**506 passed + 1 skipped**。详见 §11。
+`recovery/cmp/attempt_002`（UR 强腿复跑）、`decisions/attempt_006`（C2，证据链核验全过，
+sha `5ca7960c…`）；测试 484→506 passed + 1 skipped。详见 §11。
+
+**第三轮审阅 6 项缺口修复（2026-10-10，提交 `6d7f257`）后再次重跑**：方向结论仍全部成立；
+权威 C2 更替为 `decisions/attempt_007`（sha `043b0121…`，本记录 §12）——汇入报告的裁决/质量门/
+证据完整性自此**从报告自身的度量行与绑定重推**（重推结果与记录逐位一致：
+no_quality_gain、g1/g2 过、g3/g4/g5 败），诊断记录**从盘上产物重哈希+按 runs 重推**（supports_
+step03_candidate/帧 171/序号 5/rho 0.2486138173835237 逐位）；本轮 C0 快照
+`baseline/snapshots/attempt_003`（干净树 rev `6d7f257`）。测试 506→**532 passed + 1 skipped**。
 
 ## 1. 基线锚点核对（§1.1）
 
@@ -119,14 +126,15 @@ attempt_001/002 因 §5.4 配置快照缺陷作废保留为证据）：
 `admission.source_registration` 差异、registration 被正确阻断。修复为仅 UR 模式携带该键
 （§10.3"旧 CLI 无新参数时与基线一致"），回归断言入 `tests/test_omniretarget_recovery_source.py`。
 
-## 6. C2：收口（decisions/attempt_004；**权威已更替为复核轮 attempt_006，见 §11**）
+## 6. C2：收口（decisions/attempt_004；**权威已更替为第三轮复核 attempt_007，见 §12**）
 
 `--diagnosis` + `--recovery-report` 哈希钉住汇入，`a2_closure.json`（sha `8b346fa569ee04c0…`）：
 `baseline_verdict=incomplete`（原报告路径/哈希不变）、`diagnosis=supports_step03_candidate`、
 `recovery=no_quality_gain`、`training=not_ready`、`registration_status.complete=true`。
 【复核轮订正：本轮汇入只记录了当时的文件哈希、未核验证据链（审阅缺口 6），且其引用的
 `baseline/baseline_evidence.json` 已被同日更晚的收口调用覆盖（缺口 1）。该记录保留为历史证据，
-权威 C2 以 §11 的 attempt_006（sha `5ca7960c…`，证据链核验通过）为准。】
+权威 C2 以 §12 的 attempt_007（sha `043b0121…`，证据链核验+裁决/门/证据重推全过）为准；
+§11 的 attempt_006（sha `5ca7960c…`）为第二轮复核证据。】
 按 §7.4 行 2 与 §12：当前候选停止，不追加候选；W1（weak_motion_only、接触损失 0、每模型
 ≤4k）的 A3/B/C 执行方案为下一阶段的独立预注册文档，本轮不实现、不启动任何训练。
 
@@ -135,6 +143,7 @@ attempt_001/002 因 §5.4 配置快照缺陷作废保留为证据）：
 | 项 | 实测 | 预算 |
 | --- | --- | --- |
 | C0/C1/C2 三次收口入口（各含新鲜比较） | ~5min+16.9s+~4min | 合计 ≤30min |
+| 第二/三轮复核 C2 重跑（各含新鲜比较） | 16.3s/约 17s | 各 ≤30min |
 | D0（对照+两次 sub12+两次 Phase I） | 387.7s | ≤60min（单次生成 ≤15min：实测 61.9–161.1s） |
 | UR 六段生成 | 915.0s | ≤3h（单段 ≤30min：实测最长 306.95s） |
 | UR 比较 | 16.2s | 预留内 |
@@ -147,14 +156,19 @@ attempt_001/002 因 §5.4 配置快照缺陷作废保留为证据）：
 - 新增：`tests/test_omniretarget_a2_closure.py` 17 项（C0/C1 §10.1 全反例+CLI 四例）、
   `tests/test_omniretarget_sub12_diagnosis.py` 16 项（§10.2 分类表全行/聚合/对照/超时进程组/
   上游环境真实锥问题自测）、`tests/test_omniretarget_recovery_source.py` 14 项（§10.3 注册门/
-  混入/标签/回归）、**复核轮新增 `tests/test_omniretarget_a2_closure_review2.py` 22 项**
+  混入/标签/回归）、复核轮新增 `tests/test_omniretarget_a2_closure_review2.py` 22 项
   （快照不可覆盖/失败行删除/身份内容钉住/D0 零子进程封锁+控制失败零 sub12/canonical·列映射·
   锥形状篡改/裁决记录核验/汇入链 8 反例+正例/重试上限与预算门/规范基线暴露额外旗标），并按
-  §11 的语义强化更新三份既有测试的夹具（canonical 文件+形状字段/argv 烟测替身/快照路径）。
+  §11 的语义强化更新三份既有测试的夹具（canonical 文件+形状字段/argv 烟测替身/快照路径）；
+  **第三轮新增 `tests/test_omniretarget_a2_closure_review3.py` 26 项**（报告重推 9 变体含
+  admission:* 豁免语义+裁决位置一致/诊断盘上重哈希+flags-only 拒/必需证据 4 删法+可选键放行/
+  重试上限按实际调用 3 形态/预算耗尽边界+超时封顶/argv 截断 4 例含 CLI 落盘）。
 - 既有测试适配两处：`generate_one` 新增可选 `extra_argv` kwarg，review/review4 的 fake 签名
-  加 `**kw`（行为断言不变）。
-- 全量（复核轮实测）：**506 passed + 1 skipped**（`uv run --locked pytest tests/ -q`，1049s；
-  首轮收口时为 484 passed + 1 skipped）。
+  加 `**kw`（行为断言不变）；第三轮按新语义更新 review2/report 夹具（UR 报告经真实评估自洽
+  构建、诊断记录带盘上快照与 runs、生成重试场景改"失败后有理由重试"）与 sub12 快照夹具
+  （补 P/A 文件）。
+- 全量（第三轮实测）：**532 passed + 1 skipped**（`uv run --locked pytest tests/ -q`，1038s；
+  第二轮 506/首轮 484 passed + 1 skipped）。
 
 ## 9. 未运行/超出本轮范围
 
@@ -192,6 +206,22 @@ attempt_001/002 因 §5.4 配置快照缺陷作废保留为证据）：
    （首轮 D0 父哈希 83287703 与盘上 6a6ce157 失配即此形态）；证据快照必须按 attempt 隔离且
    永不覆盖，下游（D0/G0/C2）才能按哈希回指。repo 身份同理：status 行列表只说"改了哪个
    文件"，tracked diff 哈希才钉住"改成了什么内容"。
+9. **（第三轮）记录里的通过标记是主张，不是证据**：汇入报告/诊断记录自带的
+   `complete_evidence`/`equal`/`passed` 标志只说明"当时这么记的"——篡改 run2 的 canonical `b`
+   而保留记录哈希，两处核验（G0/C2）都曾通过。可信形态只有重推：诊断侧重哈希盘上产物+按
+   runs 重跑 decide；报告侧从 metrics/binding 重新计算 gates/complete/verdict。记录标志最多
+   作结构与内部一致性的快查层。
+10. **（第三轮）"两侧同缺=一致"只对可选键合法**：必需证据（ctx 六数组+canonical b·c+P/A
+    文件）在两侧同时缺失时，逐键相等比较器把它读成 both_missing=equal，§5.5 判据在缺失证据
+    上照常通过——存在性核验必须先于一致性比较；`q_a_nominal` 等后期新增键与旧格式兼容单列
+    可选集。报告重推同理须区分度量侧缺口（admission:* 前缀由 admission 腿管，重推不比对）
+    与度量侧完整性的方向性（记录 complete=True 而重推 False=矛盾；记录 False 而重推 True
+    是 admission 压制的合法方向）。
+11. **（第三轮）预算门的三处口径**：累计边界须用 `>=`（恰 10800s 时 `>` 照样启动）；当前
+    调用的超时须按剩余预算封顶（剩 5s 时 1800s 默认超时直接把总额推过 3h）；且 3h 预算在
+    方案 §11 中含"终检/比较时间"，生成侧必须预留比较份额再谈耗尽。重试上限同理按**实际
+    调用数**而非失败数计（1 失败+1 成功=2 次调用，第三次越权；skipped 行无调用不计数；
+    成功后的重试无理由须拒绝）。
 
 ## 11. 独立审阅 13 项缺口修复轮（2026-10-10，提交 `efece4a`）
 
@@ -240,3 +270,58 @@ complete+admission 过+分母满）；⑦C1 继承 identity_stable/checkout_pass
 **遗留说明**：原轮 attempts 001–004 的 D0 证据缺 prefix 与 canonical c 向量（缺陷已订正登记，
 结论不受影响——失败帧/数组/Phase I 与 rho 均独立复现）；UR 生成证据（generation/attempt_001，
 n_ok=6）不受本轮影响，未重跑（无新失败、重试上限与预算门为事前规则不追溯）。
+
+## 12. 独立审阅第三轮 6 项缺口修复（2026-10-10，提交 `6d7f257`）
+
+第三轮独立审阅确认权威结果成立（UR `no_quality_gain`、暂停生产、训练 `not_ready` 不变；
+130 项相关测试通过、12 条 P/UR 度量/admission/质量门与新报告逐位一致、两个 C0 快照各 50 项
+文件记录全配、D0 两份 171 帧前缀在盘、裁决复算一致），但收口核验实现另有 6 项缺口
+（3 P1+3 P2）；全部修复后重跑权威 C2。**裁决不变：原 U0 `incomplete`；UR
+`no_quality_gain`（complete_evidence=true）；训练 `not_ready`；W1 A3/B/C 另立预注册。**
+
+**修复清单（编号=审阅项）**：
+①**[P1] C2 未核对裁决与质量门**——权威报告临时副本中把顶层裁决改为 `local_preferred`（保留
+失败的 g3/g4/g5）、改 `verdict_record.verdict`、绑定改 False/度量行改 invalid，`verify_merge_chain`
+均仍 passed。现报告两处裁决位置必须一致（`check_report_invariants` 补
+`verdict_locations_disagree`，基线/UR 两模式同守），且汇入前经 `reverify_verdict_record` 用
+`evaluate_local_preferred` 从报告**自身的度量行与绑定**重算 gates/证据缺口/complete/verdict，
+逐门（g1/g2 per-demo、g3 per-demo 三键、g4 计数、g5 per-demo passed）与记录比对；
+`admission:*` 前缀缺口由 admission 腿管辖不参与重推比对，complete 只查"记录 True 而重推
+False"的矛盾方向（admission 压制 False 是合法方向）。
+②**[P1] G0/C2 仍信诊断摘要通过标记**——篡改诊断副本 run2 的 `failure_canonical.npz` 之 `b`、
+保留原记录哈希，`verify_diagnosis_record` 与 C2 均过、G0 实际调用仍 exit 0 写注册文件。现
+`verify_diagnosis_record` 在 supports 裁决下**重哈希盘上快照产物**（记录哈希 vs 现在，逐 run）、
+并按记录 runs（label/snapshot/failure）重建运行记录**重跑 `decide_diagnosis`** 重推 §5.5 判据
+（状态/失败帧/帧内序号/rho 逐项对账）；runs 缺失或快照不可解析=不可复核=拒绝。
+③**[P1] 两侧同缺仍算完整证据**——同删两份快照的 `q_a_indices`、目标向量 `c` 与 P/A 文件，
+`decide_diagnosis` 仍返回 `supports_step03_candidate`（both_missing/None-None 被当相等）。
+现必需证据（`REQUIRED_CTX_ARRAYS` 六数组+canonical `b`/`c`+四个产物文件）先核验**存在**再比
+一致性，缺任一即 `diagnostic_incomplete`（`missing_required_evidence:*` 列明）；`q_a_nominal`
+保持可选（both_missing 合法），前置修复轮的 b-only canonical 旧快照按设计不再可复核。
+④**[P2] 重试上限数失败数而非实际调用数**——一段已有 1 失败+1 成功时仍发起第三次生成（方案
+§6.2=一次正常运行+至多一次**有理由**重试）。现 `_prior_run_facts` 按**实际调用**计（任何非
+`skipped*` 行，含超时/绑定失败/保守计未知状态），skipped 行不计数；2 次真实调用即封顶，
+且仅有一次成功记录时该段按"成功后重试无理由"拒绝（`prior_invocations` 入 skipped 行可审计）。
+⑤**[P2] 3h 预算不约束当前调用**——累计恰 10800s 仍启动、剩 5s 也按默认 1800s 超时启动（10s
+替身实测总额推到 10810/10805s）。现生成侧可用预算=3h−比较预留 600s（方案 §11 预算行含
+"终检/比较时间"）；剩余 ≤0 即 `skipped_budget`（`>=` 边界），当前调用超时取
+`min(1800, 剩余)`（`budget_timeout_s`/`budget_remaining_s` 入行）。
+⑥**[P2] 截断 argv 令比较崩溃**——消费行命令删去步长值 0.3（旗标悬尾）触发未捕获 IndexError，
+带原因的 incomplete 报告写不出来。现 `_argv_flag_value` 安全取值（悬尾=None）、
+`_argv_parse_error` 对已知取值旗标做结构校验，逐行 parse error 进注册核验
+（`argv_parse_errors`，该行不再送子进程烟测）与 evidence_gaps
+（`source_registration:{att}:argv_parse:{demo}:dangling_flag:…`），裁决 incomplete 落盘。
+
+**修正协议重跑（干净树 rev `6d7f257`，全部预期裁决）**：C0 快照
+`baseline/snapshots/attempt_003`（身份稳定、tracked diff=空哈希、passed）+新鲜比较
+`baseline/cmp/attempt_007`（sha `aed1b85a…`）与权威报告逐位一致（差异 []）；C2 终局
+**`decisions/attempt_007`（sha `043b0121…`）**——merge 全过：prereg `f4676813` 绑定、注册父
+诊断（attempt_004，sha `7bcd253a`）在盘完整、合并诊断（attempt_007）为复核一致件（帧
+171/序号 5/rho 一致），**诊断重推腿**（盘上重哈希+decide 重跑）verified=true 且重推
+supports_step03_candidate/171/5/0.2486138173835237 逐位，**报告重推腿**
+`verdict_reverification.problems=[]`（重推 no_quality_gain、g1/g2 过、g3/g4/g5 败，与记录
+一致）；training 未满足门仍指向 local_preferred 缺失+W1 A3/B/C 前置。costs.json 累计四次
+调用。UR 生成（generation/attempt_001，n_ok=6）与 UR 比较（recovery/cmp/attempt_002）证据
+不受本轮影响、未重跑（本轮修复全部在核验侧；生成侧重试/预算规则为事前规则不追溯，权威 UR
+根本身未触发任何 skipped 行）。测试 506→**532 passed + 1 skipped**（新增 26 项
+`tests/test_omniretarget_a2_closure_review3.py`）。
