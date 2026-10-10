@@ -56,6 +56,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import math
 import subprocess
 import sys
 import time
@@ -94,6 +95,40 @@ UR_COMPARISON_RESERVE_S = 600
 UR_GENERATION_BUDGET_S = UR_TOTAL_BUDGET_S - UR_COMPARISON_RESERVE_S
 
 
+def _history_manifest_problems(manifest: object, attempt: object) -> list[str]:
+    """Round-5 review fix: structural validation of a REGISTERED attempt's
+    manifest. Parsing successfully is not evidence — ``{}`` (no rows, no
+    cost) and ``rows`` without ``total_wall_s`` both used to read as zero
+    invocations and zero cumulative cost, making the §6.2 cap and the UR
+    budget unknowable-in-practice while claimed zero. Required evidence =
+    exactly what the gates consume: a finite-number ``total_wall_s``, a
+    list ``rows``, and per row the ``demo``/``status`` keys (a row without
+    ``demo`` cannot be attributed to the scope — and would crash the
+    counting loop anyway).
+    """
+    att = attempt if isinstance(attempt, str) else "unknown_attempt"
+    if not isinstance(manifest, dict):
+        return [f"{att}:manifest_not_object"]
+    problems: list[str] = []
+    wall = manifest.get("total_wall_s")
+    if (isinstance(wall, bool) or not isinstance(wall, (int, float))
+            or not math.isfinite(wall)):
+        problems.append(f"{att}:total_wall_s_missing_or_not_finite")
+    rows = manifest.get("rows")
+    if not isinstance(rows, list):
+        problems.append(f"{att}:rows_missing_or_not_list")
+        return problems
+    for i, row in enumerate(rows):
+        if not isinstance(row, dict):
+            problems.append(f"{att}:row_{i}_not_object")
+            continue
+        if not isinstance(row.get("demo"), str):
+            problems.append(f"{att}:row_{i}_demo_missing_or_not_str")
+        if "status" not in row:
+            problems.append(f"{att}:row_{i}_status_missing")
+    return problems
+
+
 def _prior_run_facts(out_root: Path,
                      scope: list[str]) -> tuple[dict, float, list[str]]:
     """Actual-invocation history and cumulative wall time already recorded
@@ -113,6 +148,11 @@ def _prior_run_facts(out_root: Path,
     and the cumulative budget are unknowable over unreadable rows, so the
     error is returned and the caller must stop BEFORE any generation
     (unreadable history must never be treated as zero history).
+
+    Round-5 review fix: a manifest that PARSES but lacks the required
+    structure is the same unknowable history — ``{}`` or rows-without-
+    ``total_wall_s`` must not slip through the defaults as zero calls and
+    zero cost (``_history_manifest_problems``).
     """
     prior_calls: dict[str, list[dict]] = {}
     prior_wall_s = 0.0
@@ -126,8 +166,12 @@ def _prior_run_facts(out_root: Path,
             history_errors.append(
                 f"{att.get('attempt')}:{type(exc).__name__}")
             continue
-        prior_wall_s += float(manifest.get("total_wall_s") or 0.0)
-        for row in manifest.get("rows", []):
+        problems = _history_manifest_problems(manifest, att.get("attempt"))
+        if problems:
+            history_errors.extend(problems)
+            continue
+        prior_wall_s += float(manifest["total_wall_s"])
+        for row in manifest["rows"]:
             if row.get("demo") not in scope:
                 continue
             status = row.get("status")
@@ -394,21 +438,22 @@ def main() -> int:
         ensure_single_registration(out_root,
                                    source_record["preregistration_sha256"])
 
-    # review fix 11 + round-3 review fixes 4/5 + round-4 review fix 4: the
+    # review fix 11 + round-3 review fixes 4/5 + round-4/5 review fixes: the
     # invocation history is read BEFORE this run allocates its attempt, and
-    # unreadable history STOPS the run — an attempt registered in the index
-    # whose manifest cannot be read makes the invocation count and the UR
-    # cumulative budget unknowable, and generating over it would silently
-    # restart the root's past as zero.
+    # history that cannot be read OR parses but lacks the required
+    # structure (``{}``, rows without total_wall_s) STOPS the run — both
+    # make the invocation count and the UR cumulative budget unknowable,
+    # and generating over them would silently restart the root's past as
+    # zero.
     prior_calls, prior_wall_s, history_errors = _prior_run_facts(
         out_root, scope)
     if history_errors:
         raise SystemExit(
-            f"history_incomplete: prior attempt manifest(s) unreadable under "
-            f"{out_root}: {history_errors} — the per-demo invocation cap "
-            "(§6.2) and the UR cumulative budget are unknowable over "
-            "unreadable history; refusing to generate (unreadable history "
-            "is not zero history)")
+            f"history_incomplete: prior attempt manifest(s) unreadable or "
+            f"structurally deficient under {out_root}: {history_errors} — "
+            "the per-demo invocation cap (§6.2) and the UR cumulative "
+            "budget are unknowable over such history; refusing to generate "
+            "(unreadable or deficient history is not zero history)")
 
     attempt_dir = integ.allocate_attempt(out_root)
     attempt = attempt_dir.name

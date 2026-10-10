@@ -268,6 +268,57 @@ def test_unreadable_history_stops_before_generation(tmp_path, monkeypatch,
     assert not list(out_dir.glob("attempt_002*"))
 
 
+@pytest.mark.parametrize("manifest_text", [
+    "{}",  # parses, but neither rows nor cost — read as zero history
+    pytest.param(json.dumps({
+        "rows": [{"demo": PILOT[0], "status": "generation_failed"}]}),
+        id="rows_without_total_wall_s"),
+    pytest.param(json.dumps({"total_wall_s": 100.0}), id="no_rows"),
+    pytest.param(json.dumps({"rows": "not-a-list", "total_wall_s": 1.0}),
+                 id="rows_not_list"),
+    pytest.param(json.dumps({"rows": [{"demo": PILOT[0]}],
+                             "total_wall_s": 1.0}), id="row_status_missing"),
+    pytest.param(json.dumps({"rows": [{"status": "ok"}],
+                             "total_wall_s": 1.0}), id="row_demo_missing"),
+    # json.loads ACCEPTS the bare NaN literal — a NaN cost is not a number
+    '{"rows": [], "total_wall_s": NaN}',
+    # bool is an int subclass — True must not pass as a finite cost
+    '{"rows": [], "total_wall_s": true}',
+    '"a string manifest"',
+])
+def test_structurally_deficient_history_stops_before_generation(
+        tmp_path, monkeypatch, manifest_text):
+    """Round-5 reviewer counterexample: history_errors used to cover only
+    read/parse exceptions — a manifest that PARSES but lacks the fields the
+    gates consume (``{}``, or rows without ``total_wall_s``) fell through
+    the ``or 0.0``/``, []`` defaults as zero invocations and zero cost, so
+    a normal index still launched all six generation calls with exit 0."""
+    freeze, prereg = _ur_freeze(tmp_path)
+    out_dir = tmp_path / "hist5"
+    with pytest.raises(SystemExit, match="history_incomplete"):
+        _run_generation_ur(monkeypatch, tmp_path, freeze, out_dir, prereg,
+                           manifest_text=manifest_text)
+    # stopped BEFORE any generation call and BEFORE allocating an attempt
+    assert not list(out_dir.glob("attempt_002*"))
+
+
+def test_all_skipped_history_is_valid_not_deficient(tmp_path, monkeypatch):
+    """Not over-tightened: a genuine all-skipped prior run records
+    ``total_wall_s: 0.0`` with skipped rows — zero cost BY EVIDENCE, not by
+    a missing field, so the retry path keeps working."""
+    freeze, prereg = _ur_freeze(tmp_path)
+    out_dir = tmp_path / "zero"
+    prior = [{"demo": PILOT[0], "status": "skipped_retry_cap",
+              "wall_s": 0.0}]
+    rc, calls = _run_generation_ur(monkeypatch, tmp_path, freeze, out_dir,
+                                   prereg, prior_rows=prior, prior_wall=0.0)
+    # PILOT[0] was never actually invoked (only skipped) -> eligible now
+    assert calls == PILOT
+    m = json.loads(sorted(out_dir.glob("attempt_*/generation_manifest.json"))
+                   [-1].read_text())
+    assert m["prior_wall_s_in_root"] == 0.0
+
+
 def test_readable_history_still_generates(tmp_path, monkeypatch):
     """The gate is not over-tightened: a readable prior manifest keeps the
     normal retry path (one prior failure -> one justified retry call)."""
