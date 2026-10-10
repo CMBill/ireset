@@ -186,6 +186,16 @@ def test_fresh_comparison_match_ignores_only_run_scoped_fields():
     f3["admission"]["passed"] = True
     assert not a2c.compare_fresh_to_authoritative(a, f3)["matches"]
 
+    # invalid-row NaN sentinels on both sides are EQUAL (caught live in the
+    # first real C0 run: metrics.U0.sub12.fps was NaN in BOTH reports)
+    f4 = _report()
+    a4 = _report()
+    a4["metrics"]["U0"][KNOWN]["fps"] = float("nan")
+    f4["metrics"]["U0"][KNOWN]["fps"] = float("nan")
+    assert a2c.compare_fresh_to_authoritative(a4, f4)["matches"]
+    f4["metrics"]["U0"][KNOWN]["fps"] = 30.0
+    assert not a2c.compare_fresh_to_authoritative(a4, f4)["matches"]
+
 
 # --- unit: closure record keeps the three statuses apart --------------------
 

@@ -57,6 +57,13 @@ def _diff_paths(a, b, prefix: str = "") -> list[str]:
         for i, (x, y) in enumerate(zip(a, b)):
             out += _diff_paths(x, y, f"{prefix}[{i}]")
         return out
+    if isinstance(a, float) and isinstance(b, float):
+        # invalid-row sentinels serialize NaN on both sides; two NaNs from
+        # bit-identical reports are EQUAL (NaN != NaN would flag every
+        # missing-demo row as a difference)
+        import math
+        same = (a == b) or (math.isnan(a) and math.isnan(b))
+        return [] if same else [prefix or "<root>"]
     return [] if a == b else [prefix or "<root>"]
 
 
