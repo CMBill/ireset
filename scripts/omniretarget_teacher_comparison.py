@@ -50,6 +50,11 @@ denominator must still cover the full pilot. The both-hands denominator
 must be a non-negative INTEGER — ``int()`` truncation previously read
 -0.5 as a legal zero and 30.9 as 30.
 
+Round-7 additions (2026-10-10): the MANIFEST leg is scoped the same way
+— only the demos currently consumed from an attempt are re-hashed, so a
+superseded demo's PT copy missing from the older dir does not reject the
+demos still consumed from it.
+
 P rows come from the published NPZ; U0 rows from the newest OK attempt
 artifact per demo. Every expected demo keeps a row on both sides;
 missing/invalid evidence forces ``incomplete`` (never a silent drop).
@@ -160,6 +165,12 @@ def admission_record(freeze: Path, u0_root: Path, pilot: list[str],
     data_paths: dict[str, dict] = {}   # attempt -> the PT dir it consumed
     pt_dirs: dict[str, Path] = {}      # label -> dir, for the freeze leg
     dir_demos: dict[str, set] = {}     # label -> demos CONSUMED at that dir
+    # attempt -> demos whose CURRENT evidence comes from this attempt; a
+    # later attempt supersedes the older one per demo, so an attempt may
+    # have recorded inputs that are no longer consumed from it
+    attempt_consumed: dict[str, set] = {}
+    for d, e in coverage["by_demo"].items():
+        attempt_consumed.setdefault(e["attempt"], set()).add(d)
     env_lock_shas: set[str] = set()
     env_versions: set[str] = set()
     env_pythons: set[str] = set()
@@ -202,11 +213,15 @@ def admission_record(freeze: Path, u0_root: Path, pilot: list[str],
             pt_dirs.setdefault(label, pt_dir)
         dir_demos.setdefault(data_paths[attempt]["pt_dir"], set()).add(demo)
         # inputs re-hashed NOW at the recorded data path against what
-        # generation recorded; a missing file is an admission failure for
-        # this demo, not a crash
+        # generation recorded, restricted to the demos CONSUMED from this
+        # attempt (round-7 review fix): a superseded demo's PT copy in this
+        # dir is no longer consumed evidence — its absence must not reject
+        # the demos that are. A missing CONSUMED file stays an admission
+        # failure for this demo, not a crash.
         try:
             demo_inputs = integ.verify_inputs_against_manifest(
-                manifest, TEACHER_TRAJ_DIR, pt_dir)
+                manifest, TEACHER_TRAJ_DIR, pt_dir,
+                only_demos=attempt_consumed[attempt])
             row = demo_inputs.get(demo, {})
             inputs_detail[demo] = {
                 "attempt": attempt,

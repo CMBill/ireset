@@ -229,10 +229,20 @@ def verify_binding_from_artifacts(converted_npz: Path, published_npz: Path) -> o
 
 
 def verify_inputs_against_manifest(
-    manifest: dict, npz_dir: Path, pt_dir: Path,
+    manifest: dict, npz_dir: Path, pt_dir: Path, only_demos=None,
 ) -> dict[str, dict]:
-    """Current input hashes vs the hashes recorded at generation time."""
+    """Current input hashes vs the hashes recorded at generation time.
+
+    ``only_demos`` restricts the check to the demos actually CONSUMED from
+    this attempt (round-7 review fix, 2026-10-10): when a later attempt
+    supersedes some of this manifest's demos, their input copies here are
+    no longer part of the consumed evidence — their absence must not
+    reject the demos that ARE consumed. Every consumed demo stays fully
+    verified (both legs: manifest and freeze).
+    """
     recorded = manifest.get("input_sha256", {})
+    if only_demos is not None:
+        recorded = {d: h for d, h in recorded.items() if d in only_demos}
     out: dict[str, dict] = {}
     for demo, hashes in recorded.items():
         out[demo] = {
