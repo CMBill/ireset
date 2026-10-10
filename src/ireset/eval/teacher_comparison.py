@@ -47,7 +47,9 @@ verified for existence, validity and P/U0 AGREEMENT — the denominator is
 decided by the shared (binding-verified) human reference, so a missing or
 None ``denominator_frames`` is deleted evidence (gap → ``incomplete``),
 never "zero reference frames", and P and U0 disagreeing on it is an
-evidence gap too.
+evidence gap too. Round-6 (2026-10-10): the denominator must be a
+non-negative integer — fractional values are invalid evidence, never
+silently truncated to a legal count.
 """
 
 from __future__ import annotations
@@ -464,12 +466,20 @@ def _both_denominator(m) -> int | None:
     The denominator is decided by the SHARED human reference
     (binding-verified), so it is decidable evidence: missing/None/
     non-finite/negative is a gap, and P and U0 must agree on it exactly.
+
+    Round-6 review fix 2: ``int()`` truncated BEFORE the sign check — -0.5
+    read as a legal zero and 30.9 as 30, so P=30 / U0=30.9 "agreed". The
+    denominator is an exact frame COUNT: a non-negative integer is
+    required, a fractional value is invalid evidence, never silently
+    truncated.
     """
     v = m.both.get("denominator_frames")
     if _bad(v):
         return None
-    v = int(v)
-    return v if v >= 0 else None
+    f = float(v)
+    if f < 0 or f != int(f):
+        return None
+    return int(f)
 
 
 def _json_num(x, nd: int = 6):

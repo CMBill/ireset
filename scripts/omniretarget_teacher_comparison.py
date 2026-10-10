@@ -42,6 +42,14 @@ path; they fall back to the canonical dir and are labeled
 for existence, validity and P/U0 agreement (missing/None is deleted
 evidence → ``incomplete``, never "zero reference frames").
 
+Round-6 additions (2026-10-10): the freeze leg verifies each data dir
+ONLY for the demos actually consumed from it (a split retry dir holding
+one retry PT is not rejected for files it never served; demos without an
+OK artifact are reconciled at the canonical dir), and the aggregate
+denominator must still cover the full pilot. The both-hands denominator
+must be a non-negative INTEGER — ``int()`` truncation previously read
+-0.5 as a legal zero and 30.9 as 30.
+
 P rows come from the published NPZ; U0 rows from the newest OK attempt
 artifact per demo. Every expected demo keeps a row on both sides;
 missing/invalid evidence forces ``incomplete`` (never a silent drop).
@@ -151,6 +159,7 @@ def admission_record(freeze: Path, u0_root: Path, pilot: list[str],
     inputs_detail: dict[str, dict] = {}
     data_paths: dict[str, dict] = {}   # attempt -> the PT dir it consumed
     pt_dirs: dict[str, Path] = {}      # label -> dir, for the freeze leg
+    dir_demos: dict[str, set] = {}     # label -> demos CONSUMED at that dir
     env_lock_shas: set[str] = set()
     env_versions: set[str] = set()
     env_pythons: set[str] = set()
@@ -176,7 +185,11 @@ def admission_record(freeze: Path, u0_root: Path, pilot: list[str],
         }
         # round-5 review fix 1: the PT side anchors the data path THIS
         # attempt recorded consuming; legacy manifests fall back to the
-        # canonical dir and are labeled as such
+        # canonical dir and are labeled as such. Round-6 fix 1 tracks WHICH
+        # demos each dir was consumed for — the freeze leg verifies a dir
+        # only for the demos actually consumed from it, so a split retry
+        # dir holding a single retry PT is not rejected for the five files
+        # it never served.
         recorded_dp = manifest.get("data_path")
         pt_dir = (_pt_dir_from_record(str(recorded_dp)) if recorded_dp
                   else OMOMO_NEW_DIR)
@@ -187,6 +200,7 @@ def admission_record(freeze: Path, u0_root: Path, pilot: list[str],
                 "recorded_in_manifest": bool(recorded_dp),
             }
             pt_dirs.setdefault(label, pt_dir)
+        dir_demos.setdefault(data_paths[attempt]["pt_dir"], set()).add(demo)
         # inputs re-hashed NOW at the recorded data path against what
         # generation recorded; a missing file is an admission failure for
         # this demo, not a crash
@@ -240,14 +254,25 @@ def admission_record(freeze: Path, u0_root: Path, pilot: list[str],
     # fails admission, hashed at EVERY data path the consumed attempts
     # actually recorded (plus the canonical dir for legacy manifests): the
     # manifest comparison only proves "inputs now == inputs at generation".
+    # Round-6 review fix 1: each dir is verified ONLY for the demos it was
+    # actually consumed for — a split retry dir holding one retry PT must
+    # not be rejected for files it never served — while demos with no OK
+    # artifact are reconciled at the canonical dir so the leg still covers
+    # the FULL frozen denominator.
     try:
         frozen_entries = json.loads(
             (freeze / "frozen_lists.json").read_text())["teacher_pilot_train6_v1"]
+        if coverage["missing"]:
+            fallback = path_for_record(OMOMO_NEW_DIR)
+            pt_dirs.setdefault(fallback, OMOMO_NEW_DIR)
+            dir_demos.setdefault(fallback, set()).update(coverage["missing"])
         by_dir: dict[str, dict] = {}
         for label, d in sorted(pt_dirs.items()):
+            entries = [e for e in frozen_entries
+                       if e["demo"] in dir_demos.get(label, ())]
             try:
                 by_dir[label] = integ.verify_inputs_against_freeze(
-                    frozen_entries, TEACHER_TRAJ_DIR, d)
+                    entries, TEACHER_TRAJ_DIR, d)
             except Exception as exc:  # noqa: BLE001 -- recorded, not raised
                 by_dir[label] = {"error": f"{type(exc).__name__}: {exc}"}
 
@@ -256,23 +281,26 @@ def admission_record(freeze: Path, u0_root: Path, pilot: list[str],
                     and all(r.get("npz_matches") and r.get("pt_matches")
                             for r in res.values()))
 
-        freeze_inputs_ok = bool(by_dir) and all(_dir_ok(r) for r in by_dir.values())
-        if len(by_dir) == 1:
-            merged = next(iter(by_dir.values()))
-        else:
-            bad = [r for r in by_dir.values() if "error" in r]
-            if bad:
-                merged = {"error": "; ".join(r["error"] for r in bad)}
+        # the aggregate denominator stays the FULL pilot: every demo's PT
+        # must actually have been verified somewhere
+        verified = set()
+        for res in by_dir.values():
+            if "error" not in res:
+                verified.update(res)
+        freeze_inputs_ok = (bool(by_dir)
+                            and all(_dir_ok(r) for r in by_dir.values())
+                            and verified == set(pilot))
+        # per-demo view: each demo was verified at exactly one dir
+        merged: dict = {}
+        errs = []
+        for label in sorted(by_dir):
+            res = by_dir[label]
+            if "error" in res:
+                errs.append(f"{label}: {res['error']}")
             else:
-                merged = {
-                    demo: {"npz_matches": all(
-                               r.get(demo, {}).get("npz_matches")
-                               for r in by_dir.values()),
-                           "pt_matches": all(
-                               r.get(demo, {}).get("pt_matches")
-                               for r in by_dir.values())}
-                    for demo in sorted({d for r in by_dir.values() for d in r})
-                }
+                merged.update(res)
+        if errs:
+            merged = {"error": "; ".join(errs), **merged}
         inputs_vs_freeze = {"all_match": freeze_inputs_ok,
                             "by_demo": merged, "by_dir": by_dir}
     except Exception as exc:  # noqa: BLE001 -- recorded admission failure
