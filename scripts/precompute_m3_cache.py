@@ -76,8 +76,10 @@ def _w1_schedule_job(job: tuple) -> dict:
     """One W1 admitted row -> keyed schedule cache file (spawn-picklable).
 
     Derives the schedule from the SOURCE-scene box through the audited
-    derived representation; the output filename carries the identity key so
-    a drifted input/code/asset can never silently reuse a stale cache.
+    derived representation — pose AND geometry scale (review fix 1: the
+    source hull is the locked largebox scaled by the fitted similarity
+    scale); the output filename carries the identity key so a drifted
+    input/code/asset can never silently reuse a stale cache.
     """
     (demo, derived_path, key, out_root) = job
     out = Path(out_root) / "schedules" / w1.schedule_cache_filename(demo, key)
@@ -85,17 +87,37 @@ def _w1_schedule_job(job: tuple) -> dict:
         human = z["human_joints"]
         src_box = z["source_obj_pose"]
         fps = float(z["fps"])
+        scale = float(np.asarray(z["similarity_scale"]).reshape(()))
     from ireset.embodied.contact_sites import infer_reference_schedule
 
-    schedule = infer_reference_schedule(human, src_box, fps=fps)
+    schedule = infer_reference_schedule(human, src_box, fps=fps,
+                                        box_scale=scale)
     out.parent.mkdir(parents=True, exist_ok=True)
     np.savez(out, intervals=schedule_to_cache(schedule))
+    import hashlib as _hl
+
     return {"demo": demo, "T": int(human.shape[0]),
-            "cache": str(out.name), "status": "ok"}
+            "cache": str(out.name), "status": "ok",
+            "sha256": _hl.sha256(out.read_bytes()).hexdigest()}
 
 
 def _worker_init(native_threads: int) -> None:
     apply_native_threads(native_threads)
+
+
+def _append_costs(run_root: Path, stage: str, wall: float, extra: dict) -> None:
+    """Run-root cost ledger (review fix 12): every stage invocation is
+    appended with its own measured wall — including failed attempts, which
+    register BEFORE the work starts and are completed here on the way out."""
+    import datetime as _dt2
+
+    costs_path = run_root / "costs.json"
+    entries = []
+    if costs_path.is_file():
+        entries = json.loads(costs_path.read_text()).get("invocations", [])
+    entries.append({"timestamp": _dt2.datetime.now().isoformat(timespec="seconds"),
+                    "stage": stage, "wall_s": round(wall, 1), **extra})
+    costs_path.write_text(json.dumps({"invocations": entries}, indent=2))
 
 
 def run_w1(args) -> int:
@@ -119,18 +141,21 @@ def run_w1(args) -> int:
     assets_sha = prereg["assets"]["a1_assets_sha256"]
 
     admitted = [r for r in manifest["rows"] if r.get("admission", {}).get("motion")]
-    jobs, rows_meta = [], []
+    jobs = []
     for r in admitted:
         demo = r["demo"]
         dpath = PROJECT_ROOT / r["derived"]["path"]
         if integ.sha256_file(dpath) != r["derived"]["sha256"]:
             raise SystemExit(f"{demo}: derived representation drifted since the audit")
+        with np.load(dpath, allow_pickle=False) as z:
+            if "similarity_scale" not in z.files:
+                raise SystemExit(
+                    f"{demo}: derived representation predates the geometry-scale "
+                    "fix (no similarity_scale) — re-run the A3 audit first")
         key = w1.schedule_cache_key(r["inputs"]["npz_sha256"],
                                     r["inputs"]["pt_sha256"],
                                     assets_sha, code_sha)
         jobs.append((demo, str(dpath), key, str(attempt_dir)))
-        rows_meta.append({"demo": demo, "split": r["split"], "key": key[:16],
-                          "full_windows": r.get("full_windows_F60_s30", 0)})
     print(f"[w1-cache] {len(jobs)} admitted rows -> keyed schedules")
 
     workers = resolve_workers(args.workers, args.cpu_budget, len(jobs))
@@ -167,6 +192,7 @@ def run_w1(args) -> int:
         "root_stats": {
             "definition": "clip-frame root positions, every original frame "
                           "of the admitted train24 rows, once per frame",
+            "file_sha256": integ.sha256_file(attempt_dir / "root_stats.npz"),
             "files": stats_facts["files"],
             "files_canonical_sha256": hashlib.sha256(
                 files_blob.encode("utf-8")).hexdigest(),
@@ -176,7 +202,14 @@ def run_w1(args) -> int:
             "mean": stats.mean.tolist(),
             "std": stats.std.tolist(),
         },
-        "schedule_rows": rows_meta,
+        # review fix 6: consumers re-hash EVERY schedule file against this
+        # record — a key-correct filename with different content is caught
+        "schedule_rows": [
+            {"demo": row["demo"], "split": r["split"], "key": key[:16],
+             "sha256": row["sha256"],
+             "full_windows": r.get("full_windows_F60_s30", 0)}
+            for row, r, key in zip(rows, admitted, [j[2] for j in jobs])
+        ],
         "execution": execution_record(rep, len(jobs)),
         "total_wall_s": round(time.time() - t0, 1),
     }
@@ -189,6 +222,8 @@ def run_w1(args) -> int:
         "frames_fitted": identity["root_stats"]["frames_fitted"],
         "identity": path_for_record(attempt_dir / "cache_identity.json"),
     })
+    _append_costs(out_root.parent, "w1_cache", time.time() - t0,
+                  {"attempt": attempt_dir.name, "n_schedules": len(rows)})
     print(f"[w1-cache] root stats frames={identity['root_stats']['frames_fitted']} "
           f"files={stats_facts['n_train_rows_used']} -> {path_for_record(attempt_dir)}")
     return 0

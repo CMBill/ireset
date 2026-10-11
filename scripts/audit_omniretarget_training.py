@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -114,11 +115,15 @@ def audit_demo(
                           "reason": "admission failed"}
         return row
 
-    # scene split (§3.3): source box from the PT through the A1 estimator
-    source_box = w1.derive_source_box(pt_human, human, pt_obj)
+    # scene split (§3.3): source box from the PT through the A1 estimator;
+    # the fitted scale ALSO applies to the source box geometry (review fix
+    # 1) — it is stored beside the pose and consumed by every schedule/
+    # quality measurement against the source box
+    source_box, sim_scale = w1.derive_source_box(pt_human, human, pt_obj)
     scene = w1.published_to_project(q_raw)
     target_box = scene[:, 36:43].copy()
     row["scene_split"] = w1.scene_split_facts(scene, source_box, target_box)
+    row["scene_split"]["similarity_scale"] = sim_scale
     if demo in a1_source_boxes:
         match_a1 = bool(np.array_equal(source_box, a1_source_boxes[demo]))
         row["scene_split"]["matches_a1_frozen_source_box"] = match_a1
@@ -138,7 +143,8 @@ def audit_demo(
         row["inputs"] = {"npz_sha256": npz_sha, "pt_sha256": pt_sha}
         # qpos stays VERBATIM in the published layout so every consumer
         # rebuilds the scene through the one audited loader path; the scene
-        # split (source/target boxes) travels beside it, never inside qpos
+        # split (source/target boxes + geometry scale) travels beside it,
+        # never inside qpos
         derived_path = derived_dir / f"{demo}_w1_scene.npz"
         np.savez(
             derived_path,
@@ -147,10 +153,12 @@ def audit_demo(
             fps=np.float64(fps),
             source_obj_pose=source_box,
             target_obj_pose=target_box,
+            similarity_scale=np.float64(sim_scale),
             meta_json=json.dumps({
                 "demo": demo, "split": split,
                 "protocol": w1.MOTION_PROTOCOL_VERSION,
                 "npz_sha256": npz_sha, "pt_sha256": pt_sha,
+                "similarity_scale": sim_scale,
                 "layout": "published_verbatim",
             }),
         )
@@ -166,7 +174,8 @@ def audit_demo(
     # labels; a strict failure is a registrable defect, a run failure is
     # incomplete/not_checked — never a zero, never a pass
     try:
-        metrics = replayer.measure(demo, scene, human, source_box, fps)
+        metrics = replayer.measure(demo, scene, human, source_box, fps,
+                                   source_box_scale=sim_scale)
         row["quality"] = {"status": "complete", "reason": None,
                           "metrics": metrics.to_json()}
     except Exception as exc:  # noqa: BLE001 -- recorded, never raised
@@ -174,6 +183,57 @@ def audit_demo(
                           "reason": f"{type(exc).__name__}: {exc}",
                           "metrics": None}
     return row
+
+
+def _finite_num(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) \
+        and math.isfinite(float(x))
+
+
+def quality_registration_complete(row: dict) -> tuple[bool, list[str]]:
+    """Is this row's quality registration backed by ACTUAL measurements?
+
+    Review fix 5: a ``status=complete`` flag without its measurement fields
+    is a completeness claim, not evidence. Required: the metrics dict with
+    the finite core measurements (penetration/task/box-ground), per-side
+    hand/foot entries whose measured quantities are finite WHEREVER the
+    reference frames exist, and legal zero-reference sides (``None`` with
+    zero registered reference frames) staying legal.
+    """
+    q = row.get("quality") or {}
+    m = q.get("metrics")
+    if q.get("status") != "complete" or not isinstance(m, dict):
+        return False, [f"status:{q.get('status')}"]
+    problems: list[str] = []
+    if m.get("valid") is not True:
+        problems.append("metrics_not_valid")
+    for k in ("penetration_max_m", "task_mpjpe_p95_m",
+              "box_ground_penetration_max_m"):
+        if not _finite_num(m.get(k)):
+            problems.append(f"{k}:{m.get(k)}")
+    for side in ("l", "r"):
+        for group, keys in (("foot", ("gap_p95_m", "speed_p95_mps", "drift_max_m")),
+                            ("hand", ("gap_p95_m", "coverage"))):
+            entry = (m.get(group) or {}).get(side)
+            if entry is None:
+                continue     # legal zero-reference side (no intervals)
+            if not isinstance(entry, dict):
+                problems.append(f"{group}[{side}]:not_a_dict")
+                continue
+            ref_frames = entry.get("n_ref_frames")
+            if not isinstance(ref_frames, int) or ref_frames <= 0:
+                # a present entry with no reference frames contradicts the
+                # measure() contract (no ranges -> None side)
+                problems.append(f"{group}[{side}]:n_ref_frames:{ref_frames}")
+                continue
+            for k in keys:
+                if not _finite_num(entry.get(k)):
+                    problems.append(f"{group}[{side}].{k}:{entry.get(k)}")
+    if not isinstance(m.get("both"), dict):
+        problems.append("both_missing")
+    if m.get("T") != row.get("T"):
+        problems.append(f"T:{m.get('T')}!={row.get('T')}")
+    return (not problems), problems
 
 
 def summarize(rows: list[dict], scope: list[str]) -> dict:
@@ -195,13 +255,15 @@ def summarize(rows: list[dict], scope: list[str]) -> dict:
         for subj in EXPECTED_SUBJECTS}
     # §3.4: the exit criterion is the TRAIN label quality registration; a
     # val label with incomplete quality keeps its row (its generation task
-    # stays in the full expected set) and is listed separately
+    # stays in the full expected set) and is listed separately. The
+    # completeness predicate checks the MEASURED fields, not the status
+    # string (review fix 5)
     train_quality_incomplete = [
         r["demo"] for r in admitted_train
-        if r.get("quality", {}).get("status") != "complete"]
+        if not quality_registration_complete(r)[0]]
     val_quality_incomplete = [
         r["demo"] for r in admitted if r["split"] == "val"
-        and r.get("quality", {}).get("status") != "complete"]
+        and not quality_registration_complete(r)[0]]
     return {
         "n_expected": len(scope),
         "n_processed": len(processed),

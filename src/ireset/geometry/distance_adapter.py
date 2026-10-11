@@ -103,16 +103,39 @@ def largebox_hull():
     return _HULL
 
 
-def largebox_hull_surface_distance(points_world: np.ndarray, box_pose: np.ndarray) -> np.ndarray:
+def largebox_hull_surface_distance(points_world: np.ndarray, box_pose: np.ndarray,
+                                   scale: float = 1.0) -> np.ndarray:
     """Unsigned hull surface distance (0 inside), [T]; batched over frames.
 
     ``points_world`` [T, 3], ``box_pose`` [T, 7] project convention. This is
     the reference-side metric for contact scheduling and F1 scoring.
+
+    ``scale`` shrinks/grows the hull about the box BODY origin — the W1
+    source-scene box is the PT box mapped by the A1 similarity
+    (``source_obj_pose_in_target_scene``), so its geometry is the base
+    largebox scaled by the fitted similarity scale (plan §3.3: "源箱的
+    几何尺寸同时应用已登记尺度"). A similarity scales every length, so
+    ``dist(p_body, s·K) = s · dist(p_body / s, K)`` — computed without
+    building a scaled mesh.
     """
+    import math
+
     import trimesh
 
+    if not (math.isfinite(scale) and scale > 0.0):
+        raise ValueError(f"box hull scale must be finite > 0, got {scale}")
     geom = world_to_box_geom(points_world, box_pose).reshape(-1, 3)
-    return np.clip(-trimesh.proximity.signed_distance(largebox_hull(), geom), 0.0, None)
+    if scale != 1.0:
+        # undo the geom->body fold, scale the point about the BODY origin
+        # (the pose mapping already applied the similarity to the body
+        # origin's position; the body-frame geometry scales by the same
+        # factor), then re-fold into the geom frame the hull lives in
+        R_g, x_g = largebox_static_frame()
+        p_body = geom @ R_g.T + x_g
+        geom = (p_body / scale - x_g) @ R_g
+    dist = np.clip(
+        -trimesh.proximity.signed_distance(largebox_hull(), geom), 0.0, None)
+    return scale * dist if scale != 1.0 else dist
 
 
 # --- analytic AABB distances (geom frame) ------------------------------------

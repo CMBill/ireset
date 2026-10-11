@@ -299,23 +299,29 @@ def scene_split_facts(
 
 def derive_source_box(
     pt_human: np.ndarray, npz_human: np.ndarray, pt_obj: np.ndarray,
-) -> np.ndarray:
+) -> tuple[np.ndarray, float]:
     """Source-scene box in the target scene frame (§3.3, A1 mapping).
 
     Same estimator as A1's freeze so the recomputation is bit-comparable
-    with the frozen ``pairing_source_boxes.npz`` entries.
+    with the frozen ``pairing_source_boxes.npz`` entries. Returns
+    ``(pose, scale)`` — the fitted similarity scale ALSO applies to the
+    source box geometry (§3.3) and must travel with the pose into every
+    consumer that measures against the source box.
     """
     from ireset.data.pairing import source_obj_pose_in_target_scene
 
     scale, R, t, _ = fit_similarity(
         np.asarray(pt_human).reshape(-1, 3), np.asarray(npz_human).reshape(-1, 3))
-    return source_obj_pose_in_target_scene(pt_obj, scale, R, t)
+    pose = source_obj_pose_in_target_scene(pt_obj, scale, R, t)
+    return pose, float(scale)
 
 
 # --- keyed schedule cache (plan §4.2) ------------------------------------------
 
-#: bump when the schedule-inference/condition-construction semantics change
-SCHEDULE_KEY_VERSION = 1
+#: bump when the schedule-inference/condition-construction semantics change;
+#: v2 = the source box GEOMETRY carries the fitted similarity scale (review
+#: fix 1: v1 measured against the unscaled locked hull)
+SCHEDULE_KEY_VERSION = 2
 #: code that defines condition construction + schedule inference — the cache
 #: key covers CODE identity, not just file names
 CONDITION_CODE_FILES = (
@@ -349,10 +355,14 @@ def schedule_cache_key(npz_sha256: str, pt_sha256: str, assets_sha256: str,
         "npz_sha256": npz_sha256,
         "pt_sha256": pt_sha256,
         "scene_split": "a1_similarity_v1",
-        "source_geometry": "largebox_locked",
+        # the source-scene hull is the locked largebox scaled by the fitted
+        # similarity scale; the scale itself is a deterministic function of
+        # the hashed inputs, so the versioned geometry identity + input
+        # hashes cover it (v1 = unscaled hull — never reuse those files)
+        "source_geometry": "largebox_locked_x_fitted_scale_v2",
         "assets_sha256": assets_sha256,
         "protocol": MOTION_PROTOCOL_VERSION,
-        "schedule_inference": "infer_reference_schedule_v1",
+        "schedule_inference": "infer_reference_schedule_v2_scaled",
         "condition_code_sha256": code_sha256,
     }, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
@@ -360,6 +370,81 @@ def schedule_cache_key(npz_sha256: str, pt_sha256: str, assets_sha256: str,
 
 def schedule_cache_filename(demo: str, key: str) -> str:
     return f"{demo}__{key[:16]}.npz"
+
+
+def verify_cache_contents(cache_dir: Path, manifest: dict, prereg: dict,
+                          project_root: Path,
+                          hash_file=integ.sha256_file) -> dict:
+    """Re-verify the W1 cache CONTENT, not just its directory and names.
+
+    Review fix 6: a file NAME proves nothing about the file — the consumer
+    side (dataset/S0/eval/readiness) re-hashes the root statistics and
+    EVERY keyed schedule against the identity record written at cache
+    production time, re-derives each key from the manifest row's input
+    hashes + the CURRENT condition code + assets, and reconciles the stats
+    identity (file list, frame count) with the admitted train rows. Any
+    drift, missing leg or unprovable cost history is a refusal reason.
+    """
+    problems: list[str] = []
+    root = Path(project_root)
+    cache_dir = Path(cache_dir)
+    ident_path = cache_dir / "cache_identity.json"
+    if not ident_path.is_file():
+        return {"problems": ["cache_identity_missing"], "passed": False}
+    ident = json.loads(ident_path.read_text())
+
+    if ident.get("protocol") != MOTION_PROTOCOL_VERSION:
+        problems.append("cache_protocol_mismatch")
+    if ident.get("schedule_cache_key_version") != SCHEDULE_KEY_VERSION:
+        problems.append("cache_key_version_stale")
+    if ident.get("condition_code_sha256") != condition_code_sha256(root):
+        problems.append("cache_condition_code_drifted")
+    assets_sha = (prereg.get("assets") or {}).get("a1_assets_sha256")
+    if ident.get("assets_sha256") != assets_sha:
+        problems.append("cache_assets_mismatch")
+
+    # root statistics: existence AND content hash AND stats identity
+    rs_rec = ident.get("root_stats") or {}
+    rs_path = cache_dir / "root_stats.npz"
+    if not rs_path.is_file():
+        problems.append("root_stats_missing")
+    elif hash_file(rs_path) != rs_rec.get("file_sha256"):
+        problems.append("root_stats_content_drifted")
+    admitted_train = [r for r in manifest.get("rows", [])
+                      if r.get("split") == "train"
+                      and r.get("admission", {}).get("motion")]
+    if rs_rec.get("files") != [r["demo"] for r in admitted_train]:
+        problems.append("root_stats_files_mismatch_vs_manifest")
+    expected_frames = sum(r.get("T", 0) for r in admitted_train)
+    if rs_rec.get("frames_fitted") != expected_frames:
+        problems.append(
+            f"root_stats_frames_mismatch:{rs_rec.get('frames_fitted')}"
+            f"!={expected_frames}")
+
+    # every keyed schedule: file present, content hash as registered, and
+    # the key re-derivable from the CURRENT row inputs/code/assets
+    rows_rec = ident.get("schedule_rows") or []
+    by_demo = {rec.get("demo"): rec for rec in rows_rec}
+    admitted = [r for r in manifest.get("rows", [])
+                if r.get("admission", {}).get("motion")]
+    if sorted(by_demo) != sorted(r["demo"] for r in admitted):
+        problems.append("schedule_set_mismatch_vs_manifest")
+    for r in admitted:
+        demo = r["demo"]
+        rec = by_demo.get(demo)
+        if rec is None:
+            continue
+        key = schedule_cache_key(r["inputs"]["npz_sha256"],
+                                 r["inputs"]["pt_sha256"],
+                                 assets_sha or "", condition_code_sha256(root))
+        if rec.get("key") != key[:16]:
+            problems.append(f"schedule_key_not_reproducible:{demo}")
+        spath = cache_dir / "schedules" / schedule_cache_filename(demo, key)
+        if not spath.is_file():
+            problems.append(f"schedule_file_missing:{demo}")
+        elif hash_file(spath) != rec.get("sha256"):
+            problems.append(f"schedule_content_drifted:{demo}")
+    return {"problems": problems, "passed": not problems}
 
 
 # --- preregistration / manifest verification -----------------------------------
@@ -399,7 +484,18 @@ def verify_preregistration(
     if not plan_path.is_file() or hash_file(plan_path) != plan_rec.get("sha256"):
         problems.append("plan_drifted")
 
-    for key, rec in (prereg.get("anchors") or {}).items():
+    # P1 review fix: iterating only the PRESENT anchors/inputs cannot detect
+    # a deleted leg — the REQUIRED sets are checked as sets first, so an
+    # emptied ``anchors`` block or a missing input record is a problem even
+    # though the loops below would silently skip them
+    anchors_rec = prereg.get("anchors") or {}
+    missing_anchors = sorted(set(W1_PLAN_ANCHORS) - set(anchors_rec))
+    if missing_anchors:
+        problems.append(f"anchor_set_incomplete:{missing_anchors}")
+    extra_anchors = sorted(set(anchors_rec) - set(W1_PLAN_ANCHORS))
+    if extra_anchors:
+        problems.append(f"anchor_set_unknown:{extra_anchors}")
+    for key, rec in anchors_rec.items():
         p = root / str(rec.get("path", ""))
         if not p.is_file():
             problems.append(f"anchor_missing:{key}")
@@ -415,7 +511,7 @@ def verify_preregistration(
     # additionally enforces the plan-declared constant at registration time
     if sel.get("train24_canonical_sha256") not in (None, canonical_list_sha256(recomputed)):
         problems.append("train24_canonical_sha_inconsistent")
-    lists_path = root / str((prereg.get("anchors") or {}).get(
+    lists_path = root / str(anchors_rec.get(
         "a1_frozen_lists", {}).get("path", ""))
     if lists_path.is_file():
         lists = json.loads(lists_path.read_text())
@@ -429,7 +525,18 @@ def verify_preregistration(
         if overlap:
             problems.append(f"train24_val31_overlap:{overlap}")
 
-    for demo, rec in (prereg.get("inputs") or {}).items():
+    # the input registration must cover EXACTLY train24+val31 — fewer (a
+    # demo silently unverified) or more (stale entries masking removals)
+    # both break consumption admission
+    inputs_rec = prereg.get("inputs") or {}
+    expected_inputs = sorted(set(sel.get("train24", []))
+                             | set(sel.get("val31", [])))
+    actual_inputs = sorted(inputs_rec)
+    if actual_inputs != expected_inputs:
+        problems.append(
+            f"inputs_set_mismatch:missing={sorted(set(expected_inputs) - set(actual_inputs))}"
+            f":extra={sorted(set(actual_inputs) - set(expected_inputs))}")
+    for demo, rec in inputs_rec.items():
         for key, suffix, d in (("npz", "_original.npz", npz_dir), ("pt", ".pt", pt_dir)):
             p = Path(d) / f"{demo}{suffix}"
             if not p.is_file():
@@ -458,7 +565,10 @@ def load_w1_derived_clip(row: dict, schedule_cache_dir: Path,
     (plan §4.1): derived representation + keyed schedule cache + explicit
     source/target scene split. Teacher root/joints never enter the
     condition — changing only the teacher robot state leaves every
-    condition channel bit-identical.
+    condition channel bit-identical. The derived representation must carry
+    the fitted similarity scale: the source-scene schedule is inferred (on
+    a cache miss) against the SCALED hull, and the scale is part of the
+    audited representation a consumer may re-verify (review fix 1).
     """
     import numpy as np
 
@@ -475,9 +585,14 @@ def load_w1_derived_clip(row: dict, schedule_cache_dir: Path,
                   / schedule_cache_filename(row["demo"], key))
     with np.load(dpath, allow_pickle=False) as z:
         src_box = z["source_obj_pose"].copy()
+        scale = float(np.asarray(z["similarity_scale"]).reshape(()))
+    if not (math.isfinite(scale) and scale > 0.0):
+        raise ValueError(f"{row['demo']}: derived similarity_scale={scale} "
+                         "not finite > 0")
     return build_interaction_clip(
         dpath.name, schedule_cache_file=cache_file,
-        teacher_traj_dir=dpath.parent, source_obj_pose=src_box)
+        teacher_traj_dir=dpath.parent, source_obj_pose=src_box,
+        source_box_scale=scale)
 
 
 def w1_rows_for_split(manifest: dict, split: str) -> list[dict]:

@@ -205,20 +205,38 @@ def load_teacher_baseline(path: Path, mode: str, gate: float, files: list[str], 
     return (ok, why, doc.get("teacher_baseline_rows", []))
 
 
+def guard_report_output(path: Path) -> Path:
+    """W1 report output guard (review fix 10): the resolved target must sit
+    under ``derived/`` (protecting resources/ source data and any other
+    tree) and must not already exist — reports never overwrite prior
+    evidence; re-runs write to a new path."""
+    from ireset.data.a2_integrity import guard_output_dir
+
+    resolved = guard_output_dir(path)
+    if resolved.exists():
+        raise SystemExit(
+            f"report output already exists (never overwritten): {resolved} "
+            "-- choose a new path or an attempt directory")
+    return resolved
+
+
 def run_w1_raw_eval(args) -> None:
     """W1 raw full-length evaluation (omniretarget_w1_a3bc_plan §5.3).
 
     Fixed expected-set (the training manifest's val31 — failures and short
     trajectories stay rows in the denominator, never dropped), FULL clip
     length (the stitched trajectory covers the last frame through the
-    trailing T-60 window), explicit model/manifest identity verification,
-    and ZERO RepairPipeline construction or invocation — raw diagnostics
-    only (the frozen IndependentValidator is used for bare-output checks;
-    it is not the repairer).
+    trailing T-60 window), the UNIFIED consumption admission re-run here
+    (preregistration anchors/inputs, cache CONTENT re-hashing, model
+    identity binding — review fix 8: a checkpoint pointing at this
+    manifest but a foreign cache/stats is refused), and ZERO
+    RepairPipeline construction or invocation — raw diagnostics only (the
+    frozen IndependentValidator is used for bare-output checks; it is not
+    the repairer).
     """
     from ireset.data import a2_integrity as integ
     from ireset.data import w1_training as w1
-    from ireset.paths import PROJECT_ROOT, path_for_record
+    from ireset.paths import OMOMO_NEW_DIR, PROJECT_ROOT, TEACHER_TRAJ_DIR, path_for_record
 
     manifest_path = args.training_manifest.expanduser().resolve()
     manifest = json.loads(manifest_path.read_text())
@@ -233,8 +251,23 @@ def run_w1_raw_eval(args) -> None:
     if integ.sha256_file(prereg_path) != prereg_rec["sha256"]:
         raise SystemExit("training manifest not bound to its preregistration")
     prereg = json.loads(prereg_path.read_text())
+    # unified consumption admission (review fix 8): the same preregistration
+    # legs every other consumer runs — drifted inputs here cannot hide
+    # behind an intact manifest binding
+    check = w1.verify_preregistration(prereg, PROJECT_ROOT,
+                                      TEACHER_TRAJ_DIR, OMOMO_NEW_DIR)
+    if not check["passed"]:
+        raise SystemExit(f"preregistration re-verification failed: "
+                         f"{check['problems']}")
+    cache_check = w1.verify_cache_contents(args.cache_dir, manifest, prereg,
+                                           PROJECT_ROOT)
+    if not cache_check["passed"]:
+        raise SystemExit(f"W1 cache content verification failed: "
+                         f"{cache_check['problems']}")
     assets_sha = prereg["assets"]["a1_assets_sha256"]
     code_sha = w1.condition_code_sha256(PROJECT_ROOT)
+    cache_ident_sha = integ.sha256_file(args.cache_dir / "cache_identity.json")
+    root_stats_sha = integ.sha256_file(args.cache_dir / "root_stats.npz")
 
     if args.expected_set == "val31":
         expected = list(manifest["selection"]["val31"])
@@ -253,12 +286,23 @@ def run_w1_raw_eval(args) -> None:
         ckpt = torch.load(models_dir / m / "best.pt", map_location=device,
                           weights_only=False)
         ident = ckpt.get("identity") or {}
-        if (ident.get("training_manifest", {}).get("sha256") != manifest_sha
-                or ident.get("protocol") != w1.MOTION_PROTOCOL_VERSION):
+        problems = []
+        if ident.get("training_manifest", {}).get("sha256") != manifest_sha:
+            problems.append("manifest")
+        if ident.get("protocol") != w1.MOTION_PROTOCOL_VERSION:
+            problems.append("protocol")
+        if ident.get("cache", {}).get("identity_sha256") != cache_ident_sha:
+            problems.append("cache_identity")
+        if ident.get("cache", {}).get("root_stats_sha256") != root_stats_sha:
+            problems.append("root_stats")
+        if ident.get("model_type") != m:
+            problems.append("model_type")
+        if problems:
             raise SystemExit(
-                f"model {m}: checkpoint identity does not match this training "
-                f"manifest (ckpt={ident.get('training_manifest')}) — a "
-                "checkpoint from another manifest/cache is refused")
+                f"model {m}: checkpoint identity does not match the current "
+                f"manifest/cache ({problems}: ckpt={ident.get('training_manifest')}"
+                f"/{ident.get('cache')}) — a checkpoint from another "
+                "manifest/cache/stats combination is refused")
         generators[m] = load_generator(m, device, args.ddim_steps, models_dir)
     kin = G1Kinematics()
     validator = IndependentValidator(cfg=load_mode_configs("strict")[1])
@@ -336,8 +380,14 @@ def run_w1_raw_eval(args) -> None:
         },
         "rows": out_rows,
         "repair_pipeline_invocations": 0,
+        "admission": {"preregistration_reverified": True,
+                      "cache_content_reverified": True},
     }
-    out = Path(args.output) if args.output else OUT / "w1_raw_generation_eval.json"
+    if args.output:
+        out = guard_report_output(Path(args.output))
+    else:
+        out = integ.allocate_attempt(
+            OUT / "w1_raw") / "w1_raw_generation_eval.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=2, default=float))
     print(json.dumps(report["counts"], indent=2))

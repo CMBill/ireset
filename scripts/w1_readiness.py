@@ -115,13 +115,21 @@ def check_b(run_root: Path, cache: dict | None) -> dict:
     if cache is None:
         return {"passed": False, "reasons": ["cache_no_attempts"]}
     rec = cache["record"]
+    cache_dir = cache["dir"]
     manifest_path = PROJECT_ROOT / rec["training_manifest"]["path"]
     if integ.sha256_file(manifest_path) != rec["training_manifest"]["sha256"]:
         reasons.append("cache_manifest_binding_drifted")
     prereg_path = run_root / "freeze" / "preregistration.json"
     if integ.sha256_file(prereg_path) != rec["preregistration"]["sha256"]:
         reasons.append("cache_prereg_binding_drifted")
-    root_stats = cache["dir"] / "root_stats.npz"
+    # review fix 6: CONTENT re-verification — root stats and every keyed
+    # schedule re-hashed against the identity record, keys re-derived from
+    # the current code/assets, stats identity reconciled with the manifest
+    manifest = json.loads(manifest_path.read_text())
+    prereg = json.loads(prereg_path.read_text())
+    content = w1.verify_cache_contents(cache_dir, manifest, prereg, PROJECT_ROOT)
+    reasons += [f"cache_content:{p}" for p in content["problems"]]
+    root_stats = cache_dir / "root_stats.npz"
     if not root_stats.is_file():
         reasons.append("root_stats_missing")
     if reasons:
@@ -137,7 +145,7 @@ def check_b(run_root: Path, cache: dict | None) -> dict:
             ds = TeacherWindowDataset(
                 split, tokenizer, window=w1.WINDOW_F, stride=w1.WINDOW_STRIDE,
                 training_manifest=manifest_path,
-                schedule_cache_dir=cache["dir"] / "schedules")
+                schedule_cache_dir=cache_dir / "schedules")
             loader = DataLoader(ds, batch_size=4, shuffle=False)
             batch = next(iter(loader))
             out[split] = {"n_windows": len(ds), "n_clips": len(ds.clips),
@@ -152,21 +160,117 @@ def check_b(run_root: Path, cache: dict | None) -> dict:
             "datasets": out, "cache_attempt": cache["attempt"]}
 
 
-def check_c(run_root: Path) -> dict:
+def _recompute_s0_verdict(summary: dict, history: list[dict]) -> tuple[dict, list[str]]:
+    """Recompute EVERY S0 gate from the raw facts (review fix 2) — the
+    recorded ``verdict`` string is never trusted by itself."""
+    import math as _math
+
+    import numpy as np
+
+    probes = summary.get("probes") or []
+    reasons: list[str] = []
+    steps = summary.get("optimizer_steps")
+    if not isinstance(steps, int):
+        reasons.append("optimizer_steps_not_an_int")
+        steps = -1
+    gates = {}
+    gates["min_100_optimizer_steps"] = steps >= w1.S0_MIN_STEPS
+    gates["max_1000_optimizer_steps"] = steps <= w1.S0_MAX_STEPS
+    gates["micro_batches_real"] = (summary.get("micro_batches", 0)
+                                   >= steps * summary.get("grad_accum", 0) > 0)
+    gates["all_finite"] = (summary.get("nonfinite_stop") is None
+                           and all(
+                               isinstance(h.get("gnorm"), (int, float))
+                               and _math.isfinite(h["gnorm"]) for h in history))
+    # contact branch silence recomputed from the per-step loss parts
+    contact_keys = ("contact_m2", "contact")
+    gates["contact_branch_silent"] = not any(
+        anyk in h for h in history for anyk in contact_keys)
+    errs = [p.get("motion_reconstruction") for p in probes]
+    gates["probe_count_ge_40"] = len(errs) >= w1.S0_PROBE_MIN
+    if len(errs) >= 2 * w1.S0_TREND_WINDOW and all(
+            isinstance(e, (int, float)) and _math.isfinite(e) for e in errs):
+        first = float(np.mean(errs[:w1.S0_TREND_WINDOW]))
+        last = float(np.mean(errs[-w1.S0_TREND_WINDOW:]))
+        gates["trend_fit_demonstrated"] = last < first
+        gates["first20_mean"], gates["last20_mean"] = first, last
+    else:
+        gates["trend_fit_demonstrated"] = False
+        gates["first20_mean"] = gates["last20_mean"] = None
+    return gates, reasons
+
+
+def check_c(run_root: Path, cache: dict | None, prereg: dict) -> dict:
+    """Recompute both models' S0 gates from their recorded facts AND bind
+    the checkpoints to the CURRENT manifest/cache identity (review fix 2:
+    a doctored ``verdict=passed`` with zero steps, deleted probes, a
+    missing checkpoint or a foreign-identity checkpoint must all fail)."""
+    import torch
+
     reasons: list[str] = []
     per_model = {}
+    manifest_sha = cache["record"]["training_manifest"]["sha256"] if cache else None
+    cache_ident_sha = root_stats_sha = None
+    if cache is not None:
+        cache_ident_sha = integ.sha256_file(cache["identity"])
+        root_stats_sha = integ.sha256_file(cache["dir"] / "root_stats.npz")
     for model in ("deterministic", "diffusion"):
         att = latest_attempt(run_root / "s0" / model)
         if att is None:
             reasons.append(f"s0_{model}_no_attempts")
             per_model[model] = None
             continue
+        att_dir = (PROJECT_ROOT / att["summary"]).parent
         summary = json.loads((PROJECT_ROOT / att["summary"]).read_text())
-        per_model[model] = {"verdict": summary["verdict"],
-                            "gates": summary["gates"],
-                            "optimizer_steps": summary["optimizer_steps"]}
-        if summary["verdict"] != "passed":
-            reasons.append(f"s0_{model}_{summary['verdict']}")
+        history_path = att_dir / "loss_history.json"
+        history = (json.loads(history_path.read_text())
+                   if history_path.is_file() else [])
+        gates, gate_reasons = _recompute_s0_verdict(summary, history)
+        reasons += [f"s0_{model}:{r}" for r in gate_reasons]
+        # checkpoint evidence: exists, reloadable, bound to CURRENT identity
+        ckpt_path = att_dir / "last.pt"
+        ident_problems = []
+        if not ckpt_path.is_file():
+            ident_problems.append("checkpoint_missing")
+        else:
+            try:
+                ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            except Exception as exc:  # noqa: BLE001
+                ident_problems.append(f"checkpoint_unreadable:{type(exc).__name__}")
+                ck = None
+            if ck is not None:
+                ci = ck.get("identity") or {}
+                if ci.get("training_manifest", {}).get("sha256") != manifest_sha:
+                    ident_problems.append("checkpoint_manifest_identity_mismatch")
+                if ci.get("cache", {}).get("identity_sha256") != cache_ident_sha:
+                    ident_problems.append("checkpoint_cache_identity_mismatch")
+                if ci.get("cache", {}).get("root_stats_sha256") != root_stats_sha:
+                    ident_problems.append("checkpoint_root_stats_mismatch")
+                if ck.get("step") != summary.get("optimizer_steps"):
+                    ident_problems.append("checkpoint_step_mismatch")
+        reasons += [f"s0_{model}:{p}" for p in ident_problems]
+        # small set must come from the CURRENT registration
+        pilot6 = list(prereg.get("selection", {}).get("pilot6_from_a1", []))
+        small = summary.get("identity", {}).get("small_set_demos") or []
+        if not small or not set(small) <= set(pilot6):
+            reasons.append(f"s0_{model}:small_set_not_from_registered_pilot6")
+        reload_ok = summary.get("gates", {}).get("reload_reproducible")
+        if reload_ok is not True:
+            reasons.append(f"s0_{model}:reload_reproducible_not_true")
+        recomputed_pass = (all(gates.values()) and not ident_problems
+                           and reload_ok is True)
+        if summary.get("verdict") != "passed":
+            reasons.append(f"s0_{model}_{summary.get('verdict')}")
+        elif not recomputed_pass:
+            reasons.append(f"s0_{model}:recorded_verdict_not_reproducible")
+        per_model[model] = {
+            "verdict": summary.get("verdict"),
+            "recomputed_gates": {k: bool(v) if isinstance(v, bool) else v
+                                 for k, v in gates.items()},
+            "identity_problems": ident_problems,
+            "optimizer_steps": summary.get("optimizer_steps"),
+            "small_set_demos": small,
+        }
     return {"passed": not reasons, "reasons": reasons, "per_model": per_model}
 
 
@@ -181,7 +285,10 @@ def main() -> int:
     a3 = check_a3(run_root)
     cache = check_cache_binding(run_root)
     b = check_b(run_root, cache)
-    c = check_c(run_root)
+    prereg_path = run_root / "freeze" / "preregistration.json"
+    prereg = (json.loads(prereg_path.read_text())
+              if prereg_path.is_file() else {})
+    c = check_c(run_root, cache, prereg)
 
     ready = registration["passed"] and a3["passed"] and b["passed"] and c["passed"]
     record = {

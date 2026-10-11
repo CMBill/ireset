@@ -6,11 +6,21 @@ FK-loss gradients stay simple to audit), AdamW, gradient clipping. Records
 per-step wall time, peak CUDA memory and the validation loss history;
 checkpoints keep the tokenizer statistics so a checkpoint is
 self-contained.
+
+Formal best selection (W1 plan §5.2/§5.3, review fix 9): when a
+``formal_eval`` callback is provided, ``best.pt`` is selected ONLY by the
+demonstration-macro generation metric the callback measures over the FULL
+expected val set, evaluated every ``formal_eval_every`` optimizer steps —
+never by the window-validation loss (a window loss may improve while the
+macro metric worsens). Missing/incomplete formal evidence means selection
+is insufficient: no ``best.pt`` is written for that evaluation, and if no
+evaluation ever completes, ``best.pt`` simply does not exist.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from dataclasses import asdict, dataclass, field
@@ -77,13 +87,21 @@ class TrainConfig:
 
 class Trainer:
     def __init__(self, cfg: TrainConfig, tokenizer, train_ds, val_ds, out_dir: Path,
-                 identity: dict | None = None) -> None:
+                 identity: dict | None = None,
+                 formal_eval=None, formal_eval_every: int | None = None) -> None:
         self.cfg = cfg
         self.tokenizer = tokenizer
         self.train_ds, self.val_ds = train_ds, val_ds
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.identity = identity
+        #: formal-generation best-selection hook (W1 §5.3, review fix 9):
+        #: callable(model, conditioner) -> {"n_expected", "n_ok",
+        #: "macro_mpjpe_m", "per_demo": [...]}; complete evidence required
+        self.formal_eval = formal_eval
+        self.formal_eval_every = formal_eval_every
+        if (formal_eval is None) != (formal_eval_every is None):
+            raise ValueError("formal_eval and formal_eval_every come together")
 
         torch.manual_seed(cfg.seed)
         np.random.seed(cfg.seed)
@@ -146,10 +164,39 @@ class Trainer:
             x0_pred = self.model(memory, batch["x0"].shape[1])
         return self.loss_fn(x0_pred, batch)
 
+    def _run_formal_eval(self) -> dict:
+        """One formal-generation evaluation through the registered callback.
+
+        Any exception is REGISTERED as incomplete evidence — the run keeps
+        going, but that evaluation can never select ``best.pt``."""
+        assert self.formal_eval is not None
+        was_training = self.model.training
+        self.model.eval(); self.conditioner.eval()
+        try:
+            with torch.no_grad():
+                out = dict(self.formal_eval(self.model, self.conditioner))
+        except Exception as exc:  # noqa: BLE001 -- evidence, not a crash
+            out = {"n_expected": None, "n_ok": 0, "macro_mpjpe_m": None,
+                   "complete": False,
+                   "error": f"{type(exc).__name__}: {exc}"}
+        finally:
+            if was_training:
+                self.model.train(); self.conditioner.train()
+        complete = (
+            out.get("n_expected") is not None
+            and out.get("n_ok") == out.get("n_expected")
+            and isinstance(out.get("macro_mpjpe_m"), (int, float))
+            and math.isfinite(float(out["macro_mpjpe_m"])))
+        out["complete"] = bool(complete)
+        return out
+
     def run(self) -> dict:
         cfg = self.cfg
         history, val_history = [], []
+        formal_history: list[dict] = []
         best_val = float("inf")
+        best_formal = float("inf")
+        best_formal_step = None
         step, ms_ema = 0, None
         data_iter = iter(self.train_loader)
         self.model.train(); self.conditioner.train()
@@ -190,7 +237,24 @@ class Trainer:
                 val_history.append({"step": step, **val})
                 print(f"[{cfg.model_type}] VAL step {step}: total={val['total']:.4f}", flush=True)
                 self.save("last.pt", step, val, identity=self.identity)
-                if val["total"] < best_val:
+                if self.formal_eval is not None:
+                    # W1 §5.3 best rule (review fix 9): best.pt comes ONLY
+                    # from complete formal macro evidence — the window loss
+                    # never selects, and incomplete evidence selects nothing
+                    if step % self.formal_eval_every == 0 or step == cfg.steps:
+                        formal = self._run_formal_eval()
+                        formal_history.append({"step": step, **formal})
+                        macro = formal["macro_mpjpe_m"]
+                        print(f"[{cfg.model_type}] FORMAL step {step}: "
+                              f"complete={formal['complete']} macro={macro}",
+                              flush=True)
+                        if (formal["complete"]
+                                and float(macro) < best_formal):
+                            best_formal = float(macro)
+                            best_formal_step = step
+                            self.save("best.pt", step, val,
+                                      identity=self.identity, formal=formal)
+                elif val["total"] < best_val:
                     best_val = val["total"]
                     self.save("best.pt", step, val, identity=self.identity)
 
@@ -203,11 +267,18 @@ class Trainer:
             "peak_cuda_mem_gb": round(torch.cuda.max_memory_allocated() / 2**30, 2)
             if torch.cuda.is_available() else None,
             "best_val": best_val,
+            "best_selection_rule": ("formal_macro_mpjpe" if self.formal_eval
+                                    is not None else "window_val_loss"),
+            "best_formal_macro_mpjpe_m": (best_formal
+                                          if self.formal_eval is not None
+                                          else None),
+            "best_formal_step": best_formal_step,
             "n_train_windows": len(self.train_ds),
             "n_val_windows": len(self.val_ds),
         }
         (self.out_dir / "summary.json").write_text(json.dumps(
-            {**summary, "val_history": val_history}, indent=2, default=float))
+            {**summary, "val_history": val_history,
+             "formal_history": formal_history}, indent=2, default=float))
         (self.out_dir / "loss_history.json").write_text(json.dumps(history))
         return summary
 
@@ -247,13 +318,14 @@ class Trainer:
         return out
 
     def save(self, name: str, step: int, val: dict,
-             identity: dict | None = None) -> None:
+             identity: dict | None = None, formal: dict | None = None) -> None:
         torch.save(
             {
                 "model": self.model.state_dict(),
                 "conditioner": self.conditioner.state_dict(),
                 "step": step,
                 "val": val,
+                "formal": formal,
                 "config": asdict(self.cfg),
                 "root_stats": {"mean": self.tokenizer.root_stats.mean,
                                "std": self.tokenizer.root_stats.std},

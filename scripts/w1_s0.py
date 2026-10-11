@@ -69,8 +69,48 @@ def _append_costs(run_root: Path, stage: str, wall: float, extra: dict) -> None:
     costs_path.write_text(json.dumps({"invocations": entries}, indent=2))
 
 
+S0_COST_STAGES = ("s0_deterministic", "s0_diffusion")
+
+
+def historical_s0_cost_s(run_root: Path) -> float | None:
+    """Sum of PRIOR S0 model walls from the run-root cost ledger.
+
+    Returns ``None`` when the history is UNKNOWN — S0 attempts exist on
+    disk but the ledger cannot account for them (missing file or entries
+    without a finite wall). Unknown history is a STOP condition (review
+    fix 12): the shared 1h budget cannot be proven unexhausted.
+    """
+    import math as _math
+
+    attempts_seen = 0
+    for model in ("deterministic", "diffusion"):
+        idx = run_root / "s0" / model / integ.ATTEMPTS_INDEX
+        if idx.is_file():
+            attempts_seen += len(json.loads(idx.read_text())["attempts"])
+    costs_path = run_root / "costs.json"
+    if attempts_seen == 0:
+        return 0.0
+    if not costs_path.is_file():
+        return None
+    entries = json.loads(costs_path.read_text()).get("invocations", [])
+    total, accounted = 0.0, 0
+    for e in entries:
+        if e.get("stage") in S0_COST_STAGES:
+            w = e.get("wall_s")
+            if not (isinstance(w, (int, float)) and _math.isfinite(w) and w >= 0):
+                return None
+            total += float(w)
+            accounted += 1
+    if accounted < attempts_seen:
+        return None      # attempts without a ledger row: unknown history
+    return total
+
+
 def verify_cache_binding(cache_dir: Path, manifest_path: Path,
                          prereg_path: Path) -> dict:
+    """Preflight: the cache must be bound AND its CONTENT re-verified —
+    binding hashes alone cannot tell a tampered root-stats/schedule file
+    from the produced one (review fix 6)."""
     ident_path = cache_dir / "cache_identity.json"
     if not ident_path.is_file():
         raise SystemExit(f"cache identity missing: {ident_path}")
@@ -80,8 +120,10 @@ def verify_cache_binding(cache_dir: Path, manifest_path: Path,
         problems.append("cache_not_bound_to_manifest")
     if ident.get("preregistration", {}).get("sha256") != integ.sha256_file(prereg_path):
         problems.append("cache_not_bound_to_preregistration")
-    if not (cache_dir / "root_stats.npz").is_file():
-        problems.append("root_stats_missing")
+    manifest = json.loads(manifest_path.read_text())
+    prereg = json.loads(prereg_path.read_text())
+    problems += w1.verify_cache_contents(cache_dir, manifest, prereg,
+                                         PROJECT_ROOT)["problems"]
     if problems:
         raise SystemExit(f"cache identity problems: {problems}")
     return ident
@@ -280,6 +322,11 @@ def run_s0_model(model_type: str, cfg, tokenizer, small_batch: dict,
         "optimizer_steps": step,
         "micro_batches": micro_batches,
         "grad_accum": cfg.grad_accum,
+        # review fix 11: what the training loop ACTUALLY consumed — equal
+        # micro-batches of the full small set, not 4+2 ragged batches
+        "small_set_batch_size": int(small_batch["x0"].shape[0]),
+        "samples_per_optimizer_step": int(
+            small_batch["x0"].shape[0] * cfg.grad_accum),
         "wall_s": round(wall_s, 1),
         "ms_per_step_mean": round(float(np.mean([h["ms"] for h in history])), 1)
         if history else None,
@@ -383,7 +430,23 @@ def main() -> int:
 
     models = (["deterministic", "diffusion"] if args.model == "both"
               else [args.model])
-    budget_deadline = t0 + w1.S0_BUDGET_S
+    # review fix 7: ONE clock (monotonic) for the deadline; PRIOR S0
+    # attempts are deducted from the shared 1h budget, and an UNKNOWN cost
+    # history is a stop condition (the budget cannot be proven unexhausted)
+    hist = historical_s0_cost_s(run_root)
+    if hist is None:
+        raise SystemExit(
+            "S0 cost history unknown (attempts exist without ledger rows) — "
+            "refusing to run without a provable remaining budget")
+    remaining = w1.S0_BUDGET_S - hist
+    if remaining <= 0:
+        raise SystemExit(
+            f"S0 budget already exhausted: historical {hist:.1f}s of "
+            f"{w1.S0_BUDGET_S}s (run refuses to exceed the shared budget)")
+    t0_mono = time.perf_counter()
+    budget_deadline = t0_mono + remaining
+    print(f"[s0] budget: total {w1.S0_BUDGET_S}s, historical {hist:.1f}s, "
+          f"remaining {remaining:.1f}s")
     results = {}
     identity = {
         "experiment_id": w1.EXPERIMENT_ID,
@@ -392,9 +455,14 @@ def main() -> int:
                               "sha256": integ.sha256_file(manifest_path)},
         "cache": {"dir": path_for_record(args.cache_dir),
                   "identity_sha256": integ.sha256_file(
-                      args.cache_dir / "cache_identity.json")},
+                      args.cache_dir / "cache_identity.json"),
+                  "root_stats_sha256": integ.sha256_file(
+                      args.cache_dir / "root_stats.npz")},
         "config_file": "configs/train/omniretarget_motion.yaml",
         "small_set_demos": small_demos,
+        "budget": {"total_s": w1.S0_BUDGET_S,
+                   "historical_s": round(hist, 1),
+                   "remaining_at_start_s": round(remaining, 1)},
         "stage": "s0",
     }
     for model_type in models:
@@ -402,12 +470,18 @@ def main() -> int:
         model_identity = {**identity, "model_type": model_type}
         s0_root = run_root / "s0" / model_type
         attempt_dir = integ.allocate_attempt(s0_root)
+        # review fix 11: the small set trains as ONE equal-size micro-batch
+        # (batch 4 over 6 windows produced 4+2 micro-batches whose equal
+        # weighting over/under-weighted samples); every micro-batch now
+        # contains exactly len(small_ds) samples
         g = torch.Generator().manual_seed(cfg.seed)
+        small_batch_size = max(1, len(small_ds))
         small_loader = DataLoader(
-            small_ds, batch_size=cfg.micro_batch, shuffle=True, generator=g,
+            small_ds, batch_size=small_batch_size, shuffle=True, generator=g,
             num_workers=0, drop_last=False, worker_init_fn=_worker_thread_limits)
         print(f"[s0] {model_type}: target {cfg.steps} steps, "
-              f"small set={small_demos}")
+              f"small set={small_demos} (micro-batch {small_batch_size})")
+        t_model = time.time()
         summary = run_s0_model(model_type, cfg, tokenizer, small_batch,
                                small_loader, device, model_identity, attempt_dir,
                                budget_deadline)
@@ -418,13 +492,17 @@ def main() -> int:
             "optimizer_steps": summary["optimizer_steps"],
             "summary": path_for_record(attempt_dir / "s0_summary.json"),
         })
-        # costs are WALL time: t0 is time.time(), so the delta must be too —
-        # mixing in perf_counter() (a monotonic offset) produced negative
-        # "durations" (~-1.8e9); costs must be non-negative and finite
+        # costs are WALL time per model attempt (review fix 12): each model
+        # measures from its OWN start, so the second entry cannot include
+        # the first model's cost; the budget consumed is also registered
+        consumed = hist + (time.time() - t_model)
         _append_costs(run_root, f"s0_{model_type}",
-                      time.time() - t0,
-                      {"verdict": summary["verdict"],
-                       "optimizer_steps": summary["optimizer_steps"]})
+                      time.time() - t_model,
+                      {"attempt": attempt_dir.name,
+                       "verdict": summary["verdict"],
+                       "optimizer_steps": summary["optimizer_steps"],
+                       "budget_consumed_cumulative_s": round(consumed, 1)})
+        hist = consumed
         results[model_type] = summary
         print(f"[s0] {model_type}: verdict={summary['verdict']} "
               f"gates={json.dumps(summary['gates'])}")

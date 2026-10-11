@@ -110,12 +110,18 @@ def infer_reference_schedule(
     foot_speed_mps: float = 0.35,
     min_duration: int = 3,
     fps: float = 30.0,
+    box_scale: float = 1.0,   # W1 source-scene geometry scale (plan §3.3)
 ) -> ContactSchedule:
     """Infer hand/foot contact intervals from the *reference* human.
 
     Hand metric: distance from the hand centroid (wrist + fingertips) to the
     box surface in the source object frame. Foot metric: minimum world height
     of ankle/toe, gated by horizontal speed.
+
+    ``box_scale`` shrinks/grows the source box hull about its body origin:
+    the W1 source box is the PT box under the A1 similarity, whose geometry
+    is the base largebox scaled by the fitted scale — measuring against the
+    unscaled hull systematically misjudges contacts (W1 review fix 1).
     """
     from ireset.geometry.distance_adapter import largebox_hull_surface_distance
 
@@ -130,7 +136,8 @@ def infer_reference_schedule(
             # acceptance-grade hull metric; the analytic AABB is a training
             # proxy whose error (~1.8cm at a true 2cm gap) is the same order
             # as these thresholds and must not decide contacts
-            dist = largebox_hull_surface_distance(centroid, source_obj_pose)
+            dist = largebox_hull_surface_distance(
+                centroid, source_obj_pose, scale=box_scale)
         for s, e in hysteresis_intervals(dist, hand_enter_m, hand_exit_m, min_duration):
             schedule.intervals.append(ContactInterval(hand, s, e, "object"))
 

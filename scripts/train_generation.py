@@ -105,6 +105,89 @@ def w1_identity(manifest_path: Path, cache_dir: Path, config_path: Path,
     }
 
 
+def guard_w1_out(out: Path) -> Path:
+    """W1 training output guard (review fix 10): must resolve under
+    ``derived/`` and must not collide with prior artifacts — a non-empty
+    directory gets a fresh ``attempt_NNN`` instead of overwriting."""
+    resolved = integ.guard_output_dir(out)
+    if resolved.exists() and any(resolved.iterdir()):
+        resolved = integ.allocate_attempt(resolved)
+    return resolved
+
+
+def make_formal_eval(manifest_path: Path, cache_dir: Path, tokenizer,
+                     device: str, contract: dict, model_type: str):
+    """W1 formal-selection callback (plan §5.2 contract, review fix 9).
+
+    Builds every expected val demo's condition + teacher scene ONCE
+    (condition invariance: they depend only on the audited derived
+    representation, never on model weights); each call generates the FULL
+    clip length for every expected demo and returns the demonstration-macro
+    teacher-fit FK MPJPE. A demo that fails to generate keeps its row with
+    a status — one failure makes the evidence incomplete and ``best.pt``
+    unattainable at that evaluation.
+    """
+    import numpy as np
+    import torch as _torch
+
+    from eval_generation import box_frame, fk_keypoints
+    from ireset.data import w1_training as _w1
+    from ireset.kinematics.mujoco_adapter import G1Kinematics
+    from ireset.model.generator import G1Generator
+    from ireset.paths import PROJECT_ROOT
+
+    manifest = json.loads(Path(manifest_path).read_text())
+    prereg = json.loads(
+        (PROJECT_ROOT / manifest["preregistration"]["path"]).read_text())
+    assets_sha = prereg["assets"]["a1_assets_sha256"]
+    code_sha = _w1.condition_code_sha256(PROJECT_ROOT)
+    seed = int(contract.get("full_generation_seed", 7))
+    expected = [r for r in manifest["rows"]
+                if r.get("split") == "val"
+                and r.get("admission", {}).get("motion")]
+    clips = []
+    for r in expected:
+        clip = _w1.load_w1_derived_clip(r, Path(cache_dir) / "schedules",
+                                        PROJECT_ROOT, assets_sha, code_sha)
+        cond = clip.condition.truncate(clip.T)
+        teacher = np.concatenate(
+            [clip.root, clip.q, cond.target_obj_pose], axis=1)
+        clips.append((r["demo"], cond, teacher, clip.T))
+    kin = G1Kinematics()
+
+    def callback(model, conditioner):
+        gen = G1Generator(model, conditioner, tokenizer, device=device,
+                          ddim_steps=25)
+        per_demo = []
+        vals = []
+        for demo, cond, teacher, T in clips:
+            rec = {"demo": demo, "T": T}
+            try:
+                traj = gen.sample(cond, seed=seed)
+                scene = traj.scene_qpos(cond.target_obj_pose)
+                kp_r = fk_keypoints(kin, scene)
+                kp_t = fk_keypoints(kin, teacher)
+                mpjpe = float(np.linalg.norm(
+                    box_frame(kp_r, cond.target_obj_pose)
+                    - box_frame(kp_t, cond.target_obj_pose), axis=-1).mean())
+                if not np.isfinite(mpjpe):
+                    rec.update(status="nonfinite", mpjpe_m=None)
+                else:
+                    rec.update(status="ok", mpjpe_m=mpjpe)
+                    vals.append(mpjpe)
+            except Exception as exc:  # noqa: BLE001 -- kept as a row
+                rec.update(status="failed",
+                           error=f"{type(exc).__name__}: {exc}",
+                           mpjpe_m=None)
+            per_demo.append(rec)
+        macro = float(np.mean(vals)) if len(vals) == len(clips) else None
+        return {"n_expected": len(clips), "n_ok": len(vals),
+                "macro_mpjpe_m": macro, "per_demo": per_demo,
+                "seed": seed, "model_type": model_type}
+
+    return callback
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", choices=("diffusion", "deterministic"), required=True)
@@ -122,6 +205,8 @@ def main() -> None:
     args = ap.parse_args()
 
     identity = None
+    formal_eval = None
+    formal_every = None
     if args.training_manifest is not None:
         missing = [k for k, v in (("--config", args.config),
                                   ("--cache-dir", args.cache_dir),
@@ -146,7 +231,17 @@ def main() -> None:
             "val", tokenizer, window=60, stride=30,
             training_manifest=args.training_manifest,
             schedule_cache_dir=args.cache_dir / "schedules")
-        out = Path(args.out)
+        # formal best rule (review fix 9): the registered contract is
+        # EXECUTED, not just recorded — best.pt only from complete macro
+        contract = meta.get("formal_validation_contract") or {}
+        formal_every = int(contract.get(
+            "full_generation_every_optimizer_steps", 1000))
+        formal_eval = make_formal_eval(
+            args.training_manifest, args.cache_dir, tokenizer,
+            tcfg.device, contract, args.model)
+        out = guard_w1_out(Path(args.out))
+        print(f"[w1-train] out={out} (best rule: formal macro every "
+              f"{formal_every} steps)")
     else:
         cfg = load_cfg()
         cfg["model_type"] = args.model
@@ -161,12 +256,18 @@ def main() -> None:
         val_ds = TeacherWindowDataset("val", tokenizer, window=60, stride=30,
                                       max_files=min(args.max_files or 10**9, 60))
         out = Path(args.out) if args.out else ROOT / "derived" / "models" / args.model
+        if args.out is not None:
+            # custom outputs must stay inside the writable area even in the
+            # legacy mode (review fix 10); the historical default is already
+            # under derived/models/
+            integ.guard_output_dir(out)
 
     print(f"train windows={len(train_ds)} clips={len(train_ds.clips)} "
           f"excluded={ {k: len(v) for k, v in train_ds.excluded.items()} }")
     print(f"val windows={len(val_ds)} clips={len(val_ds.clips)}")
 
-    trainer = Trainer(tcfg, tokenizer, train_ds, val_ds, out, identity=identity)
+    trainer = Trainer(tcfg, tokenizer, train_ds, val_ds, out, identity=identity,
+                      formal_eval=formal_eval, formal_eval_every=formal_every)
     summary = trainer.run()
     if identity is not None:
         summary["identity"] = identity

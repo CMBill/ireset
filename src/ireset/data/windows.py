@@ -302,6 +302,40 @@ class TeacherWindowDataset(Dataset):
             raise ValueError("manifest val31 selection != preregistration "
                              "selection")
 
+        # review fix 4: rows are checked against the REGISTERED selection as
+        # a whole BEFORE any split filtering — a row relabeled into another
+        # split, a dropped row masked by a duplicated one, or an extra row
+        # must all fail here, not silently change what is consumed
+        all_rows = manifest.get("rows", [])
+        row_demos = [r.get("demo") for r in all_rows]
+        if len(row_demos) != len(set(row_demos)):
+            dupes = sorted({d for d in row_demos if row_demos.count(d) > 1})
+            raise ValueError(f"duplicate demo rows across the manifest: {dupes}")
+        registered = set(sel.get("train24", [])) | set(sel.get("val31", []))
+        if set(row_demos) != registered:
+            missing = sorted(registered - set(row_demos))
+            extra = sorted(set(row_demos) - registered)
+            raise ValueError(
+                f"manifest rows != registered selection: missing={missing} "
+                f"extra={extra}")
+        split_of = {d: ("train" if d in set(sel.get("train24", [])) else "val")
+                    for d in registered}
+        bad_split = [r["demo"] for r in all_rows
+                     if r.get("split") != split_of.get(r.get("demo"))]
+        if bad_split:
+            raise ValueError(
+                f"row split disagrees with the registered selection "
+                f"membership: {bad_split}")
+
+        # review fix 6: the keyed cache is verified by CONTENT (identity
+        # record re-hashes), not by filename — the dataset refuses a cache
+        # whose root stats or any schedule drifted since production
+        cache_check = w1.verify_cache_contents(
+            schedule_cache_dir.parent, manifest, prereg, PROJECT_ROOT)
+        if not cache_check["passed"]:
+            raise ValueError(f"W1 cache content verification failed: "
+                             f"{cache_check['problems']}")
+
         rows = w1.w1_rows_for_split(manifest, self.split)
         if not rows:
             raise ValueError(

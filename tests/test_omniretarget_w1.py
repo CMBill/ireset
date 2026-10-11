@@ -131,6 +131,55 @@ def _append_index(dir_path: Path, entry: dict):
     idx.write_text(json.dumps({"attempts": attempts}))
 
 
+def _write_anchor_standins(root: Path, a1_dir: Path | None = None) -> dict[str, str]:
+    """Write c2/ur/ur-prereg/source-box/a1 stand-ins AT the real anchor
+    paths (inside the synthetic root) and return their hashes — the
+    required nine-anchor set then re-verifies for every consumer."""
+    if a1_dir is not None:
+        for key, fname in (("a1_frozen_lists", "frozen_lists.json"),
+                           ("a1_assets", "assets.json")):
+            rel = w1.W1_PLAN_ANCHORS[key][0]
+            dst = root / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(a1_dir / fname, dst)
+    c2 = {"registration_status": {"complete": True},
+          "baseline": {"verdict": "incomplete"},
+          "recovery": {"status": "no_quality_gain"},
+          "training": {"status": "not_ready"}}
+    ur_prereg = {"experiment_id": "a2_recovery_step03_v1"}
+    ur = {"verdict": "no_quality_gain",
+          "admission": {"passed": True, "ur_coverage": {"missing": []}},
+          "verdict_record": {"complete_evidence": True},
+          "ur_identity": {"preregistration_sha256": None}}
+    sources: dict[str, str] = {}
+    for key, (rel, _) in w1.W1_PLAN_ANCHORS.items():
+        dst = root / rel
+        if key in ("c2_final_decision", "ur_full_comparison",
+                   "ur_preregistration", "a1_pairing_source_boxes",
+                   "split_manifest"):
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if key == "c2_final_decision":
+                dst.write_text(json.dumps(c2))
+            elif key == "ur_preregistration":
+                dst.write_text(json.dumps(ur_prereg))
+            elif key == "a1_pairing_source_boxes":
+                np.savez(dst)
+    # bind the UR report to the ur-preregistration file hash
+    sources["ur_preregistration"] = _sha(
+        root / w1.W1_PLAN_ANCHORS["ur_preregistration"][0])
+    ur["ur_identity"]["preregistration_sha256"] = sources["ur_preregistration"]
+    ur_path = root / w1.W1_PLAN_ANCHORS["ur_full_comparison"][0]
+    ur_path.write_text(json.dumps(ur))
+    sources["ur_full_comparison"] = _sha(ur_path)
+    sources["c2_final_decision"] = _sha(
+        root / w1.W1_PLAN_ANCHORS["c2_final_decision"][0])
+    sources["a1_pairing_source_boxes"] = _sha(
+        root / w1.W1_PLAN_ANCHORS["a1_pairing_source_boxes"][0])
+    sources["split_manifest"] = _sha(
+        root / w1.W1_PLAN_ANCHORS["split_manifest"][0])
+    return sources
+
+
 def build_synthetic_world(tmp_path: Path, *, n_train: int = 2, n_val: int = 2,
                           T: int = 90, val_T: int | None = None,
                           seed0: int = 0) -> dict:
@@ -197,6 +246,14 @@ def build_synthetic_world(tmp_path: Path, *, n_train: int = 2, n_val: int = 2,
     plan.write_text("# synthetic w1 plan\n")
     train24 = w1.select_train24(sorted(train_demos))
     val31 = sorted(val_demos)
+    # anchor stand-ins at the REAL W1_PLAN_ANCHORS paths (inside the
+    # synthetic root) so the required-NINE-anchor set check passes and every
+    # consumer's re-verification finds exactly what the prereg registers
+    anchor_sources = _write_anchor_standins(root, a1_dir=a1)
+    anchor_recs = {
+        key: {"path": rel, "sha256": _sha(root / rel)}
+        for key, (rel, _) in w1.W1_PLAN_ANCHORS.items()}
+    assert set(anchor_recs) == set(w1.W1_PLAN_ANCHORS)    # all nine required
     prereg = {
         "identity": {"experiment_id": w1.EXPERIMENT_ID,
                      "protocol": w1.MOTION_PROTOCOL_VERSION,
@@ -204,16 +261,7 @@ def build_synthetic_world(tmp_path: Path, *, n_train: int = 2, n_val: int = 2,
                      "source_type": w1.SOURCE_TYPE,
                      "published_revision": w1.PUBLISHED_REVISION},
         "plan": {"path": "plan.md", "sha256": _sha(plan)},
-        "anchors": {
-            "a1_frozen_lists": {"path": str((a1 / "frozen_lists.json").relative_to(root)),
-                                "sha256": _sha(a1 / "frozen_lists.json")},
-            "a1_assets": {"path": str((a1 / "assets.json").relative_to(root)),
-                          "sha256": _sha(a1 / "assets.json")},
-            "split_train": {"path": "derived/data/split/train.json",
-                            "sha256": _sha(split_dir / "train.json")},
-            "split_val": {"path": "derived/data/split/val.json",
-                          "sha256": _sha(split_dir / "val.json")},
-        },
+        "anchors": anchor_recs,
         "selection": {"train24": train24,
                       "train24_canonical_sha256": w1.canonical_list_sha256(train24),
                       "val31": val31, "val6": [val31[0]],
@@ -235,18 +283,20 @@ def build_synthetic_world(tmp_path: Path, *, n_train: int = 2, n_val: int = 2,
         for d in dd:
             data = demos[d]
             Td = data["T"]
-            src_box = w1.derive_source_box(
+            src_box, sim_scale = w1.derive_source_box(
                 data["pt"][:, 162:318].reshape(Td, 52, 3), data["human"],
                 data["pt"][:, 318:325])
             dpath = derived_dir / f"{d}_w1_scene.npz"
             np.savez(dpath, qpos=data["qpos"], human_joints=data["human"],
                      fps=np.float64(30.0), source_obj_pose=src_box,
                      target_obj_pose=w1.published_to_project(data["qpos"])[:, 36:43],
+                     similarity_scale=np.float64(sim_scale),
                      meta_json=json.dumps(
                          {"demo": d, "split": split,
                           "protocol": w1.MOTION_PROTOCOL_VERSION,
                           "npz_sha256": _sha(npz_dir / f"{d}_original.npz"),
                           "pt_sha256": _sha(pt_dir / f"{d}.pt"),
+                          "similarity_scale": sim_scale,
                           "layout": "published_verbatim"}))
             rows.append({
                 "demo": d, "split": split,
@@ -281,14 +331,20 @@ def build_synthetic_world(tmp_path: Path, *, n_train: int = 2, n_val: int = 2,
     from ireset.embodied.contact_sites import infer_reference_schedule
     from ireset.data.teacher import schedule_to_cache
 
+    schedule_rows = []
     for r in rows:
         key = w1.schedule_cache_key(r["inputs"]["npz_sha256"],
                                     r["inputs"]["pt_sha256"], assets_sha, code_sha)
         with np.load(root / r["derived"]["path"], allow_pickle=False) as z:
-            human, src, fps = z["human_joints"], z["source_obj_pose"], float(z["fps"])
-        sched = infer_reference_schedule(human, src, fps=fps)
-        np.savez(cache_dir / "schedules" / w1.schedule_cache_filename(r["demo"], key),
-                 intervals=schedule_to_cache(sched))
+            human, src = z["human_joints"], z["source_obj_pose"]
+            fps, scale = float(z["fps"]), float(z["similarity_scale"])
+        sched = infer_reference_schedule(human, src, fps=fps, box_scale=scale)
+        sched_file = cache_dir / "schedules" / w1.schedule_cache_filename(
+            r["demo"], key)
+        np.savez(sched_file, intervals=schedule_to_cache(sched))
+        schedule_rows.append({"demo": r["demo"], "split": r["split"],
+                              "key": key[:16], "sha256": _sha(sched_file),
+                              "full_windows": r["full_windows_F60_s30"]})
     stats, facts = w1.fit_w1_root_stats(rows, root, cache_dir / "schedules",
                                         assets_sha, code_sha)
     stats.save(cache_dir / "root_stats.npz")
@@ -298,8 +354,14 @@ def build_synthetic_world(tmp_path: Path, *, n_train: int = 2, n_val: int = 2,
         "training_manifest": {
             "path": str((audit_dir / "training_manifest.json").relative_to(root)),
             "sha256": _sha(audit_dir / "training_manifest.json")},
-        "root_stats": {"frames_fitted": facts["frames_fitted"],
+        "condition_code_sha256": code_sha,
+        "assets_sha256": assets_sha,
+        "schedule_cache_key_version": w1.SCHEDULE_KEY_VERSION,
+        "root_stats": {"file_sha256": _sha(cache_dir / "root_stats.npz"),
+                       "frames_fitted": facts["frames_fitted"],
+                       "n_train_rows_used": facts["n_train_rows_used"],
                        "files": facts["files"]},
+        "schedule_rows": schedule_rows,
     }))
     _append_index(run / "audit", {
         "attempt": "attempt_001",
@@ -325,6 +387,27 @@ def _patch_paths(monkeypatch, world):
     monkeypatch.setattr(paths_mod, "OMOMO_NEW_DIR", world["pt_dir"])
     monkeypatch.setattr(windows_mod, "TEACHER_TRAJ_DIR", world["npz_dir"])
     monkeypatch.setattr(integ, "DERIVED_DIR", world["root"] / "derived")
+
+
+def _resync_cache_identity(world):
+    """Reconcile the fixture cache-identity record with the CURRENT
+    manifest's admitted set (file hashes unchanged — the files on disk are
+    still the produced ones; only the set bookkeeping follows the edit)."""
+    manifest = json.loads(world["manifest_path"].read_text())
+    ident_path = world["cache_dir"] / "cache_identity.json"
+    ident = json.loads(ident_path.read_text())
+    ident["training_manifest"]["sha256"] = _sha(world["manifest_path"])
+    ident["preregistration"]["sha256"] = _sha(world["prereg_path"])
+    admitted = [r for r in manifest["rows"]
+                if r.get("admission", {}).get("motion")]
+    by_demo = {rec["demo"]: rec for rec in ident["schedule_rows"]}
+    ident["schedule_rows"] = [by_demo[r["demo"]] for r in admitted
+                              if r["demo"] in by_demo]
+    train = [r for r in admitted if r["split"] == "train"]
+    ident["root_stats"]["files"] = [r["demo"] for r in train]
+    ident["root_stats"]["frames_fitted"] = sum(r.get("T", 0) for r in train)
+    ident_path.write_text(json.dumps(ident))
+    return manifest
 
 
 def _tokenizer(world):
@@ -430,8 +513,9 @@ def test_published_roundtrip_sign_equivalence():
 def test_scene_split_facts_pure_z_offset_kept():
     data = _good_arrays()
     scene = w1.published_to_project(data["qpos"])
-    src = w1.derive_source_box(data["pt"][:, 162:318].reshape(90, 52, 3),
-                               data["human"], data["pt"][:, 318:325])
+    src, scale = w1.derive_source_box(data["pt"][:, 162:318].reshape(90, 52, 3),
+                                      data["human"], data["pt"][:, 318:325])
+    assert 0.0 < scale < 2.0
     tgt = scene[:, 36:43]
     facts = w1.scene_split_facts(scene, src, tgt)
     assert facts["offset_pure_z"] is True
@@ -448,16 +532,18 @@ def test_condition_invariant_under_teacher_robot_only_edit(tmp_path):
     name = "sub10_largebox_000_original.npz"
     np.savez(d / name, qpos=data["qpos"], human_joints=data["human"],
              fps=np.float64(30.0))
-    src = w1.derive_source_box(data["pt"][:, 162:318].reshape(90, 52, 3),
-                               data["human"], data["pt"][:, 318:325])
-    base = build_interaction_clip(name, teacher_traj_dir=d, source_obj_pose=src)
+    src, scale = w1.derive_source_box(data["pt"][:, 162:318].reshape(90, 52, 3),
+                                      data["human"], data["pt"][:, 318:325])
+    base = build_interaction_clip(name, teacher_traj_dir=d, source_obj_pose=src,
+                                  source_box_scale=scale)
 
     edited = data["qpos"].copy()
     edited[:, 7:36] += 0.05
     edited[:, 4:7] += 0.03
     np.savez(d / name, qpos=edited, human_joints=data["human"],
              fps=np.float64(30.0))
-    other = build_interaction_clip(name, teacher_traj_dir=d, source_obj_pose=src)
+    other = build_interaction_clip(name, teacher_traj_dir=d, source_obj_pose=src,
+                                   source_box_scale=scale)
     a, b = base.condition, other.condition
     assert np.array_equal(a.human_kps_world, b.human_kps_world)
     assert np.array_equal(a.source_obj_pose, b.source_obj_pose)
@@ -585,7 +671,10 @@ def test_dataset_refuses_missing_keyed_schedule_no_fallback(tmp_path, monkeypatc
     _patch_paths(monkeypatch, world)
     victim = sorted((world["cache_dir"] / "schedules").glob("*.npz"))[0]
     victim.unlink()
-    with pytest.raises(FileNotFoundError, match="no fallback"):
+    # P1-6: the content re-hash catches the missing file at startup (before
+    # any clip load); with content verification satisfied some other way the
+    # keyed-file miss inside load_w1_derived_clip still refuses (no fallback)
+    with pytest.raises(ValueError, match="schedule_file_missing"):
         _w1_dataset(world, "train")
 
 
@@ -600,6 +689,7 @@ def test_dataset_excludes_not_admitted_rows(tmp_path, monkeypatch):
                                                    "reasons": ["synthetic"]}
 
     _repin(world, edit)
+    _resync_cache_identity(world)
     ds = _w1_dataset(world, "train")
     assert ds.excluded["not_admitted"] == [demo]
     assert all(lc.demo != demo for lc in ds.clips)
@@ -616,7 +706,8 @@ def test_dataset_condition_invariance_vs_teacher_edit(tmp_path, monkeypatch):
         dpath = world["root"] / row["derived"]["path"]
         with np.load(dpath, allow_pickle=False) as z:
             data = {k: z[k].copy() for k in ("qpos", "human_joints", "fps",
-                                             "source_obj_pose", "target_obj_pose")}
+                                             "source_obj_pose", "target_obj_pose",
+                                             "similarity_scale")}
             meta = json.loads(str(z["meta_json"]))
         data["qpos"][:, 7:36] += 0.04          # teacher joints only
         np.savez(dpath, meta_json=json.dumps(meta), **data)
@@ -886,37 +977,60 @@ def test_w1_raw_eval_zero_repair_and_denominator_kept(tmp_path, monkeypatch):
     def edit(manifest):
         row = next(r for r in manifest["rows"] if r["demo"] == long_demo)
         dpath = world["root"] / row["derived"]["path"]
-        src_box = w1.derive_source_box(
+        src_box, sim_scale = w1.derive_source_box(
             data["pt"][:, 162:318].reshape(90, 52, 3), data["human"],
             data["pt"][:, 318:325])
         np.savez(dpath, qpos=data["qpos"], human_joints=data["human"],
                  fps=np.float64(30.0), source_obj_pose=src_box,
                  target_obj_pose=w1.published_to_project(data["qpos"])[:, 36:43],
+                 similarity_scale=np.float64(sim_scale),
                  meta_json=json.dumps({"demo": long_demo, "split": "val",
                                        "protocol": w1.MOTION_PROTOCOL_VERSION,
+                                       "similarity_scale": sim_scale,
                                        "layout": "published_verbatim"}))
         row.update({"T": 90, "full_windows_F60_s30": 1,
                     "derived": {"path": row["derived"]["path"],
                                 "sha256": _sha(dpath)}})
 
     _repin(world, edit)
+    # P1-8: the eval re-runs the preregistration legs, so the rewritten
+    # demo's input hashes are re-registered (the edit is a legal re-audit,
+    # not an attack) and the whole binding chain re-pinned
+    prereg = json.loads(world["prereg_path"].read_text())
+    prereg["inputs"][long_demo] = {
+        "npz": _sha(world["npz_dir"] / f"{long_demo}_original.npz"),
+        "pt": _sha(world["pt_dir"] / f"{long_demo}.pt")}
+    world["prereg_path"].write_text(json.dumps(prereg))
+    manifest = json.loads(world["manifest_path"].read_text())
+    manifest["preregistration"]["sha256"] = _sha(world["prereg_path"])
+    world["manifest_path"].write_text(json.dumps(manifest))
+    _resync_cache_identity(world)
     manifest_sha = _sha(world["manifest_path"])
+    import ireset.data.a2_integrity as _integ
+
     ckpt = {"identity": {"protocol": w1.MOTION_PROTOCOL_VERSION,
-                         "training_manifest": {"sha256": manifest_sha}},
+                         "model_type": "stub",
+                         "training_manifest": {"sha256": manifest_sha},
+                         "cache": {
+                             "identity_sha256": _integ.sha256_file(
+                                 world["cache_dir"] / "cache_identity.json"),
+                             "root_stats_sha256": _integ.sha256_file(
+                                 world["cache_dir"] / "root_stats.npz")}},
             "model": {}, "conditioner": {}, "config": {"d_model": 32},
             "root_stats": {"mean": [0, 0, 0], "std": [1, 1, 1]}}
     (tmp_path / "models/stub").mkdir(parents=True)
     torch.save(ckpt, tmp_path / "models/stub/best.pt")
     monkeypatch.setattr(eg, "load_generator", lambda *a, **k: _StubGen())
 
+    report_path = world["run"] / "eval/report.json"
     argv = ["prog", "--models", "stub", "--models-dir", str(tmp_path / "models"),
             "--training-manifest", str(world["manifest_path"]),
             "--expected-set", "val31",
             "--full-length", "--cache-dir", str(world["cache_dir"]),
-            "--output", str(tmp_path / "report.json")]
+            "--output", str(report_path)]
     monkeypatch.setattr("sys.argv", argv)
     eg.main()
-    report = json.loads((tmp_path / "report.json").read_text())
+    report = json.loads(report_path.read_text())
     assert report["repair_pipeline_invocations"] == 0
     assert report["counts"]["n_expected"] == len(world["val31"])
     assert report["counts"]["n_unsupported"] == 1
@@ -931,6 +1045,7 @@ def test_w1_raw_eval_refuses_foreign_checkpoint(tmp_path, monkeypatch):
     world = build_synthetic_world(tmp_path, T=90)
     _patch_paths(monkeypatch, world)
     ckpt = {"identity": {"protocol": w1.MOTION_PROTOCOL_VERSION,
+                         "model_type": "stub",
                          "training_manifest": {"sha256": "0" * 64}},
             "model": {}, "conditioner": {}, "config": {"d_model": 32},
             "root_stats": {"mean": [0, 0, 0], "std": [1, 1, 1]}}
@@ -940,7 +1055,7 @@ def test_w1_raw_eval_refuses_foreign_checkpoint(tmp_path, monkeypatch):
             "--training-manifest", str(world["manifest_path"]),
             "--expected-set", "val31",
             "--full-length", "--cache-dir", str(world["cache_dir"]),
-            "--output", str(tmp_path / "r.json")]
+            "--output", str(world["run"] / "eval/r.json")]
     monkeypatch.setattr("sys.argv", argv)
     with pytest.raises(SystemExit, match="checkpoint identity"):
         eg.main()
@@ -1049,59 +1164,19 @@ def test_s0_micro_batch_gate(tmp_path, monkeypatch):
 # --- W0 entry evidence + exclusive registration --------------------------------------
 
 def _install_w0_anchors(world, monkeypatch):
-    """Install synthetic anchor FILES at the W1_PLAN_ANCHORS paths with
-    self-consistent declared hashes (the synthetic split defines its own
-    train24, so the plan-constant check is relaxed to the synthetic sha)."""
-    import w1_preregister as w0
-
+    """Patch the anchor table onto the synthetic root's already-installed
+    stand-ins (build_synthetic_world writes them at the REAL anchor paths,
+    so the required-nine set re-verifies); relaxes the plan train24 sha to
+    the synthetic selection."""
     root = world["root"]
-    c2 = {"registration_status": {"complete": True},
-          "baseline": {"verdict": "incomplete"},
-          "recovery": {"status": "no_quality_gain"},
-          "training": {"status": "not_ready"}}
-    ur_prereg = {"experiment_id": "a2_recovery_step03_v1"}
-    ur = {"verdict": "no_quality_gain",
-          "admission": {"passed": True, "ur_coverage": {"missing": []}},
-          "verdict_record": {"complete_evidence": True},
-          "ur_identity": {"preregistration_sha256": None}}
-
-    sources = {}
-    for key, (rel, _) in w1.W1_PLAN_ANCHORS.items():
-        dst = root / rel
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        if key == "c2_final_decision":
-            dst.write_text(json.dumps(c2))
-        elif key == "ur_full_comparison":
-            ur["ur_identity"]["preregistration_sha256"] = "PENDING"
-            dst.write_text(json.dumps(ur))
-        elif key == "ur_preregistration":
-            dst.write_text(json.dumps(ur_prereg))
-        elif key in ("a1_frozen_lists", "a1_assets"):
-            src_rel = json.loads(world["prereg_path"].read_text())[
-                "anchors"][key]["path"]
-            shutil.copy(root / src_rel, dst)
-        elif key == "a1_pairing_source_boxes":
-            np.savez(dst)
-        else:
-            src = root / rel
-            if src != dst:                    # split files already in place
-                shutil.copy(src, dst)
-        sources[key] = _sha(dst)
-    # bind the UR report to the prereg file hash
-    ur["ur_identity"]["preregistration_sha256"] = sources["ur_preregistration"]
-    (root / w1.W1_PLAN_ANCHORS["ur_full_comparison"][0]).write_text(
-        json.dumps(ur))
-    sources["ur_full_comparison"] = _sha(
-        root / w1.W1_PLAN_ANCHORS["ur_full_comparison"][0])
-
+    sources = {key: _sha(root / rel)
+               for key, (rel, _) in w1.W1_PLAN_ANCHORS.items()}
     monkeypatch.setattr(w1, "W1_PLAN_ANCHORS", {
         key: (rel, sources[key])
         for key, (rel, _) in w1.W1_PLAN_ANCHORS.items()})
     monkeypatch.setattr(w1, "W1_PLAN_TRAIN24_SHA",
                         w1.canonical_list_sha256(world["train24"]))
     return sources
-
-
 
 
 def test_w0_entry_evidence_checks(tmp_path, monkeypatch):
@@ -1186,6 +1261,25 @@ def test_w0_registration_exclusive_reuse_and_refusal(tmp_path, monkeypatch):
     assert _sha(prereg_path) == first
 
 
+def _complete_metrics(row: dict) -> dict:
+    """A quality metrics dict with REAL measured fields (P1-5: the
+    completeness predicate checks measurements, not the status string)."""
+    return {
+        "demo": row["demo"], "T": row["T"], "fps": 30.0, "valid": True,
+        "error": None,
+        "penetration_max_m": 0.012, "penetration_violation_ratio": 0.0,
+        "task_mpjpe_p95_m": 0.08, "box_ground_penetration_max_m": 0.0,
+        "foot": {"l": None, "r": None},       # legal zero-reference sides
+        "hand": {"l": None, "r": None},
+        "both": {"denominator_frames": 0, "valid_coverage": None,
+                 "gap_series_p95_m": None},
+        "validator_status": "pass", "validator_worst": {},
+        "validator_failed_checks": [], "reference_intervals": [],
+        "ref_support_frames": {"l": 0, "r": 0},
+        "ref_grasp_frames": {"l": 0, "r": 0},
+    }
+
+
 # --- readiness ------------------------------------------------------------------------
 
 def test_readiness_reasons_on_missing_and_complete(tmp_path, monkeypatch):
@@ -1203,7 +1297,8 @@ def test_readiness_reasons_on_missing_and_complete(tmp_path, monkeypatch):
 
     def with_quality(manifest):
         for r in manifest["rows"]:
-            r["quality"] = {"status": "complete", "reason": None}
+            r["quality"] = {"status": "complete", "reason": None,
+                            "metrics": _complete_metrics(r)}
             r["short_trajectory"] = False
 
     _repin(world, with_quality)
@@ -1215,12 +1310,37 @@ def test_readiness_reasons_on_missing_and_complete(tmp_path, monkeypatch):
     assert report["ready_for_w1_d"] is False
     assert any("s0_deterministic_no_attempts" in x for x in report["unmet"])
 
+    import ireset.data.a2_integrity as _integ
+
+    manifest_sha = _integ.sha256_file(world["manifest_path"])
+    cache_ident_sha = _integ.sha256_file(world["cache_dir"] / "cache_identity.json")
+    root_stats_sha = _integ.sha256_file(world["cache_dir"] / "root_stats.npz")
     for model in ("deterministic", "diffusion"):
         att = world["run"] / "s0" / model / "attempt_001"
         att.mkdir(parents=True)
+        probes = [{"step": 10 * i,
+                   "motion_reconstruction": 1.0 - 0.01 * i} for i in range(50)]
+        ident = {"experiment_id": w1.EXPERIMENT_ID,
+                 "protocol": w1.MOTION_PROTOCOL_VERSION,
+                 "training_manifest": {"sha256": manifest_sha},
+                 "cache": {"identity_sha256": cache_ident_sha,
+                           "root_stats_sha256": root_stats_sha},
+                 "small_set_demos": [world["train24"][0]],
+                 "model_type": model}
         (att / "s0_summary.json").write_text(json.dumps({
-            "verdict": "passed", "gates": {"min_100_optimizer_steps": True},
-            "optimizer_steps": 120}))
+            "verdict": "passed",
+            "gates": {"min_100_optimizer_steps": True, "all_finite": True,
+                      "contact_branch_silent": True, "probe_count_ge_40": True,
+                      "trend_fit_demonstrated": True,
+                      "reload_reproducible": True},
+            "nonfinite_stop": None, "budget_stopped": False,
+            "optimizer_steps": 120, "micro_batches": 240, "grad_accum": 2,
+            "identity": ident, "probes": probes}))
+        (att / "loss_history.json").write_text(json.dumps(
+            [{"step": i + 1, "total": 1.0 / (i + 1), "gnorm": 1.0}
+             for i in range(120)]))
+        torch.save({"identity": ident, "step": 120, "model": {},
+                    "conditioner": {}}, att / "last.pt")
         _append_index(world["run"] / "s0" / model, {
             "attempt": "attempt_001",
             "summary": str(att.relative_to(world["root"]) / "s0_summary.json")})
@@ -1232,6 +1352,21 @@ def test_readiness_reasons_on_missing_and_complete(tmp_path, monkeypatch):
     assert report["ready_for_w1_d"] is True, report["unmet"]
     assert rc == 0
 
+    # review fix 2 regression: a doctored verdict with broken facts must
+    # fail the recomputed c gate
+    victim = world["run"] / "s0" / "deterministic" / "attempt_001" / "s0_summary.json"
+    doctored = json.loads(victim.read_text())
+    doctored["optimizer_steps"] = 0
+    victim.write_text(json.dumps(doctored))
+    monkeypatch.setattr("sys.argv", ["prog", "--run-root", str(world["run"])])
+    assert rd.main() == 2
+    report = json.loads(
+        sorted(decisions.glob("attempt_*/w1_readiness.json"))[-1].read_text())
+    assert report["c_complete"] is False
+    assert any("min_100_optimizer_steps" in json.dumps(report["c_per_model"])
+               or "recorded_verdict_not_reproducible" in x
+               for x in report["unmet"])
+
 
 def test_a3_exit_verdict_ignores_evidence_lists():
     """Regression (found on the real A3 run): ``all(gates.values())`` treated
@@ -1240,12 +1375,18 @@ def test_a3_exit_verdict_ignores_evidence_lists():
     from audit_omniretarget_training import exit_criteria, exit_ok, summarize
 
     def _rows(statuses):
-        return [{"demo": f"d{i}", "split": "train", "status": st,
-                 "subject": SUBJECTS[i % 6],
-                 "admission": {"motion": st == "processed"},
-                 "quality": {"status": "complete"},
-                 "full_windows_F60_s30": 1}
-                for i, st in enumerate(statuses)]
+        rows = []
+        for i, st in enumerate(statuses):
+            row = {"demo": f"d{i}", "split": "train", "status": st,
+                   "subject": SUBJECTS[i % 6],
+                   "admission": {"motion": st == "processed"},
+                   "quality": {"status": "complete", "reason": None,
+                               "metrics": None},
+                   "T": 90,
+                   "full_windows_F60_s30": 1}
+            row["quality"]["metrics"] = _complete_metrics(row)
+            rows.append(row)
+        return rows
 
     rows = _rows(["processed"] * 55)
     summary = summarize(rows, [f"d{i}" for i in range(55)])

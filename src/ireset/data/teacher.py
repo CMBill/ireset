@@ -121,6 +121,7 @@ def build_interaction_clip(
     teacher_traj_dir: Path = TEACHER_TRAJ_DIR,
     source_obj_pose: np.ndarray | None = None,
     schedule_cache_file: Path | None = None,
+    source_box_scale: float = 1.0,
 ) -> InteractionClip:
     """Load one teacher NPZ into an :class:`InteractionClip`.
 
@@ -136,7 +137,10 @@ def build_interaction_clip(
     compatibility only, never the W1 path. ``schedule_cache_file`` is an
     exact cache path (W1 keyed schedules; the dir-keyed legacy cache above
     assumes the TARGET box and must not be reused for source-scene
-    schedules).
+    schedules). ``source_box_scale`` is the fitted similarity scale that
+    also applies to the source box GEOMETRY (§3.3) — the source-scene
+    schedule is inferred against the scaled hull; the legacy target-box
+    path always uses the unscaled locked geometry.
     """
     spec = _spec()
     lo, hi = spec.joint_range[:, 0], spec.joint_range[:, 1]
@@ -172,7 +176,8 @@ def build_interaction_clip(
         if src.shape != (scene.shape[0], 7):
             raise ValueError(
                 f"{npz_name}: source_obj_pose {src.shape} != [T={scene.shape[0]}, 7]")
-        schedule = infer_reference_schedule(human, src, fps=fps)
+        schedule = infer_reference_schedule(human, src, fps=fps,
+                                            box_scale=source_box_scale)
     else:
         schedule = infer_reference_schedule(human, box, fps=fps)
 

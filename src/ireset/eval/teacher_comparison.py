@@ -331,13 +331,21 @@ class TeacherQualityReplayer:
     # -- main ---------------------------------------------------------------
 
     def measure(self, demo: str, scene: np.ndarray, human: np.ndarray,
-                source_box: np.ndarray, fps: float) -> DemoMetrics:
-        """scene [T,43] project convention; source_box [T,7] (A1 pairing)."""
+                source_box: np.ndarray, fps: float,
+                source_box_scale: float = 1.0) -> DemoMetrics:
+        """scene [T,43] project convention; source_box [T,7] (A1 pairing).
+
+        ``source_box_scale``: the fitted similarity scale applied to the
+        source box GEOMETRY (W1 plan §3.3 / review fix 1) — the reference
+        schedule is inferred against the scaled hull, matching the schedule
+        consumers bit-for-bit.
+        """
         T = scene.shape[0]
         if not np.isfinite(scene).all() or not np.isfinite(human).all():
             return DemoMetrics(demo, T, fps, valid=False, error="non-finite input")
 
-        ref_sched = infer_reference_schedule(human, source_box, fps=fps)
+        ref_sched = infer_reference_schedule(human, source_box, fps=fps,
+                                             box_scale=source_box_scale)
         rep = self.validator.validate(scene, exclude=("box_ground",))
         if rep.schedule is None:
             return DemoMetrics(demo, T, fps, valid=False,
