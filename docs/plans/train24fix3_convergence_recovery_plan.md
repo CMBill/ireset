@@ -2,9 +2,9 @@
 
 日期：2026-10-02；续行预注册修订：2026-10-03，代码核对基点 `6b305c8`。状态：**原阶段 A–D 已执行，N1–N3/S1–S2 均未通过完整六段门，winner=None；下述审阅修复、证据重验与恢复候选 R1–R3 尚未实施，阶段 E/F/G 未进入**。
 
-原起点：代码 `f76216b`，文档订正至 `e74a5f3`；正式取证为 `derived/data/teachers_regenerated/train24fix2_reviewfix3_20261002/`。当时审阅修复完成，原基线六段 rq **1/6 keep**；本轮候选结果见 §2.3。本计划属于 [M2–M3 收尾方案](m2_m3_completion_plan.md)的阶段 4–5：恢复修复器与教师质量门，再执行 train24 受限验证。它为后续阶段 6 的 312 originals 生产、阶段 7 的双模型重训准备条件，不代表 M2 鲁棒性/性能或 M4 闭环验收已经完成。
+原起点：代码 `f76216b`，文档订正至 `e74a5f3`；正式取证为 `derived/data/teachers_regenerated/train24fix2_reviewfix3_20261002/`。当时审阅修复完成，原基线六段 rq **1/6 keep**；本轮候选结果见 §2.3。本计划属于 [M2–M3 收尾方案](../archive/plans/m2_m3_completion_plan.md)的阶段 4–5：恢复修复器与教师质量门，再执行 train24 受限验证。它为后续阶段 6 的 312 originals 生产、阶段 7 的双模型重训准备条件，不代表 M2 鲁棒性/性能或 M4 闭环验收已经完成。
 
-依据：[最新审阅修复验证记录 §10](../verification/train24fix2_review_fix_verification.md#10-第三轮审阅缺口修复reviewfix32026-10-02)、[认证边缘方案](train24fix2_certification_edge_plan.md)、[标签分级与 train24 方案](m2_m3_label_quality_train24_plan.md)。旧记录中“五段结构性联合不可行”的措辞继续以订正块为准。
+依据：[最新审阅修复验证记录 §10](../archive/verification/train24fix2_review_fix_verification.md#10-第三轮审阅缺口修复reviewfix32026-10-02)、[认证边缘方案](../archive/plans/train24fix2_certification_edge_plan.md)、[标签分级与 train24 方案](m2_m3_label_quality_train24_plan.md)。旧记录中“五段结构性联合不可行”的措辞继续以订正块为准。
 
 本次修订依据 [A–D 验证记录](../verification/train24fix3_convergence_recovery_verification.md)及实现审阅，将下一步工作写入本文件对应章节。§4.3–4.4、§5.3、§7.4–7.7 与 §11–13 的续行安排构成**新的预注册补记**，须在新增算法实验前冻结；不改写原 N/S 候选及其失败裁决。此次仅编辑方案，不实施代码或运行候选。
 

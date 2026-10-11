@@ -66,7 +66,7 @@
 
 ## 6. 关联
 
-- 方案:`docs/plans/teacher_regen_robustness_plan.md`(修订记录已加)
-- 前序:`docs/verification/teacher_regen_verification.md`(先导 2/6、slack s≥0、dip 余量、手部门重标)
+- 方案:`docs/archive/plans/teacher_regen_robustness_plan.md`(修订记录已加)
+- 前序:`docs/archive/verification/teacher_regen_verification.md`(先导 2/6、slack s≥0、dip 余量、手部门重标)
 - 产物:`derived/data/teachers_regenerated/pilot_diagnosis6_v3_f1/`(含逐段 `frame_log_*.json`)
 - 诊断脚本:机制已并入 `--verbose`;探索期脚本未入库

@@ -1,6 +1,6 @@
 # P0 审阅修复方案
 
-日期:2026-09-14。状态:**已实施并验证**(同日;实施记录与全部重测结果见 [p0fix_verification.md](../verification/p0fix_verification.md);本文件保留为原始方案,完成清单逐项核对于该记录)。原始定位:依据当时代码审阅、只读数值探针及 [P0 验证记录](../verification/p0_verification.md)制定。
+日期:2026-09-14。状态:**已实施并验证**(同日;实施记录与全部重测结果见 [p0fix_verification.md](../../verification/p0fix_verification.md);本文件保留为原始方案,完成清单逐项核对于该记录)。原始定位:依据当时代码审阅、只读数值探针及 [P0 验证记录](../verification/p0_verification.md)制定。
 
 ## 1. 目标与边界
 

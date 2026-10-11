@@ -188,6 +188,6 @@ Nq 若已满足原六段全部门禁且不使用旧稳定性消融支持新结�
 - [x] R1-R9 代码、回归用例及分项提交完成(`c991f6b` R5/R7/R8、`12c5741`+`a9f9857` R4/R9、`c8d266f` R1、`b9fc080` R2、`a22e775` R3、`9658b02` R5 补全;165 项测试)。
 - [x] D 行为一致性与 Nq/Nv/Ns 全部完成,条件项 S01/S10 已执行(D:5/5 NPZ 与冻结最终版逐字节相同;Nq/Nv 5/6 keep 且除耗时外一致;Ns 6/6 与旧标准逐段核对;S01/S10 均 5/6、权重不影响几何覆盖且破坏认证,保留权重 0)。
 - [x] 新版本历史重算表与完整六段对照表完成(`quality_tables/growth_recompute_reviewfix_20260924.json`、`six_segment_comparison_reviewfix_20260924.json`),保留所有拒绝段和无法恢复的旧证据缺口。
-- [x] 新建 `docs/verification/m2_m3_stage_gate_review_fix_verification.md`,填写实际结果、成本、偏差及门禁结论。
+- [x] 新建 `docs/archive/verification/m2_m3_stage_gate_review_fix_verification.md`,填写实际结果、成本、偏差及门禁结论。
 - [x] 实施后同步本方案、原阶段门方案、收尾方案、主实现方案与 AGENTS;旧验证记录添加订正指针,保留历史数值及原适用范围。
 - [x] 仅在产生正式新数据版本或资源变化时更新资源登记与 manifest;本轮未产生新数据版本,未修改资源或宣布阶段通过。

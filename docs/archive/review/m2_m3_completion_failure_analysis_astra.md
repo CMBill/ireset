@@ -5,8 +5,8 @@
 关联文档：
 
 - [m2_m3_completion_plan.md](../plans/m2_m3_completion_plan.md)
-- [m2_m3_completion_verification.md](m2_m3_completion_verification.md)
-- [v4 六段报告](../../derived/data/teachers_regenerated/pilot_diagnosis6_v4_stage12/regen_report_diagnosis6_strict.json)
+- [m2_m3_completion_verification.md](../verification/m2_m3_completion_verification.md)
+- [v4 六段报告](../../../derived/data/teachers_regenerated/pilot_diagnosis6_v4_stage12/regen_report_diagnosis6_strict.json)
 
 ## 1. 结论摘要
 
@@ -40,10 +40,10 @@
 
 ### 3.1 代码链
 
-1. 主动接触行将身份写成 `(ga, gb, "regen")`：[scp.py:479–485](../../src/ireset/repair/scp.py#L479-L485)。
-2. 检查器将违规行身份原样交给 `note_discovered_pairs`：[pipeline.py:238–248](../../src/ireset/repair/pipeline.py#L238-L248)。
-3. `_scan_pairs` 先装入 `_extra_pairs`，遇到相同 `(ga, gb)` 时跳过注册表条目，原 `robot_box` 类型不会恢复：[scp.py:327–338](../../src/ireset/repair/scp.py#L327-L338)。
-4. 最近手部几何选择只接受 `kind == "robot_box"`：[scp.py:432–442](../../src/ireset/repair/scp.py#L432-L442)。
+1. 主动接触行将身份写成 `(ga, gb, "regen")`：[scp.py:479–485](../../../src/ireset/repair/scp.py#L479-L485)。
+2. 检查器将违规行身份原样交给 `note_discovered_pairs`：[pipeline.py:238–248](../../../src/ireset/repair/pipeline.py#L238-L248)。
+3. `_scan_pairs` 先装入 `_extra_pairs`，遇到相同 `(ga, gb)` 时跳过注册表条目，原 `robot_box` 类型不会恢复：[scp.py:327–338](../../../src/ireset/repair/scp.py#L327-L338)。
+4. 最近手部几何选择只接受 `kind == "robot_box"`：[scp.py:432–442](../../../src/ireset/repair/scp.py#L432-L442)。
 
 因此，刚发现违规的手部 pair 虽然保留在集合里，却失去主动接触行资格。它随后可能作为无接近上界的普通行存在；走廊会改选其他手部几何体，甚至完全消失。
 
@@ -67,7 +67,7 @@ sub10 v4 t=90：
 - 后续检查右手距离完全相同，但 `corridor={}`、`viol=0`。
 - 求解记录为 `accepted=true`、`iterations=1`、`qp_calls=0`、`outcome_frame_valid=true`。
 
-见 [sub10 日志:8904–8969](../../derived/data/teachers_regenerated/pilot_diagnosis6_v4_stage12/frame_log_sub10_largebox_000.json#L8904-L8969)。这不是通过运动满足了接触要求，而是相关要求在回流后消失。
+见 [sub10 日志:8904–8969](../../../derived/data/teachers_regenerated/pilot_diagnosis6_v4_stage12/frame_log_sub10_largebox_000.json#L8904-L8969)。这不是通过运动满足了接触要求，而是相关要求在回流后消失。
 
 ### 3.4 影响与修复契约
 
@@ -85,7 +85,7 @@ sub10 v4 t=90：
 
 ### 4.1 `skip_reason` 不是最终失败原因
 
-`skip_reason` 保存的是原始预测在 skip-check 中的失败原因，而非修复候选、回溯或最终 attempt 的失败阶段：[pipeline.py:494–535](../../src/ireset/repair/pipeline.py#L494-L535)。
+`skip_reason` 保存的是原始预测在 skip-check 中的失败原因，而非修复候选、回溯或最终 attempt 的失败阶段：[pipeline.py:494–535](../../../src/ireset/repair/pipeline.py#L494-L535)。
 
 因此，报告四段都显示 `skip_reason="state_constraints"`，不能推出“四段最终全部是端点失败”。
 
@@ -100,10 +100,10 @@ sub10 v4 t=90：
 
 逐段原始证据：
 
-- [sub12 日志](../../derived/data/teachers_regenerated/pilot_diagnosis6_v4_stage12/frame_log_sub12_largebox_001.json)
-- [sub16 日志](../../derived/data/teachers_regenerated/pilot_diagnosis6_v4_stage12/frame_log_sub16_largebox_000.json)
-- [sub3 日志](../../derived/data/teachers_regenerated/pilot_diagnosis6_v4_stage12/frame_log_sub3_largebox_000.json)
-- [sub7 日志](../../derived/data/teachers_regenerated/pilot_diagnosis6_v4_stage12/frame_log_sub7_largebox_000.json)
+- [sub12 日志](../../../derived/data/teachers_regenerated/pilot_diagnosis6_v4_stage12/frame_log_sub12_largebox_001.json)
+- [sub16 日志](../../../derived/data/teachers_regenerated/pilot_diagnosis6_v4_stage12/frame_log_sub16_largebox_000.json)
+- [sub3 日志](../../../derived/data/teachers_regenerated/pilot_diagnosis6_v4_stage12/frame_log_sub3_largebox_000.json)
+- [sub7 日志](../../../derived/data/teachers_regenerated/pilot_diagnosis6_v4_stage12/frame_log_sub7_largebox_000.json)
 
 注意：sub3 的 −2.618 mm 和 sub7 的 8.780 mm 是原始预测首次检查值，不是三次失败求解最后迭代状态的完整约束证据。现有日志不足以识别这两段每次求解退出时的全部冲突约束。
 
@@ -131,7 +131,7 @@ sub10 v4 t=90：
 f(e)=w\|e/D\|^2.
 \]
 
-`build_qp` 已通过 `_unit` 得到 `r=e/D`，但随后使用 `Dinv2*r` 装配线性项：[scp.py:561–568](../../src/ireset/repair/scp.py#L561-L568)。QP 变量是物理切空间增量，而不是归一化变量。
+`build_qp` 已通过 `_unit` 得到 `r=e/D`，但随后使用 `Dinv2*r` 装配线性项：[scp.py:561–568](../../../src/ireset/repair/scp.py#L561-L568)。QP 变量是物理切空间增量，而不是归一化变量。
 
 对直接加性分量，正确与当前线性项分别为：
 
@@ -156,7 +156,7 @@ q_{\mathrm{true}}=2we/D^2,\qquad q_{\mathrm{code}}=2we/D^3.
 
 错误模型可能要求过大的步长，随后被信赖域截断；不同分量的放大倍数还改变了 prediction/temporal 与 mesh/hand 目标的竞争关系。QP 模型与实际 merit 不一致，可导致线搜索拒绝和信赖域反复缩小。
 
-sub3 三次尝试的迭代数为 **15/17/16**，sub7 为 **20/25/24**，均未耗尽 40/80 的对应预算。结合 [scp.py:844–900](../../src/ireset/repair/scp.py#L844-L900)，退出与信赖域缩小分支一致；仅增加最大迭代数不一定触及主因。
+sub3 三次尝试的迭代数为 **15/17/16**，sub7 为 **20/25/24**，均未耗尽 40/80 的对应预算。结合 [scp.py:844–900](../../../src/ireset/repair/scp.py#L844-L900)，退出与信赖域缩小分支一致；仅增加最大迭代数不一定触及主因。
 
 **不能据此断言该数值缺陷单独导致四段失败。** 尚未执行修正后的逐段消融；`infeasible` 在这里是求解器返回状态，不是原非线性问题不可行的数学证明。
 
@@ -182,7 +182,7 @@ sub3 三次尝试的迭代数为 **15/17/16**，sub7 为 **20/25/24**，均未�
 
 ### 6.2 认证归零的直接机制
 
-[validation.py:429–438](../../src/ireset/repair/validation.py#L429-L438) 将三处手部 site 转到箱体 geom 坐标系，取逐 site 帧间速度的最大值。速度必须低于 **0.05 m/s**，距离 enter 为 **10 mm**、exit 为 **30 mm**，候选区间不足 **3 帧**会被删除。
+[validation.py:429–438](../../../src/ireset/repair/validation.py#L429-L438) 将三处手部 site 转到箱体 geom 坐标系，取逐 site 帧间速度的最大值。速度必须低于 **0.05 m/s**，距离 enter 为 **10 mm**、exit 为 **30 mm**，候选区间不足 **3 帧**会被删除。
 
 虽然名称为 entry gate，实际速度门逐帧应用，超门也会终止已有区间。
 
@@ -205,7 +205,7 @@ v4 左手最长候选区间仅 1 帧，右手仅 2 帧，因此认证归零。�
 
 ### 6.4 为什么零认证仍然 keep
 
-当前 keep 使用每侧参考抓取帧中的**几何接近覆盖率 ≥50%**，不是认证区间覆盖率：[regenerate_teachers.py:252–259](../../scripts/regenerate_teachers.py#L252-L259)。几何接近实际判据为最近手部 geom 距离小于 10 mm。
+当前 keep 使用每侧参考抓取帧中的**几何接近覆盖率 ≥50%**，不是认证区间覆盖率：[regenerate_teachers.py:252–259](../../../scripts/regenerate_teachers.py#L252-L259)。几何接近实际判据为最近手部 geom 距离小于 10 mm。
 
 独立终检仍执行全局碰撞、限位及速度等检查，但手部锚漂等检查只在推断出的手部区间中执行。没有认证区间不能证明持续抓握成立。
 
@@ -233,7 +233,7 @@ v4 左手最长候选区间仅 1 帧，右手仅 2 帧，因此认证归零。�
 
 原因：pipeline 的逐帧数组主要追加最终采用的成功结果；失败帧只追加耗时，未完整累计全部求解尝试。报告 `attempts` 实际读取 `fallbacks`，也不是求解调用总数。
 
-对应代码：[pipeline.py:507–549](../../src/ireset/repair/pipeline.py#L507-L549)、[regenerate_teachers.py:231–236](../../scripts/regenerate_teachers.py#L231-L236)。
+对应代码：[pipeline.py:507–549](../../../src/ireset/repair/pipeline.py#L507-L549)、[regenerate_teachers.py:231–236](../../../scripts/regenerate_teachers.py#L231-L236)。
 
 这不改变 2/6 保留率；逐帧耗时包含尝试成本，但 QP/迭代汇总不完整，会误导预算和性能归因。应分别记录尝试总数、全部 QP/迭代、最终采用分支、slack 尝试与接受帧使用情况。
 

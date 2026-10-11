@@ -1,6 +1,6 @@
 # M2-M3 标签分级与 train24 受限验证记录
 
-日期:2026-09-26。方案:[m2_m3_label_quality_train24_plan.md](../plans/m2_m3_label_quality_train24_plan.md)。上游:[m2_m3_stage_gate_review_fix_verification.md](m2_m3_stage_gate_review_fix_verification.md)(R1-R9 统一版本,本记录顶部有其 2026-09-26 订正指针)。
+日期:2026-09-26。方案:[m2_m3_label_quality_train24_plan.md](../../plans/m2_m3_label_quality_train24_plan.md)。上游:[m2_m3_stage_gate_review_fix_verification.md](m2_m3_stage_gate_review_fix_verification.md)(R1-R9 统一版本,本记录顶部有其 2026-09-26 订正指针)。
 
 状态:**阶段 A(证据订正与质量协议)、阶段 B(分级标签与消费接口)全部落地;六段回归三次运行(regen quiet/verbose、standard)与冻结基线逐段一致(NPZ 字节级相同);受限转段门通过后执行 train24 完整运行——数量门 13/24 < 18/24 未达标,按预注册规则停止规模扩展、不进入 312 与重训。train24 共执行三次(前两次溯源带无关未跟踪文件漂移标记、产物字节一致,采纳第三次洁净运行,详见 §6.1)。** 全量测试 `uv run --locked pytest tests/ -q` **186 passed**(165 旧 + 21 新,本方案不预设总数、实测记录)。strict/keep/任务工作门 0.40 与全部容差零改动;未重标任务门、未实施 sub7 边界修复、未训练模型。
 

@@ -2,11 +2,11 @@
 
 日期:2026-09-26。状态:**方案已编写,待实施。本次仅保存方案,未修改代码、配置、历史验证记录或数据,未执行六段新回归、train24 重生成、312 全量生成或模型重训。** 下文的基线数字来自已有运行及方案设计期间的只读核查,不代表本方案已通过验收。
 
-前序:[阶段门实现审阅修复方案](m2_m3_stage_gate_review_fix_plan.md)及其[验证记录](../verification/m2_m3_stage_gate_review_fix_verification.md)。本方案承接 R1-R9 修复后的统一版本,不重复实施这些修复。
+前序:[阶段门实现审阅修复方案](../archive/plans/m2_m3_stage_gate_review_fix_plan.md)及其[验证记录](../archive/verification/m2_m3_stage_gate_review_fix_verification.md)。本方案承接 R1-R9 修复后的统一版本,不重复实施这些修复。
 
 ## 1. 在整体方案中的位置
 
-本工作属于主方案 [§9.1 教师数据与监督训练及 M3 教师清洗待办](interaction_retarget_impl_plan.md),承担 M3 收尾中的教师数据质量准入与小规模验证。对应[收尾方案](m2_m3_completion_plan.md)阶段 4 的标签适用性与转段判断,以及阶段 5 的 train24 数据验证部分;不覆盖阶段 5 中全部 M2 收尾工作。
+本工作属于主方案 [§9.1 教师数据与监督训练及 M3 教师清洗待办](interaction_retarget_impl_plan.md),承担 M3 收尾中的教师数据质量准入与小规模验证。对应[收尾方案](../archive/plans/m2_m3_completion_plan.md)阶段 4 的标签适用性与转段判断,以及阶段 5 的 train24 数据验证部分;不覆盖阶段 5 中全部 M2 收尾工作。
 
 ```text
 M0/M1:资产、配对、运动学与独立验收

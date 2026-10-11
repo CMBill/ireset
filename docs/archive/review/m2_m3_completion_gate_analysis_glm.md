@@ -1,6 +1,6 @@
 # M2-M3 收尾阶段 0-3 阶段门未达标原因分析(GLM)
 
-日期:2026-09-17。性质:**分析文档**——仅复核既有 v4 产物与逐段 `frame_log`,未运行新实验、未修改代码与容差。分析对象:[m2_m3_completion_plan.md](../plans/m2_m3_completion_plan.md) 阶段 0-3 的实施结果(验证记录:[m2_m3_completion_verification.md](m2_m3_completion_verification.md)):阶段门要求 ≥4/6 保留,实测 **2/6**,按方案 §7 门禁停止扩展、不进入 24/312 段规模化。
+日期:2026-09-17。性质:**分析文档**——仅复核既有 v4 产物与逐段 `frame_log`,未运行新实验、未修改代码与容差。分析对象:[m2_m3_completion_plan.md](../plans/m2_m3_completion_plan.md) 阶段 0-3 的实施结果(验证记录:[m2_m3_completion_verification.md](../verification/m2_m3_completion_verification.md)):阶段门要求 ≥4/6 保留,实测 **2/6**,按方案 §7 门禁停止扩展、不进入 24/312 段规模化。
 
 证据基线:`derived/data/teachers_regenerated/pilot_diagnosis6_v4_stage12/`(git `1a8e330`,strict,全长度,`--verbose`),逐段 `frame_log_*.json` 与 `regen_report_diagnosis6_strict.json`;代码引用以该提交为准。
 

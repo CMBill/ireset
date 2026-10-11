@@ -1,6 +1,6 @@
 # 教师重生成鲁棒性修复方案
 
-日期:2026-09-15。前序:`docs/verification/teacher_regen_verification.md` §5"后续"。状态:**已实现(F1+诊断增强);F3 经 P1 检查点取消;F2/F4 机理评估不实现;先导重测 2/6 未达标——失败机理与本文 §2 假设不符,见 [验证记录](../verification/teacher_regen_robustness_verification.md) §2 修订与 §5 后续建议**。
+日期:2026-09-15。前序:`docs/archive/verification/teacher_regen_verification.md` §5"后续"。状态:**已实现(F1+诊断增强);F3 经 P1 检查点取消;F2/F4 机理评估不实现;先导重测 2/6 未达标——失败机理与本文 §2 假设不符,见 [验证记录](../verification/teacher_regen_robustness_verification.md) §2 修订与 §5 后续建议**。
 
 ## 1. 背景与目标
 
@@ -182,7 +182,7 @@
 
 ## 8. 关联文档
 
-- 前序实验:`docs/verification/teacher_regen_verification.md`(先导 2/6 结果与发现)
+- 前序实验:`docs/archive/verification/teacher_regen_verification.md`(先导 2/6 结果与发现)
 - 路径 B 设计:`docs/plans/p0_relaxed_validation_plan.md` §7
 - 实现方案:`docs/plans/interaction_retarget_impl_plan.md` M3 教师重生成任务
 - 修复器设计:plan §8.3/8.4/8.5,`src/ireset/repair/{scp,pipeline}.py`

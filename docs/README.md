@@ -1,0 +1,59 @@
+# 文档索引
+
+整理日期：2026-10-11。当前推进到 **A2 收口完成，W1 A3/B/C 方案已起草、尚未实施；训练仍为 `not_ready`**。本页区分当前执行入口、保留的参考资料和历史归档。
+
+## 当前入口
+
+| 文档 | 用途与状态 |
+| --- | --- |
+| [W1 弱动作监督 A3/B/C 方案](plans/omniretarget_w1_a3bc_plan.md) | 下一项交付物，v0.1 草案；明确发布 original 标签、train24/val31 审计、数据/缓存接口、接触损失关闭及 S0；实施与运行预注册未开始 |
+| [OmniRetarget 优先教师与初步训练总方案](plans/omniretarget_first_training_plan.md) | 父方案，约束来源裁决、W1 用途、训练和裸输出评估；原文字节是 A2 快照证据的一部分 |
+| [A2 收口与有限恢复方案](plans/omniretarget_a2_closure_plan.md) | 已执行阶段的实验契约，W1 入口依据；原文字节保留供 A2 证据复核 |
+| [A2 最新验证记录](verification/omniretarget_a2_closure_verification.md) | C0/C1/D0/G0/UR/C2 及六轮修复的实际证据；当前权威 C2 为 attempt_010 |
+| [项目整体实现方案](plans/interaction_retarget_impl_plan.md) | 项目目标、资产/坐标约定、模型与最终验收设计；当前实施顺序由 OmniRetarget 总方案和 W1 草案具体化 |
+
+当前事实：A1 冻结与配对已完成；原 U0 保持 `incomplete` 并停线；独立 UR 六段比较为完整 `no_quality_gain`；W1 具有登记资格，A3/B/C 和正式训练尚未执行。实际 W1 标签来源计划为已发布 original 数据，用途 `weak_motion_only`；UR 标签不混入该来源。
+
+[权威 C2](../derived/experiments/omniretarget_first/20261010_a39d763_a2_closure/decisions/attempt_010/a2_closure.json) 的 SHA-256 为 `34a392f92a9cda5b8317a08d5b5b486f750c5fc83933174d36d361cb7b1d0fa2`。实际证据位于 ignored 的 derived/，迁移仓库时需按资源和验证记录恢复，不能把文档链接存在视作实验产物已携带。
+
+## 冻结方案与进度说明
+
+两份 OmniRetarget 方案的首页状态保留其编写时快照；“收口尚未实施”等表述不代表当前进度。当前执行状态由本页、最新验证记录和其权威产物共同说明：A2 已完成收口，W1 仅起草。
+
+A2 的 `baseline/snapshots/attempt_006/evidence_files.json` 已按文件路径记录两份方案的完整哈希。本次不覆写其内容，也保留它们直接引用的文档路径：
+
+| 冻结文档 | SHA-256 |
+| --- | --- |
+| `plans/omniretarget_first_training_plan.md` | `ca7cd4d8db553cac0057d1392c3238f0ca0fbfcbe4748f4c5946a3e650da2e84` |
+| `plans/omniretarget_a2_closure_plan.md` | `28fd40e43af0f524e5c2c23dc776a5a9b1b00bd872d75ee90442b5f41a8b81b3` |
+
+后续需要修改其协议时，应明确新版本、旧版本保存位置和证据引用关系，避免把历史核验锚点当作普通进度备注覆盖。
+
+## 原路径保留的参考资料
+
+以下材料保留，是因为冻结父方案或现行代码/配置仍直接引用其路径。它们提供带版本范围的参考，**不是当前执行计划**；旧实验数字不自动成为 W1 的新基线或准入门。
+
+| 参考 | 保留作用 |
+| --- | --- |
+| [M0 验证](verification/m0_verification.md) | 资产、布局、分组和源/目标配对基础；父方案及资源/任务配置仍引用 |
+| [M1 验证](verification/m1_verification.md) | 运动学、独立验收和已知发布教师缺陷；父方案仍引用 |
+| [M2 验证](verification/m2_verification.md) | 现行修复配置的测量依据与历史局限 |
+| [M3 验证](verification/m3_verification.md) | 模型与历史训练参考；旧口径不与 W1 直接作配对比较 |
+| [P0-fix 验证](verification/p0fix_verification.md) | 语义修复及发布数据悬浮证据；父方案仍引用 |
+| [分级标签/train24 方案](plans/m2_m3_label_quality_train24_plan.md) | 现行 graded_labels_v1 配置的来源；其[实施记录](archive/verification/m2_m3_label_quality_train24_verification.md)已归档 |
+| [CPU 并行方案](plans/cpu_parallel_optimization_plan.md)与[验证](verification/cpu_parallel_optimization_verification.md) | 线程/进程约定及现有测试的依据 |
+| [M1 修复方案](plans/m1_fix_plan.md) | 现有接触标定工具的文档依据 |
+| [P0 分层验证方案](plans/p0_relaxed_validation_plan.md) | 现有诊断工具的文档依据；不授权重开旧阈值或教师路线 |
+| [train24fix3 方案](plans/train24fix3_convergence_recovery_plan.md)与[验证](verification/train24fix3_convergence_recovery_verification.md) | 父方案冻结引用的旧 D+ 终局与自研路线边界；停线结论保留 |
+
+## 历史归档
+
+[archive 索引与路径迁移表](archive/README.md)收纳22份已结束执行、被替代或随旧路线停线的文档，按 `plans/`、`verification/`、`review/` 保留分类和原文件名。方案—审阅—验证的相对链接已随位置更新。
+
+历史实验产物及其哈希不改写。旧产物或消息中出现的文档原路径，通过 archive 的迁移表查找。归档不表示旧阶段目标达成，不删除失败证据，也不恢复已停止的训练或教师生产。
+
+## 文档维护
+
+新增执行方案写入 plans/，明确日期、范围、真实前置证据、预期集合、预算、停止条件和当前状态。实施后在 verification/ 写实际结果，关联方案和产物；方案存在不等于实施完成。
+
+归档前检查冻结哈希及当前引用，更新文档相对链接和项目导航，并核对本地文件链接与标题锚点。涉及已有证据锚点的文件先保留历史字节和引用关系，再建立新版本。本次没有修改代码、配置、资源或实验数据。

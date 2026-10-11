@@ -1,6 +1,6 @@
 # M2-M3 收尾阶段门未达标原因分析(2/6 < 4/6)
 
-日期:2026-09-17。分析对象:[m2_m3_completion_plan.md](../plans/m2_m3_completion_plan.md) 阶段 3 重测(v4,阶段 1+2 组合)后的**阶段门判定**。证据来源:[m2_m3_completion_verification.md](m2_m3_completion_verification.md) §4-5、`derived/data/teachers_regenerated/pilot_diagnosis6_v4_stage12/`(逐段 frame_log + regen_report)、`src/ireset/repair/{scp,pipeline}.py` 实现核对。
+日期:2026-09-17。分析对象:[m2_m3_completion_plan.md](../plans/m2_m3_completion_plan.md) 阶段 3 重测(v4,阶段 1+2 组合)后的**阶段门判定**。证据来源:[m2_m3_completion_verification.md](../verification/m2_m3_completion_verification.md) §4-5、`derived/data/teachers_regenerated/pilot_diagnosis6_v4_stage12/`(逐段 frame_log + regen_report)、`src/ireset/repair/{scp,pipeline}.py` 实现核对。
 
 ## 1. 结论
 

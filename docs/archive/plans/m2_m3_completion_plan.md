@@ -2,13 +2,13 @@
 
 日期:2026-09-16;审阅订正:2026-09-17;**阶段门修复实施:2026-09-22**。状态:**阶段 0/1 的正确性与诊断缺口已按[阶段门修复方案](m2_m3_stage_gate_fix_plan.md)修复(F0/F1/F2/F4 分项提交 `736f676`→`23bc211`);六段重测:regen 5/6 keep(sub12 拒绝)、标准模式 6/6 无撤回、认证底线达标;“每侧几何接近覆盖不低于 v3”2/12 项偏差未达标,按修复方案 §9 不自动转段,阶段 4-7 与 24/312 段仍未执行。** 详见[验证记录](../verification/m2_m3_stage_gate_fix_verification.md)。strict 容差不变;任务门保持 0.40 工作值;`calibration24_train_v1` 已冻结(train-only),旧 `p02_calibration` 保留作历史。M4 strict 闭环与最终测试不在本方案范围。
 
-**最新补充(2026-09-26,已实施):**[标签分级与 train24 受限验证方案](m2_m3_label_quality_train24_plan.md)(本方案阶段 4 的标签适用性与阶段 5 的 train24 数据验证部分)已实施完毕:证据订正(统一版本相对 v3 为 **3 项**退化——sub10 左手认证∩参考交集 0 帧、sub10 右覆盖 −5.4pp、sub8 右覆盖 −1.25pp)、标签协议 v1(`configs/labels/graded_labels_v1.yaml`)、分级标签导出/数据集/损失接口、六段回归(与冻结基线逐段一致)、train24 受限验证(`calibration24_train_v1`,三次运行字节一致)。**预注册裁决:13/24 < 18/24 数量门未达标——停止规模扩展,阶段 6(312 originals)与阶段 7(重训)不启动**;失败分类(速度终检微超限 3 段 3e-9~4e-7 rad/s、regen 手带行不可行 6 段、召回不足 2 段)待另立最小修复方案后重新冻结重跑。详见[验证记录](../verification/m2_m3_label_quality_train24_verification.md)。前段“2 项偏差”表述经本轮订正(sub10 左交集实为 0,review-fix 记录顶部订正指针)。
+**最新补充(2026-09-26,已实施):**[标签分级与 train24 受限验证方案](../../plans/m2_m3_label_quality_train24_plan.md)(本方案阶段 4 的标签适用性与阶段 5 的 train24 数据验证部分)已实施完毕:证据订正(统一版本相对 v3 为 **3 项**退化——sub10 左手认证∩参考交集 0 帧、sub10 右覆盖 −5.4pp、sub8 右覆盖 −1.25pp)、标签协议 v1(`configs/labels/graded_labels_v1.yaml`)、分级标签导出/数据集/损失接口、六段回归(与冻结基线逐段一致)、train24 受限验证(`calibration24_train_v1`,三次运行字节一致)。**预注册裁决:13/24 < 18/24 数量门未达标——停止规模扩展,阶段 6(312 originals)与阶段 7(重训)不启动**;失败分类(速度终检微超限 3 段 3e-9~4e-7 rad/s、regen 手带行不可行 6 段、召回不足 2 段)待另立最小修复方案后重新冻结重跑。详见[验证记录](../verification/m2_m3_label_quality_train24_verification.md)。前段“2 项偏差”表述经本轮订正(sub10 左交集实为 0,review-fix 记录顶部订正指针)。
 
 **2026-09-24 补充(已被上段订正/扩展):**阶段门实现审阅确认的 9 项数值/缓存/诊断/报告缺陷已按[实现审阅修复方案](m2_m3_stage_gate_review_fix_plan.md)全部修复并分项提交(R1 `c8d266f`、R2 `b9fc080`、R3 `a22e775`、R5/R7/R8 `c991f6b`、R4/R9 `12c5741`、R5 补全 `9658b02`,165 项测试),历史受影响字段已重算。统一版本六段:Nq/Nv regen **5/6 keep**(sub12 恢复接受、sub7 转为终检速度 @t=101 拒绝,两轮同因)、Ns 标准模式 **6/6** 与旧标准逐段一致;“每侧几何接近覆盖不低于 v3”仍有 2 项偏差(sub10 右 −5.4 pp、sub8 右 −1.25 pp,与第十轮同值;S01/S10 证明与稳定权重无关),按方案 §8 保留新结果、**不自动进入 train24**,阶段 4-7 与 24/312 段仍未执行。详见[修复验证记录](../verification/m2_m3_stage_gate_review_fix_verification.md)。上段 5/6、6/6 保留为 2026-09-22 历史快照,其质量/成本字段表述以本轮结论为准。
 
 **2026-09-17 历史审阅订正(后续状态见上文):**`skip_reason` 不能代表最终失败阶段,sub12/sub16 存在端点通过但插值碰撞;“教师 120mm/帧滑步”混用了求解候选运动量;回流 `regen` 类型污染、QP 跟踪尺度、best 返回复核及 verbose 副作用当时尚未正式修复。临时类别修正 3/6 不计入验收。旧 `p02_calibration` 实际为 19 train/2 val/3 test,进入阶段 5 前须冻结新的 train24 清单,不得沿用“旧清单 train-only”的声明。
 
-主方案:[interaction_retarget_impl_plan.md](interaction_retarget_impl_plan.md) §8-10(M4 闭环测试不在本方案范围)。
+主方案:[interaction_retarget_impl_plan.md](../../plans/interaction_retarget_impl_plan.md) §8-10(M4 闭环测试不在本方案范围)。
 前序:[教师重生成鲁棒性方案](teacher_regen_robustness_plan.md)及其[验证记录](../verification/teacher_regen_robustness_verification.md)。
 
 ## 1. 目标与执行边界
@@ -145,7 +145,7 @@
 ## 11. 产物与进度维护
 
 - 各实验使用独立输出目录,包含模式、任务门及版本信息;不覆盖基线。
-- 后续验证汇总建议写入 `docs/verification/m2_m3_completion_verification.md`,未执行前不创建成功记录。
+- 后续验证汇总建议写入 `docs/archive/verification/m2_m3_completion_verification.md`,未执行前不创建成功记录。
 - 每个阶段结束同步本文件勾选状态、主实现方案及 AGENTS 阶段摘要;资源变化同步 `resources/README.md` 与 manifest。最终再统一核查文档一致性。
 - 优先按诊断统计、动态 pair、走廊语义、条件性策略分别组织可审阅改动;提交与实验元数据相互对应。
 - 当前已有阶段 0-3 历史实现与 2/6 重测;审阅补修及阶段 4-7 尚待执行。2026-09-17 新修复方案只完成编写,不代表任何新修复或验收已通过。
