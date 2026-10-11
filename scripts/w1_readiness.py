@@ -73,7 +73,9 @@ def check_registration(run_root: Path) -> dict:
 
 
 def check_a3(run_root: Path) -> dict:
-    from audit_omniretarget_training import exit_criteria, summarize
+    from audit_omniretarget_training import (
+        BOOL_EXIT_GATES, exit_criteria, exit_ok, summarize,
+    )
 
     att = latest_attempt(run_root / "audit")
     if att is None:
@@ -84,10 +86,8 @@ def check_a3(run_root: Path) -> dict:
     gates = exit_criteria(summary, manifest["rows"])
     # only the boolean gates count as unmet reasons (``missing_rows`` is the
     # evidence list, not itself a verdict)
-    bool_gates = ("all_candidates_processed", "train_label_quality_complete",
-                  "six_subjects_usable_train_windows")
-    reasons = [k for k in bool_gates if gates.get(k) is not True]
-    return {"passed": not reasons, "reasons": reasons,
+    reasons = [k for k in BOOL_EXIT_GATES if gates.get(k) is not True]
+    return {"passed": exit_ok(gates) and not reasons, "reasons": reasons,
             "exit_criteria": gates, "counts": {
                 k: v for k, v in summary.items()
                 if not isinstance(v, (dict, list))},

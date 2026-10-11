@@ -235,6 +235,17 @@ def exit_criteria(summary: dict, rows: list[dict]) -> dict:
     }
 
 
+BOOL_EXIT_GATES = ("all_candidates_processed", "train_label_quality_complete",
+                   "six_subjects_usable_train_windows")
+
+
+def exit_ok(gates: dict, n_budget_stop: int = 0) -> bool:
+    """Only the BOOLEAN gates decide — ``missing_rows`` is the evidence list
+    (an empty list is a PASS; ``all(gates.values())`` treated it as falsy)."""
+    return (all(gates.get(k) is True for k in BOOL_EXIT_GATES)
+            and n_budget_stop == 0)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--preregistration", type=Path, required=True)
@@ -352,7 +363,7 @@ def main() -> int:
                                  if not isinstance(v, dict)},
                       "exit_criteria": gates}, indent=2))
     print(f"[a3] manifest -> {path_for_record(out)}")
-    ok = all(gates.values()) and n_budget_stop == 0
+    ok = exit_ok(gates, n_budget_stop)
     print(f"[a3] overall: {'PASS' if ok else 'FAIL'} "
           f"(denominator kept at {len(train24) + len(val31)})")
     return 0 if ok else 1

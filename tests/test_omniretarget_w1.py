@@ -1231,3 +1231,32 @@ def test_readiness_reasons_on_missing_and_complete(tmp_path, monkeypatch):
         sorted(decisions.glob("attempt_*/w1_readiness.json"))[-1].read_text())
     assert report["ready_for_w1_d"] is True, report["unmet"]
     assert rc == 0
+
+
+def test_a3_exit_verdict_ignores_evidence_lists():
+    """Regression (found on the real A3 run): ``all(gates.values())`` treated
+    the empty ``missing_rows`` evidence list as a falsy gate — a full-pass
+    audit exited FAIL. Only the boolean gates decide."""
+    from audit_omniretarget_training import exit_criteria, exit_ok, summarize
+
+    def _rows(statuses):
+        return [{"demo": f"d{i}", "split": "train", "status": st,
+                 "subject": SUBJECTS[i % 6],
+                 "admission": {"motion": st == "processed"},
+                 "quality": {"status": "complete"},
+                 "full_windows_F60_s30": 1}
+                for i, st in enumerate(statuses)]
+
+    rows = _rows(["processed"] * 55)
+    summary = summarize(rows, [f"d{i}" for i in range(55)])
+    gates = exit_criteria(summary, rows)
+    assert gates["missing_rows"] == [] and exit_ok(gates) is True
+
+    rows[3]["status"] = "not_processed"
+    summary = summarize(rows, [f"d{i}" for i in range(55)])
+    gates = exit_criteria(summary, rows)
+    assert gates["missing_rows"] == ["d3"]
+    assert gates["all_candidates_processed"] is False   # reflected HERE
+    assert exit_ok(gates) is False
+    assert exit_ok({**gates, "all_candidates_processed": True},
+                   n_budget_stop=1) is False
