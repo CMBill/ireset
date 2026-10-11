@@ -1,18 +1,19 @@
 # 文档索引
 
-整理日期：2026-10-11。当前推进到 **A2 收口完成，W1 A3/B/C 方案已起草、尚未实施；训练仍为 `not_ready`**。本页区分当前执行入口、保留的参考资料和历史归档。
+整理日期：2026-10-11。当前推进到 **W1 A3/B/C 已实施并全部通过（`ready_for_w1_d=true`）；W1-D/E 正式训练尚未运行，最终可行性结论不变**。本页区分当前执行入口、保留的参考资料和历史归档。
 
 ## 当前入口
 
 | 文档 | 用途与状态 |
 | --- | --- |
-| [W1 弱动作监督 A3/B/C 方案](plans/omniretarget_w1_a3bc_plan.md) | 下一项交付物，v0.1 草案；明确发布 original 标签、train24/val31 审计、数据/缓存接口、接触损失关闭及 S0；实施与运行预注册未开始 |
+| [W1 弱动作监督 A3/B/C 方案](plans/omniretarget_w1_a3bc_plan.md) | 本轮已执行的实验契约（v0.1）；固定 W1-D/E 契约但 D/E 本轮 `not_run` |
+| [W1 A3/B/C 验证记录](verification/omniretarget_w1_a3bc_verification.md) | 接口实现、34 项反例与正式运行 W0→A3→缓存→S0→就绪的实际证据；运行根 `20261011_b6eef5c_w1_a3bc`，就绪报告 `decisions/attempt_001` |
 | [OmniRetarget 优先教师与初步训练总方案](plans/omniretarget_first_training_plan.md) | 父方案，约束来源裁决、W1 用途、训练和裸输出评估；原文字节是 A2 快照证据的一部分 |
 | [A2 收口与有限恢复方案](plans/omniretarget_a2_closure_plan.md) | 已执行阶段的实验契约，W1 入口依据；原文字节保留供 A2 证据复核 |
 | [A2 最新验证记录](verification/omniretarget_a2_closure_verification.md) | C0/C1/D0/G0/UR/C2 及六轮修复的实际证据；当前权威 C2 为 attempt_010 |
-| [项目整体实现方案](plans/interaction_retarget_impl_plan.md) | 项目目标、资产/坐标约定、模型与最终验收设计；当前实施顺序由 OmniRetarget 总方案和 W1 草案具体化 |
+| [项目整体实现方案](plans/interaction_retarget_impl_plan.md) | 项目目标、资产/坐标约定、模型与最终验收设计；当前实施顺序由 OmniRetarget 总方案和 W1 方案具体化 |
 
-当前事实：A1 冻结与配对已完成；原 U0 保持 `incomplete` 并停线；独立 UR 六段比较为完整 `no_quality_gain`；W1 具有登记资格，A3/B/C 和正式训练尚未执行。实际 W1 标签来源计划为已发布 original 数据，用途 `weak_motion_only`；UR 标签不混入该来源。
+当前事实：A1 冻结与配对已完成；原 U0 保持 `incomplete` 并停线；独立 UR 六段比较为完整 `no_quality_gain`；W1 按发布 original 数据、用途 `weak_motion_only` 完成注册/审计（train24+val31=55 段全准入、质量登记完整）、键控缓存与 train 统计、两模型 S0 烟测（各 1000 步、拟合趋势成立），工程就绪门 `ready_for_w1_d=true`。UR 标签不混入该来源；W1-D/E 正式训练与最终比较未运行。
 
 [权威 C2](../derived/experiments/omniretarget_first/20261010_a39d763_a2_closure/decisions/attempt_010/a2_closure.json) 的 SHA-256 为 `34a392f92a9cda5b8317a08d5b5b486f750c5fc83933174d36d361cb7b1d0fa2`。实际证据位于 ignored 的 derived/，迁移仓库时需按资源和验证记录恢复，不能把文档链接存在视作实验产物已携带。
 
