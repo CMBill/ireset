@@ -150,6 +150,9 @@ T<60 短片段零。
 
 ## 5R. 审阅修复轮（2026-10-12，提交 `f2099f4`；上位条目的就绪判断与 A3/cache/S0 权威产物自此被本轮取代）
 
+【本节权威产物又被下方 §5R2 第二轮审阅修复轮取代——缓存键因代码身份扩展全部 re-key、
+S0/readiness 以新链重建；本节 12 项修复本身继续有效】
+
 独立复核确认两模型 1000 步记录、拟合趋势与 checkpoint 末次 probe 成立、60 项相关测试全过，
 但 **`ready_for_w1_d=true` 不予验收**：另发现 12 项缺口（10 P1+2 P2，源几何问题已影响条件数据）
 已全部修复。**P1-1 源箱几何未应用相似变换尺度**：日程/质量推断按无尺度锁定 hull 测距——
@@ -204,11 +207,88 @@ PASS（55/55 准入、源箱=A1 冻结 37/37 逐位、尺度入册、质量完�
 6. **共享预算需要台账而非记忆**：重跑同一 run 根时，历史成本只能来自逐阶段/逐 attempt 的
    台账行；有 attempt 无台账行=未知历史=停止条件（否则预算上限只是纸面约束）。
 
+## 5R2. 第二轮审阅修复轮（2026-10-11，提交 `a0dbfa1`；§5R 的就绪判断与 A3/cache/S0 权威产物自此被本轮取代——12 项修复本身继续有效）
+
+独立复核确认源几何修正、训练统计与两模型 S0 结果成立（140 项相关测试、55 份缩放日程、
+47 段/527 标记、4,351 帧统计逐位一致；checkpoint 末次 probe 差值 0；"89"复算成立=demo×手侧
+整段二值序列变化数），但另发现 **8 项缺口（5 P1+3 P2）**，全部修复：
+
+- **P1-1 C 门训练证据深度重算**：`_recompute_s0_verdict` 新增 `loss_history_present`
+  （删 loss_history.json 不再被 all([]) 空真接受）/`loss_history_contiguous`（步号恰为
+  1..N 且行数=optimizer_steps）/`all_finite` 扩展为每行**全部**损失字段 isfinite（原只查
+  gnorm，NaN total 通过）/`probe_errors_finite`+`probe_schedule_valid`（首探 step 0、严格
+  增、后续步号=注册 cadence 整倍数、末探覆盖最终状态）；小集从 ⊆pilot6 收紧为**集合相等**
+  +`small_set_batch_size` 对账（缩为一个 demo 不再过）。
+- **P1-2 checkpoint 实际重建加载重放**：S0 每次尝试新增 `probe_replay.pt`（固定 probe 的
+  输入 batch+专用 t/noise+记录的末次误差）；`check_c` 的 `_verify_checkpoint_deep` 从
+  checkpoint config 重建 TrainConfig→`build_s0_modules` 重建模型→strict `load_state_dict`
+  （清空/异构 state 被拒）→全参数 isfinite（NaN 权重被拒）→内嵌 root_stats 与缓存
+  root_stats **逐位相等**（+100m 被拒）→CPU 重放固定 probe 与记录误差对账（容差
+  1e-3+1e-3·|rec|）。`reload_reproducible` 标记不再是唯一证据。
+- **P1-3 正式选模分母固定注册 val31**：`make_formal_eval` 的 expected=preregistration
+  `selection.val31` 全集（原按 `admission.motion` 过滤——一段标签被拒即缩小分母，
+  n_ok=1/n_expected=1 判 complete 仍可选 best）；缺行/未准入/不可载标签各留 gap 行
+  （`row_missing`/`label_not_admitted`/`label_unloadable`），宏只在**全集** ok 时存在。
+- **P1-4 质量完整性对照参考帧核验测量存在性**：`quality_registration_complete` 以
+  `ref_grasp_frames`/`ref_support_frames`（并与 `reference_intervals` 复算对账，`sup`=
+  ground/object）为存在性契约——参考帧>0 而 hand/foot 侧为 None = **缺测量**（审阅者
+  sub10 左手 46 帧反例），参考帧=0 才允许 None；`n_ref_frames` 与参考帧数互查；新增必需
+  字段 `penetration_violation_ratio`（有限）/`fps`（有限）/`both.denominator_frames`>0 时
+  `valid_coverage`+`gap_series_p95_m` 有限（清空 both 被拒）。真实 manifest 55/55 全过。
+- **P1-5 S0 成本盘×索引×台账三方对账**：`_upsert_cost` 按 (stage, attempt) 原位登记
+  （事前 `running` 行+全退出口更新）；崩溃路径补写 incomplete 摘要+索引行+`crashed` 台账行
+  后重抛；`historical_s0_cost_s` 要求每模型 盘上 attempt 目录=索引=台账行 且无重复行、无
+  `running` 残留、墙钟有限≥0——崩溃尝试留下无索引 attempt 的洗零路径关闭（=未知=停止）。
+- **P2-6 budget_stopped 裁决**：`run_s0_model` 门新增 `completed_within_budget`，预算停机
+  裁决=incomplete（原趋势过关仍 passed）；readiness 重算同拒。
+- **P2-7 缓存预算执行**：`run_w1` 读 `CACHE_BUDGET_S`(7200s)——历史 `w1_cache` 台账扣减、
+  未知/耗尽即拒；作业分块（块=workers）块间查单调截止；超限=INCOMPLETE 尝试
+  （`complete:false`+`missing_demos`+exit 2，不造统计）；`verify_cache_contents` 消费侧
+  拒 `complete≠true` 的缓存。
+- **P2-8 缓存代码身份纳入距离实现**：`CONDITION_CODE_FILES` 增加
+  `src/ireset/geometry/distance_adapter.py`（本轮源几何根因所在文件；原清单漏列——仅回退
+  缩放查询不改变 condition_code_sha256，旧键日程仍可复用）。全部缓存键随之 re-key。
+
+**新权威链** `derived/experiments/omniretarget_first/20261011_a0dbfa1_w1_a3bc_reviewfix3/
+w1_reviewfix3/`（干净树 a0dbfa1；§5R 链与 `20261011_a0dbfa1_..._reviewfix2` 误参轮
+【A3 --out 误传 $RUN/audit 产生 audit/audit 嵌套致 readiness a3_no_attempts；其
+W0/A3/cache/S0 数值本身有效，保留为调用契约证据】均保留）：W0 2.5s；A3 attempt_001 PASS
+（55/55 准入、质量完整性按新谓词全过，66.9s）；cache attempt_001（complete:true、预算块
+52.5s/7200s、55 键控日程——与 §5R 轮文件名**零重叠**=re-key 实证，53.5s，较 §5R 5.4s 慢
+系分块并行的 spawn 冷启动成本，预算内如实登记）；S0 双模型各 1000 步 PASS——确定性
+1295.0s 趋势 0.394223→0.013504、扩散 1263.9s 趋势 0.428729→0.011308（与 §5R 轮**逐位一致**
+=代码身份/预算/台账改动不触训练数值）、probe 101、`probe_replay.pt` 双双在册、S0 合计
+2558.9s≤3600s；readiness `decisions/attempt_001` 五门全 true——C 门为重算门且
+`identity_problems` 空、checkpoint 重放误差 0.0115/0.0087 与记录末探匹配。台账 6 行齐
+（w0 2.5/a3 66.9/cache 53.5 complete:true/s0_det 1295.0 done/s0_diff 1263.9 done/
+readiness 12.7）。测试 616→**621 passed + 1 skipped**（审阅文件 18→23 项：loss 历史
+删除/NaN/断号、probe 脱 cadence、小集缩水双向、budget 裁决（受控单调钟）、崩溃洗零关闭、
+缓存预算耗尽 exit 2+消费侧拒 incomplete、代码身份覆盖 distance_adapter、formal 分母
+gap、质量存在性九反例+合法零参考侧）。
+
+工程事实（本轮新增）：
+1. **摘要计数不是训练证据**：loss_history 删除后 all([]) 空真、NaN 只查 gnorm、小集 ⊆ 判定
+   ——三类都让"门重算"退化为"摘要复读"；证据链必须落到逐行（连续步号/全字段 isfinite/
+   probe cadence）与集合相等。
+2. **torch.load 只证明容器可读**：清空 state/NaN 权重/+100m 内嵌统计都在"身份标签+步数
+   不变"下通过；唯一闭合=生产侧落重放工件（固定输入+t/noise+记录误差），消费侧重建模块
+   strict 加载+逐位统计对账+实际重放。
+3. **分母必须锚定注册名单而非幸存标签**：任何按 admission 过滤 expected 的评估都在用
+   准入结果改写验证集；缺标签保留 gap 行、宏只在全集上存在，才不会被"少评估=更好"反向激励。
+4. **存在性契约要有独立账本**：测量为 None 是否合法不能由测量自身报告（n_ref_frames 可被
+   一并改写）；参考帧数需第二表示（ref_*_frames）并与第三表示（intervals）复算对账。
+5. **共享预算的"已花费"来自三方对账**：盘上 attempt 目录、attempts 索引、台账行按
+   (model, attempt) 集合相等——崩溃在分配后登记前的窗口靠事前 running 行+全退出口 upsert
+   关闭；重复行/running 残留=未知=停止。
+6. **代码身份清单必须覆盖行为的真实依赖闭包**：清单列了调用方（contact_sites）却漏了
+   被调方（distance_adapter），几何回退不触发 re-key；清单按 import 闭包而非按"谁定义协议"
+   圈定。
+
 ## 6. 就绪判断与后续边界（§10）
 
-【本节首段就绪指针已被 §5R 审阅修复轮取代——权威就绪记录为
-`20261012_f2099f4_w1_a3bc_reviewfix/w1_reviewfix/decisions/attempt_001/w1_readiness.json`
-（五门全 true，check_c 为重算门）；本节其余边界表述继续有效】
+【本节首段就绪指针已被 §5R2 第二轮审阅修复轮取代——权威就绪记录为
+`20261011_a0dbfa1_w1_a3bc_reviewfix3/w1_reviewfix3/decisions/attempt_001/w1_readiness.json`
+（五门全 true，check_c 为重算门+checkpoint 重建重放门）；本节其余边界表述继续有效】
 `decisions/attempt_001/w1_readiness.json`：五门全 true、unmet=[]。就绪由事实重算
 （A3 行复算、缓存身份对账、双数据集真实构建、S0 门读取）；exit 0=记录完成。
 
