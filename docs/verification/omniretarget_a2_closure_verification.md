@@ -3,7 +3,8 @@
 日期：2026-10-10。方案：[A2 收口与有限恢复实现方案](../plans/omniretarget_a2_closure_plan.md)（提交 `e487eb3`）。
 实现提交：C0/C1+D0 `a39d763`、NaN 对照修复 `420afbf`、UR `360556d`、对照修复 `880bff8`、
 审阅 13 项缺口修复 `efece4a`（§11）、审阅第三轮 6 项缺口修复 `6d7f257`（§12）、
-边界复验第四轮 4 项缺口修复 `ee363cd`（§13）、**第五轮 1 项缺口修复 `87f45aa`（§14）**。
+边界复验第四轮 4 项缺口修复 `ee363cd`（§13）、第五轮 1 项缺口修复 `87f45aa`（§14）、
+**第六轮 2 项缺口修复 `08b348b`（§15）**。
 运行根：`derived/experiments/omniretarget_first/20261010_a39d763_a2_closure/`。
 
 ## 0. 结论摘要
@@ -49,6 +50,13 @@ rev `ee363cd`）、新鲜比较 `baseline/cmp/attempt_008`。测试 532→**547 
 逐字段一致（唯一差异=新快照哈希指针），本轮 C0 快照 `baseline/snapshots/attempt_005`（干净树
 rev `87f45aa`）、新鲜比较 `baseline/cmp/attempt_009`。生成入口的历史消费自此先做**结构校验**
 （可解析但残缺的 manifest 不再经默认值读作零调用零成本）。测试 547→**557 passed + 1 skipped**。
+
+**第六轮边界复验 2 项缺口修复（2026-10-10，提交 `08b348b`）后第五次重跑**：方向结论仍全部
+成立；权威 C2 更替为 `decisions/attempt_010`（sha `34a392f9…`，本记录 §15）——与 attempt_009
+逐字段一致（唯一差异=新快照哈希指针），本轮 C0 快照 `baseline/snapshots/attempt_006`（干净树
+rev `08b348b`）、新鲜比较 `baseline/cmp/attempt_010`。历史消费自此另加**非负+逐行汇总对账**
+与 **rows vs 登记 scope 对账**两腿（负成本曾补回预算、汇总改 0 曾放行超 3h 的六次重试、删行
+曾把两次调用计为一次）。测试 557→**564 passed + 1 skipped**。
 
 ## 1. 基线锚点核对（§1.1）
 
@@ -141,17 +149,17 @@ attempt_001/002 因 §5.4 配置快照缺陷作废保留为证据）：
 `admission.source_registration` 差异、registration 被正确阻断。修复为仅 UR 模式携带该键
 （§10.3"旧 CLI 无新参数时与基线一致"），回归断言入 `tests/test_omniretarget_recovery_source.py`。
 
-## 6. C2：收口（decisions/attempt_004；**权威已更替为第五轮复核 attempt_009，见 §12–§14**）
+## 6. C2：收口（decisions/attempt_004；**权威已更替为第六轮复核 attempt_010，见 §12–§15**）
 
 `--diagnosis` + `--recovery-report` 哈希钉住汇入，`a2_closure.json`（sha `8b346fa569ee04c0…`）：
 `baseline_verdict=incomplete`（原报告路径/哈希不变）、`diagnosis=supports_step03_candidate`、
 `recovery=no_quality_gain`、`training=not_ready`、`registration_status.complete=true`。
 【复核轮订正：本轮汇入只记录了当时的文件哈希、未核验证据链（审阅缺口 6），且其引用的
 `baseline/baseline_evidence.json` 已被同日更晚的收口调用覆盖（缺口 1）。该记录保留为历史证据，
-权威 C2 以 §14 的 attempt_009（sha `32fc0b6a…`，证据链核验+裁决/门/证据重推+phase_one 事实
-重推与盘上运行事实对账全过）为准；§13 的 attempt_008（sha `dcc72460…`）、§12 的
-attempt_007（sha `043b0121…`）与 §11 的 attempt_006（sha `5ca7960c…`）为第二至四轮复核
-证据，度量与裁决逐位一致。】
+权威 C2 以 §15 的 attempt_010（sha `34a392f9…`，证据链核验+裁决/门/证据重推+phase_one 事实
+重推与盘上运行事实对账全过）为准；§14 的 attempt_009（sha `32fc0b6a…`）、§13 的
+attempt_008（sha `dcc72460…`）、§12 的 attempt_007（sha `043b0121…`）与 §11 的
+attempt_006（sha `5ca7960c…`）为第二至五轮复核证据，度量与裁决逐位一致。】
 按 §7.4 行 2 与 §12：当前候选停止，不追加候选；W1（weak_motion_only、接触损失 0、每模型
 ≤4k）的 A3/B/C 执行方案为下一阶段的独立预注册文档，本轮不实现、不启动任何训练。
 
@@ -168,6 +176,7 @@ attempt_007（sha `043b0121…`）与 §11 的 attempt_006（sha `5ca7960c…`�
 | 第三轮复核 C2 重跑（attempt_007） | 18.3s | 预留内 |
 | 第四轮复核 C2 重跑（attempt_008） | 18.5s | 预留内 |
 | 第五轮复核 C2 重跑（attempt_009） | 18.2s | 预留内 |
+| 第六轮复核 C2 重跑（attempt_010） | 18.2s | 预留内 |
 | GPU 训练 | 0（未创建） | 0 |
 | 新产物 | <2GiB | 起步上限 2GiB |
 
@@ -190,15 +199,23 @@ attempt_007（sha `043b0121…`）与 §11 的 attempt_006（sha `5ca7960c…`�
   可读历史正常重试）；**第五轮在同一模块扩 10 项**（结构残缺历史 9 变体——`{}`·有 rows 缺
   total_wall_s·缺 rows·rows 非 list·行缺 status·行缺 demo·NaN 成本（json.loads 裸字面量）·
   bool 成本·非对象 manifest——全部 history_incomplete 于分配 attempt 前停止，另加全 skipped
-  历史负控制：total_wall_s=0.0 有证据零成本合法、重试路径不受影响）。
+  历史负控制：total_wall_s=0.0 有证据零成本合法、重试路径不受影响）；**第六轮再扩 7 项**
+  （成本非负+汇总对账 4 变体——负 total 配负 rows 曾补回预算/负 total 配零 rows/rows 合计
+  9900s 汇总改 0 的审阅复现形态/NaN 行成本；删行 vs 登记 scope[索引+manifest 双侧保留 demo
+  而行消失+汇总同步清零]停止；scope 双侧缺失停止；真实非零成本历史负控制[prior_wall 100s
+  入册]）。
 - 既有测试适配两处：`generate_one` 新增可选 `extra_argv` kwarg，review/review4 的 fake 签名
   加 `**kw`（行为断言不变）；第三轮按新语义更新 review2/report 夹具（UR 报告经真实评估自洽
   构建、诊断记录带盘上快照与 runs、生成重试场景改"失败后有理由重试"）与 sub12 快照夹具
   （补 P/A 文件）；第四轮按新语义更新 review2 夹具（`_canonical_failure` 统一记录/盘上
   failure_meta+child_summary 同源、生成 harness 增 demos/manifest_text）与 sub12 夹具
-  （`_run` 增 status/max_violation，retained_infeasible 行改真 infeasible 状态）。
-- 全量（第五轮实测）：**557 passed + 1 skipped**（`uv run --locked pytest tests/ -q`，1030s；
-  第四轮 547/第三轮 532/第二轮 506/首轮 484 passed + 1 skipped）。
+  （`_run` 增 status/max_violation，retained_infeasible 行改真 infeasible 状态）；第六轮把
+  review2/review3 生成 harness 的先例历史改为**真实一 attempt 一调用布局**（每行带 wall_s、
+  total 与行汇总一致、scope 在 index 与 manifest 双侧登记——同 demo 两次调用是两个 attempt，
+  两处 `prior_invocations` 断言随之真实化为 attempt_001/002），`_run_generation_ur` 增
+  tamper 钩子供篡改复现。
+- 全量（第六轮实测）：**564 passed + 1 skipped**（`uv run --locked pytest tests/ -q`，1039s；
+  第五轮 557/第四轮 547/第三轮 532/第二轮 506/首轮 484 passed + 1 skipped）。
 
 ## 9. 未运行/超出本轮范围
 
@@ -271,6 +288,14 @@ attempt_007（sha `043b0121…`）与 §11 的 attempt_006（sha `5ca7960c…`�
     `bool` 是 `int` 子类，两者都要显式排除），证据缺失即按 history_incomplete 停止；而
     `total_wall_s: 0.0` 的全 skipped 历史是**有证据的零**，必须放行——校验的对象是证据的
     存在性，不是数值的大小。
+15. **（第六轮）成本要三重一致（非负、有限、=逐行汇总），行数要与登记 scope 重排相等**：
+    有限性单独不够——`total_wall_s=-600` 会**补回**预算；汇总与逐行是两份独立记录，只信汇总
+    时把 9900s 改 0 即放行六次 300s 重试（加比较预留共 12300s>3h）。写入端
+    `round(sum(row.wall_s),1)` 只有一次舍入，对账容差 0.05 恰为该舍入的上界（真实三 attempt
+    差 0.04/0.05/0.05）——容差必须由写入公式推导而非拍脑袋。同理 rows 只是 list 不证明行完整：
+    删一行+汇总同步清零后"两次调用计为一次"重开第三次——行的 demo 清单与数量必须与**登记
+    scope**（index `scope` 与 manifest `attempt_scope` 双腿，任一在册即须重排相等）对账，双侧
+    都缺 scope=行完整性不可证，同样停止。合法零成本（全 skipped、0.0 对 0 行值）不受影响。
 
 ## 11. 独立审阅 13 项缺口修复轮（2026-10-10，提交 `efece4a`）
 
@@ -453,3 +478,38 @@ timestamp/comparison_attempt/cost_s）；C2 终局 **`decisions/attempt_009`（s
 （recovery/cmp/attempt_002）证据不受影响、未重跑（修复为生成入口的事前结构规则，不追溯
 已验收产物）。测试 547→**557 passed + 1 skipped**（review4 模块扩 10 项：结构残缺 9 变体
 +全 skipped 负控制）。
+
+## 15. 边界复验第六轮 2 项缺口修复（2026-10-10，提交 `08b348b`）
+
+第六轮边界复验确认第五轮缺字段反例已封堵、权威链成立（181 项相关测试通过；50 项快照哈希、
+C2 attempt_009 哈希及重推链一致），但历史消费的结构校验另有 2 项 P2 缺口；修复后按修正协议
+重跑权威 C2。**裁决不变：原 U0 `incomplete`；UR `no_quality_gain`（complete_evidence=true）；
+训练 `not_ready`；W1 A3/B/C 另立预注册。**
+
+**修复清单（编号=审阅项）**：
+①**[P2] 历史成本还需非负性与逐行对账**——有限性检查放过 `total_wall_s=-600.0`（负成本**补回**
+预算）；另一 CLI 复现中历史行耗时合计 9900s、汇总被改为 0，六次各 300s 的重试全部获准
+（exit 0），加比较预留共 12300s 超过 3h。现 `_history_manifest_problems` 要求成本三重一致：
+非负（`total>=0`、逐行 `wall_s>=0`）、有限（bool/NaN 字面量排除）且 `total_wall_s` 与逐行
+`wall_s` 汇总对账（容差 `0.05+1e-6`——写入端 `round(sum(row.wall_s),1)` 单次舍入的上界，
+真实三 attempt 差 0.04/0.05/0.05；行 wall_s 缺失/非有限即无法对账同拒）。全 skipped 历史
+的 `0.0` 对零值行是**有证据的零成本**，保留合法。
+②**[P2] 历史行未与登记 scope 对账**——rows 是 list 仍不能证明记录完整：索引与 attempt_scope
+保留 demo A，删去某次调用行并把其成本汇总同步为 0 后，两次历史调用被计为一次，CLI 允许第三
+次调用并 exit 0。现行的 demo 清单与数量（重排相等，即每 scope demo 恰一行）须与**登记
+scope** 对账——index 条目 `scope` 与 manifest `attempt_scope` 双腿，任一在册即须匹配（双腿
+互为独立登记，删行只骗一侧也会被另一侧逮住）；双侧都缺 scope=行完整性不可证
+（`scope_missing_everywhere`），同样停止。
+
+**修正协议重跑（干净树 rev `08b348b`，全部预期裁决，18.2s）**：C0 快照
+`baseline/snapshots/attempt_006`（rev start==end `08b348b`、passed）+新鲜比较
+`baseline/cmp/attempt_010` 与 attempt_009 新鲜比较逐位一致（差异仅
+timestamp/comparison_attempt/cost_s）；C2 终局 **`decisions/attempt_010`（sha
+`34a392f92a9cda5b8317a08d5b5b486f750c5fc83933174d36d361cb7b1d0fa2`）**——与 attempt_009
+逐字段一致（仅 `verification.baseline_evidence` 路径与 `baseline_evidence_sha256` 两个快照
+指针字段不同）。真实双根在新校验下预验干净：UR 根 915.0s/六段各 1 次 ok（与审阅独立复核
+一致）；U0 根 845.7s（attempt_001 701.0 + attempt_002 144.7）、sub12 两次失败调用恰计 2。
+costs.json 累计七次调用。UR 生成（generation/attempt_001）与 UR 比较（recovery/cmp/
+attempt_002）证据不受影响、未重跑（修复为生成入口事前规则，不追溯已验收产物）。测试
+557→**564 passed + 1 skipped**（review4 扩 7 项；review2/review3 生成夹具真实化为
+一 attempt 一调用布局+tamper 钩子）。
