@@ -148,8 +148,67 @@ T<60 短片段零。
   5. 发布标签在 train18 上的已知缺陷形态与 pilot6/val31 一致（穿透 1.5–43.1mm、
      48/55 段 strict 穿透失败）——`weak_motion_only` 语义下登记不剔除。
 
+## 5R. 审阅修复轮（2026-10-12，提交 `f2099f4`；上位条目的就绪判断与 A3/cache/S0 权威产物自此被本轮取代）
+
+独立复核确认两模型 1000 步记录、拟合趋势与 checkpoint 末次 probe 成立、60 项相关测试全过，
+但 **`ready_for_w1_d=true` 不予验收**：另发现 12 项缺口（10 P1+2 P2，源几何问题已影响条件数据）
+已全部修复。**P1-1 源箱几何未应用相似变换尺度**：日程/质量推断按无尺度锁定 hull 测距——
+修复为 body 系缩放（`dist(p, sK)=s·dist(p/s, K)`，非 `s·dist(p,K)`），尺度
+（0.68–0.7995）自 `derive_source_box` 贯穿接触推断/审计质量重放/缓存/数据集，derived npz
+增加 `similarity_scale`，缓存键升 v2（旧日程文件零复用）；**真实 55 段对拍：47/55 段、
+527 个手部帧标记变化，与审阅者独立复算逐位一致**（序列计数依口径而异：对称差 198、
+边界移动+消失 94；审阅者 89 在两种口径下未复现，方向与规模吻合，如实登记）。
+其余：P1-2 readiness check_c 重算全部 S0 门（步数/微批/曲线/接触分支自 loss_history 重算/
+checkpoint 身份绑定当前 manifest+缓存+统计），verdict 字符串不再被信任；P1-3 注册核验
+必需集合（九锚点集合相等+inputs 精确=train24∪val31，空块=缺项=多项均拒）；P1-4 数据集
+行级对账（全局唯一/行集合=注册选择/split 按注册成员）；P1-5 质量完整性核验实际测量字段
+（零参考帧 None 合法）；P1-6 缓存内容哈希登记+消费侧复验（`verify_cache_contents`：
+root_stats 文件哈希+逐日程 sha256+键重推+统计身份对账，数据集/S0/评估/就绪统一准入）；
+P1-7 S0 预算单调钟+历史成本扣除+未知历史=停止；P1-8 raw 评估复用统一准入（preregistration
+腿+缓存内容+checkpoint 四重身份）；P1-9 正式 best 规则执行（`formal_eval` 回调：val31 宏平均
+teacher-fit FK MPJPE 选 best，窗口损失不再选择，缺证据无 best；回调接线首次实际执行在 W1-D）；
+P1-10 W1 raw 报告与训练 out 的 derived 守卫+不覆盖既有产物（非空目录自动 attempt_NNN）；
+P2-11 S0 小集整批等权（batch=小集全量 6，24 样本/步，消除 4+2 碎批的 12≠16）；P2-12 成本
+台账逐模型各自计时+attempt+累计预算，缓存入口入册，S0 仅认 `s0_*` 台账。
+
+**新权威链** `derived/experiments/omniretarget_first/20261012_f2099f4_w1_a3bc_reviewfix/
+w1_reviewfix/`（干净树 f2099f4；旧链 `20261011_b6eef5c_w1_a3bc` 保留为被取代证据——其
+S0 证据按未缩放日程构建）：W0 注册 2.4s（55 输入/120 资产/九锚点全配）；A3 attempt_001
+PASS（55/55 准入、源箱=A1 冻结 37/37 逐位、尺度入册、质量完整性按新谓词全过、strict 穿透
+失败 48/55 登记不剔除，墙钟 66.8s）；cache attempt_001（55 键控日程逐文件 sha256+root_stats
+文件哈希入册，4351 帧/24 文件，消费侧复验 passed，5.4s）；S0 双模型新预算（historical 0.0）
+各 1000 步全过——确定性 1295.6s 趋势 0.394→0.0135、扩散 1305.9s 趋势 0.429→0.0113、
+重载 ≤1e-5、峰值 8.16GiB、合计 2601.5s≤3600s（整批后单模型成本约为旧轮 2×：660→1296/
+870→1306s，如实登记）；readiness decisions/attempt_001 五门全 true（check_c 为重算门：
+`recomputed_gates` 全 true+checkpoint 身份对当前链闭合）。测试 598→**616 passed + 1 skipped**
+（新增 18 项反例 `tests/test_omniretarget_w1_review.py`：缩放 hull 对拍直接缩放网格真值/
+掠过点日程翻转/尺度缺失拒载/空锚点空输入/val 改 train/删行重复/质量字段剥离/统计+日程篡改/
+键版本陈旧/预算耗尽与未知历史/篡改缓存与 PT 漂移评估拒绝/宏平均恶化与缺证据无 best/
+守卫与 attempt 隔离/doctored 摘要四变体/整批与逐模型台账）。
+
+工程事实（本轮新增）：
+1. **相似变换的几何缩放不可省**：位姿映射应用尺度后，几何尺寸必须同乘——body 系
+   `dist(p, sK)=s·dist(p/s, K)`，错误形态 `s·dist(p, K)`（只缩结果不缩查询点）在自造
+   反例前不易察觉；对拍"直接缩放网格+trimesh 真值"是唯一可靠锁定（本实现第一版即犯此错，
+   被真值测试逮住后修正）。
+2. **"必需集合"必须按集合判定**：遍历"现有条目"的核验对删除腿免疫——空 anchors/inputs
+   块照常"passed"；集合相等（缺/多都报）+逐项哈希两层缺一不可。
+3. **文件名不能证明内容**：键控缓存若只按文件名寻址，改写内容（统计均值+100m、接触标记
+   0→60）照常消费；生产侧逐文件 sha256+消费侧重哈希+键从当前代码/资产重推才闭合。
+4. **verdict 字符串不是门**：摘要可被改写（steps=0/probes 删空/checkpoint 缺失/外来身份仍
+   verdict=passed）；就绪判定必须从原始事实（曲线/loss_history/checkpoint 文件）重算并
+   与记录 verdict 对账。
+5. **碎批等权记账**：batch 4 对 6 样本 drop_last=False 产生 4+2 微批，等权平均=实际 12
+   样本当 16 用且权重失真——整批（batch=集合全量）或按样本数加权二选一，并登记
+   `small_set_batch_size`/`samples_per_optimizer_step`。
+6. **共享预算需要台账而非记忆**：重跑同一 run 根时，历史成本只能来自逐阶段/逐 attempt 的
+   台账行；有 attempt 无台账行=未知历史=停止条件（否则预算上限只是纸面约束）。
+
 ## 6. 就绪判断与后续边界（§10）
 
+【本节首段就绪指针已被 §5R 审阅修复轮取代——权威就绪记录为
+`20261012_f2099f4_w1_a3bc_reviewfix/w1_reviewfix/decisions/attempt_001/w1_readiness.json`
+（五门全 true，check_c 为重算门）；本节其余边界表述继续有效】
 `decisions/attempt_001/w1_readiness.json`：五门全 true、unmet=[]。就绪由事实重算
 （A3 行复算、缓存身份对账、双数据集真实构建、S0 门读取）；exit 0=记录完成。
 
