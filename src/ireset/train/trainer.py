@@ -52,6 +52,9 @@ class TrainConfig:
     val_every: int = 250
     log_every: int = 25
     device: str = "cuda"
+    #: dedicated seed for the FIXED validation t/noise stream (W1 §5.3);
+    #: None falls back to ``seed``. Validation never touches the global RNG.
+    val_seed: int | None = None
     # backbone (plan 7.1 pilot: d_model 240, 4 layers, 6 heads, window 31)
     d_model: int = 240
     n_layers: int = 4
@@ -61,6 +64,8 @@ class TrainConfig:
     # diffusion
     num_train_timesteps: int = 1000
     beta_schedule: str = "scaled_linear"
+    beta_start: float = 0.0001
+    beta_end: float = 0.02
     loss: LossWeights = field(default_factory=LossWeights)
 
     def backbone_kwargs(self) -> dict:
@@ -71,12 +76,14 @@ class TrainConfig:
 
 
 class Trainer:
-    def __init__(self, cfg: TrainConfig, tokenizer, train_ds, val_ds, out_dir: Path) -> None:
+    def __init__(self, cfg: TrainConfig, tokenizer, train_ds, val_ds, out_dir: Path,
+                 identity: dict | None = None) -> None:
         self.cfg = cfg
         self.tokenizer = tokenizer
         self.train_ds, self.val_ds = train_ds, val_ds
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.identity = identity
 
         torch.manual_seed(cfg.seed)
         np.random.seed(cfg.seed)
@@ -84,6 +91,8 @@ class Trainer:
             self.model = DiffusionG1(
                 num_train_timesteps=cfg.num_train_timesteps,
                 beta_schedule=cfg.beta_schedule,
+                beta_start=cfg.beta_start,
+                beta_end=cfg.beta_end,
                 **cfg.backbone_kwargs(),
             ).to(cfg.device)
         else:
@@ -102,21 +111,35 @@ class Trainer:
             persistent_workers=cfg.num_workers > 0,
             worker_init_fn=_worker_thread_limits,
         )
+        # the val loader keeps its OWN generator: creating a DataLoader
+        # iterator draws a base seed from the loader's generator, and with
+        # ``generator=None`` that draw comes from the GLOBAL stream —
+        # validation must never perturb the training RNG (W1 §5.3)
+        g_val = torch.Generator().manual_seed(cfg.seed)
         self.val_loader = DataLoader(
             val_ds, batch_size=cfg.micro_batch, shuffle=False,
-            num_workers=0, drop_last=False,
+            num_workers=0, drop_last=False, generator=g_val,
         )
 
     def _to_device(self, batch: dict) -> dict:
         return {k: (v.to(self.cfg.device) if torch.is_tensor(v) else v)
                 for k, v in batch.items()}
 
-    def _forward(self, batch):
+    def _forward(self, batch, noise_generator: torch.Generator | None = None):
         B = batch["x0"].shape[0]
         memory = self.conditioner(batch)
         if self.cfg.model_type == "diffusion":
-            t = torch.randint(0, self.cfg.num_train_timesteps, (B,), device=self.cfg.device)
-            noise = torch.randn_like(batch["x0"])
+            if noise_generator is not None:
+                # validation: FIXED t/noise drawn from a dedicated CPU
+                # generator — reproducible, and never touching the global
+                # RNG stream the training steps sample from
+                t = torch.randint(0, self.cfg.num_train_timesteps, (B,),
+                                  generator=noise_generator).to(self.cfg.device)
+                noise = torch.randn(batch["x0"].shape,
+                                    generator=noise_generator).to(self.cfg.device)
+            else:
+                t = torch.randint(0, self.cfg.num_train_timesteps, (B,), device=self.cfg.device)
+                noise = torch.randn_like(batch["x0"])
             x_t = self.model.add_noise(batch["x0"], noise, t)
             x0_pred = self.model(x_t, t, memory)
         else:
@@ -166,13 +189,14 @@ class Trainer:
                 val = self.validate()
                 val_history.append({"step": step, **val})
                 print(f"[{cfg.model_type}] VAL step {step}: total={val['total']:.4f}", flush=True)
-                self.save("last.pt", step, val)
+                self.save("last.pt", step, val, identity=self.identity)
                 if val["total"] < best_val:
                     best_val = val["total"]
-                    self.save("best.pt", step, val)
+                    self.save("best.pt", step, val, identity=self.identity)
 
         summary = {
             "config": asdict(cfg),
+            "identity": self.identity,
             "steps": step,
             "wall_s": round(time.perf_counter() - t_start, 1),
             "ms_per_step_ema": round(ms_ema, 1),
@@ -188,24 +212,42 @@ class Trainer:
         return summary
 
     @torch.no_grad()
-    def validate(self, max_batches: int = 40) -> dict:
+    def validate(self, max_batches: int | None = None) -> dict:
+        """Loss validation over the val dataset.
+
+        W1 contract (plan §5.3): EVERY admitted val window participates —
+        no 40-batch truncation (``max_batches`` stays available only as an
+        explicit debug knob); batch parts are weighted by SAMPLE count so a
+        smaller final batch cannot skew the mean; the diffusion t/noise
+        stream is FIXED through a dedicated generator (``val_seed``) and
+        the global RNG is never reseeded — validation must not perturb the
+        training random sequence or the DataLoader order.
+        """
         self.model.eval(); self.conditioner.eval()
-        torch.manual_seed(self.cfg.seed)                    # reproducible val noise
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed(self.cfg.seed)
-        acc, n = {}, 0
+        g = torch.Generator()
+        g.manual_seed(self.cfg.val_seed if self.cfg.val_seed is not None
+                      else self.cfg.seed)
+        acc: dict[str, float] = {}
+        n_samples, n_batches = 0, 0
         for i, batch in enumerate(self.val_loader):
-            if i >= max_batches:
+            if max_batches is not None and i >= max_batches:
                 break
             batch = self._to_device(batch)
-            _, parts = self._forward(batch)
+            _, parts = self._forward(batch, noise_generator=g)
+            w = batch["x0"].shape[0]
             for k, v in parts.items():
-                acc[k] = acc.get(k, 0.0) + v
-            n += 1
+                acc[k] = acc.get(k, 0.0) + v * w
+            n_samples += w
+            n_batches += 1
         self.model.train(); self.conditioner.train()
-        return {k: v / max(n, 1) for k, v in acc.items()}
+        out = {k: v / max(n_samples, 1) for k, v in acc.items()}
+        out["n_windows_evaluated"] = n_samples
+        out["n_val_windows_total"] = len(self.val_ds)
+        out["n_batches"] = n_batches
+        return out
 
-    def save(self, name: str, step: int, val: dict) -> None:
+    def save(self, name: str, step: int, val: dict,
+             identity: dict | None = None) -> None:
         torch.save(
             {
                 "model": self.model.state_dict(),
@@ -215,6 +257,10 @@ class Trainer:
                 "config": asdict(self.cfg),
                 "root_stats": {"mean": self.tokenizer.root_stats.mean,
                                "std": self.tokenizer.root_stats.std},
+                # W1 model identity (plan §5.3): what this checkpoint is
+                # bound to — consumers refuse a checkpoint whose identity
+                # does not match the manifest/cache/stats they hold
+                "identity": identity,
             },
             self.out_dir / name,
         )

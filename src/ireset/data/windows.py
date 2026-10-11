@@ -16,6 +16,14 @@ any hash/T/fps/protocol/group mismatch or on a trajectory whose labels
 would need modification (joint-limit clamping) -- it never falls back to
 the original teacher files or silently drops certified labels. The old
 entry (no manifest) keeps its historical behaviour bit-for-bit.
+
+W1 entry (omniretarget_w1_a3bc_plan §4.1): with ``training_manifest`` the
+dataset reads ONLY the ``admission.motion`` rows of the requested split,
+re-verifies the preregistration binding, the recomputed train24 selection,
+input hashes, derived-representation hashes, the KEYED schedule cache and
+the A1 asset closure at startup, and consumes the source/target scene split
+explicitly (the legacy source=target approximation is not used). The two
+manifest entries are mutually exclusive; there is no cross-fallback.
 """
 
 from __future__ import annotations
@@ -81,14 +89,30 @@ class TeacherWindowDataset(Dataset):
         max_files: int | None = None,
         max_windows: int | None = None,
         label_manifest: str | Path | None = None,
+        training_manifest: str | Path | None = None,
+        schedule_cache_dir: Path | None = None,
+        verify_assets: bool = True,
     ) -> None:
         self.split = split
         self.window, self.stride = window, stride
         self.tokenizer = tokenizer
         self.graded = label_manifest is not None
+        self.w1 = training_manifest is not None
+        if self.graded and self.w1:
+            raise ValueError(
+                "label_manifest and training_manifest are mutually "
+                "exclusive (W1 plan §4.1)")
 
         if self.graded:
             self._load_graded(Path(label_manifest), schedule_cache, window, max_files)
+        elif self.w1:
+            if schedule_cache_dir is None:
+                raise ValueError(
+                    "training_manifest consumption requires schedule_cache_dir "
+                    "(the keyed W1 cache; the legacy name-keyed cache assumes "
+                    "the TARGET box and must not be reused)")
+            self._load_w1(Path(training_manifest), Path(schedule_cache_dir),
+                          window, max_files, verify_assets)
         else:
             self._load_split(split, schedule_cache, window, max_files)
         self.index: list[tuple[int, int]] = [
@@ -226,6 +250,121 @@ class TeacherWindowDataset(Dataset):
                     hand_supervision_interval_id=ids,
                 )
             )
+
+    def _load_w1(self, manifest_path: Path, schedule_cache_dir: Path,
+                 window: int, max_files: int | None,
+                 verify_assets: bool) -> None:
+        """W1 training-manifest entry (protocol ``omniretarget_motion_v1``).
+
+        ONLY ``admission.motion`` rows of the requested split are consumed,
+        and every identity leg is re-verified at startup: manifest/prereg
+        identity + hash binding, train24 recomputation from the locked
+        split, input hashes, the derived representation hash, the KEYED
+        schedule cache (identity-derived filename — the legacy name-keyed
+        cache assumes the TARGET box and is never consulted) and the A1
+        asset closure. Any drift, missing file, duplicate row or protocol
+        mismatch is a hard error: no fallback to split files, legacy caches
+        or any other source, and labels are never modified at load time.
+        """
+        from ireset.data import a2_integrity as integ
+        from ireset.data import w1_training as w1
+        from ireset.paths import OMOMO_NEW_DIR, PROJECT_ROOT
+
+        manifest = json.loads(manifest_path.read_text())
+        for key, want in (("manifest_name", w1.MANIFEST_NAME),
+                          ("protocol", w1.MOTION_PROTOCOL_VERSION),
+                          ("experiment_id", w1.EXPERIMENT_ID),
+                          ("training_purpose", w1.TRAINING_PURPOSE),
+                          ("source_type", w1.SOURCE_TYPE),
+                          ("published_revision", w1.PUBLISHED_REVISION)):
+            if manifest.get(key) != want:
+                raise ValueError(
+                    f"training manifest {key}={manifest.get(key)!r} != {want!r} "
+                    "-- wrong source/protocol, refusing to load")
+
+        prereg_rec = manifest.get("preregistration") or {}
+        prereg_path = PROJECT_ROOT / str(prereg_rec.get("path", ""))
+        if not prereg_path.is_file() or integ.sha256_file(prereg_path) != prereg_rec.get("sha256"):
+            raise ValueError("training manifest not bound to its "
+                             "preregistration (missing or drifted)")
+        prereg = json.loads(prereg_path.read_text())
+        check = w1.verify_preregistration(
+            prereg, PROJECT_ROOT, TEACHER_TRAJ_DIR, OMOMO_NEW_DIR,
+            verify_assets=verify_assets)
+        if not check["passed"]:
+            raise ValueError(f"preregistration re-verification failed: "
+                             f"{check['problems']}")
+        sel = manifest.get("selection") or {}
+        if list(sel.get("train24", [])) != list(prereg.get("selection", {}).get("train24", [])):
+            raise ValueError("manifest train24 selection != preregistration "
+                             "selection")
+        if sorted(sel.get("val31", [])) != sorted(prereg.get("selection", {}).get("val31", [])):
+            raise ValueError("manifest val31 selection != preregistration "
+                             "selection")
+
+        rows = w1.w1_rows_for_split(manifest, self.split)
+        if not rows:
+            raise ValueError(
+                f"training manifest has no rows for split {self.split!r} "
+                f"(splits present: {sorted({r.get('split') for r in manifest.get('rows', [])})})")
+        demos = [r["demo"] for r in rows]
+        if len(demos) != len(set(demos)):
+            raise ValueError("duplicate demo rows in the training manifest")
+
+        code_sha = w1.condition_code_sha256(PROJECT_ROOT)
+        assets_sha = prereg.get("assets", {}).get("a1_assets_sha256")
+        self.clips: list[LoadedClip] = []
+        self.excluded: dict[str, list[str]] = {"not_admitted": [], "too_short": []}
+        for r in rows:
+            demo = r["demo"]
+            if not r.get("admission", {}).get("motion"):
+                self.excluded["not_admitted"].append(demo)
+                continue
+            inputs = r.get("inputs") or {}
+            for key, suffix, d in (("npz_sha256", "_original.npz", TEACHER_TRAJ_DIR),
+                                   ("pt_sha256", ".pt", OMOMO_NEW_DIR)):
+                p = Path(d) / f"{demo}{suffix}"
+                if not p.is_file() or integ.sha256_file(p) != inputs.get(key):
+                    raise ValueError(f"{demo}: input {key} missing or drifted")
+            derived = r.get("derived") or {}
+            dpath = PROJECT_ROOT / str(derived.get("path", ""))
+            if not dpath.is_file() or integ.sha256_file(dpath) != derived.get("sha256"):
+                raise ValueError(f"{demo}: derived representation missing or drifted")
+            with np.load(dpath, allow_pickle=False) as z:
+                meta = json.loads(str(z["meta_json"]))
+                fps = float(z["fps"])
+            if meta.get("demo") != demo or meta.get("protocol") != w1.MOTION_PROTOCOL_VERSION:
+                raise ValueError(f"{demo}: derived representation identity mismatch")
+            if abs(fps - float(r.get("fps", fps))) > 1e-12:
+                raise ValueError(f"{demo}: fps mismatch with the manifest row")
+
+            # shared condition constructor (train/eval identical by
+            # construction — plan §4.1); the keyed schedule file must exist,
+            # there is no fallback
+            clip = w1.load_w1_derived_clip(r, schedule_cache_dir, PROJECT_ROOT,
+                                           assets_sha or "", code_sha)
+            if clip.validation.get("drop") or clip.validation.get("clamped"):
+                raise ValueError(
+                    f"{demo}: label joints would need modification "
+                    f"({clip.validation}) -- W1 forbids teacher rewriting")
+            if clip.T != r.get("T"):
+                raise ValueError(f"{demo}: T={clip.T} != manifest T={r.get('T')}")
+            if clip.T < window:
+                self.excluded["too_short"].append(demo)
+                continue
+            cond = clip.condition
+            self.clips.append(
+                LoadedClip(
+                    npz_name=dpath.name,
+                    demo=demo,
+                    clip=clip,
+                    kps_obj=keypoints_in_source_object(cond.human_kps_world, cond.source_obj_pose),
+                    kps_clip=world_to_clip(cond.human_kps_world, cond.world_from_clip),
+                )
+            )
+        if max_files is not None:
+            self.clips = self.clips[:max_files]
+            # re-index happens in __init__ over the truncated clip list
 
     def __len__(self) -> int:
         return len(self.index)

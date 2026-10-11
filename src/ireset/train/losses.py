@@ -117,26 +117,33 @@ class LossAssembler:
             parts["fk_m2"] = ((kp_p - kp_t) ** 2).sum(-1).mean()
             loss = loss + self.w.w_fk * parts["fk_m2"]
 
-            # hand contact deviation in the box geom frame (AABB proxy)
-            hand_p = self.fk.site_world_positions(
-                flat(pos_p), flat(quat_p), flat(q_p), HAND_SITE_NAMES
-            ).view(B, F, -1, 3)                                                     # [B,F,6,3]
-            p_geom = self.hand_points_box_geom(hand_p, batch)                           # [B,F,6,3]
-            sdf = point_box_sdf_torch(p_geom)                                            # [B,F,6]
-            if "hand_contact_supervision_mask" in batch:
-                # graded supervision (label protocol v1): contact loss ONLY on
-                # certified-and-in-reference frames, normalized by valid frames;
-                # an empty mask contributes zero loss and zero contact gradient
-                # (clamp_min keeps the denominator defined) and never masks the
-                # motion/FK/velocity terms above
-                contact = batch["hand_contact_supervision_mask"].to(sdf.dtype)          # [B,F,2]
-            else:
-                contact = batch["contact"][..., 0:2]                                    # [B,F,2]
-            left = sdf[..., 0:3] * contact[..., 0:1]
-            right = sdf[..., 3:6] * contact[..., 1:2]
-            parts["contact_m2"] = (left ** 2).sum() / contact[..., 0].sum().clamp_min(1.0) / 3.0 \
-                + (right ** 2).sum() / contact[..., 1].sum().clamp_min(1.0) / 3.0
-            loss = loss + self.w.w_contact * parts["contact_m2"]
+            # Hand-contact deviation is gated on its OWN weight (W1 plan
+            # §5.1): with ``w_contact == 0`` the dedicated hand-site FK,
+            # box-geom transform, SDF and supervision-mask reads must not
+            # EXECUTE at all — a zero weight on computed values still costs
+            # the branch and (worse) reads supervision masks the protocol
+            # says are not consumed. The motion-FK branch above is
+            # unaffected.
+            if self.w.w_contact > 0:
+                hand_p = self.fk.site_world_positions(
+                    flat(pos_p), flat(quat_p), flat(q_p), HAND_SITE_NAMES
+                ).view(B, F, -1, 3)                                                 # [B,F,6,3]
+                p_geom = self.hand_points_box_geom(hand_p, batch)                     # [B,F,6,3]
+                sdf = point_box_sdf_torch(p_geom)                                    # [B,F,6]
+                if "hand_contact_supervision_mask" in batch:
+                    # graded supervision (label protocol v1): contact loss ONLY on
+                    # certified-and-in-reference frames, normalized by valid frames;
+                    # an empty mask contributes zero loss and zero contact gradient
+                    # (clamp_min keeps the denominator defined) and never masks the
+                    # motion/FK/velocity terms above
+                    contact = batch["hand_contact_supervision_mask"].to(sdf.dtype)    # [B,F,2]
+                else:
+                    contact = batch["contact"][..., 0:2]                              # [B,F,2]
+                left = sdf[..., 0:3] * contact[..., 0:1]
+                right = sdf[..., 3:6] * contact[..., 1:2]
+                parts["contact_m2"] = (left ** 2).sum() / contact[..., 0].sum().clamp_min(1.0) / 3.0 \
+                    + (right ** 2).sum() / contact[..., 1].sum().clamp_min(1.0) / 3.0
+                loss = loss + self.w.w_contact * parts["contact_m2"]
 
         parts["total"] = loss
         return loss, {k: float(v.detach()) for k, v in parts.items()}

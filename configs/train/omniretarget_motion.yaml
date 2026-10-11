@@ -1,0 +1,47 @@
+# W1 weak-motion training config (omniretarget_w1_a3bc_plan §5.2).
+#
+# Both models (deterministic & diffusion) train from scratch with the same
+# data/backbone/action-loss/effective-batch; single-GPU sequential runs.
+# w_contact is 0 — the contact branch must not execute (see losses.py); the
+# motion/FK/velocity terms stay. Root/rotation are never clamped; the joint
+# limit mapping applies to clean joint outputs only.
+model_type: diffusion        # overridden per-run by --model
+steps: 4000
+micro_batch: 4
+grad_accum: 4                # effective batch 16
+lr: 1.0e-4
+weight_decay: 1.0e-5
+grad_clip: 1.0
+seed: 20261008
+val_seed: 20261008           # dedicated FIXED validation t/noise stream
+num_workers: 4               # one native thread per worker (worker_init_fn)
+val_every: 250
+log_every: 25
+device: cuda
+d_model: 240
+n_layers: 4
+n_heads: 6
+ffn_mult: 4
+time_window: 31
+num_train_timesteps: 1000
+beta_schedule: scaled_linear
+beta_start: 1.0e-4
+beta_end: 0.02
+loss:
+  w_pos: 1.0
+  w_rot6d: 1.0
+  w_joint: 1.0
+  w_geodesic: 0.5
+  w_fk: 2.0
+  w_contact: 0.0
+  w_vel: 0.5
+# recorded contract of the FORMAL validation (executed in the W1-D stage;
+# S0 saves curves/last only) — kept here so the config is the single source
+formal_validation_contract:
+  loss_validation_every_optimizer_steps: 250
+  full_generation_every_optimizer_steps: 1000
+  full_generation_seed: 7
+  full_generation_expected_set: val31
+  best_selection: "demonstration-macro teacher-fit FK MPJPE over ALL "
+                  "expected val demos (missing/bad evidence => selection "
+                  "insufficient, never best)"

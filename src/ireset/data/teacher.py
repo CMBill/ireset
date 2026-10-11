@@ -11,10 +11,11 @@ plan omniretarget_first_training_plan §4.3) show that the two scenes are
 NOT identical even for ``_original`` clips: the NPZ box equals the
 similarity-transformed PT box plus a per-demo constant offset, and rot/trans
 variants keep ``human_joints`` fixed while the robot scene (root and box)
-moves. ``qpos[36:43]`` is therefore the **target** scene box. Reading it
-into ``source_obj_pose`` as well is a known approximation retained only
-until the I1/I2 source-scene adapter lands; reference contact inference
-against the target box is offset by exactly that constant per-demo offset.
+moves. ``qpos[36:43]`` is therefore the **target** scene box. The W1 path
+(W1 plan §3.3/§4.1) passes the A1-mapped source box explicitly through
+``build_interaction_clip(..., source_obj_pose=...)``; reading the qpos box
+into ``source_obj_pose`` as well remains only as the legacy approximation
+for historical entries and must not enter W1 consumption.
 """
 
 from __future__ import annotations
@@ -118,6 +119,8 @@ def build_interaction_clip(
     clamp_tol_rad: float = 1e-3,
     drop_tol_rad: float = 2e-2,
     teacher_traj_dir: Path = TEACHER_TRAJ_DIR,
+    source_obj_pose: np.ndarray | None = None,
+    schedule_cache_file: Path | None = None,
 ) -> InteractionClip:
     """Load one teacher NPZ into an :class:`InteractionClip`.
 
@@ -125,6 +128,15 @@ def build_interaction_clip(
     clamped (recorded in ``validation``); any violation beyond
     ``drop_tol_rad`` marks the clip invalid (``validation["drop"] = True``)
     so window extraction can exclude it instead of silently clipping.
+
+    Source/target scene split (W1, omniretarget_w1_a3bc_plan §3.3/§4.1):
+    ``source_obj_pose`` is the A1-mapped source-scene box the reference
+    human actually corresponds to; without it the legacy source=target
+    approximation (the qpos box in both fields) is retained — historical
+    compatibility only, never the W1 path. ``schedule_cache_file`` is an
+    exact cache path (W1 keyed schedules; the dir-keyed legacy cache above
+    assumes the TARGET box and must not be reused for source-scene
+    schedules).
     """
     spec = _spec()
     lo, hi = spec.joint_range[:, 0], spec.joint_range[:, 1]
@@ -142,20 +154,33 @@ def build_interaction_clip(
         q = np.clip(q, lo, hi)
 
     cached = None
-    if schedule_cache is not None:
+    if schedule_cache_file is not None:
+        if not schedule_cache_file.is_file():
+            raise FileNotFoundError(
+                f"W1 keyed schedule cache missing: {schedule_cache_file} "
+                "(no fallback: recompute it with the W1 cache entry)")
+        cached = np.load(schedule_cache_file, allow_pickle=True)
+    elif schedule_cache is not None:
         cpath = schedule_cache / f"{npz_name}.npz"
         if cpath.exists():
             cached = np.load(cpath, allow_pickle=True)
 
     if cached is not None:
         schedule = _schedule_from_cache(cached)
+    elif source_obj_pose is not None:
+        src = np.asarray(source_obj_pose, dtype=np.float64)
+        if src.shape != (scene.shape[0], 7):
+            raise ValueError(
+                f"{npz_name}: source_obj_pose {src.shape} != [T={scene.shape[0]}, 7]")
+        schedule = infer_reference_schedule(human, src, fps=fps)
     else:
         schedule = infer_reference_schedule(human, box, fps=fps)
 
     cond = ReferenceCondition(
         source_clip_id=npz_name[: -len(".npz")],
         human_kps_world=human,
-        source_obj_pose=box.copy(),
+        source_obj_pose=(np.asarray(source_obj_pose, dtype=np.float64).copy()
+                         if source_obj_pose is not None else box.copy()),
         target_obj_pose=box,
         contacts=schedule.intervals,
         frame_dt=1.0 / fps,

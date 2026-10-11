@@ -205,6 +205,145 @@ def load_teacher_baseline(path: Path, mode: str, gate: float, files: list[str], 
     return (ok, why, doc.get("teacher_baseline_rows", []))
 
 
+def run_w1_raw_eval(args) -> None:
+    """W1 raw full-length evaluation (omniretarget_w1_a3bc_plan §5.3).
+
+    Fixed expected-set (the training manifest's val31 — failures and short
+    trajectories stay rows in the denominator, never dropped), FULL clip
+    length (the stitched trajectory covers the last frame through the
+    trailing T-60 window), explicit model/manifest identity verification,
+    and ZERO RepairPipeline construction or invocation — raw diagnostics
+    only (the frozen IndependentValidator is used for bare-output checks;
+    it is not the repairer).
+    """
+    from ireset.data import a2_integrity as integ
+    from ireset.data import w1_training as w1
+    from ireset.paths import PROJECT_ROOT, path_for_record
+
+    manifest_path = args.training_manifest.expanduser().resolve()
+    manifest = json.loads(manifest_path.read_text())
+    for key, want in (("manifest_name", w1.MANIFEST_NAME),
+                      ("protocol", w1.MOTION_PROTOCOL_VERSION),
+                      ("experiment_id", w1.EXPERIMENT_ID)):
+        if manifest.get(key) != want:
+            raise SystemExit(f"training manifest {key} mismatch: "
+                             f"{manifest.get(key)!r} != {want!r}")
+    prereg_rec = manifest["preregistration"]
+    prereg_path = PROJECT_ROOT / prereg_rec["path"]
+    if integ.sha256_file(prereg_path) != prereg_rec["sha256"]:
+        raise SystemExit("training manifest not bound to its preregistration")
+    prereg = json.loads(prereg_path.read_text())
+    assets_sha = prereg["assets"]["a1_assets_sha256"]
+    code_sha = w1.condition_code_sha256(PROJECT_ROOT)
+
+    if args.expected_set == "val31":
+        expected = list(manifest["selection"]["val31"])
+    elif args.expected_set:
+        expected = json.loads(Path(args.expected_set).read_text())["demos"]
+    else:
+        raise SystemExit("W1 eval requires --expected-set (val31 or a "
+                         "frozen demo-list json) — no default subset")
+    rows_by_demo = {r["demo"]: r for r in manifest["rows"] if r.get("split") == "val"}
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    models_dir = Path(args.models_dir)
+    manifest_sha = integ.sha256_file(manifest_path)
+    generators = {}
+    for m in args.models:
+        ckpt = torch.load(models_dir / m / "best.pt", map_location=device,
+                          weights_only=False)
+        ident = ckpt.get("identity") or {}
+        if (ident.get("training_manifest", {}).get("sha256") != manifest_sha
+                or ident.get("protocol") != w1.MOTION_PROTOCOL_VERSION):
+            raise SystemExit(
+                f"model {m}: checkpoint identity does not match this training "
+                f"manifest (ckpt={ident.get('training_manifest')}) — a "
+                "checkpoint from another manifest/cache is refused")
+        generators[m] = load_generator(m, device, args.ddim_steps, models_dir)
+    kin = G1Kinematics()
+    validator = IndependentValidator(cfg=load_mode_configs("strict")[1])
+
+    out_rows = []
+    for demo in expected:
+        row_rec = rows_by_demo.get(demo)
+        if row_rec is None:
+            out_rows.append({"demo": demo, "status": "missing_row"})
+            continue
+        if not row_rec.get("admission", {}).get("motion"):
+            out_rows.append({"demo": demo, "status": "not_admitted",
+                             "reasons": row_rec["admission"]["reasons"]})
+            continue
+        dpath = PROJECT_ROOT / row_rec["derived"]["path"]
+        if integ.sha256_file(dpath) != row_rec["derived"]["sha256"]:
+            out_rows.append({"demo": demo, "status": "derived_drifted"})
+            continue
+        clip = w1.load_w1_derived_clip(row_rec, args.cache_dir / "schedules",
+                                       PROJECT_ROOT, assets_sha, code_sha)
+        T = clip.T if args.full_length else min(clip.T, args.frames)
+        if T < 60:
+            # short trajectories are recorded, never deleted from the set
+            out_rows.append({"demo": demo, "status": "unsupported_short_trajectory",
+                             "T": T})
+            continue
+        cond = clip.condition.truncate(T)
+        teacher_scene = np.concatenate(
+            [clip.root[:T], clip.q[:T], cond.target_obj_pose[:T]], axis=1)
+        for model_name, gen in generators.items():
+            rec = {"demo": demo, "model": model_name, "T": T,
+                   "ddim_steps": args.ddim_steps if model_name == "diffusion" else None,
+                   "seed": args.seed}
+            try:
+                traj = gen.sample(cond, seed=args.seed)
+                scene = traj.scene_qpos(cond.target_obj_pose)
+                rec["status"] = "ok"
+                rec["generation_wall_s"] = round(traj.metadata["generation_wall_s"], 3)
+                rec["boundary"] = traj.metadata["boundary"]
+                rec["degenerate_windows"] = traj.metadata["degenerate_windows"]
+                rec["covers_last_frame"] = bool(
+                    traj.root.shape[0] == T)  # stitched length == clip length
+                rec["raw_metrics"] = eval_raw(scene, teacher_scene, cond, kin, validator)
+            except Exception as exc:  # noqa: BLE001 -- failure keeps the row
+                rec["status"] = "failed"
+                rec["error"] = f"{type(exc).__name__}: {exc}"
+            out_rows.append(rec)
+            print(f"[w1-raw][{model_name}] {demo}: {rec['status']} T={T}")
+
+    processed = [r for r in out_rows if r.get("status") == "ok"]
+    report = {
+        "stage": "W1 raw full-length generation evaluation",
+        "expected_set": {"n": len(expected), "demos": expected},
+        "training_manifest": {"path": path_for_record(manifest_path),
+                              "sha256": manifest_sha},
+        "cache_dir": str(args.cache_dir),
+        "full_length": bool(args.full_length),
+        "seed": args.seed,
+        "models": args.models,
+        "counts": {
+            "n_expected": len(expected),
+            "n_rows": len(out_rows),
+            "n_ok": len(processed),
+            "n_failed": sum(1 for r in out_rows if r.get("status") == "failed"),
+            "n_unsupported": sum(1 for r in out_rows
+                                 if r.get("status") == "unsupported_short_trajectory"),
+        },
+        "aggregate_raw": {
+            m: {k: float(np.mean([r["raw_metrics"][k] for r in processed
+                                  if r["model"] == m]))
+                for k in ("root_rmse_m", "root_geodesic_deg", "joint_mae_rad",
+                          "teacher_fit_mpjpe_box_m")}
+            for m in args.models
+            if any(r["model"] == m for r in processed)
+        },
+        "rows": out_rows,
+        "repair_pipeline_invocations": 0,
+    }
+    out = Path(args.output) if args.output else OUT / "w1_raw_generation_eval.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(report, indent=2, default=float))
+    print(json.dumps(report["counts"], indent=2))
+    print(f"-> {out}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--models", nargs="+", default=["diffusion", "deterministic"])
@@ -225,7 +364,24 @@ def main() -> None:
                     help="save accepted repaired trajectories as NPZ")
     ap.add_argument("--task-gate-yaml", type=str, default=None,
                     help="override task_mpjpe_tol_m from a task_quality_gates.yaml")
+    ap.add_argument("--training-manifest", type=Path, default=None,
+                    help="W1 raw mode: A3 training_manifest.json (fixed "
+                         "expected-set, full length, zero repair)")
+    ap.add_argument("--expected-set", type=str, default=None,
+                    help="W1 raw mode: 'val31' (from the manifest) or a "
+                         "frozen demo-list json {'demos': [...]}")
+    ap.add_argument("--full-length", action="store_true",
+                    help="W1 raw mode: evaluate the COMPLETE clip length "
+                         "(default keeps the legacy frame cap)")
+    ap.add_argument("--cache-dir", type=Path, default=None,
+                    help="W1 raw mode: keyed W1 cache attempt dir (schedules)")
     args = ap.parse_args()
+
+    if args.training_manifest is not None:
+        if args.cache_dir is None:
+            raise SystemExit("W1 raw mode requires --cache-dir (keyed "
+                             "schedule cache; no legacy fallback)")
+        return run_w1_raw_eval(args)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     models_dir = Path(args.models_dir)

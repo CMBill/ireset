@@ -1,0 +1,47 @@
+# W1 weak-motion-supervision label protocol (omniretarget_w1_a3bc_plan §4.1).
+#
+# Frozen identity for the omniretarget published-original motion round. The
+# graded protocol (graded_labels_v1) and every historical manifest-less
+# entry keep their own contracts unchanged; this file only declares the W1
+# consumption rules.
+label_protocol: omniretarget_motion_v1
+frozen: 2026-10-11
+code_constant: ireset.data.w1_training.MOTION_PROTOCOL_VERSION
+experiment_id: w1_published_motion_v1
+training_purpose: weak_motion_only
+source:
+  type: published
+  variant: original
+  published_revision: "135259130158f1cb1799e4ab9b6566c938285fc9"
+  production_environment: not_published
+consumption:
+  dataset_entry: TeacherWindowDataset(training_manifest=...)
+  mutually_exclusive_with: label_manifest
+  admitted_rows_only: admission.motion == true
+  requires_verification:
+    - protocol / experiment / purpose / source identity
+    - selection basis (preregistration hash + train24 recomputation)
+    - input NPZ/PT hashes vs the training manifest
+    - derived representation hash
+    - A1 asset closure re-hash
+    - keyed schedule-cache identity
+  forbid:
+    - fallback to split files, legacy m3 caches or any other source
+    - teacher rewriting (clamp/smooth/project) at load time
+    - using teacher root/joints/feet/FK as model condition inputs
+supervision:
+  w_contact: 0.0
+  contact_branch: must_not_execute_or_read_masks
+  note: >-
+    reference contact flags remain a CONDITION channel recoverable from the
+    source human per the frozen condition protocol; they are not robot
+    contact supervision and not a quality label.
+windowing:
+  frames: 60
+  stride: 30
+  complete_windows_only: true
+  windows_formula: "max(0, floor((T-60)/30)+1)"
+quality_registration:
+  admission_vs_quality: separate_fields
+  strict_failures: registrable_weak_supervision_defect
+  run_failures: incomplete_or_not_checked_with_reason
