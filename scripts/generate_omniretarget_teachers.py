@@ -95,29 +95,47 @@ UR_COMPARISON_RESERVE_S = 600
 UR_GENERATION_BUDGET_S = UR_TOTAL_BUDGET_S - UR_COMPARISON_RESERVE_S
 
 
-def _history_manifest_problems(manifest: object, attempt: object) -> list[str]:
-    """Round-5 review fix: structural validation of a REGISTERED attempt's
+def _history_manifest_problems(manifest: object, entry: object) -> list[str]:
+    """Round-5/6 review fix: structural validation of a REGISTERED attempt's
     manifest. Parsing successfully is not evidence — ``{}`` (no rows, no
     cost) and ``rows`` without ``total_wall_s`` both used to read as zero
     invocations and zero cumulative cost, making the §6.2 cap and the UR
     budget unknowable-in-practice while claimed zero. Required evidence =
-    exactly what the gates consume: a finite-number ``total_wall_s``, a
-    list ``rows``, and per row the ``demo``/``status`` keys (a row without
-    ``demo`` cannot be attributed to the scope — and would crash the
-    counting loop anyway).
+    exactly what the gates consume: a finite non-negative-number
+    ``total_wall_s``, a list ``rows``, and per row the ``demo``/``status``
+    keys (a row without ``demo`` cannot be attributed to the scope — and
+    would crash the counting loop anyway).
+
+    Round-6 fix 1: the recorded cost must also be non-negative and
+    RECONCILE with the per-row evidence — a ``total_wall_s`` of −600 used
+    to RESTORE budget, and a 9900s row sum flattened to a 0 total re-
+    approved six fresh 300s calls past the 3h budget. Genuine writers
+    record ``total_wall_s = round(sum(row.wall_s), 1)`` — one rounding, so
+    the reconciliation bound is 0.05 (real roots: 0.04/0.05/0.05). An
+    all-skipped attempt's ``0.0`` total against zero-valued rows is
+    evidence-backed zero cost and stays legal.
+
+    Round-6 fix 2: the rows must reconcile with the REGISTERED scope
+    (index entry ``scope`` and manifest ``attempt_scope`` — genuine
+    attempts record exactly one row per scope demo): deleting a call row
+    used to undercount a demo's invocations and re-open a third call.
     """
-    att = attempt if isinstance(attempt, str) else "unknown_attempt"
+    att = entry.get("attempt") if isinstance(entry, dict) else None
+    att = att if isinstance(att, str) else "unknown_attempt"
     if not isinstance(manifest, dict):
         return [f"{att}:manifest_not_object"]
     problems: list[str] = []
-    wall = manifest.get("total_wall_s")
-    if (isinstance(wall, bool) or not isinstance(wall, (int, float))
-            or not math.isfinite(wall)):
-        problems.append(f"{att}:total_wall_s_missing_or_not_finite")
+    total = manifest.get("total_wall_s")
+    total_ok = (not isinstance(total, bool)
+                and isinstance(total, (int, float))
+                and math.isfinite(total) and total >= 0)
+    if not total_ok:
+        problems.append(f"{att}:total_wall_s_missing_negative_or_not_finite")
     rows = manifest.get("rows")
     if not isinstance(rows, list):
         problems.append(f"{att}:rows_missing_or_not_list")
         return problems
+    row_sum = 0.0
     for i, row in enumerate(rows):
         if not isinstance(row, dict):
             problems.append(f"{att}:row_{i}_not_object")
@@ -126,6 +144,32 @@ def _history_manifest_problems(manifest: object, attempt: object) -> list[str]:
             problems.append(f"{att}:row_{i}_demo_missing_or_not_str")
         if "status" not in row:
             problems.append(f"{att}:row_{i}_status_missing")
+        wall = row.get("wall_s")
+        if (isinstance(wall, bool) or not isinstance(wall, (int, float))
+                or not math.isfinite(wall) or wall < 0):
+            problems.append(
+                f"{att}:row_{i}_wall_s_missing_negative_or_not_finite")
+        else:
+            row_sum += float(wall)
+    if total_ok and abs(float(total) - row_sum) > 0.05 + 1e-6:
+        problems.append(f"{att}:total_wall_s_mismatch_row_sum:"
+                        f"{total}:vs:{round(row_sum, 2)}")
+    scopes: list[tuple[str, list]] = []
+    if isinstance(entry, dict) and isinstance(entry.get("scope"), list):
+        scopes.append(("index_scope", entry["scope"]))
+    if isinstance(manifest.get("attempt_scope"), list):
+        scopes.append(("manifest_scope", manifest["attempt_scope"]))
+    if not scopes:
+        problems.append(f"{att}:scope_missing_everywhere")
+    else:
+        row_demos = sorted(row.get("demo") for row in rows
+                           if isinstance(row, dict)
+                           and isinstance(row.get("demo"), str))
+        for name, sc in scopes:
+            scope_demos = sorted(str(d) for d in sc)
+            if scope_demos != row_demos:
+                problems.append(f"{att}:rows_do_not_match_{name}:"
+                                f"{scope_demos}:vs:{row_demos}")
     return problems
 
 
@@ -153,6 +197,13 @@ def _prior_run_facts(out_root: Path,
     structure is the same unknowable history — ``{}`` or rows-without-
     ``total_wall_s`` must not slip through the defaults as zero calls and
     zero cost (``_history_manifest_problems``).
+
+    Round-6 review fixes: the cost must also be non-negative and reconcile
+    with the per-row ``wall_s`` sum (a negative total used to restore
+    budget; a flattened total re-approved calls past 3h), and the rows must
+    reconcile with the REGISTERED scope (index ``scope`` / manifest
+    ``attempt_scope``) — a deleted call row used to undercount a demo's
+    invocations.
     """
     prior_calls: dict[str, list[dict]] = {}
     prior_wall_s = 0.0
@@ -166,7 +217,7 @@ def _prior_run_facts(out_root: Path,
             history_errors.append(
                 f"{att.get('attempt')}:{type(exc).__name__}")
             continue
-        problems = _history_manifest_problems(manifest, att.get("attempt"))
+        problems = _history_manifest_problems(manifest, att)
         if problems:
             history_errors.extend(problems)
             continue

@@ -319,6 +319,112 @@ def test_all_skipped_history_is_valid_not_deficient(tmp_path, monkeypatch):
     assert m["prior_wall_s_in_root"] == 0.0
 
 
+# --- round-6 P2-1: cost must be non-negative AND reconcile with the rows ---
+
+@pytest.mark.parametrize("manifest_text", [
+    # −600s "reconciling" with negative rows: a negative total used to
+    # RESTORE 600s of budget
+    pytest.param(json.dumps({
+        "rows": [{"demo": PILOT[0], "status": "generation_failed",
+                  "wall_s": -600.0}],
+        "total_wall_s": -600.0, "attempt_scope": [PILOT[0]]}),
+        id="negative_total_matching_negative_rows"),
+    pytest.param(json.dumps({
+        "rows": [{"demo": PILOT[0], "status": "generation_failed",
+                  "wall_s": 0.0}],
+        "total_wall_s": -600.0, "attempt_scope": [PILOT[0]]}),
+        id="negative_total_zero_cost_rows"),
+    # the reviewer's repro shape: rows sum to 9900s but the flattened
+    # total read as zero cost — six fresh 300s calls were approved and the
+    # 3h budget (with the comparison reserve) blew to 12300s
+    pytest.param(json.dumps({
+        "rows": [{"demo": d, "status": "generation_failed",
+                  "wall_s": 1650.0} for d in PILOT],
+        "total_wall_s": 0.0, "attempt_scope": PILOT}),
+        id="flattened_total_vs_9900s_row_sum"),
+    # NaN row cost (json.loads accepts the bare literal) beside a finite
+    # total: the sum cannot be reconciled
+    '{"rows": [{"demo": "%s", "status": "generation_failed",'
+    ' "wall_s": NaN}], "total_wall_s": 10.0, "attempt_scope": ["%s"]}'
+    % (PILOT[0], PILOT[0]),
+])
+def test_cost_must_be_nonnegative_and_reconcile_with_rows(
+        tmp_path, monkeypatch, manifest_text):
+    freeze, prereg = _ur_freeze(tmp_path)
+    out_dir = tmp_path / "cost6"
+    with pytest.raises(SystemExit, match="history_incomplete"):
+        _run_generation_ur(monkeypatch, tmp_path, freeze, out_dir, prereg,
+                           manifest_text=manifest_text)
+    assert not list(out_dir.glob("attempt_002*"))
+
+
+def test_genuine_nonzero_cost_history_still_generates(tmp_path, monkeypatch):
+    """Not over-tightened: a genuine failed prior run with real cost
+    reconciling row-by-row keeps the justified-retry path and its budget
+    accounting."""
+    freeze, prereg = _ur_freeze(tmp_path)
+    out_dir = tmp_path / "costok"
+    prior = [{"demo": PILOT[0], "status": "generation_failed"}]
+    rc, calls = _run_generation_ur(monkeypatch, tmp_path, freeze, out_dir,
+                                   prereg, prior_rows=prior,
+                                   prior_wall=100.0)
+    assert calls == PILOT
+    m = json.loads(sorted(out_dir.glob("attempt_*/generation_manifest.json"))
+                   [-1].read_text())
+    assert m["prior_wall_s_in_root"] == 100.0
+
+
+# --- round-6 P2-2: rows must reconcile with the REGISTERED scope ----------
+
+def test_deleted_call_row_vs_registered_scope_stops(tmp_path, monkeypatch):
+    """The reviewer's counterexample: the index and attempt_scope keep
+    demo A registered, but one call row is deleted (and its cost synced
+    to 0) — two historical invocations used to count as ONE, authorizing
+    a third call with exit 0."""
+    freeze, prereg = _ur_freeze(tmp_path)
+    out_dir = tmp_path / "delrow"
+
+    def delete_row(root):
+        mp = root / "attempt_002" / "generation_manifest.json"
+        m = json.loads(mp.read_text())
+        m["rows"] = []                 # the call row disappears...
+        m["total_wall_s"] = 0.0        # ...and the cost is synced to 0
+        mp.write_text(json.dumps(m))
+
+    prior = [{"demo": PILOT[0], "status": "generation_failed"},
+             {"demo": PILOT[0], "status": "timeout"}]
+    with pytest.raises(SystemExit, match="history_incomplete"):
+        _run_generation_ur(monkeypatch, tmp_path, freeze, out_dir, prereg,
+                           prior_rows=prior, tamper=delete_row)
+    # stopped BEFORE any generation call and BEFORE allocating attempt_003
+    assert not list(out_dir.glob("attempt_003*"))
+
+
+def test_scope_missing_everywhere_stops(tmp_path, monkeypatch):
+    """Neither the index entry nor the manifest records what the attempt
+    covered — row completeness cannot be proven, so the history is
+    incomplete even with well-formed cost rows."""
+    freeze, prereg = _ur_freeze(tmp_path)
+    out_dir = tmp_path / "noscope"
+
+    def strip_scope(root):
+        ip = root / "attempts_index.json"
+        idx = json.loads(ip.read_text())
+        for e in idx["attempts"]:
+            e.pop("scope", None)
+        ip.write_text(json.dumps(idx))
+        mp = root / "attempt_001" / "generation_manifest.json"
+        m = json.loads(mp.read_text())
+        m.pop("attempt_scope", None)
+        mp.write_text(json.dumps(m))
+
+    prior = [{"demo": PILOT[0], "status": "generation_failed"}]
+    with pytest.raises(SystemExit, match="history_incomplete"):
+        _run_generation_ur(monkeypatch, tmp_path, freeze, out_dir, prereg,
+                           prior_rows=prior, tamper=strip_scope)
+    assert not list(out_dir.glob("attempt_002*"))
+
+
 def test_readable_history_still_generates(tmp_path, monkeypatch):
     """The gate is not over-tightened: a readable prior manifest keeps the
     normal retry path (one prior failure -> one justified retry call)."""

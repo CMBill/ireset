@@ -298,7 +298,7 @@ def test_retry_cap_counts_actual_invocations_not_failures(
     assert row0["status"] == "skipped_retry_cap"
     assert row0["prior_invocations"] == [
         {"attempt": "attempt_001", "status": "generation_failed"},
-        {"attempt": "attempt_001", "status": "ok"}]
+        {"attempt": "attempt_002", "status": "ok"}]
 
 
 def test_skipped_prior_rows_never_count_as_invocations(tmp_path, monkeypatch):
@@ -370,13 +370,23 @@ def _run_gen_timed(monkeypatch, tmp_path, freeze, out_dir, prereg, *,
                         lambda *a, **k: {"diff": {}, "default": {},
                                          "recovery": {}})
     if prior_rows is not None:
-        att = out_dir / "attempt_001"
-        att.mkdir(parents=True, exist_ok=True)
-        (att / "generation_manifest.json").write_text(json.dumps(
-            {"rows": prior_rows, "total_wall_s": prior_wall}))
+        # round-6: genuine one-attempt-per-invocation layout with wall_s on
+        # each row (summing to prior_wall) and the scope registered on both
+        # the index entry and the manifest (the history validator enforces
+        # exactly this shape)
+        per = prior_wall / len(prior_rows)
+        for i, r in enumerate(prior_rows, start=1):
+            att = out_dir / f"attempt_{i:03d}"
+            att.mkdir(parents=True, exist_ok=True)
+            row = {"wall_s": per, **r}
+            (att / "generation_manifest.json").write_text(json.dumps(
+                {"rows": [row], "total_wall_s": row["wall_s"],
+                 "attempt_scope": [r["demo"]]}))
         (out_dir / integ.ATTEMPTS_INDEX).write_text(json.dumps(
-            {"attempts": [{"attempt": "attempt_001",
-                           "preregistration_sha256": "shaReg"}]}))
+            {"attempts": [
+                {"attempt": f"attempt_{i:03d}", "scope": [r["demo"]],
+                 "preregistration_sha256": "shaReg"}
+                for i, r in enumerate(prior_rows, start=1)]}))
     monkeypatch.setattr(sys, "argv", [
         "prog", "--freeze", str(freeze), "--out-dir", str(out_dir),
         "--source-record", str(prereg)])

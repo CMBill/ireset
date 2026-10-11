@@ -870,7 +870,7 @@ def test_canonical_base_argv_exposes_extra_flags():
 
 def _run_generation_ur(monkeypatch, tmp_path, freeze, out_dir, prereg,
                        *, prior_rows=None, prior_wall=0.0, demo_results=None,
-                       demos=None, manifest_text=None):
+                       demos=None, manifest_text=None, tamper=None):
     import generate_omniretarget_teachers as gen
     calls = []
     monkeypatch.setattr(integ, "DERIVED_DIR", tmp_path)
@@ -910,25 +910,46 @@ def _run_generation_ur(monkeypatch, tmp_path, freeze, out_dir, prereg,
                         lambda *a, **k: {"diff": {}, "default": {},
                                          "recovery": {}})
     if prior_rows is not None:
-        att = out_dir / "attempt_001"
-        att.mkdir(parents=True, exist_ok=True)
-        (att / "generation_manifest.json").write_text(
-            manifest_text if manifest_text is not None else json.dumps({
-                "rows": prior_rows, "total_wall_s": prior_wall}))
+        # round-6: GENUINE layout — one attempt per prior invocation, each
+        # row carries wall_s summing to prior_wall, total reconciles, and
+        # the scope is registered on BOTH the index entry and the manifest
+        # (the history validator enforces exactly this shape; two rows for
+        # one demo are two attempts, never one manifest)
+        per = prior_wall / len(prior_rows)
+        for i, r in enumerate(prior_rows, start=1):
+            att = out_dir / f"attempt_{i:03d}"
+            att.mkdir(parents=True, exist_ok=True)
+            row = {"wall_s": per, **r}
+            (att / "generation_manifest.json").write_text(json.dumps({
+                "rows": [row], "total_wall_s": row["wall_s"],
+                "attempt_scope": [r["demo"]]}))
         (out_dir / integ.ATTEMPTS_INDEX).write_text(json.dumps(
-            {"attempts": [{"attempt": "attempt_001",
-                           "preregistration_sha256": "shaReg"}]}))
+            {"attempts": [
+                {"attempt": f"attempt_{i:03d}", "scope": [r["demo"]],
+                 "preregistration_sha256": "shaReg"}
+                for i, r in enumerate(prior_rows, start=1)]}))
     elif manifest_text is not None:
         # round-4 review fix 4: an index-registered attempt with an
         # unreadable manifest (corrupt json / missing file) must stop the
-        # run before generation, not read as zero history
+        # run before generation, not read as zero history. The index
+        # registers the demo scope the manifest itself claims (when
+        # parseable) so a deficient manifest is deficient on its own terms.
         att = out_dir / "attempt_001"
         att.mkdir(parents=True, exist_ok=True)
+        scope = [PILOT[0]]
         if manifest_text != "__missing__":
             (att / "generation_manifest.json").write_text(manifest_text)
+            try:
+                sc = json.loads(manifest_text).get("attempt_scope")
+                if isinstance(sc, list) and sc:
+                    scope = sc
+            except Exception:
+                pass
         (out_dir / integ.ATTEMPTS_INDEX).write_text(json.dumps(
-            {"attempts": [{"attempt": "attempt_001",
+            {"attempts": [{"attempt": "attempt_001", "scope": scope,
                            "preregistration_sha256": "shaReg"}]}))
+    if tamper is not None:
+        tamper(out_dir)
     argv = ["prog", "--freeze", str(freeze), "--out-dir", str(out_dir),
             "--source-record", str(prereg)]
     if demos is not None:
@@ -967,7 +988,7 @@ def test_generation_retry_cap_skips_the_third_call(tmp_path, monkeypatch):
     assert row0["status"] == "skipped_retry_cap"
     assert row0["prior_invocations"] == [
         {"attempt": "attempt_001", "status": "generation_failed"},
-        {"attempt": "attempt_001", "status": "timeout"}]
+        {"attempt": "attempt_002", "status": "timeout"}]
     assert m["n_skipped_retry_cap"] == 1
 
 
