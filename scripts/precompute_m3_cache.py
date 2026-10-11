@@ -185,12 +185,12 @@ def run_w1(args) -> int:
     integ.append_attempts_index(out_root, {
         "attempt": attempt_dir.name,
         "n_schedules": len(rows),
-        "n_train_files": len(train_rows),
+        "n_train_files": stats_facts["n_train_rows_used"],
         "frames_fitted": identity["root_stats"]["frames_fitted"],
         "identity": path_for_record(attempt_dir / "cache_identity.json"),
     })
     print(f"[w1-cache] root stats frames={identity['root_stats']['frames_fitted']} "
-          f"files={len(train_rows)} -> {path_for_record(attempt_dir)}")
+          f"files={stats_facts['n_train_rows_used']} -> {path_for_record(attempt_dir)}")
     return 0
 
 

@@ -418,8 +418,11 @@ def main() -> int:
             "optimizer_steps": summary["optimizer_steps"],
             "summary": path_for_record(attempt_dir / "s0_summary.json"),
         })
+        # costs are WALL time: t0 is time.time(), so the delta must be too —
+        # mixing in perf_counter() (a monotonic offset) produced negative
+        # "durations" (~-1.8e9); costs must be non-negative and finite
         _append_costs(run_root, f"s0_{model_type}",
-                      time.perf_counter() - t0,
+                      time.time() - t0,
                       {"verdict": summary["verdict"],
                        "optimizer_steps": summary["optimizer_steps"]})
         results[model_type] = summary

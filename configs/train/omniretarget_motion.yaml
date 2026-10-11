@@ -42,6 +42,6 @@ formal_validation_contract:
   full_generation_every_optimizer_steps: 1000
   full_generation_seed: 7
   full_generation_expected_set: val31
-  best_selection: "demonstration-macro teacher-fit FK MPJPE over ALL "
-                  "expected val demos (missing/bad evidence => selection "
-                  "insufficient, never best)"
+  best_selection: >-
+    demonstration-macro teacher-fit FK MPJPE over ALL expected val demos
+    (missing/bad evidence means selection insufficient, never best)
