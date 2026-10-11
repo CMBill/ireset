@@ -59,13 +59,33 @@ from ireset.paths import OMOMO_NEW_DIR, PROJECT_ROOT, TEACHER_TRAJ_DIR, path_for
 PROBE_TOL = 1e-5
 
 
-def _append_costs(run_root: Path, stage: str, wall: float, extra: dict) -> None:
+def _load_costs(run_root: Path) -> list[dict]:
     costs_path = run_root / "costs.json"
-    entries = []
-    if costs_path.is_file():
-        entries = json.loads(costs_path.read_text()).get("invocations", [])
-    entries.append({"timestamp": _dt.datetime.now().isoformat(timespec="seconds"),
-                    "stage": stage, "wall_s": round(wall, 1), **extra})
+    if not costs_path.is_file():
+        return []
+    return json.loads(costs_path.read_text()).get("invocations", [])
+
+
+def _upsert_cost(run_root: Path, stage: str, attempt: str, wall: float,
+                 extra: dict, status: str) -> None:
+    """Append-or-UPDATE the ledger row for one (stage, attempt).
+
+    Exactly one row per (model, attempt) EVER exists: the row is
+    pre-registered as ``running`` before any work starts and updated in
+    place on the way out — a crash can no longer leave an attempt without
+    a ledger row (round-2 review fix 5)."""
+    costs_path = run_root / "costs.json"
+    entries = _load_costs(run_root)
+    row = {"timestamp": _dt.datetime.now().isoformat(timespec="seconds"),
+           "stage": stage, "attempt": attempt, "status": status,
+           "wall_s": round(wall, 1), **extra}
+    for i, e in enumerate(entries):
+        if e.get("stage") == stage and e.get("attempt") == attempt:
+            keep_ts = e.get("timestamp")
+            entries[i] = {**row, "timestamp": keep_ts}
+            break
+    else:
+        entries.append(row)
     costs_path.write_text(json.dumps({"invocations": entries}, indent=2))
 
 
@@ -73,36 +93,50 @@ S0_COST_STAGES = ("s0_deterministic", "s0_diffusion")
 
 
 def historical_s0_cost_s(run_root: Path) -> float | None:
-    """Sum of PRIOR S0 model walls from the run-root cost ledger.
+    """Sum of PRIOR S0 model walls, reconciled THREE ways.
 
-    Returns ``None`` when the history is UNKNOWN — S0 attempts exist on
-    disk but the ledger cannot account for them (missing file or entries
-    without a finite wall). Unknown history is a STOP condition (review
-    fix 12): the shared 1h budget cannot be proven unexhausted.
+    The attempt directories ON DISK, the per-model attempts indexes and
+    the run-root cost ledger must agree exactly per (model, attempt) —
+    round-2 review fix 5: an attempt allocated and then crashed (no index,
+    no ledger row) must surface as UNKNOWN history (a stop condition), not
+    as a zero; duplicate rows for one model must not masquerade as another
+    model's accounting; a leftover ``running`` row means the exit
+    registration never ran (hard kill) — unknown.
     """
     import math as _math
 
-    attempts_seen = 0
+    disk: dict[str, set[str]] = {}
+    index: dict[str, set[str]] = {}
     for model in ("deterministic", "diffusion"):
-        idx = run_root / "s0" / model / integ.ATTEMPTS_INDEX
-        if idx.is_file():
-            attempts_seen += len(json.loads(idx.read_text())["attempts"])
-    costs_path = run_root / "costs.json"
-    if attempts_seen == 0:
+        mroot = run_root / "s0" / model
+        disk[model] = {d.name for d in mroot.glob("attempt_*") if d.is_dir()}
+        idx = mroot / integ.ATTEMPTS_INDEX
+        index[model] = (
+            {a.get("attempt") for a in json.loads(idx.read_text())["attempts"]}
+            if idx.is_file() else set())
+    ledger: dict[str, dict[str, float]] = {"deterministic": {},
+                                           "diffusion": {}}
+    total = 0.0
+    for e in _load_costs(run_root):
+        stage = e.get("stage")
+        if stage not in S0_COST_STAGES:
+            continue
+        model = stage[len("s0_"):]
+        attempt = e.get("attempt")
+        if attempt in ledger[model]:
+            return None          # duplicate (model, attempt) rows
+        w = e.get("wall_s")
+        if not (isinstance(w, (int, float)) and _math.isfinite(w) and w >= 0):
+            return None
+        if e.get("status") == "running":
+            return None          # exit registration never ran
+        ledger[model][attempt] = float(w)
+        total += float(w)
+    if not any(disk.values()) and not any(ledger.values()):
         return 0.0
-    if not costs_path.is_file():
-        return None
-    entries = json.loads(costs_path.read_text()).get("invocations", [])
-    total, accounted = 0.0, 0
-    for e in entries:
-        if e.get("stage") in S0_COST_STAGES:
-            w = e.get("wall_s")
-            if not (isinstance(w, (int, float)) and _math.isfinite(w) and w >= 0):
-                return None
-            total += float(w)
-            accounted += 1
-    if accounted < attempts_seen:
-        return None      # attempts without a ledger row: unknown history
+    for model in ("deterministic", "diffusion"):
+        if not (disk[model] == index[model] == set(ledger[model])):
+            return None          # attempt without index/ledger coverage
     return total
 
 
@@ -142,17 +176,15 @@ def probe_error(x0_pred: torch.Tensor, x0_tgt: torch.Tensor) -> dict:
     }
 
 
-def run_s0_model(model_type: str, cfg, tokenizer, small_batch: dict,
-                 train_loader, device: str, identity: dict,
-                 out_dir: Path, budget_deadline: float) -> dict:
-    """One model's S0: train + fixed probe + reload check. Returns summary."""
+def build_s0_modules(model_type: str, cfg, device: str):
+    """Fresh (model, conditioner) for one S0 config — shared by training,
+    the reload check and the readiness checkpoint replay (round-2 review
+    fix 2: the readiness gate must build and load the REAL modules, not
+    just torch.load the container)."""
     from ireset.diffusion.generator import DiffusionG1
     from ireset.model.conditioner import ConditionEncoder
     from ireset.model.deterministic import DeterministicG1
-    from ireset.train.losses import LossAssembler
 
-    torch.manual_seed(cfg.seed)
-    np.random.seed(cfg.seed)
     if model_type == "diffusion":
         model = DiffusionG1(num_train_timesteps=cfg.num_train_timesteps,
                             beta_schedule=cfg.beta_schedule,
@@ -160,7 +192,33 @@ def run_s0_model(model_type: str, cfg, tokenizer, small_batch: dict,
                             **cfg.backbone_kwargs()).to(device)
     else:
         model = DeterministicG1(**cfg.backbone_kwargs()).to(device)
-    conditioner = ConditionEncoder(cfg.d_model).to(device)
+    return model, ConditionEncoder(cfg.d_model).to(device)
+
+
+def run_fixed_probe(model, conditioner, batch: dict, model_type: str,
+                    probe_t, probe_noise) -> dict:
+    """The FIXED probe forward (dedicated t/noise tensors passed in)."""
+    model.eval(); conditioner.eval()
+    with torch.no_grad():
+        memory = conditioner(batch)
+        if model_type == "diffusion":
+            x_t = model.add_noise(batch["x0"], probe_noise, probe_t)
+            x0_pred = model(x_t, probe_t, memory)
+        else:
+            x0_pred = model(memory, batch["x0"].shape[1])
+        err = probe_error(x0_pred, batch["x0"])
+    return err
+
+
+def run_s0_model(model_type: str, cfg, tokenizer, small_batch: dict,
+                 train_loader, device: str, identity: dict,
+                 out_dir: Path, budget_deadline: float) -> dict:
+    """One model's S0: train + fixed probe + reload check. Returns summary."""
+    from ireset.train.losses import LossAssembler
+
+    torch.manual_seed(cfg.seed)
+    np.random.seed(cfg.seed)
+    model, conditioner = build_s0_modules(model_type, cfg, device)
     loss_fn = LossAssembler(tokenizer, cfg.loss, device)
     opt = torch.optim.AdamW([*model.parameters(), *conditioner.parameters()],
                             lr=cfg.lr, weight_decay=cfg.weight_decay)
@@ -176,15 +234,8 @@ def run_s0_model(model_type: str, cfg, tokenizer, small_batch: dict,
                    .to(device) if model_type == "diffusion" else None)
 
     def run_probe() -> dict:
-        model.eval(); conditioner.eval()
-        with torch.no_grad():
-            memory = conditioner(small_batch)
-            if model_type == "diffusion":
-                x_t = model.add_noise(small_batch["x0"], probe_noise, probe_t)
-                x0_pred = model(x_t, probe_t, memory)
-            else:
-                x0_pred = model(memory, small_batch["x0"].shape[1])
-            err = probe_error(x0_pred, small_batch["x0"])
+        err = run_fixed_probe(model, conditioner, small_batch, model_type,
+                              probe_t, probe_noise)
         model.train(); conditioner.train()
         return err
 
@@ -251,18 +302,25 @@ def run_s0_model(model_type: str, cfg, tokenizer, small_batch: dict,
                 "step": step, "config": cfg.__dict__, "identity": identity,
                 "root_stats": {"mean": tokenizer.root_stats.mean,
                                "std": tokenizer.root_stats.std}}, ckpt_path)
+    # fixed-probe replay artifact (round-2 review fix 2): the exact input
+    # batch + dedicated t/noise tensors + the recorded last probe errors —
+    # the readiness gate rebuilds the modules, loads the weights and
+    # REPLAYS this probe instead of trusting the summary flag
+    torch.save({
+        "model_type": model_type, "step": step,
+        "batch": {k: v.detach().cpu() for k, v in small_batch.items()
+                  if torch.is_tensor(v)},
+        "probe_t": probe_t.detach().cpu() if probe_t is not None else None,
+        "probe_noise": (probe_noise.detach().cpu()
+                        if probe_noise is not None else None),
+        "last_probe": probes[-1],
+        "val_seed": cfg.val_seed,
+    }, out_dir / "probe_replay.pt")
 
     # reload reproducibility: fresh modules, same identity + stats
     reload_ok, reload_max_diff = None, None
     if step > 0:
-        if model_type == "diffusion":
-            model2 = DiffusionG1(num_train_timesteps=cfg.num_train_timesteps,
-                                 beta_schedule=cfg.beta_schedule,
-                                 beta_start=cfg.beta_start, beta_end=cfg.beta_end,
-                                 **cfg.backbone_kwargs()).to(device)
-        else:
-            model2 = DeterministicG1(**cfg.backbone_kwargs()).to(device)
-        cond2 = ConditionEncoder(cfg.d_model).to(device)
+        model2, cond2 = build_s0_modules(model_type, cfg, device)
         ck = torch.load(ckpt_path, map_location=device, weights_only=False)
         model2.load_state_dict(ck["model"]); cond2.load_state_dict(ck["conditioner"])
         model2.eval(); cond2.eval()
@@ -302,6 +360,9 @@ def run_s0_model(model_type: str, cfg, tokenizer, small_batch: dict,
         "probe_count_ge_40": n_probes >= w1.S0_PROBE_MIN,
         "trend_fit_demonstrated": trend_ok,
         "reload_reproducible": reload_ok,
+        # round-2 review fix 6: a budget stop is NOT a pass — the run did
+        # not complete its registered step target within the shared budget
+        "completed_within_budget": not budget_stopped,
         "first20_mean": first_mean, "last20_mean": last_mean,
         "n_probes": n_probes,
     }
@@ -310,7 +371,8 @@ def run_s0_model(model_type: str, cfg, tokenizer, small_batch: dict,
                                         "contact_branch_silent",
                                         "probe_count_ge_40",
                                         "trend_fit_demonstrated",
-                                        "reload_reproducible"))
+                                        "reload_reproducible",
+                                        "completed_within_budget"))
                else ("fit_not_demonstrated" if trend_ok is False
                      else "incomplete"))
     summary = {
@@ -470,6 +532,12 @@ def main() -> int:
         model_identity = {**identity, "model_type": model_type}
         s0_root = run_root / "s0" / model_type
         attempt_dir = integ.allocate_attempt(s0_root)
+        # round-2 review fix 5: the ledger row is pre-registered BEFORE any
+        # work and updated on EVERY exit path — a crashed attempt stays
+        # accounted (its wall consumes budget) and can never be washed into
+        # a zero-cost history
+        _upsert_cost(run_root, f"s0_{model_type}", attempt_dir.name, 0.0,
+                     {"model": model_type}, status="running")
         # review fix 11: the small set trains as ONE equal-size micro-batch
         # (batch 4 over 6 windows produced 4+2 micro-batches whose equal
         # weighting over/under-weighted samples); every micro-batch now
@@ -481,10 +549,43 @@ def main() -> int:
             num_workers=0, drop_last=False, worker_init_fn=_worker_thread_limits)
         print(f"[s0] {model_type}: target {cfg.steps} steps, "
               f"small set={small_demos} (micro-batch {small_batch_size})")
-        t_model = time.time()
-        summary = run_s0_model(model_type, cfg, tokenizer, small_batch,
-                               small_loader, device, model_identity, attempt_dir,
-                               budget_deadline)
+        t_model = time.perf_counter()
+        try:
+            summary = run_s0_model(model_type, cfg, tokenizer, small_batch,
+                                   small_loader, device, model_identity,
+                                   attempt_dir, budget_deadline)
+        except BaseException as exc:  # noqa: BLE001 -- register, then re-raise
+            wall = time.perf_counter() - t_model
+            if not (attempt_dir / "s0_summary.json").is_file():
+                # the crash left no summary: write the honest incomplete one
+                # so the attempt carries consumable evidence
+                (attempt_dir / "s0_summary.json").write_text(json.dumps({
+                    "model_type": model_type, "verdict": "incomplete",
+                    "gates": {"min_100_optimizer_steps": False,
+                              "all_finite": False,
+                              "contact_branch_silent": False,
+                              "probe_count_ge_40": False,
+                              "trend_fit_demonstrated": False,
+                              "reload_reproducible": None,
+                              "completed_within_budget": False},
+                    "crashed": f"{type(exc).__name__}: {exc}",
+                    "budget_stopped": True,
+                    "optimizer_steps": 0, "micro_batches": 0,
+                    "grad_accum": cfg.grad_accum, "probes": [],
+                    "nonfinite_stop": None,
+                    "identity": model_identity,
+                }, indent=2, ensure_ascii=False))
+            integ.append_attempts_index(s0_root, {
+                "attempt": attempt_dir.name,
+                "model": model_type,
+                "verdict": "incomplete",
+                "summary": path_for_record(attempt_dir / "s0_summary.json"),
+            })
+            _upsert_cost(run_root, f"s0_{model_type}", attempt_dir.name, wall,
+                         {"model": model_type, "verdict": "incomplete",
+                          "crashed": f"{type(exc).__name__}: {exc}"},
+                         status="crashed")
+            raise
         integ.append_attempts_index(s0_root, {
             "attempt": attempt_dir.name,
             "model": model_type,
@@ -495,13 +596,14 @@ def main() -> int:
         # costs are WALL time per model attempt (review fix 12): each model
         # measures from its OWN start, so the second entry cannot include
         # the first model's cost; the budget consumed is also registered
-        consumed = hist + (time.time() - t_model)
-        _append_costs(run_root, f"s0_{model_type}",
-                      time.time() - t_model,
-                      {"attempt": attempt_dir.name,
-                       "verdict": summary["verdict"],
-                       "optimizer_steps": summary["optimizer_steps"],
-                       "budget_consumed_cumulative_s": round(consumed, 1)})
+        wall = time.perf_counter() - t_model
+        consumed = hist + wall
+        _upsert_cost(run_root, f"s0_{model_type}", attempt_dir.name, wall,
+                     {"model": model_type,
+                      "verdict": summary["verdict"],
+                      "optimizer_steps": summary["optimizer_steps"],
+                      "budget_consumed_cumulative_s": round(consumed, 1)},
+                     status="done")
         hist = consumed
         results[model_type] = summary
         print(f"[s0] {model_type}: verdict={summary['verdict']} "

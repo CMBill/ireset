@@ -160,9 +160,13 @@ def check_b(run_root: Path, cache: dict | None) -> dict:
             "datasets": out, "cache_attempt": cache["attempt"]}
 
 
-def _recompute_s0_verdict(summary: dict, history: list[dict]) -> tuple[dict, list[str]]:
-    """Recompute EVERY S0 gate from the raw facts (review fix 2) — the
-    recorded ``verdict`` string is never trusted by itself."""
+def _recompute_s0_verdict(summary: dict, history: list[dict],
+                          history_present: bool) -> tuple[dict, list[str]]:
+    """Recompute EVERY S0 gate from the raw facts (review fix 2, deepened
+    round 2) — the recorded ``verdict`` string is never trusted by itself,
+    and neither are summary COUNTS: the loss history must exist, be
+    contiguous 1..N with every loss part finite, the probes must follow the
+    registered schedule, and a budget stop is a hard fail."""
     import math as _math
 
     import numpy as np
@@ -170,7 +174,7 @@ def _recompute_s0_verdict(summary: dict, history: list[dict]) -> tuple[dict, lis
     probes = summary.get("probes") or []
     reasons: list[str] = []
     steps = summary.get("optimizer_steps")
-    if not isinstance(steps, int):
+    if not isinstance(steps, int) or isinstance(steps, bool):
         reasons.append("optimizer_steps_not_an_int")
         steps = -1
     gates = {}
@@ -178,18 +182,43 @@ def _recompute_s0_verdict(summary: dict, history: list[dict]) -> tuple[dict, lis
     gates["max_1000_optimizer_steps"] = steps <= w1.S0_MAX_STEPS
     gates["micro_batches_real"] = (summary.get("micro_batches", 0)
                                    >= steps * summary.get("grad_accum", 0) > 0)
+    # the loss history is PRIMARY evidence: it must exist and cover every
+    # completed optimizer step exactly once (round-2 review fix 1 — an
+    # empty/deleted history was accepted by all([]) vacuously)
+    gates["loss_history_present"] = history_present
+    gates["loss_history_contiguous"] = (
+        history_present and len(history) == steps
+        and [h.get("step") for h in history] == list(range(1, steps + 1)))
+    # finiteness over EVERY measured value in each row, not just gnorm
+    def _row_finite(h: dict) -> bool:
+        for k, v in h.items():
+            if k in ("step", "ms"):
+                continue
+            if not (isinstance(v, (int, float)) and not isinstance(v, bool)
+                    and _math.isfinite(float(v))):
+                return False
+        return "gnorm" in h
     gates["all_finite"] = (summary.get("nonfinite_stop") is None
-                           and all(
-                               isinstance(h.get("gnorm"), (int, float))
-                               and _math.isfinite(h["gnorm"]) for h in history))
+                           and bool(history)
+                           and all(_row_finite(h) for h in history))
     # contact branch silence recomputed from the per-step loss parts
     contact_keys = ("contact_m2", "contact")
     gates["contact_branch_silent"] = not any(
         anyk in h for h in history for anyk in contact_keys)
     errs = [p.get("motion_reconstruction") for p in probes]
     gates["probe_count_ge_40"] = len(errs) >= w1.S0_PROBE_MIN
-    if len(errs) >= 2 * w1.S0_TREND_WINDOW and all(
-            isinstance(e, (int, float)) and _math.isfinite(e) for e in errs):
+    gates["probe_errors_finite"] = bool(errs) and all(
+        isinstance(e, (int, float)) and not isinstance(e, bool)
+        and _math.isfinite(e) for e in errs)
+    # probe timing: step 0 first, strictly increasing, every later probe on
+    # the registered cadence, and the final training state was probed
+    psteps = [p.get("step") for p in probes]
+    gates["probe_schedule_valid"] = bool(psteps) and psteps[0] == 0 and all(
+        isinstance(s, int) and not isinstance(s, bool) for s in psteps
+    ) and all(b > a for a, b in zip(psteps, psteps[1:])) and all(
+        s % w1.S0_PROBE_EVERY == 0 for s in psteps[1:]
+    ) and psteps[-1] >= steps - w1.S0_PROBE_EVERY
+    if gates["probe_errors_finite"] and len(errs) >= 2 * w1.S0_TREND_WINDOW:
         first = float(np.mean(errs[:w1.S0_TREND_WINDOW]))
         last = float(np.mean(errs[-w1.S0_TREND_WINDOW:]))
         gates["trend_fit_demonstrated"] = last < first
@@ -197,7 +226,72 @@ def _recompute_s0_verdict(summary: dict, history: list[dict]) -> tuple[dict, lis
     else:
         gates["trend_fit_demonstrated"] = False
         gates["first20_mean"] = gates["last20_mean"] = None
+    # round-2 review fix 6: a budget-stopped run is never a pass
+    gates["completed_within_budget"] = summary.get("budget_stopped") is not True
     return gates, reasons
+
+
+def _verify_checkpoint_deep(ckpt_path: Path, att_dir: Path, cache_dir: Path,
+                            model: str) -> tuple[list[str], dict | None]:
+    """Actually REBUILD the modules and REPLAY the fixed probe (round-2
+    review fix 2: torch.load only proved the container readable — cleared
+    state dicts, NaN weights and doctored embedded statistics all passed).
+
+    Catches: cleared/foreign weights (strict load fails or replay diverges),
+    NaN weights (finiteness over every parameter), embedded root statistics
+    differing from the cache, config/model-type mismatch, a missing or
+    foreign probe-replay artifact."""
+    import math as _math
+
+    import numpy as _np
+    import torch
+
+    import w1_s0
+
+    problems: list[str] = []
+    replay_path = att_dir / "probe_replay.pt"
+    if not replay_path.is_file():
+        return ["probe_replay_missing"], None
+    ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    rp = torch.load(replay_path, map_location="cpu", weights_only=False)
+    if rp.get("model_type") != model or rp.get("step") != ck.get("step"):
+        problems.append("probe_replay_identity_mismatch")
+    try:
+        from ireset.train.trainer import TrainConfig
+
+        cfg = TrainConfig(**ck["config"])
+    except Exception as exc:  # noqa: BLE001
+        return problems + [f"checkpoint_config_unusable:{type(exc).__name__}"], None
+    if cfg.model_type != model:
+        problems.append("checkpoint_model_type_mismatch")
+    # embedded statistics must EQUAL the cache root statistics (bitwise)
+    with _np.load(cache_dir / "root_stats.npz") as rs:
+        stats_match = (
+            _np.array_equal(_np.asarray(ck["root_stats"]["mean"]), rs["mean"])
+            and _np.array_equal(_np.asarray(ck["root_stats"]["std"]), rs["std"]))
+    if not stats_match:
+        problems.append("checkpoint_stats_differ_from_cache")
+    try:
+        m, cond = w1_s0.build_s0_modules(model, cfg, "cpu")
+        m.load_state_dict(ck["model"], strict=True)
+        cond.load_state_dict(ck["conditioner"], strict=True)
+    except Exception as exc:  # noqa: BLE001
+        return problems + [f"checkpoint_weights_unloadable:{type(exc).__name__}"], None
+    if not all(bool(torch.isfinite(p).all()) for p in
+               [*m.parameters(), *cond.parameters()]):
+        return problems + ["checkpoint_weights_not_finite"], None
+    err = w1_s0.run_fixed_probe(m, cond, rp["batch"], model,
+                                rp.get("probe_t"), rp.get("probe_noise"))
+    recorded = rp.get("last_probe") or {}
+    rec = recorded.get("motion_reconstruction")
+    detail = {"replayed_probe": err, "recorded_last_probe": recorded}
+    if not (isinstance(rec, (int, float)) and _math.isfinite(float(rec))):
+        return problems + ["recorded_probe_error_missing"], detail
+    if abs(err["motion_reconstruction"] - float(rec)) > 1e-3 + 1e-3 * abs(float(rec)):
+        problems.append(
+            f"probe_replay_mismatch:{err['motion_reconstruction']:.3e}"
+            f"!={float(rec):.3e}")
+    return problems, detail
 
 
 def check_c(run_root: Path, cache: dict | None, prereg: dict) -> dict:
@@ -225,11 +319,13 @@ def check_c(run_root: Path, cache: dict | None, prereg: dict) -> dict:
         history_path = att_dir / "loss_history.json"
         history = (json.loads(history_path.read_text())
                    if history_path.is_file() else [])
-        gates, gate_reasons = _recompute_s0_verdict(summary, history)
+        gates, gate_reasons = _recompute_s0_verdict(
+            summary, history, history_path.is_file())
         reasons += [f"s0_{model}:{r}" for r in gate_reasons]
         # checkpoint evidence: exists, reloadable, bound to CURRENT identity
         ckpt_path = att_dir / "last.pt"
         ident_problems = []
+        deep_detail = None
         if not ckpt_path.is_file():
             ident_problems.append("checkpoint_missing")
         else:
@@ -248,16 +344,25 @@ def check_c(run_root: Path, cache: dict | None, prereg: dict) -> dict:
                     ident_problems.append("checkpoint_root_stats_mismatch")
                 if ck.get("step") != summary.get("optimizer_steps"):
                     ident_problems.append("checkpoint_step_mismatch")
+                if cache is not None:
+                    deep_problems, deep_detail = _verify_checkpoint_deep(
+                        ckpt_path, att_dir, cache["dir"], model)
+                    ident_problems += deep_problems
         reasons += [f"s0_{model}:{p}" for p in ident_problems]
-        # small set must come from the CURRENT registration
+        # the small set must COVER the registered pilot6 (round-2 review fix
+        # 1: a shrunken one-demo small set still "came from" pilot6 under
+        # the subset check) and the recorded batch size must match it
         pilot6 = list(prereg.get("selection", {}).get("pilot6_from_a1", []))
         small = summary.get("identity", {}).get("small_set_demos") or []
-        if not small or not set(small) <= set(pilot6):
-            reasons.append(f"s0_{model}:small_set_not_from_registered_pilot6")
+        if sorted(small) != sorted(pilot6):
+            reasons.append(f"s0_{model}:small_set_not_the_registered_pilot6")
+        if summary.get("small_set_batch_size") != len(pilot6):
+            reasons.append(f"s0_{model}:small_set_batch_size_mismatch")
         reload_ok = summary.get("gates", {}).get("reload_reproducible")
         if reload_ok is not True:
             reasons.append(f"s0_{model}:reload_reproducible_not_true")
-        recomputed_pass = (all(gates.values()) and not ident_problems
+        bool_gates = {k: v for k, v in gates.items() if isinstance(v, bool)}
+        recomputed_pass = (all(bool_gates.values()) and not ident_problems
                            and reload_ok is True)
         if summary.get("verdict") != "passed":
             reasons.append(f"s0_{model}_{summary.get('verdict')}")
@@ -270,6 +375,7 @@ def check_c(run_root: Path, cache: dict | None, prereg: dict) -> dict:
             "identity_problems": ident_problems,
             "optimizer_steps": summary.get("optimizer_steps"),
             "small_set_demos": small,
+            "checkpoint_replay": deep_detail,
         }
     return {"passed": not reasons, "reasons": reasons, "per_model": per_model}
 

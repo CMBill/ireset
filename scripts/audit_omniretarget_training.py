@@ -193,12 +193,20 @@ def _finite_num(x) -> bool:
 def quality_registration_complete(row: dict) -> tuple[bool, list[str]]:
     """Is this row's quality registration backed by ACTUAL measurements?
 
-    Review fix 5: a ``status=complete`` flag without its measurement fields
-    is a completeness claim, not evidence. Required: the metrics dict with
-    the finite core measurements (penetration/task/box-ground), per-side
-    hand/foot entries whose measured quantities are finite WHEREVER the
-    reference frames exist, and legal zero-reference sides (``None`` with
-    zero registered reference frames) staying legal.
+    Review fix 5 (deepened round 2): a ``status=complete`` flag without its
+    measurement fields is a completeness claim, not evidence. Required:
+
+    * the finite core measurements (penetration/task/box-ground AND the
+      keyframe violation ratio) plus finite fps;
+    * per-side hand/foot measurements must EXIST exactly where the recorded
+      reference frames exist — ``None`` stays legal ONLY for a genuinely
+      zero-reference side (checked against ``ref_grasp_frames`` /
+      ``ref_support_frames``, themselves reconciled against the recorded
+      ``reference_intervals``);
+    * the both-hands block measured wherever its denominator is non-zero.
+
+    A deleted measurement must therefore surface as a gap (missing evidence),
+    never as a legal zero-reference side.
     """
     q = row.get("quality") or {}
     m = q.get("metrics")
@@ -207,30 +215,91 @@ def quality_registration_complete(row: dict) -> tuple[bool, list[str]]:
     problems: list[str] = []
     if m.get("valid") is not True:
         problems.append("metrics_not_valid")
-    for k in ("penetration_max_m", "task_mpjpe_p95_m",
-              "box_ground_penetration_max_m"):
+    for k in ("penetration_max_m", "penetration_violation_ratio",
+              "task_mpjpe_p95_m", "box_ground_penetration_max_m", "fps"):
         if not _finite_num(m.get(k)):
             problems.append(f"{k}:{m.get(k)}")
+
+    # per-side reference-frame counts — the EXISTENCE contract for the
+    # hand/foot measurements; reconciled against the recorded intervals
+    ref_support = m.get("ref_support_frames")
+    ref_grasp = m.get("ref_grasp_frames")
+    if not isinstance(ref_support, dict) or not isinstance(ref_grasp, dict):
+        problems.append("ref_frame_counts_missing")
+        ref_support = ref_support if isinstance(ref_support, dict) else {}
+        ref_grasp = ref_grasp if isinstance(ref_grasp, dict) else {}
+    intervals = m.get("reference_intervals")
+    recon_support = {"l": 0, "r": 0}
+    recon_grasp = {"l": 0, "r": 0}
+    if not isinstance(intervals, list):
+        problems.append("reference_intervals_missing")
+    else:
+        for iv in intervals:
+            if not isinstance(iv, dict):
+                continue
+            eff = str(iv.get("eff", iv.get("effector", "")))
+            side = ("l" if eff.startswith("left")
+                    else "r" if eff.startswith("right") else None)
+            start, end = iv.get("start"), iv.get("end")
+            if (side is None or not isinstance(start, int)
+                    or not isinstance(end, int) or end < start):
+                continue
+            n = end - start
+            if eff.endswith("_foot") and iv.get("sup") == "ground":
+                recon_support[side] += n
+            elif eff.endswith("_hand") and iv.get("sup") == "object":
+                recon_grasp[side] += n
     for side in ("l", "r"):
-        for group, keys in (("foot", ("gap_p95_m", "speed_p95_mps", "drift_max_m")),
-                            ("hand", ("gap_p95_m", "coverage"))):
+        if ref_support.get(side, recon_support[side]) != recon_support[side]:
+            problems.append(
+                f"foot[{side}]:ref_frames_vs_intervals:"
+                f"{ref_support.get(side)}!={recon_support[side]}")
+        if ref_grasp.get(side, recon_grasp[side]) != recon_grasp[side]:
+            problems.append(
+                f"hand[{side}]:ref_frames_vs_intervals:"
+                f"{ref_grasp.get(side)}!={recon_grasp[side]}")
+
+    for side in ("l", "r"):
+        for group, counts, keys in (
+                ("foot", ref_support, ("gap_p95_m", "speed_p95_mps",
+                                       "drift_max_m")),
+                ("hand", ref_grasp, ("gap_p95_m", "coverage"))):
+            need = counts.get(side, 0)
+            if not isinstance(need, int) or isinstance(need, bool) or need < 0:
+                problems.append(f"{group}[{side}]:ref_frames:{need}")
+                need = None
             entry = (m.get(group) or {}).get(side)
+            if need == 0:
+                # legal zero-reference side ONLY as an absent measurement
+                if entry is not None:
+                    problems.append(f"{group}[{side}]:measurement_without_reference")
+                continue
             if entry is None:
-                continue     # legal zero-reference side (no intervals)
+                # reference frames EXIST but the measurement was deleted —
+                # the reviewer's counterexample: NOT a legal zero side
+                problems.append(f"{group}[{side}]:reference_without_measurement")
+                continue
             if not isinstance(entry, dict):
                 problems.append(f"{group}[{side}]:not_a_dict")
                 continue
-            ref_frames = entry.get("n_ref_frames")
-            if not isinstance(ref_frames, int) or ref_frames <= 0:
-                # a present entry with no reference frames contradicts the
-                # measure() contract (no ranges -> None side)
-                problems.append(f"{group}[{side}]:n_ref_frames:{ref_frames}")
-                continue
+            nrf = entry.get("n_ref_frames")
+            if nrf != need:
+                problems.append(f"{group}[{side}].n_ref_frames:{nrf}!={need}")
             for k in keys:
                 if not _finite_num(entry.get(k)):
                     problems.append(f"{group}[{side}].{k}:{entry.get(k)}")
-    if not isinstance(m.get("both"), dict):
+
+    both = m.get("both")
+    if not isinstance(both, dict) or "denominator_frames" not in both:
         problems.append("both_missing")
+    else:
+        den = both.get("denominator_frames")
+        if not isinstance(den, int) or isinstance(den, bool) or den < 0:
+            problems.append(f"both.denominator_frames:{den}")
+        elif den > 0:
+            for k in ("valid_coverage", "gap_series_p95_m"):
+                if not _finite_num(both.get(k)):
+                    problems.append(f"both.{k}:{both.get(k)}")
     if m.get("T") != row.get("T"):
         problems.append(f"T:{m.get('T')}!={row.get('T')}")
     return (not problems), problems

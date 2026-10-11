@@ -323,11 +323,15 @@ def derive_source_box(
 #: fix 1: v1 measured against the unscaled locked hull)
 SCHEDULE_KEY_VERSION = 2
 #: code that defines condition construction + schedule inference — the cache
-#: key covers CODE identity, not just file names
+#: key covers CODE identity, not just file names. ``distance_adapter.py`` is
+#: the ACTUAL hull-distance implementation the schedule inference calls (the
+#: scaled-query semantics of this round live there; review fix 8 of round 2:
+#: leaving it out let a geometry revert reuse keyed schedules unchanged)
 CONDITION_CODE_FILES = (
     "src/ireset/data/teacher.py",
     "src/ireset/data/pairing.py",
     "src/ireset/embodied/contact_sites.py",
+    "src/ireset/geometry/distance_adapter.py",
     "src/ireset/data/w1_training.py",
 )
 
@@ -392,6 +396,12 @@ def verify_cache_contents(cache_dir: Path, manifest: dict, prereg: dict,
     if not ident_path.is_file():
         return {"problems": ["cache_identity_missing"], "passed": False}
     ident = json.loads(ident_path.read_text())
+
+    # a budget-stopped cache attempt is INCOMPLETE evidence even where its
+    # files look bound (round-2 review fix 7): the producer records the flag,
+    # the consumer side refuses it
+    if ident.get("complete") is not True:
+        problems.append(f"cache_not_complete:{ident.get('incomplete_reason')}")
 
     if ident.get("protocol") != MOTION_PROTOCOL_VERSION:
         problems.append("cache_protocol_mismatch")

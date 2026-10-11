@@ -119,13 +119,17 @@ def make_formal_eval(manifest_path: Path, cache_dir: Path, tokenizer,
                      device: str, contract: dict, model_type: str):
     """W1 formal-selection callback (plan §5.2 contract, review fix 9).
 
-    Builds every expected val demo's condition + teacher scene ONCE
-    (condition invariance: they depend only on the audited derived
-    representation, never on model weights); each call generates the FULL
-    clip length for every expected demo and returns the demonstration-macro
-    teacher-fit FK MPJPE. A demo that fails to generate keeps its row with
-    a status — one failure makes the evidence incomplete and ``best.pt``
-    unattainable at that evaluation.
+    The expected set is the REGISTERED val31 selection (round-2 review fix
+    3) — NOT the subset of val rows that happen to be admitted: a rejected
+    or unloadable label keeps its row as a gap, so ``n_expected`` stays the
+    full registered denominator and one gap makes the evidence incomplete
+    (``best.pt`` unattainable at that evaluation) instead of shrinking the
+    validation set to whichever labels survived.
+
+    Conditions + teacher scenes are built ONCE (condition invariance: they
+    depend only on the audited derived representation, never on model
+    weights); each call generates the FULL clip length for every loadable
+    demo and returns the demonstration-macro teacher-fit FK MPJPE.
     """
     import numpy as np
     import torch as _torch
@@ -142,17 +146,33 @@ def make_formal_eval(manifest_path: Path, cache_dir: Path, tokenizer,
     assets_sha = prereg["assets"]["a1_assets_sha256"]
     code_sha = _w1.condition_code_sha256(PROJECT_ROOT)
     seed = int(contract.get("full_generation_seed", 7))
-    expected = [r for r in manifest["rows"]
-                if r.get("split") == "val"
-                and r.get("admission", {}).get("motion")]
-    clips = []
-    for r in expected:
-        clip = _w1.load_w1_derived_clip(r, Path(cache_dir) / "schedules",
-                                        PROJECT_ROOT, assets_sha, code_sha)
+    expected_demos = list(prereg.get("selection", {}).get("val31", []))
+    if not expected_demos:
+        raise SystemExit("registered val31 selection is empty — the formal "
+                         "evaluation denominator is undefined")
+    row_by_demo = {r["demo"]: r for r in manifest["rows"]}
+    clips = []          # (demo, cond, teacher, T) for the LOADABLE labels
+    gaps = []           # (demo, status, error) — expected but not loadable
+    for demo in expected_demos:
+        r = row_by_demo.get(demo)
+        if r is None:
+            gaps.append((demo, "row_missing", None))
+            continue
+        if not r.get("admission", {}).get("motion"):
+            gaps.append((demo, "label_not_admitted", None))
+            continue
+        try:
+            clip = _w1.load_w1_derived_clip(
+                r, Path(cache_dir) / "schedules", PROJECT_ROOT,
+                assets_sha, code_sha)
+        except Exception as exc:  # noqa: BLE001 -- a kept gap, not a crash
+            gaps.append((demo, "label_unloadable",
+                         f"{type(exc).__name__}: {exc}"))
+            continue
         cond = clip.condition.truncate(clip.T)
         teacher = np.concatenate(
             [clip.root, clip.q, cond.target_obj_pose], axis=1)
-        clips.append((r["demo"], cond, teacher, clip.T))
+        clips.append((demo, cond, teacher, clip.T))
     kin = G1Kinematics()
 
     def callback(model, conditioner):
@@ -160,6 +180,9 @@ def make_formal_eval(manifest_path: Path, cache_dir: Path, tokenizer,
                           ddim_steps=25)
         per_demo = []
         vals = []
+        for demo, status, error in gaps:
+            per_demo.append({"demo": demo, "T": None, "status": status,
+                             "error": error, "mpjpe_m": None})
         for demo, cond, teacher, T in clips:
             rec = {"demo": demo, "T": T}
             try:
@@ -180,8 +203,12 @@ def make_formal_eval(manifest_path: Path, cache_dir: Path, tokenizer,
                            error=f"{type(exc).__name__}: {exc}",
                            mpjpe_m=None)
             per_demo.append(rec)
-        macro = float(np.mean(vals)) if len(vals) == len(clips) else None
-        return {"n_expected": len(clips), "n_ok": len(vals),
+        # the macro exists only over the FULL registered denominator
+        macro = (float(np.mean(vals))
+                 if len(vals) == len(expected_demos) else None)
+        return {"n_expected": len(expected_demos), "n_ok": len(vals),
+                "n_label_gaps": len(gaps),
+                "expected_set": "registered_val31",
                 "macro_mpjpe_m": macro, "per_demo": per_demo,
                 "seed": seed, "model_type": model_type}
 

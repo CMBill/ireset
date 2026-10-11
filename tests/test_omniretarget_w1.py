@@ -357,6 +357,7 @@ def build_synthetic_world(tmp_path: Path, *, n_train: int = 2, n_val: int = 2,
         "condition_code_sha256": code_sha,
         "assets_sha256": assets_sha,
         "schedule_cache_key_version": w1.SCHEDULE_KEY_VERSION,
+        "complete": True,
         "root_stats": {"file_sha256": _sha(cache_dir / "root_stats.npz"),
                        "frames_fitted": facts["frames_fitted"],
                        "n_train_rows_used": facts["n_train_rows_used"],
@@ -1280,6 +1281,61 @@ def _complete_metrics(row: dict) -> dict:
     }
 
 
+def _run_real_s0_attempt(world, model, steps=24, deadline_s=600.0):
+    """Run a REAL tiny S0 attempt into a fresh ``s0/<model>/attempt_NNN``
+    and index it — internally consistent evidence (trained checkpoint,
+    probe-replay artifact, contiguous loss history, on-cadence probes) that
+    satisfies the readiness deep verification (round-2 review fixtures)."""
+    import time as _time
+
+    import ireset.data.a2_integrity as _integ
+    import w1_s0
+
+    tok = _tokenizer(world)
+    manifest = json.loads(world["manifest_path"].read_text())
+    prereg = json.loads(world["prereg_path"].read_text())
+    pilot6 = list(prereg["selection"]["pilot6_from_a1"])
+    ds = windows_mod.TeacherWindowDataset(
+        "train", tok, window=w1.WINDOW_F, stride=w1.WINDOW_STRIDE,
+        training_manifest=world["manifest_path"],
+        schedule_cache_dir=world["cache_dir"] / "schedules")
+    row_by_demo = {r["demo"]: r for r in manifest["rows"]}
+    idxs, demos = [], []
+    for demo in pilot6:
+        row = row_by_demo.get(demo)
+        if row is None or not row.get("admission", {}).get("motion"):
+            continue
+        lc_idx = next((i for i, lc in enumerate(ds.clips) if lc.demo == demo), None)
+        if lc_idx is None:
+            continue
+        idxs.append(ds.index.index((lc_idx, 0)))
+        demos.append(demo)
+    items = [ds[i] for i in idxs]
+    small_batch = {k: torch.stack([it[k] for it in items])
+                   for k in items[0] if torch.is_tensor(items[0][k])}
+    loader = torch.utils.data.DataLoader(
+        torch.utils.data.Subset(ds, idxs), batch_size=max(1, len(idxs)),
+        shuffle=True, generator=torch.Generator().manual_seed(3))
+    identity = {
+        "experiment_id": w1.EXPERIMENT_ID,
+        "protocol": w1.MOTION_PROTOCOL_VERSION,
+        "training_manifest": {"sha256": _sha(world["manifest_path"])},
+        "cache": {"identity_sha256": _sha(world["cache_dir"] / "cache_identity.json"),
+                  "root_stats_sha256": _sha(world["cache_dir"] / "root_stats.npz")},
+        "small_set_demos": demos, "model_type": model,
+    }
+    s0_root = world["run"] / "s0" / model
+    att = _integ.allocate_attempt(s0_root)
+    cfg = _s0_cfg(model, steps)
+    summary = w1_s0.run_s0_model(
+        model, cfg, tok, small_batch, loader, "cpu", identity, att,
+        _time.perf_counter() + deadline_s)
+    _append_index(s0_root, {
+        "attempt": att.name, "model": model, "verdict": summary["verdict"],
+        "summary": str((att / "s0_summary.json").relative_to(world["root"]))})
+    return att, summary
+
+
 # --- readiness ------------------------------------------------------------------------
 
 def test_readiness_reasons_on_missing_and_complete(tmp_path, monkeypatch):
@@ -1312,38 +1368,16 @@ def test_readiness_reasons_on_missing_and_complete(tmp_path, monkeypatch):
 
     import ireset.data.a2_integrity as _integ
 
-    manifest_sha = _integ.sha256_file(world["manifest_path"])
-    cache_ident_sha = _integ.sha256_file(world["cache_dir"] / "cache_identity.json")
-    root_stats_sha = _integ.sha256_file(world["cache_dir"] / "root_stats.npz")
+    # small S0 constants so a REAL tiny attempt satisfies the recomputed
+    # gates (the deep verification rebuilds models and replays probes —
+    # fabricated summaries can no longer stand in for training evidence)
+    monkeypatch.setattr(w1, "S0_MIN_STEPS", 20)
+    monkeypatch.setattr(w1, "S0_PROBE_EVERY", 2)
+    monkeypatch.setattr(w1, "S0_TREND_WINDOW", 3)
+    monkeypatch.setattr(w1, "S0_PROBE_MIN", 6)
     for model in ("deterministic", "diffusion"):
-        att = world["run"] / "s0" / model / "attempt_001"
-        att.mkdir(parents=True)
-        probes = [{"step": 10 * i,
-                   "motion_reconstruction": 1.0 - 0.01 * i} for i in range(50)]
-        ident = {"experiment_id": w1.EXPERIMENT_ID,
-                 "protocol": w1.MOTION_PROTOCOL_VERSION,
-                 "training_manifest": {"sha256": manifest_sha},
-                 "cache": {"identity_sha256": cache_ident_sha,
-                           "root_stats_sha256": root_stats_sha},
-                 "small_set_demos": [world["train24"][0]],
-                 "model_type": model}
-        (att / "s0_summary.json").write_text(json.dumps({
-            "verdict": "passed",
-            "gates": {"min_100_optimizer_steps": True, "all_finite": True,
-                      "contact_branch_silent": True, "probe_count_ge_40": True,
-                      "trend_fit_demonstrated": True,
-                      "reload_reproducible": True},
-            "nonfinite_stop": None, "budget_stopped": False,
-            "optimizer_steps": 120, "micro_batches": 240, "grad_accum": 2,
-            "identity": ident, "probes": probes}))
-        (att / "loss_history.json").write_text(json.dumps(
-            [{"step": i + 1, "total": 1.0 / (i + 1), "gnorm": 1.0}
-             for i in range(120)]))
-        torch.save({"identity": ident, "step": 120, "model": {},
-                    "conditioner": {}}, att / "last.pt")
-        _append_index(world["run"] / "s0" / model, {
-            "attempt": "attempt_001",
-            "summary": str(att.relative_to(world["root"]) / "s0_summary.json")})
+        att, summary = _run_real_s0_attempt(world, model, steps=24)
+        assert summary["verdict"] == "passed", summary["gates"]
 
     monkeypatch.setattr("sys.argv", ["prog", "--run-root", str(world["run"])])
     rc = rd.main()
@@ -1354,7 +1388,8 @@ def test_readiness_reasons_on_missing_and_complete(tmp_path, monkeypatch):
 
     # review fix 2 regression: a doctored verdict with broken facts must
     # fail the recomputed c gate
-    victim = world["run"] / "s0" / "deterministic" / "attempt_001" / "s0_summary.json"
+    victim_dir = sorted((world["run"] / "s0" / "deterministic").glob("attempt_*"))[-1]
+    victim = victim_dir / "s0_summary.json"
     doctored = json.loads(victim.read_text())
     doctored["optimizer_steps"] = 0
     victim.write_text(json.dumps(doctored))

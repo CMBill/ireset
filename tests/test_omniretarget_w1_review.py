@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -46,6 +47,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_omniretarget_w1 import (  # noqa: E402
     _complete_metrics,
     _patch_paths,
+    _repin,
+    _run_real_s0_attempt,
     _sha,
     _write_demo_files,
     build_synthetic_world,
@@ -324,6 +327,79 @@ def test_quality_completeness_requires_actual_measurements():
         "n_ref_frames": 0, "gap_p95_m": None, "coverage": None}
     assert not quality_registration_complete(bad_side)[0]
 
+    # --- round-2 fix 5: measurement EXISTENCE is checked against the recorded
+    # reference-frame counts (the reviewer's real-sub10 counterexamples) ---
+    def _row_with_refs(demo):
+        r = _row(demo)
+        m = r["quality"]["metrics"]
+        m["ref_grasp_frames"] = {"l": 46, "r": 50}
+        m["ref_support_frames"] = {"l": 94, "r": 89}
+        m["reference_intervals"] = [
+            {"eff": "left_hand", "start": 1, "end": 47, "sup": "object"},
+            {"eff": "right_hand", "start": 44, "end": 94, "sup": "object"},
+            {"eff": "left_foot", "start": 4, "end": 98, "sup": "ground"},
+            {"eff": "right_foot", "start": 0, "end": 89, "sup": "ground"},
+        ]
+        m["hand"] = {
+            "l": {"n_ref_frames": 46, "gap_p95_m": 0.02, "coverage": 0.9},
+            "r": {"n_ref_frames": 50, "gap_p95_m": 0.02, "coverage": 0.9}}
+        m["foot"] = {
+            "l": {"n_ref_frames": 94, "gap_p95_m": 0.01, "speed_p95_mps": 0.1,
+                  "drift_max_m": 0.02, "n_speed_frames": 90},
+            "r": {"n_ref_frames": 89, "gap_p95_m": 0.01, "speed_p95_mps": 0.1,
+                  "drift_max_m": 0.02, "n_speed_frames": 85}}
+        m["both"] = {"denominator_frames": 3, "valid_coverage": 0.5,
+                     "gap_series_p95_m": 0.03}
+        return r
+
+    ref_row = _row_with_refs("d10")
+    ok, problems = quality_registration_complete(ref_row)
+    assert ok, problems
+
+    def _mutated(base, fn):
+        r = json.loads(json.dumps(base))
+        fn(r["quality"]["metrics"])
+        return quality_registration_complete(r)
+
+    # hand.l -> None while 46 reference frames exist (was: legal zero side)
+    ok, problems = _mutated(ref_row, lambda m: m["hand"].__setitem__("l", None))
+    assert not ok and "hand[l]:reference_without_measurement" in problems
+    # whole hand/foot blocks deleted
+    ok, problems = _mutated(ref_row, lambda m: m.pop("hand"))
+    assert not ok and any("reference_without_measurement" in p for p in problems)
+    ok, problems = _mutated(ref_row, lambda m: m.pop("foot"))
+    assert not ok
+    # keyframe violation ratio NaN'd (a measured quantity, not optional)
+    ok, problems = _mutated(
+        ref_row, lambda m: m.__setitem__("penetration_violation_ratio",
+                                         float("nan")))
+    assert not ok and any("penetration_violation_ratio" in p for p in problems)
+    # both block cleared (was: any dict passed)
+    ok, problems = _mutated(ref_row, lambda m: m.__setitem__("both", {}))
+    assert not ok and "both_missing" in problems
+    # doctored per-entry n_ref_frames vs the recorded reference counts
+    ok, problems = _mutated(
+        ref_row, lambda m: m["hand"]["l"].__setitem__("n_ref_frames", 1))
+    assert not ok and "hand[l].n_ref_frames:1!=46" in problems
+    # ref counts doctored against the recorded intervals
+    ok, problems = _mutated(
+        ref_row, lambda m: m["ref_grasp_frames"].__setitem__("l", 999))
+    assert not ok and any("ref_frames_vs_intervals" in p for p in problems)
+    # ref count dicts deleted entirely
+    ok, problems = _mutated(ref_row, lambda m: m.pop("ref_grasp_frames"))
+    assert not ok and "ref_frame_counts_missing" in problems
+    # a genuinely zero-reference side stays legal (None with 0 counts)
+    zero_side = json.loads(json.dumps(ref_row))
+    zm = zero_side["quality"]["metrics"]
+    zm["ref_grasp_frames"] = {"l": 46, "r": 0}
+    zm["reference_intervals"] = [iv for iv in zm["reference_intervals"]
+                                 if iv["eff"] != "right_hand"]
+    zm["hand"]["r"] = None
+    zm["both"] = {"denominator_frames": 0, "valid_coverage": None,
+                  "gap_series_p95_m": None}
+    ok, problems = quality_registration_complete(zero_side)
+    assert ok, problems
+
     # ...and the exit gate flips when a TRAIN row loses its measurements
     rows = [_row(f"d{i}") for i in range(55)]
     rows[3] = stripped
@@ -394,32 +470,77 @@ def test_cache_content_verification_catches_tampering(tmp_path, monkeypatch):
 # --- fix 7 + 12: S0 budget clock, history and cost ledger ------------------------
 
 def test_historical_s0_cost_semantics(tmp_path):
+    """Round-2 fix 5: the ledger reconciles THREE ways (disk attempt dirs ×
+    per-model index × cost rows) — a crashed attempt without a row, a
+    leftover ``running`` row or duplicate (model, attempt) rows are all
+    UNKNOWN history (stop), never a zero."""
     from w1_s0 import historical_s0_cost_s
 
     run = tmp_path / "run"
     assert historical_s0_cost_s(run) == 0.0        # nothing yet: full budget
 
-    for model in ("deterministic", "diffusion"):
-        d = run / "s0" / model
-        d.mkdir(parents=True)
-        (d / "attempts_index.json").write_text(
-            json.dumps({"attempts": [{"attempt": "attempt_001"}]}))
+    def stage(attempts, rows):
+        import shutil
+
+        for model in ("deterministic", "diffusion"):
+            mroot = run / "s0" / model
+            if mroot.exists():
+                shutil.rmtree(mroot)
+            mroot.mkdir(parents=True, exist_ok=True)
+            for name in attempts.get(model, ()):
+                (mroot / name).mkdir(parents=True, exist_ok=True)
+            (mroot / "attempts_index.json").write_text(json.dumps(
+                {"attempts": [{"attempt": n} for n in attempts.get(model, ())]}))
+        (run / "costs.json").write_text(json.dumps({"invocations": rows}))
+
+    stage({"deterministic": ["attempt_001"], "diffusion": ["attempt_001"]}, [])
     # attempts exist but the ledger does not: UNKNOWN -> stop condition
     assert historical_s0_cost_s(run) is None
-    (run / "costs.json").write_text(json.dumps({"invocations": [
+    stage({"deterministic": ["attempt_001"], "diffusion": ["attempt_001"]}, [
         {"stage": "w1_cache", "wall_s": 500.0},
-        {"stage": "s0_deterministic", "wall_s": 100.0},
+        {"stage": "s0_deterministic", "attempt": "attempt_001",
+         "wall_s": 100.0, "status": "done"},
         {"stage": "w1_readiness", "wall_s": 5.0},
-    ]}))
+    ])
     assert historical_s0_cost_s(run) is None        # diffusion unaccounted
-    entries = json.loads((run / "costs.json").read_text())["invocations"]
-    entries.append({"stage": "s0_diffusion", "wall_s": 50.0})
-    (run / "costs.json").write_text(json.dumps({"invocations": entries}))
+    stage({"deterministic": ["attempt_001"], "diffusion": ["attempt_001"]}, [
+        {"stage": "s0_deterministic", "attempt": "attempt_001",
+         "wall_s": 100.0, "status": "done"},
+        {"stage": "s0_diffusion", "attempt": "attempt_001",
+         "wall_s": 50.0, "status": "done"},
+    ])
     # ONLY s0 stages count; cache/readiness walls never consume the S0 budget
     assert historical_s0_cost_s(run) == 150.0
-    entries.append({"stage": "s0_deterministic", "wall_s": -3.0})
-    (run / "costs.json").write_text(json.dumps({"invocations": entries}))
-    assert historical_s0_cost_s(run) is None        # negative wall = unknown
+    # a leftover "running" row = the exit registration never ran -> unknown
+    stage({"deterministic": ["attempt_001"], "diffusion": ["attempt_001"]}, [
+        {"stage": "s0_deterministic", "attempt": "attempt_001",
+         "wall_s": 100.0, "status": "done"},
+        {"stage": "s0_diffusion", "attempt": "attempt_001",
+         "wall_s": 50.0, "status": "running"},
+    ])
+    assert historical_s0_cost_s(run) is None
+    # duplicate (model, attempt) rows cannot masquerade as two models
+    stage({"deterministic": ["attempt_001"], "diffusion": ["attempt_001"]}, [
+        {"stage": "s0_deterministic", "attempt": "attempt_001",
+         "wall_s": 100.0, "status": "done"},
+        {"stage": "s0_deterministic", "attempt": "attempt_001",
+         "wall_s": 50.0, "status": "done"},
+    ])
+    assert historical_s0_cost_s(run) is None
+    # a crashed attempt WITH its exit-registered row stays accounted (its
+    # wall consumed budget) — the wash-to-zero path is closed
+    stage({"deterministic": ["attempt_001", "attempt_002"],
+           "diffusion": []}, [
+        {"stage": "s0_deterministic", "attempt": "attempt_001",
+         "wall_s": 100.0, "status": "done"},
+        {"stage": "s0_deterministic", "attempt": "attempt_002",
+         "wall_s": 37.5, "status": "crashed"},
+    ])
+    assert historical_s0_cost_s(run) == 137.5
+    # an attempt dir missing from the index (crash before index write)
+    d = run / "s0" / "diffusion" / "attempt_001"
+    d.mkdir(parents=True)
+    assert historical_s0_cost_s(run) is None
 
 
 def test_s0_main_refuses_exhausted_or_unknown_budget(tmp_path, monkeypatch):
@@ -434,12 +555,14 @@ def test_s0_main_refuses_exhausted_or_unknown_budget(tmp_path, monkeypatch):
     # a prior pair of attempts fully consuming the 1h budget
     for model, wall in (("deterministic", 2000.0), ("diffusion", 1800.0)):
         d = world["run"] / "s0" / model
-        d.mkdir(parents=True)
+        (d / "attempt_001").mkdir(parents=True)
         (d / "attempts_index.json").write_text(
             json.dumps({"attempts": [{"attempt": "attempt_001"}]}))
     (world["run"] / "costs.json").write_text(json.dumps({"invocations": [
-        {"stage": "s0_deterministic", "wall_s": 2000.0},
-        {"stage": "s0_diffusion", "wall_s": 1800.0},
+        {"stage": "s0_deterministic", "attempt": "attempt_001",
+         "wall_s": 2000.0, "status": "done"},
+        {"stage": "s0_diffusion", "attempt": "attempt_001",
+         "wall_s": 1800.0, "status": "done"},
     ]}))
     argv = ["prog", "--preregistration", str(world["prereg_path"]),
             "--training-manifest", str(world["manifest_path"]),
@@ -458,6 +581,57 @@ def test_s0_main_refuses_exhausted_or_unknown_budget(tmp_path, monkeypatch):
     (world["run"] / "costs.json").unlink()
     with pytest.raises(SystemExit, match="unknown"):
         w1_s0.main()
+
+
+def test_s0_crash_stays_in_ledger_and_cannot_wash_to_zero(
+        tmp_path, monkeypatch):
+    """Round-2 fix 5 reviewer scenario: run_s0_model raising after the
+    attempt was allocated used to leave an unaccounted attempt_001 whose
+    next historical cost read 0.0. Now the crash registers an index row, a
+    crash summary and a ledger row — history stays KNOWN and non-zero."""
+    import w1_s0
+
+    world = build_synthetic_world(tmp_path, n_train=2, n_val=2, T=90)
+    _patch_paths(monkeypatch, world)
+    monkeypatch.setattr(w1_s0, "PROJECT_ROOT", world["root"])
+    monkeypatch.setattr(w1_s0, "TEACHER_TRAJ_DIR", world["npz_dir"])
+    monkeypatch.setattr(w1_s0, "OMOMO_NEW_DIR", world["pt_dir"])
+    import train_generation
+    from test_omniretarget_w1 import _s0_cfg
+
+    cfg = _s0_cfg("deterministic", 2)
+    cfg.micro_batch = 2
+    monkeypatch.setattr(train_generation, "load_train_config",
+                        lambda p: (cfg, {}))
+
+    def explode(*a, **k):
+        import time
+
+        time.sleep(0.2)          # a measurable wall before the crash
+        raise RuntimeError("boom after attempt allocation")
+
+    monkeypatch.setattr(w1_s0, "run_s0_model", explode)
+    argv = ["prog", "--preregistration", str(world["prereg_path"]),
+            "--training-manifest", str(world["manifest_path"]),
+            "--cache-dir", str(world["cache_dir"]), "--out", str(world["run"]),
+            "--model", "deterministic", "--steps", "2"]
+    monkeypatch.setattr("sys.argv", argv)
+    with pytest.raises(RuntimeError, match="boom"):
+        w1_s0.main()
+
+    att = world["run"] / "s0" / "deterministic" / "attempt_001"
+    assert att.is_dir()
+    assert (att / "s0_summary.json").is_file()
+    assert json.loads((att / "s0_summary.json").read_text())["verdict"] \
+        == "incomplete"
+    rows = [e for e in json.loads(
+        (world["run"] / "costs.json").read_text())["invocations"]
+        if e["stage"] == "s0_deterministic"]
+    assert len(rows) == 1 and rows[0]["status"] == "crashed"
+    # the crashed attempt's history is KNOWN and its wall consumed budget —
+    # not the reviewer's 0.0
+    hist = w1_s0.historical_s0_cost_s(world["run"])
+    assert hist is not None and hist > 0.0
 
 
 # --- fix 8: W1 raw eval unified admission ---------------------------------------
@@ -614,6 +788,10 @@ def test_w1_train_out_guard_and_attempt_isolation(tmp_path, monkeypatch):
 # --- fix 2 + 11 + 12: readiness recompute / S0 batch / per-model costs ----------
 
 def test_readiness_check_c_rejects_doctored_summaries(tmp_path, monkeypatch):
+    """Round-2 review fixes 1+2+6: the C gate recomputes every gate from
+    PRIMARY evidence (loss history, probe schedule, small-set identity) and
+    actually REBUILDS + RELOADS + REPLAYS the checkpoint — fabricated or
+    doctored training evidence fails even under an intact verdict=passed."""
     import w1_readiness as rd
 
     world = build_synthetic_world(tmp_path)
@@ -622,78 +800,159 @@ def test_readiness_check_c_rejects_doctored_summaries(tmp_path, monkeypatch):
     cache = rd.check_cache_binding(world["run"])
     prereg = json.loads(world["prereg_path"].read_text())
 
-    manifest_sha = _sha(world["manifest_path"])
-    cache_ident_sha = _sha(world["cache_dir"] / "cache_identity.json")
-    root_stats_sha = _sha(world["cache_dir"] / "root_stats.npz")
+    monkeypatch.setattr(w1, "S0_MIN_STEPS", 20)
+    monkeypatch.setattr(w1, "S0_PROBE_EVERY", 2)
+    monkeypatch.setattr(w1, "S0_TREND_WINDOW", 3)
+    monkeypatch.setattr(w1, "S0_PROBE_MIN", 6)
 
-    def write_s0(model, mutate=None):
-        att = world["run"] / "s0" / model / "attempt_001"
-        att.mkdir(parents=True, exist_ok=True)
-        summary = {
-            "verdict": "passed",
-            "gates": {"min_100_optimizer_steps": True, "all_finite": True,
-                      "contact_branch_silent": True, "probe_count_ge_40": True,
-                      "trend_fit_demonstrated": True,
-                      "reload_reproducible": True},
-            "nonfinite_stop": None, "budget_stopped": False,
-            "optimizer_steps": 120, "micro_batches": 240, "grad_accum": 2,
-            "identity": {
-                "training_manifest": {"sha256": manifest_sha},
-                "cache": {"identity_sha256": cache_ident_sha,
-                          "root_stats_sha256": root_stats_sha},
-                "small_set_demos": [world["train24"][0]],
-                "model_type": model},
-            "probes": [{"step": 10 * i,
-                        "motion_reconstruction": 1.0 - 0.01 * i}
-                       for i in range(50)]}
-        history = [{"step": i + 1, "total": 1.0 / (i + 1), "gnorm": 1.0}
-                   for i in range(120)]
-        if mutate:
-            summary, history = mutate(summary, history)
-        (att / "s0_summary.json").write_text(json.dumps(summary))
-        (att / "loss_history.json").write_text(json.dumps(history))
-        torch.save({"identity": summary["identity"], "step":
-                    summary["optimizer_steps"], "model": {}, "conditioner": {}},
-                   att / "last.pt")
-        idx = world["run"] / "s0" / model / "attempts_index.json"
-        idx.write_text(json.dumps({"attempts": [{
-            "attempt": "attempt_001",
-            "summary": str(att.relative_to(world["root"])
-                           / "s0_summary.json")}]}))
+    def latest(model):
+        return sorted((world["run"] / "s0" / model).glob("attempt_*"))[-1]
 
-    write_s0("deterministic")
-    write_s0("diffusion")
+    def fresh_pair():
+        """New REAL attempts for both models -> the honest baseline passes."""
+        atts = {}
+        for model in ("deterministic", "diffusion"):
+            atts[model], summary = _run_real_s0_attempt(world, model, steps=24)
+            assert summary["verdict"] == "passed", summary["gates"]
+        return atts
+
+    def doctor(model, summary_edit=None, history_edit=None, ckpt_edit=None,
+               delete=()):
+        att = latest(model)
+        if summary_edit is not None:
+            sp = att / "s0_summary.json"
+            s = json.loads(sp.read_text())
+            summary_edit(s)
+            sp.write_text(json.dumps(s))
+        if history_edit is not None:
+            hp = att / "loss_history.json"
+            h = json.loads(hp.read_text())
+            history_edit(h)
+            hp.write_text(json.dumps(h))
+        if ckpt_edit is not None:
+            ck = torch.load(att / "last.pt", map_location="cpu",
+                            weights_only=False)
+            ckpt_edit(ck)
+            torch.save(ck, att / "last.pt")
+        for name in delete:
+            (att / name).unlink(missing_ok=True)
+        return att
+
+    fresh_pair()
     assert rd.check_c(world["run"], cache, prereg)["passed"]
 
-    # doctored facts under an intact verdict=passed: steps zeroed out
-    write_s0("deterministic",
-             lambda s, h: ({**s, "optimizer_steps": 0},
-                           [{**r, "gnorm": r["gnorm"]} for r in h]))
+    # round-2 fix 1: deleted loss history no longer passes vacuously
+    fresh_pair()
+    doctor("deterministic", delete=("loss_history.json",))
     r = rd.check_c(world["run"], cache, prereg)
-    assert not r["passed"]
+    assert r["per_model"]["deterministic"]["recomputed_gates"][
+        "loss_history_present"] is False
+
+    # NaN in ANY loss part (not just gnorm) breaks all_finite
+    fresh_pair()
+    doctor("deterministic",
+           history_edit=lambda h: h[3].__setitem__("total", float("nan")))
+    r = rd.check_c(world["run"], cache, prereg)
+    assert r["per_model"]["deterministic"]["recomputed_gates"]["all_finite"] is False
+
+    # a gap in the step numbering breaks contiguity
+    fresh_pair()
+    doctor("deterministic", history_edit=lambda h: h.pop(5))
+    r = rd.check_c(world["run"], cache, prereg)
+    assert r["per_model"]["deterministic"]["recomputed_gates"][
+        "loss_history_contiguous"] is False
+
+    # probes off the registered cadence are invalid evidence
+    fresh_pair()
+    doctor("deterministic",
+           summary_edit=lambda s: s["probes"].insert(
+               2, {"step": 7, "motion_reconstruction": 0.5}))
+    r = rd.check_c(world["run"], cache, prereg)
+    assert r["per_model"]["deterministic"]["recomputed_gates"][
+        "probe_schedule_valid"] is False
+
+    # a shrunken small set no longer "comes from" pilot6 (was: subset
+    # check) — evidenced from both directions: the recorded set emptied,
+    # and a registered pilot6 larger than what actually trained
+    fresh_pair()
+    doctor("deterministic",
+           summary_edit=lambda s: s["identity"].__setitem__(
+               "small_set_demos", []))
+    r = rd.check_c(world["run"], cache, prereg)
+    assert any("small_set_not_the_registered_pilot6" in p for p in r["reasons"])
+    fresh_pair()
+    six = {**prereg, "selection": {**prereg["selection"],
+                                   "pilot6_from_a1": list(world["train24"])}}
+    r = rd.check_c(world["run"], cache, six)
+    assert any("small_set_not_the_registered_pilot6" in p for p in r["reasons"])
+    assert any("small_set_batch_size_mismatch" in p for p in r["reasons"])
+
+    # round-2 fix 6: budget_stopped is a hard fail even with a good trend
+    fresh_pair()
+    doctor("deterministic", summary_edit=lambda s: s.__setitem__(
+        "budget_stopped", True))
+    r = rd.check_c(world["run"], cache, prereg)
+    assert r["per_model"]["deterministic"]["recomputed_gates"][
+        "completed_within_budget"] is False
+
+    # round-2 fix 2: cleared state dicts must fail a STRICT load
+    fresh_pair()
+    doctor("deterministic", ckpt_edit=lambda ck: ck.__setitem__("model", {}))
+    r = rd.check_c(world["run"], cache, prereg)
+    assert any("checkpoint_weights_unloadable" in p
+               for p in r["per_model"]["deterministic"]["identity_problems"])
+
+    # NaN weights load but fail the finiteness sweep
+    fresh_pair()
+    def nan_weights(ck):
+        k = next(iter(ck["model"]))
+        ck["model"][k] = ck["model"][k] * float("nan")
+    doctor("deterministic", ckpt_edit=nan_weights)
+    r = rd.check_c(world["run"], cache, prereg)
+    assert any("checkpoint_weights_not_finite" in p
+               for p in r["per_model"]["deterministic"]["identity_problems"])
+
+    # embedded statistics doctored (+100 m) differ from the cache's
+    fresh_pair()
+    def bump_stats(ck):
+        import numpy as _np
+
+        ck["root_stats"]["mean"] = (_np.asarray(ck["root_stats"]["mean"])
+                                    + 100.0).tolist()
+    doctor("deterministic", ckpt_edit=bump_stats)
+    r = rd.check_c(world["run"], cache, prereg)
+    assert any("checkpoint_stats_differ_from_cache" in p
+               for p in r["per_model"]["deterministic"]["identity_problems"])
+
+    # deleted probe-replay artifact: the fixed probe can no longer be replayed
+    fresh_pair()
+    doctor("deterministic", delete=("probe_replay.pt",))
+    r = rd.check_c(world["run"], cache, prereg)
+    assert any("probe_replay_missing" in p
+               for p in r["per_model"]["deterministic"]["identity_problems"])
+
+    # original round-1 regressions still hold on real evidence
+    fresh_pair()
+    doctor("deterministic",
+           summary_edit=lambda s: s.__setitem__("optimizer_steps", 0))
+    r = rd.check_c(world["run"], cache, prereg)
     assert r["per_model"]["deterministic"]["recomputed_gates"][
         "min_100_optimizer_steps"] is False
 
-    # probes deleted, gates dict still claims the trend
-    write_s0("deterministic",
-             lambda s, h: ({**s, "probes": []}, h))
+    fresh_pair()
+    doctor("deterministic", summary_edit=lambda s: s.__setitem__("probes", []))
     assert not rd.check_c(world["run"], cache, prereg)["passed"]
 
-    # checkpoint with a foreign cache identity
-    def foreign_ckpt(s, h):
-        ident = json.loads(json.dumps(s["identity"]))
-        ident["cache"]["identity_sha256"] = "0" * 64
-        return {**s, "identity": ident}, h
-
-    write_s0("deterministic", foreign_ckpt)
+    fresh_pair()
+    doctor("deterministic",
+           ckpt_edit=lambda ck: ck["identity"]["cache"].__setitem__(
+               "identity_sha256", "0" * 64))
     r = rd.check_c(world["run"], cache, prereg)
-    assert not r["passed"]
     assert any("checkpoint_cache_identity_mismatch" in p
                for p in r["per_model"]["deterministic"]["identity_problems"])
 
-    # contact part smuggled into the loss history contradicts the gate
-    write_s0("diffusion",
-             lambda s, h: (s, [{**h[0], "contact_m2": 0.5}] + h[1:]))
+    fresh_pair()
+    doctor("diffusion", history_edit=lambda h: h[0].__setitem__("contact_m2", 0.5))
     r = rd.check_c(world["run"], cache, prereg)
     assert r["per_model"]["diffusion"]["recomputed_gates"][
         "contact_branch_silent"] is False
@@ -753,3 +1012,177 @@ def test_s0_main_equal_micro_batches_and_per_model_costs(tmp_path, monkeypatch):
     assert all("attempt" in e and e["wall_s"] >= 0.0 for e in s0_rows)
     assert s0_rows[1]["budget_consumed_cumulative_s"] >= \
         s0_rows[0]["budget_consumed_cumulative_s"]
+
+
+# --- round-2 fix 3: formal-selection denominator stays the REGISTERED val31 ----
+
+def test_formal_eval_denominator_is_the_registered_val31(tmp_path, monkeypatch):
+    """A rejected val label keeps its row as a gap: n_expected stays the
+    FULL registered val31 count, the macro is None and the evidence is
+    incomplete — the validation set can no longer shrink to whichever
+    labels survived admission."""
+    from train_generation import make_formal_eval
+
+    world = build_synthetic_world(tmp_path, n_train=2, n_val=2, T=90)
+    _patch_paths(monkeypatch, world)
+    monkeypatch.setattr("ireset.paths.PROJECT_ROOT", world["root"])
+
+    def reject_one(manifest):
+        victim = next(r for r in manifest["rows"] if r["split"] == "val")
+        victim["admission"]["motion"] = False
+        victim["admission"]["reasons"] = ["doctored_for_test"]
+
+    _repin(world, reject_one)
+    from test_omniretarget_w1 import _tokenizer
+
+    callback = make_formal_eval(
+        world["manifest_path"], world["cache_dir"], _tokenizer(world),
+        "cpu", {"full_generation_seed": 7}, "deterministic")
+    from ireset.model.conditioner import ConditionEncoder
+    from ireset.model.deterministic import DeterministicG1
+    from test_omniretarget_w1 import _s0_cfg
+
+    cfg = _s0_cfg("deterministic", 2)
+    model = DeterministicG1(**cfg.backbone_kwargs())
+    cond = ConditionEncoder(cfg.d_model)
+    out = callback(model, cond)
+    assert out["expected_set"] == "registered_val31"
+    assert out["n_expected"] == len(world["val31"])      # the FULL set
+    assert out["n_label_gaps"] == 1
+    gap_rows = [r for r in out["per_demo"] if r["status"] == "label_not_admitted"]
+    assert len(gap_rows) == 1 and gap_rows[0]["mpjpe_m"] is None
+    # the gap alone makes the evidence incomplete (macro None even though
+    # every loadable demo generated fine)
+    assert out["n_ok"] < out["n_expected"]
+    assert out["macro_mpjpe_m"] is None
+    from ireset.train.trainer import Trainer  # completeness rule: n_ok==n_expected
+    assert not (out["n_ok"] == out["n_expected"]
+                and isinstance(out["macro_mpjpe_m"], float))
+
+
+# --- round-2 fix 6: budget stop is never a pass -----------------------------------
+
+def test_budget_stop_mid_run_is_incomplete(tmp_path, monkeypatch):
+    """Reviewer scenario: 390/1000 steps under budget exhaustion with a good
+    trend used to exit verdict=passed. A controlled monotonic clock lets
+    some steps finish before the deadline passes; the verdict must be
+    incomplete regardless of the trend."""
+    import w1_s0
+    from test_omniretarget_w1 import _FakeDS, _s0_cfg, _tokenizer_for_losses
+
+    monkeypatch.setattr(w1, "S0_PROBE_EVERY", 2)
+    tok = _tokenizer_for_losses()
+    ds = _FakeDS(4, F=8, seed=3)
+    loader = torch.utils.data.DataLoader(ds, batch_size=2, shuffle=True)
+    out = tmp_path / "s0budget"
+    out.mkdir()
+
+    real = time.perf_counter
+    calls = {"n": 0}
+
+    def slow_clock():
+        calls["n"] += 1
+        # the first ~40 calls run at the real clock (setup + some steps),
+        # everything after jumps past any deadline
+        return real() if calls["n"] <= 40 else real() + 1e6
+
+    monkeypatch.setattr(w1_s0.time, "perf_counter", slow_clock)
+    cfg = _s0_cfg("deterministic", 40)
+    summary = w1_s0.run_s0_model(
+        "deterministic", cfg, tok, {k: ds.__dict__[k].clone() for k in _FakeDS.KEYS},
+        loader, "cpu", {"experiment_id": "x"}, out, real() + 5.0)
+    monkeypatch.undo()
+    assert summary["budget_stopped"] is True
+    assert 0 < summary["optimizer_steps"] < cfg.steps
+    assert summary["verdict"] == "incomplete"          # never "passed"
+    assert summary["gates"]["completed_within_budget"] is False
+
+
+# --- round-2 fix 7: the cache stage executes CACHE_BUDGET_S ----------------------
+
+def test_cache_budget_exhaustion_stops_incomplete(tmp_path, monkeypatch):
+    import precompute_m3_cache as pc
+
+    world = build_synthetic_world(tmp_path, n_train=2, n_val=2, T=90)
+    _patch_paths(monkeypatch, world)
+    monkeypatch.setattr(pc, "PROJECT_ROOT", world["root"])
+    monkeypatch.setattr(pc, "TEACHER_TRAJ_DIR", world["npz_dir"])
+    monkeypatch.setattr(pc, "OMOMO_NEW_DIR", world["pt_dir"])
+
+    out_root = world["run"] / "cache"
+    argv = ["prog", "--training-manifest", str(world["manifest_path"]),
+            "--out-dir", str(out_root), "--workers", "1"]
+
+    # historical exhaustion: a prior attempt with a full-budget ledger row
+    (out_root / "attempt_001").mkdir(parents=True, exist_ok=True)
+    (out_root / "attempts_index.json").write_text(
+        json.dumps({"attempts": [{"attempt": "attempt_001"}]}))
+    (world["run"] / "costs.json").write_text(json.dumps({"invocations": [
+        {"stage": "w1_cache", "wall_s": float(w1.CACHE_BUDGET_S),
+         "attempt": "attempt_001", "complete": True}]}))
+    monkeypatch.setattr("sys.argv", argv)
+    with pytest.raises(SystemExit, match="already exhausted"):
+        pc.main()
+
+    # a slow job set overruns the remaining budget -> INCOMPLETE attempt,
+    # non-zero exit, and the consumer-side content check refuses it
+    import shutil
+
+    (world["run"] / "costs.json").unlink()
+    shutil.rmtree(out_root)
+
+    def slow_job(job):
+        import time as _t
+        import hashlib as _hl
+        import numpy as _np
+
+        _t.sleep(1.2)
+        out = Path(job[3]) / "schedules" / w1.schedule_cache_filename(
+            job[0], job[2])
+        out.parent.mkdir(parents=True, exist_ok=True)
+        _np.savez(out, intervals=_np.zeros((1, 4)))
+        return {"demo": job[0], "T": 1, "cache": out.name, "status": "ok",
+                "sha256": _hl.sha256(out.read_bytes()).hexdigest()}
+
+    monkeypatch.setattr(pc, "_w1_schedule_job", slow_job)
+    monkeypatch.setattr(w1, "CACHE_BUDGET_S", 1.0)
+    monkeypatch.setattr("sys.argv", argv)
+    assert pc.main() == 2
+    att = sorted(out_root.glob("attempt_*"))[-1]
+    ident = json.loads((att / "cache_identity.json").read_text())
+    assert ident["complete"] is False
+    assert ident["incomplete_reason"] == "cache_budget_exhausted"
+    manifest = json.loads(world["manifest_path"].read_text())
+    prereg = json.loads(world["prereg_path"].read_text())
+    problems = w1.verify_cache_contents(att, manifest, prereg, world["root"])
+    assert any("cache_not_complete" in p for p in problems["problems"])
+
+
+# --- round-2 fix 8: the cache code identity covers the distance impl -------------
+
+def test_cache_code_identity_covers_distance_adapter(tmp_path, monkeypatch):
+    """Reviewer counterexample: reverting ONLY distance_adapter's scaled
+    query left condition_code_sha256 unchanged and old keyed schedules
+    reusable. The file is now part of CONDITION_CODE_FILES, so a content
+    change re-keys every schedule."""
+    world = build_synthetic_world(tmp_path, n_train=2, n_val=2, T=90)
+    _patch_paths(monkeypatch, world)
+
+    assert any("distance_adapter.py" in f for f in w1.CONDITION_CODE_FILES)
+    # the fixture copies the real code files INTO the synthetic root
+    adapter = world["root"] / "src/ireset/geometry/distance_adapter.py"
+    before = adapter.read_bytes()
+    base_sha = w1.condition_code_sha256(world["root"])
+    try:
+        # a content-only change (e.g. a reverted scaled query) must re-key
+        adapter.write_bytes(before + b"# reviewfix8 identity probe\n")
+        assert w1.condition_code_sha256(world["root"]) != base_sha
+        # the cache was produced under the OLD code hash -> consumer-side drift
+        manifest = json.loads(world["manifest_path"].read_text())
+        prereg = json.loads(world["prereg_path"].read_text())
+        problems = w1.verify_cache_contents(
+            world["cache_dir"], manifest, prereg, world["root"])["problems"]
+        assert "cache_condition_code_drifted" in problems
+    finally:
+        adapter.write_bytes(before)
+    assert w1.condition_code_sha256(world["root"]) == base_sha
