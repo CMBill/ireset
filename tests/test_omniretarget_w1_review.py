@@ -48,6 +48,20 @@ under the round-2 code:
             overrun after completing the target still verdicted passed;
 * r3-8 (P2) a crashed cache worker left an unregistered attempt dir that
             washed into a zero-cost history (index count alone).
+
+Review round 4 (1 P1 + 2 P2 + 1 doc correction):
+
+* r4-1 (P1) the replayed batch inside probe_replay.pt was never bound to
+            the REGISTERED six windows — a shrunk/foreign batch with
+            honestly recomputed errors and synced last probes passed;
+            the diffusion t/noise were likewise never reconciled with the
+            dedicated-generator draw for the registered batch;
+* r4-2 (P2) structurally-invalid replay evidence (NaN/missing probe_t,
+            unreadable or non-mapping artifact) escaped check_c as an
+            exception (IndexError et al.) instead of an unready reason;
+* r4-3 (P2) the cache's FINAL identity hashing and registration writes sat
+            after the last deadline check — a slow manifest hash there
+            still registered complete=true with consumed_s over budget.
 """
 
 from __future__ import annotations
@@ -1270,7 +1284,11 @@ def test_replay_nan_input_and_recorded_probe_are_rejected(tmp_path, monkeypatch)
     probs = r["per_model"]["deterministic"]["identity_problems"]
     assert any(p.startswith("probe_replay_input_not_finite:batch.x0")
                for p in probs), probs
-    assert "probe_replay_output_not_finite" in probs, probs
+    # round-4: invalid inputs are never replayed — the NaN batch must not
+    # reach run_fixed_probe (it used to crash the gate on a NaN probe_t)
+    assert "probe_replay_output_not_finite" not in probs, probs
+    assert r["per_model"]["deterministic"]["checkpoint_replay"][
+        "replayed_probe"] is None
     assert not r["passed"]
 
     # a NaN'd RECORDED probe is missing evidence, not a comparable value
@@ -1508,3 +1526,218 @@ def test_cache_crash_stays_ledgered_and_disk_only_attempts_stop(
     monkeypatch.setattr("sys.argv", argv)
     with pytest.raises(SystemExit, match="unknown"):
         pc.main()
+
+
+# --- round-4 fixes 1-3: registered-set binding, exception safety, final
+# registration budget ---------------------------------------------------------
+
+def _reload_probe_modules(att: Path, model: str):
+    """Fresh (model, conditioner) strictly loaded from a real checkpoint."""
+    import w1_s0
+    from ireset.train.trainer import TrainConfig
+
+    ck = torch.load(att / "last.pt", map_location="cpu", weights_only=False)
+    cfg = TrainConfig(**ck["config"])
+    m, cond = w1_s0.build_s0_modules(model, cfg, "cpu")
+    m.load_state_dict(ck["model"], strict=True)
+    cond.load_state_dict(ck["conditioner"], strict=True)
+    return w1_s0, m, cond
+
+
+def _sync_recomputed_errors(att: Path, rp: dict, err: dict) -> None:
+    """Write the artifact back with errors honestly recomputed for the
+    TAMPERED inputs and sync the summary's last probe to them — the
+    laundering that defeated the round-3 gate."""
+    step = rp["last_probe"]["step"]
+    rp["last_probe"] = {"step": step, **err}
+    torch.save(rp, att / "probe_replay.pt")
+    sp = att / "s0_summary.json"
+    s = json.loads(sp.read_text())
+    s["probes"][-1] = {"step": step, **err}
+    sp.write_text(json.dumps(s))
+
+
+def test_replay_batch_must_be_the_registered_windows(tmp_path, monkeypatch):
+    """r4-1: check_c bound only the summary's DECLARED demo list and batch
+    size — the batch actually inside probe_replay.pt was free. Tamper the
+    batch, HONESTLY recompute the replay errors for the tampered inputs and
+    sync summary/artifact last probes: only the registered-set binding can
+    catch it."""
+    rd, world, cache, prereg = _readiness_fixture(tmp_path, monkeypatch)
+
+    # (a) content tamper: one x0 element moved, everything else reconciled
+    att, _ = _run_real_s0_attempt(world, "deterministic", steps=24)
+    rp = torch.load(att / "probe_replay.pt", map_location="cpu",
+                    weights_only=False)
+    rp["batch"]["x0"][0, 0, 0] += 0.5
+    w1_s0, m, cond = _reload_probe_modules(att, "deterministic")
+    err = w1_s0.run_fixed_probe(m, cond, rp["batch"], "deterministic",
+                                None, None)
+    _sync_recomputed_errors(att, rp, err)
+    r = rd.check_c(world["run"], cache, prereg)
+    probs = r["per_model"]["deterministic"]["identity_problems"]
+    assert any(p.startswith("probe_replay_batch_differs:") for p in probs), probs
+    assert not r["passed"]
+
+    # (b) foreign demo: the batch replaced by ANOTHER admitted train demo's
+    # first window (not in the registered pilot set), errors recomputed
+    att, _ = _run_real_s0_attempt(world, "deterministic", steps=24)
+    rp = torch.load(att / "probe_replay.pt", map_location="cpu",
+                    weights_only=False)
+    from ireset.data.windows import TeacherWindowDataset, make_tokenizer
+    from ireset.model.tokens import RootStats
+
+    ds = TeacherWindowDataset(
+        "train", make_tokenizer(
+            RootStats.load(world["cache_dir"] / "root_stats.npz")),
+        window=w1.WINDOW_F, stride=w1.WINDOW_STRIDE,
+        training_manifest=world["manifest_path"],
+        schedule_cache_dir=world["cache_dir"] / "schedules")
+    registered = prereg["selection"]["pilot6_from_a1"][0]
+    other = next(d for d in world["train24"] if d != registered)
+    lc_idx = next(i for i, lc in enumerate(ds.clips) if lc.demo == other)
+    item = ds[ds.index.index((lc_idx, 0))]
+    rp["batch"] = {k: v.unsqueeze(0) for k, v in item.items()
+                   if torch.is_tensor(v)}
+    w1_s0, m, cond = _reload_probe_modules(att, "deterministic")
+    err = w1_s0.run_fixed_probe(m, cond, rp["batch"], "deterministic",
+                                None, None)
+    _sync_recomputed_errors(att, rp, err)
+    r = rd.check_c(world["run"], cache, prereg)
+    probs = r["per_model"]["deterministic"]["identity_problems"]
+    assert any(p.startswith("probe_replay_batch_differs:") for p in probs), probs
+
+    # honest regression: the genuine artifact IS the registered window
+    att, _ = _run_real_s0_attempt(world, "deterministic", steps=24)
+    r = rd.check_c(world["run"], cache, prereg)
+    probs = r["per_model"]["deterministic"]["identity_problems"]
+    assert not [p for p in probs if "probe_replay_batch" in p], probs
+
+
+def test_diffusion_probe_t_must_be_the_registered_draw(tmp_path, monkeypatch):
+    """r4-1 (diffusion leg): the recorded probe_t/probe_noise were never
+    reconciled with the dedicated-generator draw for the registered batch —
+    a t from a different draw (guaranteed different value), with errors
+    honestly recomputed and last probes synced, passed round-3 code."""
+    rd, world, cache, prereg = _readiness_fixture(tmp_path, monkeypatch)
+
+    att, _ = _run_real_s0_attempt(world, "diffusion", steps=24)
+    rp = torch.load(att / "probe_replay.pt", map_location="cpu",
+                    weights_only=False)
+    w1_s0, m, cond = _reload_probe_modules(att, "diffusion")
+    from ireset.train.trainer import TrainConfig
+
+    ck = torch.load(att / "last.pt", map_location="cpu", weights_only=False)
+    cfg = TrainConfig(**ck["config"])
+    # the registered draw (same expression as the S0 loop) — tamper to a
+    # GUARANTEED different value so the counterexample is deterministic
+    g0 = torch.Generator().manual_seed(cfg.val_seed or cfg.seed)
+    reg_t = torch.randint(0, cfg.num_train_timesteps,
+                          (rp["batch"]["x0"].shape[0],), generator=g0)
+    assert torch.equal(rp["probe_t"], reg_t)      # the honest artifact
+    rp["probe_t"] = reg_t.clone()
+    rp["probe_t"][0] = (reg_t[0].item() + 1) % cfg.num_train_timesteps
+    err = w1_s0.run_fixed_probe(m, cond, rp["batch"], "diffusion",
+                                rp["probe_t"], rp["probe_noise"])
+    _sync_recomputed_errors(att, rp, err)
+    r = rd.check_c(world["run"], cache, prereg)
+    probs = r["per_model"]["diffusion"]["identity_problems"]
+    assert "probe_t_not_the_registered_generator_draw" in probs, probs
+    assert not r["passed"]
+
+    # honest regression: the recorded t/noise ARE the registered draw
+    att, _ = _run_real_s0_attempt(world, "diffusion", steps=24)
+    r = rd.check_c(world["run"], cache, prereg)
+    probs = r["per_model"]["diffusion"]["identity_problems"]
+    assert not [p for p in probs
+                if "probe_t_not" in p or "probe_noise_not" in p], probs
+
+
+def test_invalid_replay_evidence_is_recorded_not_raised(tmp_path, monkeypatch):
+    """r4-2: structurally-invalid replay evidence used to ESCAPE check_c as
+    an exception (NaN probe_t -> IndexError out of the readiness script; a
+    missing t/noise or an unreadable/non-mapping artifact likewise) — an
+    unready reason must be recorded and the report still written."""
+    rd, world, cache, prereg = _readiness_fixture(tmp_path, monkeypatch)
+
+    att, _ = _run_real_s0_attempt(world, "diffusion", steps=24)
+    base = torch.load(att / "probe_replay.pt", map_location="cpu",
+                      weights_only=False)
+
+    # (a) NaN probe_t — round-3 code replayed it and crashed
+    torch.save({**base, "probe_t": torch.full(
+        tuple(base["probe_t"].shape), float("nan"))}, att / "probe_replay.pt")
+    r = rd.check_c(world["run"], cache, prereg)
+    probs = r["per_model"]["diffusion"]["identity_problems"]
+    assert "probe_replay_input_not_finite:probe_t" in probs, probs
+    assert r["per_model"]["diffusion"]["checkpoint_replay"][
+        "replayed_probe"] is None          # never replayed
+    assert not r["passed"]
+
+    # (b) missing t — invalid input, recorded, no replay
+    torch.save({**base, "probe_t": None}, att / "probe_replay.pt")
+    r = rd.check_c(world["run"], cache, prereg)
+    probs = r["per_model"]["diffusion"]["identity_problems"]
+    assert "probe_replay_input_invalid:probe_t" in probs, probs
+    assert not r["passed"]
+
+    # (c) unreadable artifact — a reason, never an exception
+    (att / "probe_replay.pt").write_bytes(b"this is not a torch file")
+    r = rd.check_c(world["run"], cache, prereg)
+    probs = r["per_model"]["diffusion"]["identity_problems"]
+    assert any(p.startswith("probe_replay_unreadable:") for p in probs), probs
+    assert not r["passed"]
+
+    # (d) non-mapping artifact (e.g. a bare list)
+    torch.save([1, 2, 3], att / "probe_replay.pt")
+    r = rd.check_c(world["run"], cache, prereg)
+    probs = r["per_model"]["diffusion"]["identity_problems"]
+    assert "probe_replay_not_a_mapping" in probs, probs
+    assert not r["passed"]
+
+
+def test_cache_final_registration_overrun_is_incomplete(tmp_path, monkeypatch):
+    """r4-3: the last deadline check sat at the stats phase — a slow
+    manifest hash in the FINAL identity construction still registered
+    complete=true with consumed_s past the budget."""
+    import precompute_m3_cache as pc
+
+    world = build_synthetic_world(tmp_path, n_train=2, n_val=2, T=90)
+    _patch_paths(monkeypatch, world)
+    monkeypatch.setattr(pc, "PROJECT_ROOT", world["root"])
+    monkeypatch.setattr(pc, "TEACHER_TRAJ_DIR", world["npz_dir"])
+    monkeypatch.setattr(pc, "OMOMO_NEW_DIR", world["pt_dir"])
+    out_root = world["run"] / "cache"
+    argv = ["prog", "--training-manifest", str(world["manifest_path"]),
+            "--out-dir", str(out_root), "--workers", "1"]
+    monkeypatch.setattr("sys.argv", argv)
+    monkeypatch.setattr(w1, "CACHE_BUDGET_S", 5.0)
+
+    # the FIRST training-manifest hash is exactly the final identity
+    # construction (preflight/jobs/stats hash other files) — delay it past
+    # the 5s budget; every earlier phase stays comfortably inside
+    real_sha = pc.integ.sha256_file
+    state = {"armed": True}
+
+    def slow_manifest_sha(p, *a, **k):
+        if state["armed"] and Path(p) == world["manifest_path"]:
+            state["armed"] = False
+            time.sleep(6.0)
+        return real_sha(p, *a, **k)
+
+    monkeypatch.setattr(pc.integ, "sha256_file", slow_manifest_sha)
+
+    assert pc.main() == 2
+    att = sorted(out_root.glob("attempt_*"))[-1]
+    ident = json.loads((att / "cache_identity.json").read_text())
+    assert ident["complete"] is False
+    assert ident["incomplete_reason"] == "cache_budget_exhausted"
+    assert ident["budget"]["consumed_s"] >= 5.0
+    # every row landed and the stats phase was within budget — only the
+    # FINAL hashing overran, so missing_demos is honestly empty
+    assert ident["missing_demos"] == []
+    assert (att / "root_stats.npz").is_file()    # stats phase did complete
+    manifest = json.loads(world["manifest_path"].read_text())
+    prereg = json.loads(world["prereg_path"].read_text())
+    problems = w1.verify_cache_contents(att, manifest, prereg, world["root"])
+    assert any("cache_not_complete" in p for p in problems["problems"])

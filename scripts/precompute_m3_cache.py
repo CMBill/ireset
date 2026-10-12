@@ -298,11 +298,12 @@ def _run_w1_attempt(args, manifest: dict, prereg: dict, prereg_rec: dict,
         exec_blocks.append(execution_record(rep, len(part)))
     print(json.dumps(exec_blocks[0] if exec_blocks else {"n_tasks": 0}))
 
-    # round-3 review fix 6: the deadline is enforced at EVERY phase boundary
-    # — the LAST chunk's return, the stats computation and the final
-    # registration. ``budget_stopped`` used to depend only on missing rows,
-    # so a final chunk (and the stats work after it) could overrun the
-    # registered budget and still register complete=true
+    # round-3 review fix 6 (deepened round-4 fix 3): the deadline is
+    # enforced at EVERY phase boundary — the LAST chunk's return, the stats
+    # computation, the FINAL identity hashing and the registration writes.
+    # ``budget_stopped`` used to depend only on missing rows, so a final
+    # chunk (and the stats work after it) could overrun the registered
+    # budget and still register complete=true
     budget_stopped = len(rows) < len(jobs)
     overran = time.perf_counter() > deadline
     stats = stats_facts = None
@@ -362,6 +363,12 @@ def _run_w1_attempt(args, manifest: dict, prereg: dict, prereg_rec: dict,
         "execution": exec_blocks,
         "total_wall_s": round(time.time() - t0, 1),
     }
+    # round-4 review fix 3: the FINAL hashing and the registration writes
+    # are also inside the budget — the last check sat at the stats phase, so
+    # a slow manifest/identity hash after it still registered complete=true
+    # with consumed_s already past the budget
+    if time.perf_counter() > deadline:
+        return write_incomplete(len(rows), [j[0] for j in jobs[len(rows):]])
     (attempt_dir / "cache_identity.json").write_text(
         json.dumps(identity, indent=2, ensure_ascii=False))
     integ.append_attempts_index(out_root, {

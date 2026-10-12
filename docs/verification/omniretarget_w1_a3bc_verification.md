@@ -339,8 +339,11 @@ S0 双模型各 1000 步 PASS——确定性 1352.8s 趋势 0.394223→0.013504�
 0.428729→0.011308（与 §5R/§5R2 轮**逐位一致**=谓词/预算/台账改动不触训练数值）、probe
 101=完整日程 0..1000、probe_replay.pt 在册、S0 合计 2715.2s≤3600s；readiness
 `decisions/attempt_001` 五门全 true——C 门重算含 `probe_schedule_valid`（全量日程）/
-`loss_fields_complete` 双新门、`identity_problems` 空、checkpoint 重放 0.011500352062284946/
-0.008721405640244484 与 summary/artifact 末探**逐位相等**（对账门实证）。台账 6 行齐且
+`loss_fields_complete` 双新门、`identity_problems` 空、checkpoint 重建 CPU 重放
+0.011500352993607521/0.008721409365534782 与工件记录末探 0.011500352062284946/
+0.008721405640244484 **容差内一致**（差 9.3e-10/3.7e-9 ≪ 门限 1e-3+1e-3·|rec|；原文
+"重放与末探逐位相等"系表述失实——逐位相等的是 summary 与 artifact 两种序列化的**记录值**，
+CPU 重放与记录值间存在浮点重算差，已按第四轮审阅订正，见 §5R4）。台账 6 行齐且
 每 attempt 恰一行（w0 2.5/a3 73.1/cache 54.9 done complete:true/s0_det 1352.8 done/
 s0_diff 1362.4 done/readiness 13.8）。测试 621→**628 passed + 1 skipped**（审阅文件
 23→30 项：NaN 重放输入+NaN 记录误差、伪造下降曲线保留真 checkpoint、{step,gnorm} 与

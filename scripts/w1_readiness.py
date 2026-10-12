@@ -243,9 +243,51 @@ def _recompute_s0_verdict(summary: dict, history: list[dict],
 PROBE_ERROR_FIELDS = ("pos", "rot6d", "joint", "motion_reconstruction")
 
 
+def _rebuild_small_probe_batch(cache_dir: Path, manifest_path: Path,
+                               pilot6: list[str]) -> tuple[dict | None, list[str]]:
+    """Rebuild the small-set probe inputs from the CURRENT registered list,
+    training manifest and keyed cache (round-4 review fix 1).
+
+    The check_c gate used to bind only the summary's DECLARED demo list and
+    batch size — the batch actually inside ``probe_replay.pt`` was never
+    bound to them, so a batch shrunk to one (or foreign) demo with honestly
+    recomputed errors and synced last probes still passed. The dataset
+    slicing is deterministic (pure cached-schedule reads), so exact equality
+    with the rebuilt windows is the correct criterion."""
+    import torch
+
+    from ireset.data.windows import TeacherWindowDataset, make_tokenizer
+    from ireset.model.tokens import RootStats
+
+    problems: list[str] = []
+    manifest = json.loads(manifest_path.read_text())
+    row_by_demo = {r["demo"]: r for r in manifest["rows"]}
+    ds = TeacherWindowDataset(
+        "train", make_tokenizer(RootStats.load(cache_dir / "root_stats.npz")),
+        window=w1.WINDOW_F, stride=w1.WINDOW_STRIDE,
+        training_manifest=manifest_path,
+        schedule_cache_dir=cache_dir / "schedules")
+    items = []
+    for demo in pilot6:
+        row = row_by_demo.get(demo)
+        if row is None or not row.get("admission", {}).get("motion"):
+            problems.append(f"probe_batch_demo_not_admitted:{demo}")
+            continue
+        lc_idx = next((i for i, lc in enumerate(ds.clips) if lc.demo == demo),
+                      None)
+        if lc_idx is None:
+            problems.append(f"probe_batch_demo_not_in_dataset:{demo}")
+            continue
+        items.append(ds[ds.index.index((lc_idx, 0))])
+    if problems or len(items) != len(pilot6):
+        return None, problems
+    return ({k: torch.stack([it[k] for it in items])
+             for k in items[0] if torch.is_tensor(items[0][k])}, [])
+
+
 def _verify_checkpoint_deep(ckpt_path: Path, att_dir: Path, cache_dir: Path,
-                            model: str,
-                            summary: dict) -> tuple[list[str], dict | None]:
+                            model: str, summary: dict,
+                            expected_batch: dict | None) -> tuple[list[str], dict | None]:
     """Actually REBUILD the modules and REPLAY the fixed probe (round-2
     review fix 2: torch.load only proved the container readable — cleared
     state dicts, NaN weights and doctored embedded statistics all passed).
@@ -260,7 +302,16 @@ def _verify_checkpoint_deep(ckpt_path: Path, att_dir: Path, cache_dir: Path,
     False, so a NaN input laundered a pass), and the summary's LAST probe —
     the value the trend gate was computed from — must equal the artifact's
     recorded last probe (step and every error field), so a doctored summary
-    curve cannot coexist with a genuine checkpoint."""
+    curve cannot coexist with a genuine checkpoint.
+
+    Round-4 review fixes 1+2: the replayed batch must BE the registered
+    six windows rebuilt from the current manifest/cache (bitwise), the
+    diffusion t/noise must be the dedicated-generator draw for that batch
+    (regenerated from the checkpoint config and compared bitwise), and an
+    unreadable/non-mapping/structurally-invalid replay artifact is RECORDED
+    as an unready reason instead of crashing the gate — invalid inputs are
+    never replayed (a NaN probe_t reached run_fixed_probe and raised
+    IndexError out of the readiness script)."""
     import math as _math
 
     import numpy as _np
@@ -273,19 +324,16 @@ def _verify_checkpoint_deep(ckpt_path: Path, att_dir: Path, cache_dir: Path,
     if not replay_path.is_file():
         return ["probe_replay_missing"], None
     ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    rp = torch.load(replay_path, map_location="cpu", weights_only=False)
+    # round-4 fix 2: an unreadable or non-mapping replay artifact is a
+    # REASON, never an exception escaping the gate
+    try:
+        rp = torch.load(replay_path, map_location="cpu", weights_only=False)
+    except Exception as exc:  # noqa: BLE001
+        return [f"probe_replay_unreadable:{type(exc).__name__}"], None
+    if not isinstance(rp, dict):
+        return ["probe_replay_not_a_mapping"], None
     if rp.get("model_type") != model or rp.get("step") != ck.get("step"):
         problems.append("probe_replay_identity_mismatch")
-    # round-3 fix 1: finite replay INPUTS — a NaN x0/t/noise replays to NaN
-    # and the tolerance comparison below can never reject it
-    finite_inputs = True
-    for name, tensor in [("probe_t", rp.get("probe_t")),
-                         ("probe_noise", rp.get("probe_noise")),
-                         *((f"batch.{k}", v)
-                           for k, v in (rp.get("batch") or {}).items())]:
-        if torch.is_tensor(tensor) and not bool(torch.isfinite(tensor).all()):
-            problems.append(f"probe_replay_input_not_finite:{name}")
-            finite_inputs = False
     try:
         from ireset.train.trainer import TrainConfig
 
@@ -301,6 +349,44 @@ def _verify_checkpoint_deep(ckpt_path: Path, att_dir: Path, cache_dir: Path,
             and _np.array_equal(_np.asarray(ck["root_stats"]["std"]), rs["std"]))
     if not stats_match:
         problems.append("checkpoint_stats_differ_from_cache")
+    # round-4 fix 1: bind the ACTUAL replay batch to the registered set —
+    # the summary's declared list + batch size left the replay inputs free
+    # (one-demo/foreign batches with honestly recomputed errors passed)
+    batch = rp.get("batch")
+    if expected_batch is None:
+        problems.append("probe_replay_batch_rebuild_failed")
+    elif not isinstance(batch, dict) or set(batch) != set(expected_batch):
+        problems.append("probe_replay_batch_keys_mismatch")
+    else:
+        for k, v in expected_batch.items():
+            got = batch.get(k)
+            if not (torch.is_tensor(got) and got.dtype == v.dtype
+                    and got.shape == v.shape and torch.equal(got, v)):
+                problems.append(f"probe_replay_batch_differs:{k}")
+                break
+    # round-4 fix 1 (diffusion): the recorded t/noise must be the
+    # dedicated-generator draw for the registered batch — same expression
+    # the S0 loop used (val_seed or seed; randint THEN randn on one stream).
+    # A non-tensor value fails the binding too (the structural gate below
+    # records it separately — this comparison must never raise)
+    if model == "diffusion" and expected_batch is not None:
+        if rp.get("val_seed") != cfg.val_seed:
+            problems.append("probe_replay_val_seed_mismatch")
+        seed = cfg.val_seed or cfg.seed
+        if seed is None:
+            problems.append("probe_replay_generator_seed_unavailable")
+        else:
+            g = torch.Generator().manual_seed(int(seed))
+            shape = expected_batch["x0"].shape
+            exp_t = torch.randint(0, int(cfg.num_train_timesteps),
+                                  (shape[0],), generator=g)
+            exp_noise = torch.randn(shape, generator=g)
+            if not (torch.is_tensor(rp.get("probe_t"))
+                    and torch.equal(rp["probe_t"], exp_t)):
+                problems.append("probe_t_not_the_registered_generator_draw")
+            if not (torch.is_tensor(rp.get("probe_noise"))
+                    and torch.equal(rp["probe_noise"], exp_noise)):
+                problems.append("probe_noise_not_the_registered_generator_draw")
     try:
         m, cond = w1_s0.build_s0_modules(model, cfg, "cpu")
         m.load_state_dict(ck["model"], strict=True)
@@ -310,17 +396,40 @@ def _verify_checkpoint_deep(ckpt_path: Path, att_dir: Path, cache_dir: Path,
     if not all(bool(torch.isfinite(p).all()) for p in
                [*m.parameters(), *cond.parameters()]):
         return problems + ["checkpoint_weights_not_finite"], None
-    err = w1_s0.run_fixed_probe(m, cond, rp["batch"], model,
-                                rp.get("probe_t"), rp.get("probe_noise"))
-    # round-3 fix 1: every replayed error must be finite BEFORE comparing
-    outputs_finite = all(
-        isinstance(v, (int, float)) and _math.isfinite(float(v))
-        for v in err.values())
-    if not outputs_finite:
-        problems.append("probe_replay_output_not_finite")
+    # round-4 fix 2: STRUCTURAL validation of the replay inputs — a missing
+    # t/noise or a non-tensor batch value used to reach run_fixed_probe and
+    # raise, crashing the readiness script before any report was written
+    inputs_valid = True
+    if not (isinstance(batch, dict) and batch and "x0" in batch
+            and all(torch.is_tensor(v) for v in batch.values())):
+        problems.append("probe_replay_input_invalid:batch")
+        inputs_valid = False
+    if model == "diffusion":
+        for name in ("probe_t", "probe_noise"):
+            if not torch.is_tensor(rp.get(name)):
+                problems.append(f"probe_replay_input_invalid:{name}")
+                inputs_valid = False
+        if (inputs_valid and isinstance(batch, dict)
+                and torch.is_tensor(batch.get("x0"))):
+            if tuple(rp["probe_t"].shape) != (batch["x0"].shape[0],):
+                problems.append("probe_replay_input_invalid:probe_t_shape")
+                inputs_valid = False
+            if tuple(rp["probe_noise"].shape) != tuple(batch["x0"].shape):
+                problems.append("probe_replay_input_invalid:probe_noise_shape")
+                inputs_valid = False
+    # round-3 fix 1: finite replay INPUTS — a NaN x0/t/noise replays to NaN
+    # and the tolerance comparison below can never reject it
+    finite_inputs = True
+    for name, tensor in [("probe_t", rp.get("probe_t")),
+                         ("probe_noise", rp.get("probe_noise")),
+                         *((f"batch.{k}", v)
+                           for k, v in (batch or {}).items())]:
+        if torch.is_tensor(tensor) and not bool(torch.isfinite(tensor).all()):
+            problems.append(f"probe_replay_input_not_finite:{name}")
+            finite_inputs = False
     recorded = rp.get("last_probe") or {}
     rec = recorded.get("motion_reconstruction")
-    detail = {"replayed_probe": err, "recorded_last_probe": recorded}
+    detail = {"replayed_probe": None, "recorded_last_probe": recorded}
     recorded_finite = isinstance(recorded, dict) and all(
         isinstance(recorded.get(k), (int, float))
         and _math.isfinite(float(recorded.get(k)))
@@ -340,6 +449,24 @@ def _verify_checkpoint_deep(ckpt_path: Path, att_dir: Path, cache_dir: Path,
         for k in PROBE_ERROR_FIELDS:
             if s_last.get(k) != recorded.get(k):
                 problems.append(f"summary_last_probe_mismatch:{k}")
+    # round-4 fix 2: invalid or non-finite inputs are never replayed — the
+    # round-3 flow proceeded to run_fixed_probe and a NaN probe_t escaped
+    # as an IndexError; the unready reasons are recorded instead
+    if not (inputs_valid and finite_inputs):
+        return problems, detail
+    try:
+        err = w1_s0.run_fixed_probe(m, cond, rp["batch"], model,
+                                    rp.get("probe_t"), rp.get("probe_noise"))
+    except Exception as exc:  # noqa: BLE001
+        problems.append(f"probe_replay_failed:{type(exc).__name__}")
+        return problems, detail
+    detail["replayed_probe"] = err
+    # round-3 fix 1: every replayed error must be finite BEFORE comparing
+    outputs_finite = all(
+        isinstance(v, (int, float)) and _math.isfinite(float(v))
+        for v in err.values())
+    if not outputs_finite:
+        problems.append("probe_replay_output_not_finite")
     if recorded_finite and outputs_finite:
         if (abs(err["motion_reconstruction"] - float(rec))
                 > 1e-3 + 1e-3 * abs(float(rec))):
@@ -360,9 +487,18 @@ def check_c(run_root: Path, cache: dict | None, prereg: dict) -> dict:
     per_model = {}
     manifest_sha = cache["record"]["training_manifest"]["sha256"] if cache else None
     cache_ident_sha = root_stats_sha = None
+    expected_batch: dict | None = None
+    rebuild_problems: list[str] = []
     if cache is not None:
         cache_ident_sha = integ.sha256_file(cache["identity"])
         root_stats_sha = integ.sha256_file(cache["dir"] / "root_stats.npz")
+        # round-4 review fix 1: rebuild the registered six first windows ONCE
+        # from the current manifest/cache — every model's replay batch is
+        # bound to them bitwise (the declared list alone proved nothing)
+        pilot6 = list(prereg.get("selection", {}).get("pilot6_from_a1", []))
+        expected_batch, rebuild_problems = _rebuild_small_probe_batch(
+            cache["dir"], PROJECT_ROOT / cache["record"]["training_manifest"]["path"],
+            pilot6)
     for model in ("deterministic", "diffusion"):
         att = latest_attempt(run_root / "s0" / model)
         if att is None:
@@ -401,8 +537,13 @@ def check_c(run_root: Path, cache: dict | None, prereg: dict) -> dict:
                     ident_problems.append("checkpoint_step_mismatch")
                 if cache is not None:
                     deep_problems, deep_detail = _verify_checkpoint_deep(
-                        ckpt_path, att_dir, cache["dir"], model, summary)
+                        ckpt_path, att_dir, cache["dir"], model, summary,
+                        expected_batch)
                     ident_problems += deep_problems
+                    # a failed rebuild (unadmitted/missing pilot demo) is
+                    # itself unready evidence, reported per model
+                    ident_problems += [f"probe_batch_rebuild:{p}"
+                                       for p in rebuild_problems]
         reasons += [f"s0_{model}:{p}" for p in ident_problems]
         # the small set must COVER the registered pilot6 (round-2 review fix
         # 1: a shrunken one-demo small set still "came from" pilot6 under
