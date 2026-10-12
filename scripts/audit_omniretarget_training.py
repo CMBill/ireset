@@ -205,6 +205,11 @@ def quality_registration_complete(row: dict) -> tuple[bool, list[str]]:
       ``reference_intervals``);
     * the both-hands block measured wherever its denominator is non-zero.
 
+    Round-3 deepening: the per-side count KEYS must both exist (a deleted
+    ``l`` key is missing evidence, never zero and never the recomputed
+    value), and the both-hands denominator is recomputed from the reference
+    intervals as the left∩right grasp-frame intersection.
+
     A deleted measurement must therefore surface as a gap (missing evidence),
     never as a legal zero-reference side.
     """
@@ -221,7 +226,10 @@ def quality_registration_complete(row: dict) -> tuple[bool, list[str]]:
             problems.append(f"{k}:{m.get(k)}")
 
     # per-side reference-frame counts — the EXISTENCE contract for the
-    # hand/foot measurements; reconciled against the recorded intervals
+    # hand/foot measurements; reconciled against the recorded intervals.
+    # Round-3 review fix 4: both ``l`` and ``r`` keys must EXIST — a missing
+    # key was read through ``.get(side, <recomputed>)`` (laundering the
+    # deletion) and then as zero (declaring a legal zero-reference side)
     ref_support = m.get("ref_support_frames")
     ref_grasp = m.get("ref_grasp_frames")
     if not isinstance(ref_support, dict) or not isinstance(ref_grasp, dict):
@@ -231,6 +239,7 @@ def quality_registration_complete(row: dict) -> tuple[bool, list[str]]:
     intervals = m.get("reference_intervals")
     recon_support = {"l": 0, "r": 0}
     recon_grasp = {"l": 0, "r": 0}
+    grasp_frames = {"l": set(), "r": set()}
     if not isinstance(intervals, list):
         problems.append("reference_intervals_missing")
     else:
@@ -249,12 +258,13 @@ def quality_registration_complete(row: dict) -> tuple[bool, list[str]]:
                 recon_support[side] += n
             elif eff.endswith("_hand") and iv.get("sup") == "object":
                 recon_grasp[side] += n
+                grasp_frames[side].update(range(start, end))
     for side in ("l", "r"):
-        if ref_support.get(side, recon_support[side]) != recon_support[side]:
+        if ref_support.get(side) != recon_support[side]:
             problems.append(
                 f"foot[{side}]:ref_frames_vs_intervals:"
                 f"{ref_support.get(side)}!={recon_support[side]}")
-        if ref_grasp.get(side, recon_grasp[side]) != recon_grasp[side]:
+        if ref_grasp.get(side) != recon_grasp[side]:
             problems.append(
                 f"hand[{side}]:ref_frames_vs_intervals:"
                 f"{ref_grasp.get(side)}!={recon_grasp[side]}")
@@ -264,10 +274,13 @@ def quality_registration_complete(row: dict) -> tuple[bool, list[str]]:
                 ("foot", ref_support, ("gap_p95_m", "speed_p95_mps",
                                        "drift_max_m")),
                 ("hand", ref_grasp, ("gap_p95_m", "coverage"))):
-            need = counts.get(side, 0)
+            need = counts.get(side)
+            if need is None:
+                problems.append(f"{group}[{side}]:ref_frames_key_missing")
+                continue
             if not isinstance(need, int) or isinstance(need, bool) or need < 0:
                 problems.append(f"{group}[{side}]:ref_frames:{need}")
-                need = None
+                continue
             entry = (m.get(group) or {}).get(side)
             if need == 0:
                 # legal zero-reference side ONLY as an absent measurement
@@ -289,14 +302,26 @@ def quality_registration_complete(row: dict) -> tuple[bool, list[str]]:
                 if not _finite_num(entry.get(k)):
                     problems.append(f"{group}[{side}].{k}:{entry.get(k)}")
 
+    # both-hands block: the denominator is RECOMPUTED from the reference
+    # intervals (left-grasp frames ∩ right-grasp frames) — a doctored 0 with
+    # deleted measurements used to pass as a legal zero-reference (round-3
+    # review fix 4)
     both = m.get("both")
     if not isinstance(both, dict) or "denominator_frames" not in both:
         problems.append("both_missing")
     else:
         den = both.get("denominator_frames")
+        both_need = len(grasp_frames["l"] & grasp_frames["r"])
         if not isinstance(den, int) or isinstance(den, bool) or den < 0:
             problems.append(f"both.denominator_frames:{den}")
-        elif den > 0:
+        elif den != both_need:
+            problems.append(
+                f"both.denominator_frames_vs_intervals:{den}!={both_need}")
+        elif both_need == 0:
+            if both.get("valid_coverage") is not None \
+                    or both.get("gap_series_p95_m") is not None:
+                problems.append("both:measurement_without_reference")
+        else:
             for k in ("valid_coverage", "gap_series_p95_m"):
                 if not _finite_num(both.get(k)):
                     problems.append(f"both.{k}:{both.get(k)}")

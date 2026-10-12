@@ -105,86 +105,160 @@ def _worker_init(native_threads: int) -> None:
     apply_native_threads(native_threads)
 
 
-def _append_costs(run_root: Path, stage: str, wall: float, extra: dict) -> None:
-    """Run-root cost ledger (review fix 12): every stage invocation is
-    appended with its own measured wall — including failed attempts, which
-    register BEFORE the work starts and are completed here on the way out."""
-    import datetime as _dt2
+def _upsert_cost(run_root: Path, stage: str, attempt: str, wall: float,
+                 extra: dict, status: str) -> None:
+    """Append-or-UPDATE the ledger row for one (stage, attempt).
 
+    Exactly one row per attempt EVER exists: pre-registered ``running``
+    before any work and updated in place on every exit path (round-3 review
+    fix 8 mirrors the w1_s0 contract — a crashed cache attempt can never be
+    left without a ledger row)."""
     costs_path = run_root / "costs.json"
     entries = []
     if costs_path.is_file():
         entries = json.loads(costs_path.read_text()).get("invocations", [])
-    entries.append({"timestamp": _dt2.datetime.now().isoformat(timespec="seconds"),
-                    "stage": stage, "wall_s": round(wall, 1), **extra})
+    row = {"timestamp": _dt.datetime.now().isoformat(timespec="seconds"),
+           "stage": stage, "attempt": attempt, "status": status,
+           "wall_s": round(wall, 1), **extra}
+    for i, e in enumerate(entries):
+        if e.get("stage") == stage and e.get("attempt") == attempt:
+            entries[i] = {**row, "timestamp": e.get("timestamp")}
+            break
+    else:
+        entries.append(row)
     costs_path.write_text(json.dumps({"invocations": entries}, indent=2))
 
 
 def _historical_cache_cost_s(out_root: Path) -> float | None:
-    """Sum of PRIOR w1-cache stage walls for this cache root.
+    """Sum of PRIOR w1-cache stage walls, reconciled THREE ways.
 
-    ``None`` = UNKNOWN history (attempts on disk that the ledger cannot
-    account for) — a stop condition: the registered CACHE_BUDGET_S cannot be
-    proven unexhausted (round-2 review fix 7).
+    Round-3 review fix 8: the attempt directories ON DISK, the attempts
+    index and the ledger rows keyed by attempt must agree exactly — judging
+    history by the index entry count alone let a crashed worker's
+    unregistered attempt_001 wash into a zero-cost history (the next call
+    then started attempt_002 as if nothing had been spent). ``None`` =
+    UNKNOWN history (an attempt the index/ledger cannot account for, an
+    unkeyed/duplicate row, or a leftover ``running`` row) — a stop
+    condition: the registered CACHE_BUDGET_S cannot be proven unexhausted
+    (round-2 review fix 7).
     """
     import math as _math
 
-    attempts_seen = 0
-    idx = out_root / integ.ATTEMPTS_INDEX
-    if idx.is_file():
-        attempts_seen = len(json.loads(idx.read_text())["attempts"])
+    disk = {d.name for d in out_root.glob("attempt_*") if d.is_dir()}
+    idx_path = out_root / integ.ATTEMPTS_INDEX
+    index = ({a.get("attempt")
+              for a in json.loads(idx_path.read_text())["attempts"]}
+             if idx_path.is_file() else set())
+    entries = []
     costs_path = out_root.parent / "costs.json"
-    if attempts_seen == 0:
-        return 0.0
-    if not costs_path.is_file():
-        return None
-    entries = json.loads(costs_path.read_text()).get("invocations", [])
-    total, accounted = 0.0, 0
+    if costs_path.is_file():
+        entries = json.loads(costs_path.read_text()).get("invocations", [])
+    ledger: dict[str, float] = {}
+    total = 0.0
     for e in entries:
-        if e.get("stage") == "w1_cache":
-            wall = e.get("wall_s")
-            if not (isinstance(wall, (int, float)) and _math.isfinite(wall)
-                    and wall >= 0):
-                return None
-            total += float(wall)
-            accounted += 1
-    if accounted < attempts_seen:
-        return None
+        if e.get("stage") != "w1_cache":
+            continue
+        attempt = e.get("attempt")
+        if attempt is None or attempt in ledger:
+            return None          # unkeyed or duplicate rows: unknown
+        wall = e.get("wall_s")
+        if not (isinstance(wall, (int, float)) and _math.isfinite(wall)
+                and wall >= 0):
+            return None
+        if e.get("status") == "running":
+            return None          # the exit registration never ran
+        ledger[attempt] = float(wall)
+        total += float(wall)
+    if not disk and not ledger:
+        return 0.0
+    if disk != index or disk != set(ledger):
+        return None              # attempt without index/ledger coverage
     return total
 
 
-def run_w1(args) -> int:
-    """W1 keyed cache: schedules + train-only root stats + identity."""
-    t0 = time.time()
-    manifest_path = args.training_manifest.expanduser().resolve()
-    manifest = json.loads(manifest_path.read_text())
-    prereg_rec = manifest["preregistration"]
-    prereg_path = PROJECT_ROOT / prereg_rec["path"]
-    if integ.sha256_file(prereg_path) != prereg_rec["sha256"]:
-        raise SystemExit("training manifest not bound to its preregistration")
-    prereg = json.loads(prereg_path.read_text())
-    check = w1.verify_preregistration(prereg, PROJECT_ROOT,
-                                      TEACHER_TRAJ_DIR, OMOMO_NEW_DIR)
-    if not check["passed"]:
-        raise SystemExit(f"preregistration re-verification failed: {check['problems']}")
+def _register_crashed_cache_attempt(out_root: Path, attempt_dir: Path,
+                                    exc: BaseException, wall: float) -> None:
+    """Honest incomplete registration for a crashed cache attempt (round-3
+    review fix 8): a minimal identity, an index row and a ``crashed`` ledger
+    row — the attempt stays visible and its wall stays accounted, so the
+    budget history remains KNOWABLE instead of washing to zero."""
+    ident_path = attempt_dir / "cache_identity.json"
+    if not ident_path.is_file():
+        ident_path.write_text(json.dumps({
+            "protocol": w1.MOTION_PROTOCOL_VERSION,
+            "experiment_id": w1.EXPERIMENT_ID,
+            "attempt": attempt_dir.name,
+            "timestamp": _dt.datetime.now().isoformat(timespec="seconds"),
+            "complete": False,
+            "incomplete_reason": f"crashed:{type(exc).__name__}",
+        }, indent=2, ensure_ascii=False))
+    idx_path = out_root / integ.ATTEMPTS_INDEX
+    indexed = ({a.get("attempt")
+                for a in json.loads(idx_path.read_text())["attempts"]}
+               if idx_path.is_file() else set())
+    if attempt_dir.name not in indexed:
+        integ.append_attempts_index(out_root, {
+            "attempt": attempt_dir.name, "complete": False,
+            "incomplete_reason": f"crashed:{type(exc).__name__}",
+            "identity": path_for_record(ident_path),
+        })
+    _upsert_cost(out_root.parent, "w1_cache", attempt_dir.name, wall,
+                 {"complete": False,
+                  "incomplete_reason": f"crashed:{type(exc).__name__}"},
+                 status="crashed")
 
-    out_root = integ.guard_output_dir(args.out_dir)
-    # budget preflight BEFORE allocating the attempt (round-2 review fix 7):
-    # the registered CACHE_BUDGET_S is enforced against the run-root ledger —
-    # prior attempts are deducted and an unknown history refuses to start
-    hist = _historical_cache_cost_s(out_root)
-    if hist is None:
-        raise SystemExit("cache cost history unknown (attempts exist without "
-                         "ledger rows) — refusing without a provable budget")
-    remaining = w1.CACHE_BUDGET_S - hist
-    if remaining <= 0:
-        raise SystemExit(f"cache budget already exhausted: historical "
-                         f"{hist:.1f}s of {w1.CACHE_BUDGET_S}s")
-    deadline = time.perf_counter() + remaining
 
-    attempt_dir = integ.allocate_attempt(out_root)
-    code_sha = w1.condition_code_sha256(PROJECT_ROOT)
-    assets_sha = prereg["assets"]["a1_assets_sha256"]
+def _run_w1_attempt(args, manifest: dict, prereg: dict, prereg_rec: dict,
+                    manifest_path: Path, prereg_path: Path, out_root: Path,
+                    attempt_dir: Path, hist: float, remaining: float,
+                    deadline: float, code_sha: str, assets_sha: str,
+                    t0: float) -> int:
+    """One (already allocated, already ledger-registered) cache attempt."""
+
+    def write_incomplete(n_schedules: int, missing: list[str]) -> int:
+        # INCOMPLETE attempt: record what is missing (or that only the
+        # budget ran out), never fabricate stats; consumers refuse this
+        # attempt (the identity carries complete=False)
+        identity = {
+            "protocol": w1.MOTION_PROTOCOL_VERSION,
+            "experiment_id": w1.EXPERIMENT_ID,
+            "attempt": attempt_dir.name,
+            "timestamp": _dt.datetime.now().isoformat(timespec="seconds"),
+            "preregistration": {"path": path_for_record(prereg_path),
+                                "sha256": prereg_rec["sha256"]},
+            "training_manifest": {"path": path_for_record(manifest_path),
+                                  "sha256": integ.sha256_file(manifest_path)},
+            "condition_code_sha256": code_sha,
+            "assets_sha256": assets_sha,
+            "schedule_cache_key_version": w1.SCHEDULE_KEY_VERSION,
+            "complete": False,
+            "incomplete_reason": "cache_budget_exhausted",
+            "missing_demos": missing,
+            "budget": {"total_s": w1.CACHE_BUDGET_S,
+                       "historical_s": round(hist, 1),
+                       "remaining_at_start_s": round(remaining, 1),
+                       "consumed_s": round(
+                           time.perf_counter() - (deadline - remaining), 1)},
+            "execution": exec_blocks,
+            "total_wall_s": round(time.time() - t0, 1),
+        }
+        (attempt_dir / "cache_identity.json").write_text(
+            json.dumps(identity, indent=2, ensure_ascii=False))
+        integ.append_attempts_index(out_root, {
+            "attempt": attempt_dir.name, "complete": False,
+            "incomplete_reason": "cache_budget_exhausted",
+            "n_schedules": n_schedules,
+            "identity": path_for_record(attempt_dir / "cache_identity.json"),
+        })
+        _upsert_cost(out_root.parent, "w1_cache", attempt_dir.name,
+                     time.time() - t0,
+                     {"attempt": attempt_dir.name,
+                      "n_schedules": n_schedules, "complete": False,
+                      "incomplete_reason": "cache_budget_exhausted"},
+                     status="done")
+        print(f"[w1-cache] INCOMPLETE (budget exhausted): {n_schedules}/"
+              f"{len(jobs)} schedules, missing {missing}")
+        return 2
 
     admitted = [r for r in manifest["rows"] if r.get("admission", {}).get("motion")]
     jobs = []
@@ -207,9 +281,7 @@ def run_w1(args) -> int:
           f"remaining {remaining:.1f}s)")
 
     workers = resolve_workers(args.workers, args.cpu_budget, len(jobs))
-    # the job set runs in CHUNKS with the deadline checked between chunks:
-    # an over-budget cache stops INCOMPLETE (missing rows recorded) instead
-    # of silently overrunning the registered budget
+    # the job set runs in CHUNKS with the deadline checked between chunks
     rows: list[dict] = []
     exec_blocks: list[dict] = []
     chunk = max(1, workers)
@@ -224,58 +296,28 @@ def run_w1(args) -> int:
                                  initargs=(args.native_threads,))
         rows.extend(part)
         exec_blocks.append(execution_record(rep, len(part)))
-    budget_stopped = len(rows) < len(jobs)
     print(json.dumps(exec_blocks[0] if exec_blocks else {"n_tasks": 0}))
 
-    if budget_stopped:
-        # INCOMPLETE attempt: record what is missing, never fabricate stats
-        # from a partial schedule set; consumers refuse this attempt (the
-        # identity carries complete=False)
-        missing = [j[0] for j in jobs[len(rows):]]
-        identity = {
-            "protocol": w1.MOTION_PROTOCOL_VERSION,
-            "experiment_id": w1.EXPERIMENT_ID,
-            "attempt": attempt_dir.name,
-            "timestamp": _dt.datetime.now().isoformat(timespec="seconds"),
-            "preregistration": {"path": path_for_record(prereg_path),
-                                "sha256": prereg_rec["sha256"]},
-            "training_manifest": {"path": path_for_record(manifest_path),
-                                  "sha256": integ.sha256_file(manifest_path)},
-            "condition_code_sha256": code_sha,
-            "assets_sha256": assets_sha,
-            "schedule_cache_key_version": w1.SCHEDULE_KEY_VERSION,
-            "complete": False,
-            "incomplete_reason": "cache_budget_exhausted",
-            "missing_demos": missing,
-            "budget": {"total_s": w1.CACHE_BUDGET_S,
-                       "historical_s": round(hist, 1),
-                       "remaining_at_start_s": round(remaining, 1)},
-            "execution": exec_blocks,
-            "total_wall_s": round(time.time() - t0, 1),
-        }
-        (attempt_dir / "cache_identity.json").write_text(
-            json.dumps(identity, indent=2, ensure_ascii=False))
-        integ.append_attempts_index(out_root, {
-            "attempt": attempt_dir.name, "complete": False,
-            "incomplete_reason": "cache_budget_exhausted",
-            "n_schedules": len(rows),
-            "identity": path_for_record(attempt_dir / "cache_identity.json"),
-        })
-        _append_costs(out_root.parent, "w1_cache", time.time() - t0,
-                      {"attempt": attempt_dir.name, "n_schedules": len(rows),
-                       "complete": False,
-                       "incomplete_reason": "cache_budget_exhausted"})
-        print(f"[w1-cache] INCOMPLETE (budget exhausted): {len(rows)}/{len(jobs)} "
-              f"schedules, missing {missing}")
-        return 2
-
-    # root stats: ONLY admitted train24 rows, every ORIGINAL frame once
-    # (val/test and rejected files never contribute — plan §4.2; the helper
-    # filters split=="train" itself)
-    stats, stats_facts = w1.fit_w1_root_stats(
-        manifest["rows"], PROJECT_ROOT, attempt_dir / "schedules",
-        assets_sha, code_sha)
-    stats.save(attempt_dir / "root_stats.npz")
+    # round-3 review fix 6: the deadline is enforced at EVERY phase boundary
+    # — the LAST chunk's return, the stats computation and the final
+    # registration. ``budget_stopped`` used to depend only on missing rows,
+    # so a final chunk (and the stats work after it) could overrun the
+    # registered budget and still register complete=true
+    budget_stopped = len(rows) < len(jobs)
+    overran = time.perf_counter() > deadline
+    stats = stats_facts = None
+    if not budget_stopped and not overran:
+        # root stats: ONLY admitted train24 rows, every ORIGINAL frame once
+        # (val/test and rejected files never contribute — plan §4.2; the
+        # helper filters split=="train" itself)
+        stats, stats_facts = w1.fit_w1_root_stats(
+            manifest["rows"], PROJECT_ROOT, attempt_dir / "schedules",
+            assets_sha, code_sha)
+        stats.save(attempt_dir / "root_stats.npz")
+        overran = time.perf_counter() > deadline   # the stats phase counts
+    if budget_stopped or overran:
+        return write_incomplete(len(rows),
+                                [j[0] for j in jobs[len(rows):]])
 
     files_blob = json.dumps(stats_facts["files"],
                             ensure_ascii=False, separators=(",", ":"))
@@ -330,12 +372,63 @@ def run_w1(args) -> int:
         "frames_fitted": identity["root_stats"]["frames_fitted"],
         "identity": path_for_record(attempt_dir / "cache_identity.json"),
     })
-    _append_costs(out_root.parent, "w1_cache", time.time() - t0,
-                  {"attempt": attempt_dir.name, "n_schedules": len(rows),
-                   "complete": True})
+    _upsert_cost(out_root.parent, "w1_cache", attempt_dir.name,
+                 time.time() - t0,
+                 {"attempt": attempt_dir.name, "n_schedules": len(rows),
+                  "complete": True}, status="done")
     print(f"[w1-cache] root stats frames={identity['root_stats']['frames_fitted']} "
           f"files={stats_facts['n_train_rows_used']} -> {path_for_record(attempt_dir)}")
     return 0
+
+
+def run_w1(args) -> int:
+    """W1 keyed cache: schedules + train-only root stats + identity."""
+    t0 = time.time()
+    manifest_path = args.training_manifest.expanduser().resolve()
+    manifest = json.loads(manifest_path.read_text())
+    prereg_rec = manifest["preregistration"]
+    prereg_path = PROJECT_ROOT / prereg_rec["path"]
+    if integ.sha256_file(prereg_path) != prereg_rec["sha256"]:
+        raise SystemExit("training manifest not bound to its preregistration")
+    prereg = json.loads(prereg_path.read_text())
+    check = w1.verify_preregistration(prereg, PROJECT_ROOT,
+                                      TEACHER_TRAJ_DIR, OMOMO_NEW_DIR)
+    if not check["passed"]:
+        raise SystemExit(f"preregistration re-verification failed: {check['problems']}")
+
+    out_root = integ.guard_output_dir(args.out_dir)
+    # budget preflight BEFORE allocating the attempt (round-2 review fix 7):
+    # the registered CACHE_BUDGET_S is enforced against the run-root ledger —
+    # prior attempts are deducted and an unknown history refuses to start
+    hist = _historical_cache_cost_s(out_root)
+    if hist is None:
+        raise SystemExit("cache cost history unknown (attempts exist without "
+                         "ledger rows) — refusing without a provable budget")
+    remaining = w1.CACHE_BUDGET_S - hist
+    if remaining <= 0:
+        raise SystemExit(f"cache budget already exhausted: historical "
+                         f"{hist:.1f}s of {w1.CACHE_BUDGET_S}s")
+    deadline = time.perf_counter() + remaining
+
+    attempt_dir = integ.allocate_attempt(out_root)
+    code_sha = w1.condition_code_sha256(PROJECT_ROOT)
+    assets_sha = prereg["assets"]["a1_assets_sha256"]
+    # round-3 review fix 8: the ledger row is pre-registered BEFORE any work
+    # and every exit path updates it — a crashed cache stage stays accounted
+    # (disk × index × ledger stay reconcilable, never an unknown zero)
+    _upsert_cost(out_root.parent, "w1_cache", attempt_dir.name, 0.0,
+                 {"attempt": attempt_dir.name, "n_schedules": 0},
+                 status="running")
+    t_attempt = time.perf_counter()
+    try:
+        return _run_w1_attempt(args, manifest, prereg, prereg_rec,
+                               manifest_path, prereg_path, out_root,
+                               attempt_dir, hist, remaining, deadline,
+                               code_sha, assets_sha, t0)
+    except BaseException as exc:  # noqa: BLE001 -- register, then re-raise
+        _register_crashed_cache_attempt(out_root, attempt_dir, exc,
+                                        time.perf_counter() - t_attempt)
+        raise
 
 
 def main() -> int:

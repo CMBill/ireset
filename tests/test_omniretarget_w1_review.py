@@ -27,6 +27,27 @@ failed (or laundered a pass) before the fix:
               with equal weighting (effective 12, not 16, samples);
 * fix 12 (P2) cost ledger double-counted the first model into the second
               and never registered cache/failed attempts.
+
+Review round 3 (4 P1 + 4 P2) — every counterexample below laundered a pass
+under the round-2 code:
+
+* r3-1 (P1) a NaN probe-replay input replays to NaN and
+            ``abs(NaN - rec) > tol`` is silently False;
+* r3-2 (P1) a doctored summary probe curve (trend evidence) was never
+            reconciled with the checkpoint's replay artifact;
+* r3-3 (P1) a loss history shrunk to {step, gnorm} still counted as
+            complete training evidence (only PRESENT fields were checked);
+* r3-4 (P1) a deleted per-side reference-count KEY read as zero (legal
+            zero-reference side) and the both-hands denominator was never
+            recomputed from the reference intervals;
+* r3-5 (P2) deleting one on-cadence probe kept "increasing multiples"
+            schedule validity — the schedule must EQUAL the full cadence;
+* r3-6 (P2) the cache's LAST chunk / stats phase could overrun the budget
+            and still register complete=true;
+* r3-7 (P2) S0 budget_stopped required ``step < cfg.steps`` — a tail
+            overrun after completing the target still verdicted passed;
+* r3-8 (P2) a crashed cache worker left an unregistered attempt dir that
+            washed into a zero-cost history (index count alone).
 """
 
 from __future__ import annotations
@@ -388,6 +409,35 @@ def test_quality_completeness_requires_actual_measurements():
     # ref count dicts deleted entirely
     ok, problems = _mutated(ref_row, lambda m: m.pop("ref_grasp_frames"))
     assert not ok and "ref_frame_counts_missing" in problems
+    # --- round-3 fix 4: a missing per-side KEY is missing evidence ---
+    # reviewer scenario: ref_grasp_frames.l deleted AND hand.l=None (46
+    # reference frames actually exist) used to read the key as the
+    # recomputed value / as zero -> legal zero-reference side
+    ok, problems = _mutated(
+        ref_row, lambda m: (m["ref_grasp_frames"].pop("l"),
+                            m["hand"].__setitem__("l", None)))
+    assert not ok
+    assert "hand[l]:ref_frames_key_missing" in problems
+    assert "hand[l]:ref_frames_vs_intervals:None!=46" in problems
+    # same laundering through the foot counts
+    ok, problems = _mutated(
+        ref_row, lambda m: (m["ref_support_frames"].pop("r"),
+                            m["foot"].__setitem__("r", None)))
+    assert not ok and "foot[r]:ref_frames_key_missing" in problems
+    # the both-hands denominator is RECOMPUTED from the intervals: the
+    # left[1,47) x right[44,94) grasp intersection is 3 frames — a doctored
+    # 0 with the measurements deleted used to pass as a legal zero block
+    ok, problems = _mutated(ref_row, lambda m: m.__setitem__(
+        "both", {"denominator_frames": 0, "valid_coverage": None,
+                 "gap_series_p95_m": None}))
+    assert not ok
+    assert "both.denominator_frames_vs_intervals:0!=3" in problems
+    # a denominator INFLATED above the recomputed intersection is equally
+    # inconsistent (measurements cannot exist for frames without reference)
+    ok, problems = _mutated(
+        ref_row, lambda m: m["both"].__setitem__("denominator_frames", 40))
+    assert not ok
+    assert "both.denominator_frames_vs_intervals:40!=3" in problems
     # a genuinely zero-reference side stays legal (None with 0 counts)
     zero_side = json.loads(json.dumps(ref_row))
     zm = zero_side["quality"]["metrics"]
@@ -1186,3 +1236,275 @@ def test_cache_code_identity_covers_distance_adapter(tmp_path, monkeypatch):
     finally:
         adapter.write_bytes(before)
     assert w1.condition_code_sha256(world["root"]) == base_sha
+
+
+# --- round-3 fixes 1+2: replay finiteness + summary/artifact reconciliation ------
+
+def _readiness_fixture(tmp_path, monkeypatch):
+    """Shared fixture: synthetic world + relaxed S0 constants + cache binding."""
+    import w1_readiness as rd
+
+    world = build_synthetic_world(tmp_path)
+    _patch_paths(monkeypatch, world)
+    monkeypatch.setattr(rd, "PROJECT_ROOT", world["root"])
+    cache = rd.check_cache_binding(world["run"])
+    prereg = json.loads(world["prereg_path"].read_text())
+    for k, v in (("S0_MIN_STEPS", 20), ("S0_PROBE_EVERY", 2),
+                 ("S0_TREND_WINDOW", 3), ("S0_PROBE_MIN", 6)):
+        monkeypatch.setattr(w1, k, v)
+    return rd, world, cache, prereg
+
+
+def test_replay_nan_input_and_recorded_probe_are_rejected(tmp_path, monkeypatch):
+    """r3-1: one NaN x0 element makes the replay error NaN — ``abs(NaN -
+    rec) > tol`` is False, so the round-2 comparison laundered a pass. The
+    inputs and every replayed/recorded error must be checked finite FIRST."""
+    rd, world, cache, prereg = _readiness_fixture(tmp_path, monkeypatch)
+
+    att, _ = _run_real_s0_attempt(world, "deterministic", steps=24)
+    rp = torch.load(att / "probe_replay.pt", map_location="cpu",
+                    weights_only=False)
+    rp["batch"]["x0"][0, 0, 0] = float("nan")
+    torch.save(rp, att / "probe_replay.pt")
+    r = rd.check_c(world["run"], cache, prereg)
+    probs = r["per_model"]["deterministic"]["identity_problems"]
+    assert any(p.startswith("probe_replay_input_not_finite:batch.x0")
+               for p in probs), probs
+    assert "probe_replay_output_not_finite" in probs, probs
+    assert not r["passed"]
+
+    # a NaN'd RECORDED probe is missing evidence, not a comparable value
+    att, _ = _run_real_s0_attempt(world, "deterministic", steps=24)
+    rp = torch.load(att / "probe_replay.pt", map_location="cpu",
+                    weights_only=False)
+    rp["last_probe"]["motion_reconstruction"] = float("nan")
+    torch.save(rp, att / "probe_replay.pt")
+    r = rd.check_c(world["run"], cache, prereg)
+    probs = r["per_model"]["deterministic"]["identity_problems"]
+    assert "recorded_probe_not_finite" in probs, probs
+    assert not r["passed"]
+
+
+def test_summary_trend_curve_must_match_replay_artifact(tmp_path, monkeypatch):
+    """r3-2: only summary.probes doctored into a declining 100->50 curve
+    (checkpoint and replay artifact untouched) kept schedule/finite/trend
+    all green under round-2 code — the trend evidence must be the SAME
+    measurement the artifact recorded."""
+    rd, world, cache, prereg = _readiness_fixture(tmp_path, monkeypatch)
+
+    att, summary = _run_real_s0_attempt(world, "deterministic", steps=24)
+    sp = att / "s0_summary.json"
+    s = json.loads(sp.read_text())
+    for i, p in enumerate(s["probes"]):
+        for k in ("pos", "rot6d", "joint", "motion_reconstruction"):
+            p[k] = 100.0 - 0.5 * i          # still finite, still declining
+    sp.write_text(json.dumps(s))
+    r = rd.check_c(world["run"], cache, prereg)
+    probs = r["per_model"]["deterministic"]["identity_problems"]
+    assert any(p.startswith("summary_last_probe_mismatch:") for p in probs), probs
+    assert not r["passed"]
+    # the honest summary still reconciles (regression on the same fixture)
+    att, summary = _run_real_s0_attempt(world, "deterministic", steps=24)
+    r = rd.check_c(world["run"], cache, prereg)
+    det = r["per_model"]["deterministic"]
+    assert not [p for p in det["identity_problems"]
+                if "summary_last_probe" in p or "probe_replay" in p]
+
+
+def test_loss_history_requires_every_configured_field(tmp_path, monkeypatch):
+    """r3-3: rows shrunk to {step, gnorm} (or {step, total, gnorm}) are
+    missing the configured loss parts — existence is its own gate, checked
+    before finiteness."""
+    rd, world, cache, prereg = _readiness_fixture(tmp_path, monkeypatch)
+
+    att, _ = _run_real_s0_attempt(world, "deterministic", steps=24)
+    hp = att / "loss_history.json"
+    h = json.loads(hp.read_text())
+    assert all(k in h[0] for k in w1.S0_REQUIRED_LOSS_KEYS)  # the fixture is complete
+    hp.write_text(json.dumps(
+        [{"step": row["step"], "gnorm": row["gnorm"], "ms": row["ms"]}
+         for row in h]))
+    gates = rd.check_c(world["run"], cache, prereg)["per_model"][
+        "deterministic"]["recomputed_gates"]
+    assert gates["loss_fields_complete"] is False
+
+    hp.write_text(json.dumps(
+        [{"step": row["step"], "total": row["total"], "gnorm": row["gnorm"]}
+         for row in h]))
+    gates = rd.check_c(world["run"], cache, prereg)["per_model"][
+        "deterministic"]["recomputed_gates"]
+    assert gates["loss_fields_complete"] is False
+
+    # the honest history passes the same gate
+    hp.write_text(json.dumps(h))
+    gates = rd.check_c(world["run"], cache, prereg)["per_model"][
+        "deterministic"]["recomputed_gates"]
+    assert gates["loss_fields_complete"] is True
+
+
+def test_probe_schedule_must_be_the_complete_cadence(tmp_path, monkeypatch):
+    """r3-5: deleting one on-cadence probe leaves the remaining steps
+    increasing multiples of the cadence — only an exact comparison with the
+    full expected schedule catches the hole."""
+    rd, world, cache, prereg = _readiness_fixture(tmp_path, monkeypatch)
+
+    att, _ = _run_real_s0_attempt(world, "deterministic", steps=24)
+    sp = att / "s0_summary.json"
+    s = json.loads(sp.read_text())
+    assert [p["step"] for p in s["probes"]] == list(range(0, 25, 2))
+    del s["probes"][1]                      # the step-2 sample point
+    sp.write_text(json.dumps(s))
+    gates = rd.check_c(world["run"], cache, prereg)["per_model"][
+        "deterministic"]["recomputed_gates"]
+    assert gates["probe_schedule_valid"] is False
+
+
+# --- round-3 fixes 6+7: budget enforcement at every phase boundary ---------------
+
+def test_cache_final_chunk_overrun_is_incomplete(tmp_path, monkeypatch):
+    """r3-6: with every schedule row landed, a final chunk that overruns the
+    budget used to still register complete=true/consumed_s>budget — the
+    deadline is now enforced at the chunk return, the stats phase and the
+    final registration."""
+    import precompute_m3_cache as pc
+
+    world = build_synthetic_world(tmp_path, n_train=2, n_val=2, T=90)
+    _patch_paths(monkeypatch, world)
+    monkeypatch.setattr(pc, "PROJECT_ROOT", world["root"])
+    monkeypatch.setattr(pc, "TEACHER_TRAJ_DIR", world["npz_dir"])
+    monkeypatch.setattr(pc, "OMOMO_NEW_DIR", world["pt_dir"])
+    out_root = world["run"] / "cache"
+    argv = ["prog", "--training-manifest", str(world["manifest_path"]),
+            "--out-dir", str(out_root), "--workers", "1"]
+    monkeypatch.setattr("sys.argv", argv)
+
+    manifest = json.loads(world["manifest_path"].read_text())
+    last_demo = [r for r in manifest["rows"]
+                 if r.get("admission", {}).get("motion")][-1]["demo"]
+
+    def slow_last_job(job):
+        import hashlib as _hl
+        import time as _t
+
+        if job[0] == last_demo:
+            _t.sleep(1.2)                   # the FINAL chunk overruns
+        out = Path(job[3]) / "schedules" / w1.schedule_cache_filename(
+            job[0], job[2])
+        out.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(out, intervals=np.zeros((1, 4)))
+        return {"demo": job[0], "T": 1, "cache": out.name, "status": "ok",
+                "sha256": _hl.sha256(out.read_bytes()).hexdigest()}
+
+    monkeypatch.setattr(pc, "_w1_schedule_job", slow_last_job)
+    monkeypatch.setattr(w1, "CACHE_BUDGET_S", 1.0)
+    assert pc.main() == 2
+    att = sorted(out_root.glob("attempt_*"))[-1]
+    ident = json.loads((att / "cache_identity.json").read_text())
+    assert ident["complete"] is False
+    assert ident["incomplete_reason"] == "cache_budget_exhausted"
+    assert ident["missing_demos"] == []     # every row landed — the BUDGET ran out
+    assert ident["budget"]["consumed_s"] >= 1.0
+    rows = [e for e in json.loads(
+        (world["run"] / "costs.json").read_text())["invocations"]
+        if e["stage"] == "w1_cache"]
+    # the fixture's ledgered attempt_001 + THIS over-budget attempt_002
+    assert [r["attempt"] for r in rows] == ["attempt_001", "attempt_002"]
+    assert rows[-1]["status"] == "done" and rows[-1]["complete"] is False
+    # no root stats fabricated for an over-budget attempt
+    assert not (att / "root_stats.npz").is_file()
+    prereg = json.loads(world["prereg_path"].read_text())
+    problems = w1.verify_cache_contents(att, manifest, prereg, world["root"])
+    assert any("cache_not_complete" in p for p in problems["problems"])
+
+
+def test_s0_overrun_after_target_steps_is_incomplete(tmp_path, monkeypatch):
+    """r3-7: the full step target completed (400 in the review, 8 here) but
+    the checkpoint phase crossed the deadline — budget_stopped used to
+    require ``step < cfg.steps``, so the run still verdicted passed."""
+    import w1_s0
+    from test_omniretarget_w1 import _FakeDS, _s0_cfg, _tokenizer_for_losses
+
+    monkeypatch.setattr(w1, "S0_PROBE_EVERY", 2)
+    tok = _tokenizer_for_losses()
+    ds = _FakeDS(4, F=8, seed=3)
+    loader = torch.utils.data.DataLoader(ds, batch_size=2, shuffle=True)
+    out = tmp_path / "s0tail"
+    out.mkdir()
+    real = time.perf_counter
+    state = {"jump": False}
+
+    def clock():
+        return real() + (1e6 if state["jump"] else 0.0)
+
+    real_save = torch.save
+
+    def flipping_save(*a, **k):
+        state["jump"] = True                # the deadline passes DURING the
+        return real_save(*a, **k)           # checkpoint save, after all steps
+
+    monkeypatch.setattr(w1_s0.time, "perf_counter", clock)
+    monkeypatch.setattr(torch, "save", flipping_save)
+    cfg = _s0_cfg("deterministic", 8)
+    summary = w1_s0.run_s0_model(
+        "deterministic", cfg, tok,
+        {k: ds.__dict__[k].clone() for k in _FakeDS.KEYS},
+        loader, "cpu", {"experiment_id": "x"}, out, real() + 600.0)
+    monkeypatch.undo()
+    assert summary["optimizer_steps"] == cfg.steps      # the full target ran
+    assert summary["budget_stopped"] is True            # ...but the tail overran
+    assert summary["verdict"] == "incomplete"           # never "passed"
+    assert summary["gates"]["completed_within_budget"] is False
+
+
+def test_cache_crash_stays_ledgered_and_disk_only_attempts_stop(
+        tmp_path, monkeypatch):
+    """r3-8: a worker raising after attempt allocation used to leave an
+    unregistered dir that washed into a zero-cost history; the crash now
+    registers identity+index+ledger, and a FABRICATED disk-only attempt is
+    UNKNOWN history — the next invocation refuses to start."""
+    import precompute_m3_cache as pc
+
+    world = build_synthetic_world(tmp_path, n_train=2, n_val=2, T=90)
+    _patch_paths(monkeypatch, world)
+    monkeypatch.setattr(pc, "PROJECT_ROOT", world["root"])
+    monkeypatch.setattr(pc, "TEACHER_TRAJ_DIR", world["npz_dir"])
+    monkeypatch.setattr(pc, "OMOMO_NEW_DIR", world["pt_dir"])
+    out_root = world["run"] / "cache"
+    argv = ["prog", "--training-manifest", str(world["manifest_path"]),
+            "--out-dir", str(out_root), "--workers", "1"]
+
+    def exploding_job(job):
+        import time as _t
+
+        _t.sleep(0.2)                       # a measurable wall before dying
+        raise RuntimeError("worker boom after attempt allocation")
+
+    monkeypatch.setattr(pc, "_w1_schedule_job", exploding_job)
+    monkeypatch.setattr("sys.argv", argv)
+    with pytest.raises(RuntimeError, match="worker boom"):
+        pc.main()
+
+    # the fixture's attempt_001 (ledgered 0.0s) is prior history; the crash
+    # landed in attempt_002 and must be fully registered
+    att = out_root / "attempt_002"
+    assert att.is_dir()
+    ident = json.loads((att / "cache_identity.json").read_text())
+    assert ident["complete"] is False
+    assert "crashed" in ident["incomplete_reason"]
+    index = json.loads((out_root / "attempts_index.json").read_text())["attempts"]
+    assert [a["attempt"] for a in index] == ["attempt_001", "attempt_002"]
+    assert index[-1]["incomplete_reason"] == ident["incomplete_reason"]
+    rows = [e for e in json.loads(
+        (world["run"] / "costs.json").read_text())["invocations"]
+        if e["stage"] == "w1_cache"]
+    assert [r["status"] for r in rows] == ["done", "crashed"]
+    # the crashed attempt stays ACCOUNTED: known history, wall consumed
+    hist = pc._historical_cache_cost_s(out_root)
+    assert hist is not None and hist > 0.0
+
+    # a disk-only attempt (no index, no ledger) is UNKNOWN -> refuse
+    (out_root / "attempt_003").mkdir()
+    assert pc._historical_cache_cost_s(out_root) is None
+    monkeypatch.setattr("sys.argv", argv)
+    with pytest.raises(SystemExit, match="unknown"):
+        pc.main()

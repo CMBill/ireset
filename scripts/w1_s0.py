@@ -352,7 +352,11 @@ def run_s0_model(model_type: str, cfg, tokenizer, small_batch: dict,
         trend_ok, first_mean, last_mean = last < first, first, last
     else:
         trend_ok, first_mean, last_mean = None, None, None
-    budget_stopped = time.perf_counter() > budget_deadline and step < cfg.steps
+    # round-3 review fix 7: the budget verdict is INDEPENDENT of step
+    # completion — checkpoint saving, the reload check and this final
+    # registration all run inside the budget; ``step == cfg.steps`` no
+    # longer exempts a tail that crossed the deadline
+    budget_stopped = time.perf_counter() > budget_deadline
     gates = {
         "min_100_optimizer_steps": step >= w1.S0_MIN_STEPS,
         "all_finite": nonfinite_stop is None,

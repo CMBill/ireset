@@ -163,10 +163,11 @@ def check_b(run_root: Path, cache: dict | None) -> dict:
 def _recompute_s0_verdict(summary: dict, history: list[dict],
                           history_present: bool) -> tuple[dict, list[str]]:
     """Recompute EVERY S0 gate from the raw facts (review fix 2, deepened
-    round 2) — the recorded ``verdict`` string is never trusted by itself,
+    rounds 2-3) — the recorded ``verdict`` string is never trusted by itself,
     and neither are summary COUNTS: the loss history must exist, be
-    contiguous 1..N with every loss part finite, the probes must follow the
-    registered schedule, and a budget stop is a hard fail."""
+    contiguous 1..N with EVERY configured loss part present and finite, the
+    probes must equal the complete registered schedule, and a budget stop is
+    a hard fail."""
     import math as _math
 
     import numpy as np
@@ -189,6 +190,12 @@ def _recompute_s0_verdict(summary: dict, history: list[dict],
     gates["loss_history_contiguous"] = (
         history_present and len(history) == steps
         and [h.get("step") for h in history] == list(range(1, steps + 1)))
+    # round-3 review fix 3: every configured loss part must EXIST in every
+    # row — checking only the fields that are present let a history shrunk
+    # to {step, gnorm} count as complete training evidence
+    required = (*w1.S0_REQUIRED_LOSS_KEYS, "gnorm")
+    gates["loss_fields_complete"] = bool(history) and all(
+        all(k in h for k in required) for h in history)
     # finiteness over EVERY measured value in each row, not just gnorm
     def _row_finite(h: dict) -> bool:
         for k, v in h.items():
@@ -210,14 +217,14 @@ def _recompute_s0_verdict(summary: dict, history: list[dict],
     gates["probe_errors_finite"] = bool(errs) and all(
         isinstance(e, (int, float)) and not isinstance(e, bool)
         and _math.isfinite(e) for e in errs)
-    # probe timing: step 0 first, strictly increasing, every later probe on
-    # the registered cadence, and the final training state was probed
+    # probe timing (round-3 review fix 5): the recorded steps must EQUAL the
+    # complete registered schedule up to the completed steps — increasing
+    # multiples of the cadence did not prove that no sample point was
+    # deleted (e.g. dropping the step-10 probe kept the gate green)
     psteps = [p.get("step") for p in probes]
-    gates["probe_schedule_valid"] = bool(psteps) and psteps[0] == 0 and all(
-        isinstance(s, int) and not isinstance(s, bool) for s in psteps
-    ) and all(b > a for a, b in zip(psteps, psteps[1:])) and all(
-        s % w1.S0_PROBE_EVERY == 0 for s in psteps[1:]
-    ) and psteps[-1] >= steps - w1.S0_PROBE_EVERY
+    expected_psteps = ([0] + list(range(w1.S0_PROBE_EVERY, steps + 1,
+                                        w1.S0_PROBE_EVERY)))
+    gates["probe_schedule_valid"] = psteps == expected_psteps
     if gates["probe_errors_finite"] and len(errs) >= 2 * w1.S0_TREND_WINDOW:
         first = float(np.mean(errs[:w1.S0_TREND_WINDOW]))
         last = float(np.mean(errs[-w1.S0_TREND_WINDOW:]))
@@ -231,8 +238,14 @@ def _recompute_s0_verdict(summary: dict, history: list[dict],
     return gates, reasons
 
 
+#: the fixed-probe error fields that must be finite and RECONCILED between
+#: the summary's trend evidence and the replay artifact (round-3 fix 2)
+PROBE_ERROR_FIELDS = ("pos", "rot6d", "joint", "motion_reconstruction")
+
+
 def _verify_checkpoint_deep(ckpt_path: Path, att_dir: Path, cache_dir: Path,
-                            model: str) -> tuple[list[str], dict | None]:
+                            model: str,
+                            summary: dict) -> tuple[list[str], dict | None]:
     """Actually REBUILD the modules and REPLAY the fixed probe (round-2
     review fix 2: torch.load only proved the container readable — cleared
     state dicts, NaN weights and doctored embedded statistics all passed).
@@ -240,7 +253,14 @@ def _verify_checkpoint_deep(ckpt_path: Path, att_dir: Path, cache_dir: Path,
     Catches: cleared/foreign weights (strict load fails or replay diverges),
     NaN weights (finiteness over every parameter), embedded root statistics
     differing from the cache, config/model-type mismatch, a missing or
-    foreign probe-replay artifact."""
+    foreign probe-replay artifact.
+
+    Round-3 review fixes 1+2: the replay INPUTS and OUTPUTS must be finite
+    BEFORE any tolerance comparison (``abs(NaN - rec) > tol`` is silently
+    False, so a NaN input laundered a pass), and the summary's LAST probe —
+    the value the trend gate was computed from — must equal the artifact's
+    recorded last probe (step and every error field), so a doctored summary
+    curve cannot coexist with a genuine checkpoint."""
     import math as _math
 
     import numpy as _np
@@ -256,6 +276,16 @@ def _verify_checkpoint_deep(ckpt_path: Path, att_dir: Path, cache_dir: Path,
     rp = torch.load(replay_path, map_location="cpu", weights_only=False)
     if rp.get("model_type") != model or rp.get("step") != ck.get("step"):
         problems.append("probe_replay_identity_mismatch")
+    # round-3 fix 1: finite replay INPUTS — a NaN x0/t/noise replays to NaN
+    # and the tolerance comparison below can never reject it
+    finite_inputs = True
+    for name, tensor in [("probe_t", rp.get("probe_t")),
+                         ("probe_noise", rp.get("probe_noise")),
+                         *((f"batch.{k}", v)
+                           for k, v in (rp.get("batch") or {}).items())]:
+        if torch.is_tensor(tensor) and not bool(torch.isfinite(tensor).all()):
+            problems.append(f"probe_replay_input_not_finite:{name}")
+            finite_inputs = False
     try:
         from ireset.train.trainer import TrainConfig
 
@@ -282,15 +312,40 @@ def _verify_checkpoint_deep(ckpt_path: Path, att_dir: Path, cache_dir: Path,
         return problems + ["checkpoint_weights_not_finite"], None
     err = w1_s0.run_fixed_probe(m, cond, rp["batch"], model,
                                 rp.get("probe_t"), rp.get("probe_noise"))
+    # round-3 fix 1: every replayed error must be finite BEFORE comparing
+    outputs_finite = all(
+        isinstance(v, (int, float)) and _math.isfinite(float(v))
+        for v in err.values())
+    if not outputs_finite:
+        problems.append("probe_replay_output_not_finite")
     recorded = rp.get("last_probe") or {}
     rec = recorded.get("motion_reconstruction")
     detail = {"replayed_probe": err, "recorded_last_probe": recorded}
-    if not (isinstance(rec, (int, float)) and _math.isfinite(float(rec))):
-        return problems + ["recorded_probe_error_missing"], detail
-    if abs(err["motion_reconstruction"] - float(rec)) > 1e-3 + 1e-3 * abs(float(rec)):
-        problems.append(
-            f"probe_replay_mismatch:{err['motion_reconstruction']:.3e}"
-            f"!={float(rec):.3e}")
+    recorded_finite = isinstance(recorded, dict) and all(
+        isinstance(recorded.get(k), (int, float))
+        and _math.isfinite(float(recorded.get(k)))
+        for k in PROBE_ERROR_FIELDS)
+    if not recorded_finite:
+        problems.append("recorded_probe_not_finite")
+    # round-3 fix 2: the summary's last probe IS the trend evidence — it
+    # must be the SAME measurement the artifact recorded (step + every
+    # error field; both serializations round-trip Python floats exactly)
+    s_probes = summary.get("probes") or []
+    s_last = s_probes[-1] if s_probes else None
+    if not isinstance(s_last, dict):
+        problems.append("summary_last_probe_missing")
+    elif recorded_finite:
+        if s_last.get("step") != recorded.get("step"):
+            problems.append("summary_last_probe_mismatch:step")
+        for k in PROBE_ERROR_FIELDS:
+            if s_last.get(k) != recorded.get(k):
+                problems.append(f"summary_last_probe_mismatch:{k}")
+    if recorded_finite and outputs_finite:
+        if (abs(err["motion_reconstruction"] - float(rec))
+                > 1e-3 + 1e-3 * abs(float(rec))):
+            problems.append(
+                f"probe_replay_mismatch:{err['motion_reconstruction']:.3e}"
+                f"!={float(rec):.3e}")
     return problems, detail
 
 
@@ -346,7 +401,7 @@ def check_c(run_root: Path, cache: dict | None, prereg: dict) -> dict:
                     ident_problems.append("checkpoint_step_mismatch")
                 if cache is not None:
                     deep_problems, deep_detail = _verify_checkpoint_deep(
-                        ckpt_path, att_dir, cache["dir"], model)
+                        ckpt_path, att_dir, cache["dir"], model, summary)
                     ident_problems += deep_problems
         reasons += [f"s0_{model}:{p}" for p in ident_problems]
         # the small set must COVER the registered pilot6 (round-2 review fix

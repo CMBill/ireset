@@ -371,6 +371,14 @@ def build_synthetic_world(tmp_path: Path, *, n_train: int = 2, n_val: int = 2,
     _append_index(run / "cache", {
         "attempt": "attempt_001",
         "identity": str((cache_dir / "cache_identity.json").relative_to(root))})
+    # the fixture cache attempt is pre-existing evidence: a real run root
+    # ALWAYS carries its ledger row (round-3 three-way reconciliation in
+    # precompute_m3_cache._historical_cache_cost_s refuses disk-without-
+    # ledger history)
+    (run / "costs.json").write_text(json.dumps({"invocations": [{
+        "timestamp": "2026-10-12T00:00:00",
+        "stage": "w1_cache", "attempt": "attempt_001",
+        "status": "done", "wall_s": 0.0}]}))
     return {"root": root, "run": run, "prereg_path": freeze / "preregistration.json",
             "manifest_path": audit_dir / "training_manifest.json",
             "cache_dir": cache_dir, "demos": demos, "train24": train24,

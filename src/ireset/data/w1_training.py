@@ -127,6 +127,12 @@ S0_MIN_STEPS = 100
 S0_PROBE_EVERY = 10
 S0_PROBE_MIN = 40
 S0_TREND_WINDOW = 20
+#: the loss parts the S0 training loop MUST record every step — exactly the
+#: parts LossAssembler emits under the W1 config (w_contact=0 silences the
+#: contact part, use_fk=True emits fk_m2); round-3 review fix 3: a history
+#: row shrunk to {step, gnorm} is missing evidence, not a complete one
+S0_REQUIRED_LOSS_KEYS = ("pos", "rot6d", "joint", "geodesic_rad2", "vel",
+                         "fk_m2", "total")
 
 
 # --- list selection (plan §3.1) -----------------------------------------------
