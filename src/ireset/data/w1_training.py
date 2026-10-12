@@ -401,6 +401,15 @@ def verify_cache_contents(cache_dir: Path, manifest: dict, prereg: dict,
     complete=true identity is a refusal, so a crash during the final
     registration cannot leave a consumable "complete" attempt behind even
     where the producer-side revocation itself failed.
+
+    Round-7 review fix: a ``running`` ledger row is an explicit
+    non-completion TOO — a SIGKILL between the index append and the final
+    ledger upsert leaves identity+index complete=true with the
+    allocation-time ``running`` row (no handler can run for an
+    uncapturable termination, so the crash revocation never fires), and
+    the producer's history leg already treats ``running`` residue as
+    unknown/stop — refusing only crashed/complete=false judged the SAME
+    row "stop" on one leg and "passed" on the other.
     """
     problems: list[str] = []
     root = Path(project_root)
@@ -425,6 +434,15 @@ def verify_cache_contents(cache_dir: Path, manifest: dict, prereg: dict,
     # identity is a refusal reason. (A row simply MISSING the complete flag
     # — legacy/fixture index rows — states nothing and is not a
     # contradiction.)
+    #
+    # round-7 review fix: ``running`` is an explicit non-completion as well
+    # — SIGKILL cannot be caught, so the crash handler's revocation never
+    # runs and the allocation-time ``running`` ledger row is the only
+    # witness that the final registration died; the producer's history leg
+    # (_historical_cache_cost_s) already stops on ``running`` residue, and
+    # a consumer that accepted it left the same row judged "stop" on one
+    # leg and "passed" on the other. (Rows merely MISSING status/complete —
+    # legacy ledger rows — still state nothing.)
     attempt_name = cache_dir.name
     idx_path = cache_dir.parent / integ.ATTEMPTS_INDEX
     if idx_path.is_file():
@@ -458,7 +476,7 @@ def verify_cache_contents(cache_dir: Path, manifest: dict, prereg: dict,
                 if (isinstance(e, dict)
                         and e.get("stage") == "w1_cache"
                         and e.get("attempt") == attempt_name
-                        and (e.get("status") == "crashed"
+                        and (e.get("status") in ("crashed", "running")
                              or e.get("complete") is False)
                         and ident.get("complete") is True):
                     problems.append(

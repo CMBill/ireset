@@ -97,6 +97,19 @@ Review round 6 (2 P2):
             crash exit now revokes the completion marks in place AND the
             consumer refuses three-way contradictions (explicit
             incomplete/crashed index or ledger leg vs complete identity).
+
+Review round 7 (1 P2):
+
+* r7-1 (P2) the round-6 consumer leg refused only ``crashed``/complete=
+            false ledger rows — a SIGKILL between the index append and
+            the final ledger upsert leaves identity+index complete=true
+            with the allocation-time ``running`` row (no handler can run
+            for an uncapturable termination), the producer's history leg
+            already stops on ``running`` residue, yet the consumer
+            passed: the same ledger row was judged "stop" on one leg and
+            "passed" on the other. ``running`` is now part of the
+            explicit-non-completion set; rows merely MISSING status/
+            complete (legacy shape) still state nothing.
 """
 
 from __future__ import annotations
@@ -2044,3 +2057,169 @@ def test_crash_during_final_registration_revokes_complete_marks(
     problems = w1.verify_cache_contents(att, manifest, prereg, world["root"])
     assert any(p.startswith("cache_index_contradicts_identity")
                for p in problems["problems"]), problems["problems"]
+
+
+def test_sigkill_before_final_ledger_write_running_row_refused(
+        tmp_path, monkeypatch):
+    """r7-1: SIGKILL cannot be caught, so the r6 crash revocation never
+    runs — a child killed between the index append and the final ledger
+    upsert leaves identity+index complete=true with the allocation-time
+    ``running`` ledger row. The producer's history leg already treats the
+    residue as unknown/stop; the consumer must refuse it too instead of
+    judging the SAME row "stop" on one leg and "passed" on the other.
+
+    The kill is REAL: the cache stage runs in a spawned child whose final
+    complete-true ledger write stalls, and the parent SIGKILLs it once
+    identity+index are complete on disk."""
+    import subprocess
+
+    import precompute_m3_cache as pc
+
+    world = build_synthetic_world(tmp_path, n_train=2, n_val=2, T=90)
+    _patch_paths(monkeypatch, world)
+    monkeypatch.setattr(pc, "PROJECT_ROOT", world["root"])
+    monkeypatch.setattr(pc, "TEACHER_TRAJ_DIR", world["npz_dir"])
+    monkeypatch.setattr(pc, "OMOMO_NEW_DIR", world["pt_dir"])
+    out_root = world["run"] / "cache"
+
+    # the child replicates the in-process patches (no monkeypatch across
+    # the process boundary) and STALLS inside the final complete-true
+    # costs.json write — the only write filtered, exactly as in the r6
+    # OSError repro
+    driver = tmp_path / "kill_driver.py"
+    driver.write_text(
+        "import sys, time\n"
+        "from pathlib import Path\n"
+        "repo, root, npz_dir, pt_dir, manifest, out_dir = "
+        "(Path(a) for a in sys.argv[1:7])\n"
+        "sys.path.insert(0, str(repo / 'src'))\n"
+        "sys.path.insert(0, str(repo / 'scripts'))\n"
+        "import ireset.paths as paths_mod\n"
+        "import ireset.data.a2_integrity as integ\n"
+        "import ireset.data.windows as windows_mod\n"
+        "import ireset.data.w1_training as w1m\n"
+        "import precompute_m3_cache as pcm\n"
+        "paths_mod.PROJECT_ROOT = root\n"
+        "paths_mod.TEACHER_TRAJ_DIR = npz_dir\n"
+        "paths_mod.OMOMO_NEW_DIR = pt_dir\n"
+        "windows_mod.TEACHER_TRAJ_DIR = npz_dir\n"
+        "integ.DERIVED_DIR = root / 'derived'\n"
+        "pcm.PROJECT_ROOT = root\n"
+        "pcm.TEACHER_TRAJ_DIR = npz_dir\n"
+        "pcm.OMOMO_NEW_DIR = pt_dir\n"
+        "w1m.CACHE_BUDGET_S = 5.0\n"
+        "real_write = Path.write_text\n"
+        "def stalled_write(self, data, *a, **k):\n"
+        "    if self.name == 'costs.json' and '\"complete\": true' in data:\n"
+        "        time.sleep(600.0)  # the parent SIGKILLs during this stall\n"
+        "    return real_write(self, data, *a, **k)\n"
+        "Path.write_text = stalled_write\n"
+        "sys.argv = ['prog', '--training-manifest', str(manifest),\n"
+        "            '--out-dir', str(out_dir), '--workers', '1']\n"
+        "raise SystemExit(pcm.main())\n")
+    child_log = tmp_path / "child.log"
+    with open(child_log, "w") as log_fh:
+        proc = subprocess.Popen(
+            [sys.executable, str(driver), str(REPO), str(world["root"]),
+             str(world["npz_dir"]), str(world["pt_dir"]),
+             str(world["manifest_path"]), str(out_root)],
+            cwd=str(REPO), stdout=log_fh, stderr=subprocess.STDOUT)
+
+    def _residue():
+        atts = sorted(out_root.glob("attempt_*"))
+        if not atts:
+            return None
+        att = atts[-1]
+        ident_p = att / "cache_identity.json"
+        idx_p = out_root / "attempts_index.json"
+        costs_p = world["run"] / "costs.json"
+        if not (ident_p.is_file() and idx_p.is_file() and costs_p.is_file()):
+            return None
+        try:
+            ident = json.loads(ident_p.read_text())
+            idx = json.loads(idx_p.read_text())
+            costs = json.loads(costs_p.read_text())
+        except ValueError:               # mid-write partial file, poll again
+            return None
+        rows = [a for a in idx.get("attempts", [])
+                if a.get("attempt") == att.name]
+        led = [e for e in costs.get("invocations", [])
+               if e.get("stage") == "w1_cache"
+               and e.get("attempt") == att.name]
+        if (ident.get("complete") is True and len(rows) == 1
+                and rows[0].get("complete") is True
+                and len(led) == 1 and led[0].get("status") == "running"):
+            return att, led[0]
+        return None
+
+    # wait until identity AND the index row say complete=true while the
+    # ledger still holds the allocation-time running row — from there the
+    # child is stalled at (never past) the final ledger write
+    att = None
+    poll_deadline = time.time() + 300.0
+    while time.time() < poll_deadline:
+        if proc.poll() is not None:
+            tail = child_log.read_text()[-2000:]
+            pytest.fail(f"child exited before stalling "
+                        f"(rc={proc.returncode}):\n{tail}")
+        got = _residue()
+        if got is not None:
+            att = got[0]
+            break
+        time.sleep(0.2)
+    assert att is not None, "stall state never reached"
+    time.sleep(2.0)                      # firmly inside the 600 s stall
+    proc.kill()
+    proc.wait()
+
+    # the reviewer's residue, reproduced through the REAL producer path:
+    # the uncapturable termination left the completion marks unrevoke…
+    ident = json.loads((att / "cache_identity.json").read_text())
+    assert ident["complete"] is True
+    idx = json.loads(
+        (out_root / "attempts_index.json").read_text())["attempts"]
+    rows = [a for a in idx if a.get("attempt") == att.name]
+    assert len(rows) == 1 and rows[0]["complete"] is True
+    ledger = json.loads(
+        (world["run"] / "costs.json").read_text())["invocations"]
+    row = next(e for e in ledger
+               if e.get("stage") == "w1_cache" and e.get("attempt") == att.name)
+    assert row["status"] == "running"    # allocation-time row, never updated
+    assert row["wall_s"] == 0.0 and row["n_schedules"] == 0
+
+    # the producer's history leg already stops on the residue (r3-8):
+    # the budget spent on the killed attempt is UNKNOWN, not zero
+    assert pc._historical_cache_cost_s(out_root) is None
+
+    # the consumer must refuse the same row (round-7 fix) — pre-fix it
+    # passed while the identity claims complete
+    manifest = json.loads(world["manifest_path"].read_text())
+    prereg = json.loads(world["prereg_path"].read_text())
+    problems = w1.verify_cache_contents(att, manifest, prereg, world["root"])
+    assert "cache_ledger_contradicts_identity:running" in problems["problems"], \
+        problems["problems"]
+    assert not any(p.startswith("cache_not_complete")
+                   for p in problems["problems"]), problems["problems"]
+
+    # legacy compatibility: a ledger row merely MISSING status/complete —
+    # or saying status done without a complete flag — states nothing and
+    # is not a contradiction (the fixture/legacy shape)
+    row.pop("complete", None)
+    row.pop("status", None)              # minimal legacy row: no declaration
+    (world["run"] / "costs.json").write_text(
+        json.dumps({"invocations": ledger}, indent=2))
+    problems = w1.verify_cache_contents(att, manifest, prereg, world["root"])
+    assert not any(
+        p.startswith(("cache_ledger_contradicts_identity",
+                      "cache_index_contradicts_identity",
+                      "cache_not_complete"))
+        for p in problems["problems"]), problems["problems"]
+    row["status"] = "done"               # fixture legacy shape: done, no flag
+    (world["run"] / "costs.json").write_text(
+        json.dumps({"invocations": ledger}, indent=2))
+    problems = w1.verify_cache_contents(att, manifest, prereg, world["root"])
+    assert not any(
+        p.startswith(("cache_ledger_contradicts_identity",
+                      "cache_index_contradicts_identity",
+                      "cache_not_complete"))
+        for p in problems["problems"]), problems["problems"]
