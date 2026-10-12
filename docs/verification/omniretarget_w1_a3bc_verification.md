@@ -287,7 +287,7 @@ gap、质量存在性九反例+合法零参考侧）。
    被调方（distance_adapter），几何回退不触发 re-key；清单按 import 闭包而非按"谁定义协议"
    圈定。
 
-## 5R3. 第三轮审阅修复轮（2026-10-12，提交 `027cb3e`；§5R2 的就绪判断与 A3/cache/S0 权威产物自此被本轮取代——8 项修复本身继续有效）
+## 5R3. 第三轮审阅修复轮（2026-10-12，提交 `027cb3e`；§5R2 的就绪判断与 A3/cache/S0 权威产物自此被本轮取代——8 项修复本身继续有效；本轮权威链又被 §5R4 取代，且本节"CPU 重放与末探逐位相等"表述已按第四轮审阅订正）
 
 独立复跑确认 §5R2 权威链数值成立（57 项 W1 测试+60 项回归、4,351 帧统计、重放输入、
 扩散 t/noise 逐位一致，双模型重放误差 ≈0.01150036/0.00872141，S0 成本 2558.9s），但另发现
@@ -368,12 +368,85 @@ s0_diff 1362.4 done/readiness 13.8）。测试 621→**628 passed + 1 skipped**�
 6. **崩溃窗口靠事前登记关闭**：attempt 分配到退出登记之间的崩溃只能靠"先写 running 行"
    兜底；历史核验按盘×索引×台账三方集合相等，"未知"必须是停止条件而非零。
 
+## 5R4. 第四轮审阅修复轮（2026-10-12，提交 `05b3f6e`；§5R3 的就绪判断与 A3/cache/S0 权威产物自此被本轮取代——§5R3 的 8 项修复与事实全部继续有效，仅"逐位相等"表述订正）
+
+复核确认当前权威链五门通过、S0 结果成立（独立执行 87 项相关测试全过；真实工件的六段
+输入、扩散 t/noise、训练统计均已复核正确，未触发本轮缺口），但另发现 **3 项代码缺口
+（1 P1+2 P2）+1 处文档表述失实**，全部修复：
+
+- **P1-r4-1 实际重放输入绑定注册六段**（`w1_readiness`：新 `_rebuild_small_probe_batch`
+  +`check_c` 接线）：原只核对 summary **声明**的六段名单与 batch_size——真实工件副本中
+  batch 缩为一段、按篡改输入诚实重算误差并同步 summary/工件双末探、保留六段声明，
+  check_c 仍 passed。现从**当前**注册名单×training manifest×键控缓存重建六个首窗（数据集
+  切片是确定性的纯缓存读取，精确相等是判据），与 probe_replay.pt 实际 batch 逐键
+  dtype/shape/torch.equal 对账（缩段/换段/内容篡改均拒，`probe_replay_batch_differs:*`）；
+  扩散 probe_t/probe_noise 以 checkpoint 配置的 val_seed-or-seed 专用生成器**同式复现**
+  （randint 后 randn 同一流）逐位对账，换 t 重算并同步双末探同被逮
+  （`probe_t_not_the_registered_generator_draw`）；重建失败（pilot 段未准入/不在数据集）
+  本身记 unready 而非跳过绑定。
+- **P2-r4-2 异常重放证据不崩溃**（`_verify_checkpoint_deep`）：r3-1 只加了有限性标记，
+  检测到非有限输入后仍继续执行重放——扩散 probe_t 含 NaN 抛未捕获 IndexError、缺
+  t/noise、重放文件不可读各自使 readiness 以异常退出、写不出未就绪报告。现工件
+  torch.load 捕获记 `probe_replay_unreadable:<Exc>`、非映射记 `probe_replay_not_a_mapping`；
+  结构验证（batch 为非空全张量 dict 且含 x0、扩散 t/noise 为张量且形状与 batch 匹配）
+  先于重放；无效或非有限输入**不执行重放**只记原因（`replayed_probe=None`）；重放调用
+  本身亦捕获（`probe_replay_failed:<Exc>`）。
+- **P2-r4-3 缓存最终登记受截止约束**（`precompute_m3_cache._run_w1_attempt`）：r3-6 的
+  最后一次 deadline 检查停在统计阶段——identity 构造内的 manifest/root_stats 哈希与其后
+  的写盘登记没有检查，1s 预算在最终 manifest 哈希阶段延迟 1.2s 仍 exit 0/complete=true/
+  consumed_s 超限、消费侧亦通过。现 identity 构造（含全部最终哈希）之后、写盘登记之前
+  再查 deadline，超限走同一 incomplete 登记（complete:false+`cache_budget_exhausted`+
+  consumed_s 入册+exit 2；全部行已落时 missing_demos 如实为空——仅预算超限，root_stats
+  已算但尝试不可消费）。
+- **r4-4 文档订正**：§5R3 与 AGENTS 原"CPU 重放与记录末探**逐位相等**"表述失实——权威
+  记录中确定性 CPU 重放 0.011500352993607521 vs 记录末探 0.011500352062284946（差
+  9.3e-10）、扩散 0.008721409365534782 vs 0.008721405640244484（差 3.7e-9），均在
+  1e-3+1e-3·|rec| 容差内一致；**逐位相等**的只是 summary 与 artifact 两种序列化的记录值
+  本身（r3-2 对账门的实证对象）。两处已在实现提交内订正。
+
+**新权威链** `derived/experiments/omniretarget_first/20261012_05b3f6e_w1_a3bc_reviewfix5/
+w1_reviewfix5/`（干净树 05b3f6e；§5R3 链保留为被取代证据）：W0 2.4s；A3 attempt_001
+PASS（55/55 准入、denominator kept at 55，67.5s）；cache attempt_001（complete:true、
+consumed 52.5s/7200s、55 键控日程——与 §5R3 轮文件名 55/55 重叠且**内容逐位一致**：本轮
+只改 scripts/ 两文件、均非 CONDITION_CODE_FILES，condition_code_sha256 不变
+（86781b47…）=**无 re-key，属预期**——内容寻址键在同代码身份下必然复现，S0 probe 曲线
+逐位相等是同一事实的独立佐证）；S0 双模型各 1000 步 PASS——确定性 1367.1s 趋势
+0.394223→0.013504、扩散 1376.8s 趋势 0.428729→0.011308（两模型 101 probe 曲线与 §5R3 轮
+**逐位相等**=绑定/异常安全/登记截止改动不触训练数值）、probe 101=完整日程 0..1000、S0
+合计 2744.0s≤3600s；readiness `decisions/attempt_001` 五门全 true、unmet=[]、两模型
+identity_problems **空**——新增绑定腿在真实证据上通过（六首窗重建逐位相等、t/noise
+生成器复现逐位相等）、CPU 重放 0.011500352993607521/0.008721409365534782 与记录末探
+容差内一致（重放值与 §5R3 轮亦逐位相等）。台账 6 行齐且每 attempt 恰一行（w0 2.4/
+a3 67.5/cache 53.5 done complete:true/s0_det 1367.1 done/s0_diff 1376.8 done/
+readiness 14.1）。测试 628→**632 passed + 1 skipped**（审阅文件 30→34 项：内容篡改+
+换段 batch 均按篡改输入诚实重算并同步双末探、换 t 同式重算同步、NaN probe_t/缺 t/
+不可读工件/非映射工件四形态只记原因不崩溃且 `replayed_probe=None`、最终 manifest 哈希
+阶段 6s 延迟超 5s 预算登记 incomplete+missing_demos 空如实+消费侧拒；r3-1 断言随"无效
+输入不重放"更新——不再出现 output_not_finite）。
+
+工程事实（本轮新增）：
+1. **声明与载荷必须分别绑定**：核验"用了哪六段"若只读 summary 声明（名单+batch_size），
+   篡改者保留声明、替换载荷、按新载荷诚实重算并同步双末探即可全绿——载荷必须从注册
+   名单×manifest×缓存**重建**后与工件精确对账；确定性切片（纯缓存读取）使精确相等可用。
+2. **随机输入的"注册"=生成器同式复现**：扩散 t/noise 无法从内容判断来源，唯一绑定是按
+   生产侧同式（val_seed-or-seed 专用生成器、randint 后 randn 同一流）复现后逐位比较；
+   val_seed 本身须与 checkpoint 配置对账（同一次 `.to(device)` 往返不改比特）。
+3. **"检测到坏证据"必须改变控制流**：给坏输入打标记、仍按原路径执行，等于把异常处理
+   让给坏数据本身（NaN t 以 IndexError 逃出、报告写不出）；结构/有限性验证前置的目的是
+   让无效输入**不进入**被验证的执行，而非给执行结果多打一个标。
+4. **"最后检查点"之后永远还有工作**：预算检查停在统计阶段时，其后仍有 identity 构造
+   （哈希是最容易被忽略的重活）与写盘登记；检查必须贴着每一阶段边界，最终哈希后、
+   写盘前是最后一个可判定的位置。
+5. **容差判定与逐位对账必须区分对象**：summary↔artifact（同一次运行的两种序列化）是
+   精确相等；CPU 重放↔记录值（跨进程重算）必有浮点差、只能称容差内一致——把后者写成
+   "逐位相等"是登记失实，本轮第 4 项即为此类订正。
+
 ## 6. 就绪判断与后续边界（§10）
 
-【本节首段就绪指针已被 §5R3 第三轮审阅修复轮取代——权威就绪记录为
-`20261012_027cb3e_w1_a3bc_reviewfix4/w1_reviewfix4/decisions/attempt_001/w1_readiness.json`
-（五门全 true，check_c 为重算门+checkpoint 重建重放门+summary/工件末探对账门）；本节
-其余边界表述继续有效】
+【本节首段就绪指针已被 §5R4 第四轮审阅修复轮取代——权威就绪记录为
+`20261012_05b3f6e_w1_a3bc_reviewfix5/w1_reviewfix5/decisions/attempt_001/w1_readiness.json`
+（五门全 true，check_c 为重算门+checkpoint 重建重放门+summary/工件末探对账门+注册集
+重建绑定门）；本节其余边界表述继续有效】
 `decisions/attempt_001/w1_readiness.json`：五门全 true、unmet=[]。就绪由事实重算
 （A3 行复算、缓存身份对账、双数据集真实构建、S0 门读取）；exit 0=记录完成。
 
