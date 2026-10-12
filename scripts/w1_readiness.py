@@ -318,7 +318,13 @@ def _verify_checkpoint_deep(ckpt_path: Path, att_dir: Path, cache_dir: Path,
     round-4 gate marked a non-dict batch invalid but the finiteness loop
     still called ``.items()`` on it (AttributeError), a scalar x0 reached
     the diffusion shape check whose ``.shape[0]`` raised IndexError, and a
-    non-mapping last_probe raised AttributeError on ``.get``."""
+    non-mapping last_probe raised AttributeError on ``.get``.
+
+    Round-6 review fix 1: sanitization never evaluates truthiness on the
+    RAW artifact value first — ``rp.get("last_probe") or {}`` bools a
+    multi-element Tensor/ndarray (RuntimeError/ValueError) before the
+    isinstance check could run; the type is now judged on the untouched
+    value."""
     import math as _math
 
     import numpy as _np
@@ -445,11 +451,18 @@ def _verify_checkpoint_deep(ckpt_path: Path, att_dir: Path, cache_dir: Path,
         if torch.is_tensor(tensor) and not bool(torch.isfinite(tensor).all()):
             problems.append(f"probe_replay_input_not_finite:{name}")
             finite_inputs = False
-    recorded = rp.get("last_probe") or {}
-    if not isinstance(recorded, dict):
-        # a non-empty list/scalar last_probe is a reason, never an
-        # AttributeError from .get — the sanitized value keeps the report
-        # path alive and recorded_finite below reports the missing fields
+    recorded = rp.get("last_probe")
+    if recorded is None or isinstance(recorded, dict):
+        # dict truthiness is unambiguous — an empty dict sanitizes to {}
+        recorded = recorded or {}
+    else:
+        # round-6 review fix 1: the raw value is type-checked BEFORE any
+        # truthiness — ``rp.get(...) or {}`` evaluated bool() first, so a
+        # multi-element Tensor/ndarray last_probe raised RuntimeError/
+        # ValueError out of the readiness script before any report was
+        # written. A non-mapping is a reason, never a crash; the sanitized
+        # {} keeps the report path alive and recorded_finite below reports
+        # the missing fields
         problems.append("recorded_probe_not_a_mapping")
         recorded = {}
     rec = recorded.get("motion_reconstruction")

@@ -181,30 +181,77 @@ def _register_crashed_cache_attempt(out_root: Path, attempt_dir: Path,
     """Honest incomplete registration for a crashed cache attempt (round-3
     review fix 8): a minimal identity, an index row and a ``crashed`` ledger
     row — the attempt stays visible and its wall stays accounted, so the
-    budget history remains KNOWABLE instead of washing to zero."""
+    budget history remains KNOWABLE instead of washing to zero.
+
+    Round-6 review fix 2: the crash can land AFTER the complete registration
+    already wrote the identity and the index row (e.g. the final ledger
+    write itself failing). Those rows used to be left untouched — the disk
+    said complete=true while the ledger said crashed, and consumers trusting
+    the identity file accepted the attempt. Existing completion marks are
+    now REVOKED IN PLACE (an already-incomplete identity stays untouched);
+    a failed revocation still lands the crashed ledger row, and the
+    consumer-side three-way contradiction check refuses the leftover."""
+    reason = f"crashed:{type(exc).__name__}"
     ident_path = attempt_dir / "cache_identity.json"
-    if not ident_path.is_file():
-        ident_path.write_text(json.dumps({
+    ident: dict | None = None
+    leave_untouched = False
+    if ident_path.is_file():
+        try:
+            loaded = json.loads(ident_path.read_text())
+        except Exception:              # noqa: BLE001 -- truncated final write
+            loaded = None
+        if isinstance(loaded, dict) and loaded.get("complete") is False:
+            leave_untouched = True     # already honest (budget-stopped)
+        elif isinstance(loaded, dict):
+            ident = loaded             # claims complete: revoke in place
+    if not leave_untouched:
+        base = ident if ident is not None else {
             "protocol": w1.MOTION_PROTOCOL_VERSION,
             "experiment_id": w1.EXPERIMENT_ID,
             "attempt": attempt_dir.name,
             "timestamp": _dt.datetime.now().isoformat(timespec="seconds"),
-            "complete": False,
-            "incomplete_reason": f"crashed:{type(exc).__name__}",
-        }, indent=2, ensure_ascii=False))
+        }
+        try:
+            ident_path.write_text(json.dumps({
+                **base,
+                "complete": False,
+                "incomplete_reason": reason,
+                **({"revoked_after_crash": True} if ident is not None else {}),
+            }, indent=2, ensure_ascii=False))
+        except Exception:              # noqa: BLE001 -- ledger row still lands
+            pass
     idx_path = out_root / integ.ATTEMPTS_INDEX
-    indexed = ({a.get("attempt")
-                for a in json.loads(idx_path.read_text())["attempts"]}
-               if idx_path.is_file() else set())
-    if attempt_dir.name not in indexed:
+    row_state = "absent"               # absent | honest | complete
+    if idx_path.is_file():
+        try:
+            rows = json.loads(idx_path.read_text()).get("attempts", [])
+        except Exception:              # noqa: BLE001 -- treat as absent
+            rows = []
+        for a in rows:
+            if isinstance(a, dict) and a.get("attempt") == attempt_dir.name:
+                row_state = ("honest" if a.get("complete") is False
+                             else "complete")
+                break
+    if row_state == "absent":
         integ.append_attempts_index(out_root, {
             "attempt": attempt_dir.name, "complete": False,
-            "incomplete_reason": f"crashed:{type(exc).__name__}",
+            "incomplete_reason": reason,
             "identity": path_for_record(ident_path),
         })
+    elif row_state == "complete":
+        # the complete registration already indexed this attempt — flip its
+        # row in place (never a second row for one attempt); SystemExit from
+        # a duplicate-row refusal is swallowed here too: the crashed ledger
+        # row must still land
+        try:
+            _replace_index_row(out_root, attempt_dir.name, {
+                "complete": False, "incomplete_reason": reason,
+            })
+        except BaseException:          # noqa: BLE001 -- see above
+            pass
     _upsert_cost(out_root.parent, "w1_cache", attempt_dir.name, wall,
                  {"complete": False,
-                  "incomplete_reason": f"crashed:{type(exc).__name__}"},
+                  "incomplete_reason": reason},
                  status="crashed")
 
 

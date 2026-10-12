@@ -394,6 +394,13 @@ def verify_cache_contents(cache_dir: Path, manifest: dict, prereg: dict,
     hashes + the CURRENT condition code + assets, and reconciles the stats
     identity (file list, frame count) with the admitted train rows. Any
     drift, missing leg or unprovable cost history is a refusal reason.
+
+    Round-6 review fix 2: the attempt's three-way state (identity ×
+    attempts index × cost ledger) is reconciled for CONTRADICTIONS — an
+    explicitly incomplete/crashed index or ledger leg against a
+    complete=true identity is a refusal, so a crash during the final
+    registration cannot leave a consumable "complete" attempt behind even
+    where the producer-side revocation itself failed.
     """
     problems: list[str] = []
     root = Path(project_root)
@@ -408,6 +415,55 @@ def verify_cache_contents(cache_dir: Path, manifest: dict, prereg: dict,
     # the consumer side refuses it
     if ident.get("complete") is not True:
         problems.append(f"cache_not_complete:{ident.get('incomplete_reason')}")
+
+    # round-6 review fix 2: the attempt's three-way state must not CONTRADICT
+    # — a crash during the final registration could leave the identity
+    # (and/or index row) saying complete=true while the ledger row says
+    # crashed. The producer's crash handler revokes in place, but the
+    # revocation itself can fail, so the contradiction is ALSO refused at
+    # consumption: an explicitly-false/crashed leg against a complete
+    # identity is a refusal reason. (A row simply MISSING the complete flag
+    # — legacy/fixture index rows — states nothing and is not a
+    # contradiction.)
+    attempt_name = cache_dir.name
+    idx_path = cache_dir.parent / integ.ATTEMPTS_INDEX
+    if idx_path.is_file():
+        try:
+            idx_rows = json.loads(idx_path.read_text()).get("attempts", [])
+        except Exception:              # noqa: BLE001 -- fail closed
+            idx_rows = None
+        if idx_rows is None:
+            problems.append("cache_attempts_index_unreadable")
+        else:
+            for row in idx_rows:
+                if (isinstance(row, dict)
+                        and row.get("attempt") == attempt_name
+                        and (row.get("complete") is False
+                             or row.get("incomplete_reason"))
+                        and ident.get("complete") is True):
+                    problems.append(
+                        "cache_index_contradicts_identity:"
+                        f"{row.get('incomplete_reason')}")
+    costs_path = cache_dir.parent.parent / "costs.json"
+    if costs_path.is_file():
+        try:
+            ledger_rows = json.loads(
+                costs_path.read_text()).get("invocations", [])
+        except Exception:              # noqa: BLE001 -- fail closed
+            ledger_rows = None
+        if ledger_rows is None:
+            problems.append("cache_ledger_unreadable")
+        else:
+            for e in ledger_rows:
+                if (isinstance(e, dict)
+                        and e.get("stage") == "w1_cache"
+                        and e.get("attempt") == attempt_name
+                        and (e.get("status") == "crashed"
+                             or e.get("complete") is False)
+                        and ident.get("complete") is True):
+                    problems.append(
+                        "cache_ledger_contradicts_identity:"
+                        f"{e.get('status')}")
 
     if ident.get("protocol") != MOTION_PROTOCOL_VERSION:
         problems.append("cache_protocol_mismatch")
