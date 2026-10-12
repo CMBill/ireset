@@ -62,6 +62,25 @@ Review round 4 (1 P1 + 2 P2 + 1 doc correction):
 * r4-3 (P2) the cache's FINAL identity hashing and registration writes sat
             after the last deadline check — a slow manifest hash there
             still registered complete=true with consumed_s over budget.
+
+Review round 5 (3 P2):
+
+* r5-1 (P2) the round-4 structural gate marked invalid evidence but still
+            READ the fields — a non-empty list batch hit ``.items()``
+            (AttributeError), a scalar x0 hit the diffusion shape check's
+            ``.shape[0]`` (IndexError) and a non-empty list last_probe hit
+            ``.get`` (AttributeError): each crashed the readiness script
+            instead of returning an unready reason;
+* r5-2 (P2) the round-4 first-window rebuild was not exception-safe — with
+            one schedule cache file missing, check_b returned unready but
+            check_c re-constructed the same dataset and the exception
+            escaped BEFORE any readiness report could be written;
+* r5-3 (P2) the round-4 deadline check sat BEFORE the registration writes
+            — a slow identity WRITE still registered complete=true/exit 0
+            with a stale consumed_s while the ledger alone recorded the
+            real wall; the final registration (identity + index + ledger)
+            is now itself the last checked phase and an overrun flips the
+            SAME rows to incomplete with the measured elapsed.
 """
 
 from __future__ import annotations
@@ -1737,6 +1756,141 @@ def test_cache_final_registration_overrun_is_incomplete(tmp_path, monkeypatch):
     # FINAL hashing overran, so missing_demos is honestly empty
     assert ident["missing_demos"] == []
     assert (att / "root_stats.npz").is_file()    # stats phase did complete
+    manifest = json.loads(world["manifest_path"].read_text())
+    prereg = json.loads(world["prereg_path"].read_text())
+    problems = w1.verify_cache_contents(att, manifest, prereg, world["root"])
+    assert any("cache_not_complete" in p for p in problems["problems"])
+
+
+# --- round-5 fixes 1-3: nested-container validation, rebuild exception
+# safety, final-registration budget -------------------------------------------
+
+def test_nested_replay_containers_are_validated_not_crashed(tmp_path, monkeypatch):
+    """r5-1: the round-4 structural gate marked invalid evidence but still
+    READ the fields — a non-empty list batch hit ``.items()``, a scalar x0
+    hit the diffusion shape check's ``.shape[0]`` and a non-empty list
+    last_probe hit ``.get``: three crash paths out of the readiness script
+    instead of unready reasons."""
+    rd, world, cache, prereg = _readiness_fixture(tmp_path, monkeypatch)
+
+    att, _ = _run_real_s0_attempt(world, "diffusion", steps=24)
+    base = torch.load(att / "probe_replay.pt", map_location="cpu",
+                      weights_only=False)
+
+    # (a) non-empty list batch — flagged invalid AND the finiteness loop
+    # must not call .items() on a list
+    torch.save({**base, "batch": [1, 2, 3]}, att / "probe_replay.pt")
+    r = rd.check_c(world["run"], cache, prereg)          # must not raise
+    probs = r["per_model"]["diffusion"]["identity_problems"]
+    assert "probe_replay_input_invalid:batch" in probs, probs
+    assert r["per_model"]["diffusion"]["checkpoint_replay"][
+        "replayed_probe"] is None                        # never replayed
+    assert not r["passed"]
+
+    # (b) scalar x0 — a tensor with no batch dimension; the diffusion
+    # shape check must not read .shape[0] on it
+    torch.save({**base, "batch": {**base["batch"],
+                                  "x0": torch.tensor(1.0)}},
+               att / "probe_replay.pt")
+    r = rd.check_c(world["run"], cache, prereg)          # must not raise
+    probs = r["per_model"]["diffusion"]["identity_problems"]
+    assert "probe_replay_input_invalid:batch.x0_ndim" in probs, probs
+    assert r["per_model"]["diffusion"]["checkpoint_replay"][
+        "replayed_probe"] is None
+    assert not r["passed"]
+
+    # (c) non-empty list last_probe — .get must never run on a list
+    torch.save({**base, "last_probe": [1, 2, 3]}, att / "probe_replay.pt")
+    r = rd.check_c(world["run"], cache, prereg)          # must not raise
+    probs = r["per_model"]["diffusion"]["identity_problems"]
+    assert "recorded_probe_not_a_mapping" in probs, probs
+    assert "recorded_probe_not_finite" in probs, probs  # sanitized to {}
+    assert not r["passed"]
+
+    # honest regression: the genuine artifact still verifies cleanly
+    att, _ = _run_real_s0_attempt(world, "diffusion", steps=24)
+    r = rd.check_c(world["run"], cache, prereg)
+    probs = r["per_model"]["diffusion"]["identity_problems"]
+    assert not [p for p in probs if "probe_replay_input_invalid" in p
+                or "recorded_probe_not" in p], probs
+
+
+def test_probe_batch_rebuild_failure_is_a_reason_not_a_crash(
+        tmp_path, monkeypatch):
+    """r5-2: with one schedule cache file missing, check_b correctly
+    returned unready, but check_c's round-4 rebuild re-constructed the
+    same dataset and the exception escaped before any readiness report
+    could be written — a rebuild failure must be an explicit reason."""
+    rd, world, cache, prereg = _readiness_fixture(tmp_path, monkeypatch)
+    att, _ = _run_real_s0_attempt(world, "deterministic", steps=24)
+
+    schedules = sorted((world["cache_dir"] / "schedules").glob("*"))
+    assert schedules
+    schedules[0].unlink()
+
+    b = rd.check_b(world["run"], cache)
+    assert not b["passed"]                    # B gate fails honestly
+    assert any("schedule_file_missing" in p for p in b["reasons"]), b
+
+    c = rd.check_c(world["run"], cache, prereg)          # must not raise
+    assert not c["passed"]
+    probs = c["per_model"]["deterministic"]["identity_problems"]
+    assert any(p.startswith("probe_batch_rebuild:rebuild_failed:")
+               for p in probs), probs
+    assert "probe_replay_batch_rebuild_failed" in probs, probs
+
+
+def test_cache_final_write_overrun_is_incomplete(tmp_path, monkeypatch):
+    """r5-3: the round-4 check sat BEFORE the registration writes — a slow
+    identity WRITE (after every checked phase) still registered
+    complete=true/exit 0 with identity consumed_s ≈ 0 while the ledger
+    alone recorded the real wall."""
+    import precompute_m3_cache as pc
+
+    world = build_synthetic_world(tmp_path, n_train=2, n_val=2, T=90)
+    _patch_paths(monkeypatch, world)
+    monkeypatch.setattr(pc, "PROJECT_ROOT", world["root"])
+    monkeypatch.setattr(pc, "TEACHER_TRAJ_DIR", world["npz_dir"])
+    monkeypatch.setattr(pc, "OMOMO_NEW_DIR", world["pt_dir"])
+    out_root = world["run"] / "cache"
+    argv = ["prog", "--training-manifest", str(world["manifest_path"]),
+            "--out-dir", str(out_root), "--workers", "1"]
+    monkeypatch.setattr("sys.argv", argv)
+    monkeypatch.setattr(w1, "CACHE_BUDGET_S", 5.0)
+
+    # delay the FIRST cache_identity.json write — exactly the complete
+    # registration; the final re-check AFTER all registration work must
+    # catch the overrun and flip the same rows to incomplete
+    real_write = Path.write_text
+    state = {"armed": True}
+
+    def slow_identity_write(self, data, *a, **k):
+        if state["armed"] and self.name == "cache_identity.json":
+            state["armed"] = False
+            time.sleep(6.0)
+        return real_write(self, data, *a, **k)
+
+    monkeypatch.setattr(Path, "write_text", slow_identity_write)
+
+    assert pc.main() == 2
+    att = sorted(out_root.glob("attempt_*"))[-1]
+    ident = json.loads((att / "cache_identity.json").read_text())
+    assert ident["complete"] is False
+    assert ident["incomplete_reason"] == "cache_budget_exhausted"
+    assert ident["budget"]["consumed_s"] >= 5.0    # measured at registration
+    assert ident["missing_demos"] == []            # all rows landed in budget
+    # exactly ONE index row for the attempt — flipped in place, not doubled
+    idx = json.loads(
+        (out_root / "attempts_index.json").read_text())["attempts"]
+    rows = [a for a in idx if a.get("attempt") == att.name]
+    assert len(rows) == 1 and rows[0]["complete"] is False
+    # the ledger row carries the real wall (>= the injected delay)
+    ledger = json.loads(
+        (world["run"] / "costs.json").read_text())["invocations"]
+    row = next(e for e in ledger
+               if e.get("stage") == "w1_cache" and e.get("attempt") == att.name)
+    assert row["complete"] is False and row["wall_s"] >= 5.0
+    # consumer side refuses the attempt
     manifest = json.loads(world["manifest_path"].read_text())
     prereg = json.loads(world["prereg_path"].read_text())
     problems = w1.verify_cache_contents(att, manifest, prereg, world["root"])

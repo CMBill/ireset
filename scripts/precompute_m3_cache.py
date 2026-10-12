@@ -208,6 +208,28 @@ def _register_crashed_cache_attempt(out_root: Path, attempt_dir: Path,
                  status="crashed")
 
 
+def _replace_index_row(out_root: Path, attempt: str, entry: dict) -> None:
+    """Rewrite ONE attempts-index row IN PLACE (round-5 review fix 3).
+
+    The index is append-only by convention (exactly one row per attempt);
+    the final deadline check runs AFTER the complete registration is
+    written, and an overrun must flip THAT row to incomplete rather than
+    append a second row for the same attempt (disk × index × ledger must
+    stay one row each)."""
+    idx_path = out_root / integ.ATTEMPTS_INDEX
+    index = json.loads(idx_path.read_text())
+    hits = [i for i, a in enumerate(index["attempts"])
+            if a.get("attempt") == attempt]
+    if len(hits) != 1:
+        raise SystemExit(
+            f"attempts index does not carry exactly one row for {attempt}: "
+            "refusing to rewrite")
+    i = hits[0]
+    index["attempts"][i] = {**index["attempts"][i], **entry,
+                            "timestamp": index["attempts"][i].get("timestamp")}
+    idx_path.write_text(json.dumps(index, indent=2, ensure_ascii=False))
+
+
 def _run_w1_attempt(args, manifest: dict, prereg: dict, prereg_rec: dict,
                     manifest_path: Path, prereg_path: Path, out_root: Path,
                     attempt_dir: Path, hist: float, remaining: float,
@@ -215,10 +237,13 @@ def _run_w1_attempt(args, manifest: dict, prereg: dict, prereg_rec: dict,
                     t0: float) -> int:
     """One (already allocated, already ledger-registered) cache attempt."""
 
-    def write_incomplete(n_schedules: int, missing: list[str]) -> int:
+    def _register_incomplete(n_schedules: int, missing: list[str],
+                             *, append_index: bool) -> None:
         # INCOMPLETE attempt: record what is missing (or that only the
         # budget ran out), never fabricate stats; consumers refuse this
-        # attempt (the identity carries complete=False)
+        # attempt (the identity carries complete=False). consumed_s is
+        # measured AT REGISTRATION TIME so an overrun during the final
+        # writes is itself accounted (round-5 fix 3)
         identity = {
             "protocol": w1.MOTION_PROTOCOL_VERSION,
             "experiment_id": w1.EXPERIMENT_ID,
@@ -244,18 +269,27 @@ def _run_w1_attempt(args, manifest: dict, prereg: dict, prereg_rec: dict,
         }
         (attempt_dir / "cache_identity.json").write_text(
             json.dumps(identity, indent=2, ensure_ascii=False))
-        integ.append_attempts_index(out_root, {
+        row = {
             "attempt": attempt_dir.name, "complete": False,
             "incomplete_reason": "cache_budget_exhausted",
             "n_schedules": n_schedules,
             "identity": path_for_record(attempt_dir / "cache_identity.json"),
-        })
+        }
+        if append_index:
+            integ.append_attempts_index(out_root, row)
+        else:
+            # late overrun: the complete row was already appended — flip it
+            # in place instead of growing a second row for the attempt
+            _replace_index_row(out_root, attempt_dir.name, row)
         _upsert_cost(out_root.parent, "w1_cache", attempt_dir.name,
                      time.time() - t0,
                      {"attempt": attempt_dir.name,
                       "n_schedules": n_schedules, "complete": False,
                       "incomplete_reason": "cache_budget_exhausted"},
                      status="done")
+
+    def write_incomplete(n_schedules: int, missing: list[str]) -> int:
+        _register_incomplete(n_schedules, missing, append_index=True)
         print(f"[w1-cache] INCOMPLETE (budget exhausted): {n_schedules}/"
               f"{len(jobs)} schedules, missing {missing}")
         return 2
@@ -298,9 +332,10 @@ def _run_w1_attempt(args, manifest: dict, prereg: dict, prereg_rec: dict,
         exec_blocks.append(execution_record(rep, len(part)))
     print(json.dumps(exec_blocks[0] if exec_blocks else {"n_tasks": 0}))
 
-    # round-3 review fix 6 (deepened round-4 fix 3): the deadline is
-    # enforced at EVERY phase boundary — the LAST chunk's return, the stats
-    # computation, the FINAL identity hashing and the registration writes.
+    # round-3 review fix 6 (deepened by round-4 fix 3 and round-5 fix 3):
+    # the deadline is enforced at EVERY phase boundary — the LAST chunk's
+    # return, the stats computation, the FINAL identity hashing AND the
+    # registration writes (see the final re-check below).
     # ``budget_stopped`` used to depend only on missing rows, so a final
     # chunk (and the stats work after it) could overrun the registered
     # budget and still register complete=true
@@ -363,12 +398,23 @@ def _run_w1_attempt(args, manifest: dict, prereg: dict, prereg_rec: dict,
         "execution": exec_blocks,
         "total_wall_s": round(time.time() - t0, 1),
     }
-    # round-4 review fix 3: the FINAL hashing and the registration writes
-    # are also inside the budget — the last check sat at the stats phase, so
-    # a slow manifest/identity hash after it still registered complete=true
-    # with consumed_s already past the budget
+    # round-4 review fix 3: the FINAL hashing is inside the budget — the
+    # last check sat at the stats phase, so a slow manifest/identity hash
+    # after it still registered complete=true with consumed_s already past
+    # the budget
     if time.perf_counter() > deadline:
         return write_incomplete(len(rows), [j[0] for j in jobs[len(rows):]])
+    # round-5 review fix 3: the registration WRITES are budget work too —
+    # the round-4 check sat before them, so a slow identity write still
+    # registered complete=true with the stale consumed snapshot while the
+    # ledger recorded the real wall. The registration is now written FIRST
+    # (consumed_s refreshed right before the write so it covers the final
+    # hashing) and the deadline is re-checked after ALL of it; an overrun
+    # rewrites the SAME attempt's identity/index/ledger rows as incomplete
+    # with the elapsed measured at registration time — never a second
+    # index row for one attempt
+    identity["budget"]["consumed_s"] = round(
+        time.perf_counter() - (deadline - remaining), 1)
     (attempt_dir / "cache_identity.json").write_text(
         json.dumps(identity, indent=2, ensure_ascii=False))
     integ.append_attempts_index(out_root, {
@@ -383,6 +429,11 @@ def _run_w1_attempt(args, manifest: dict, prereg: dict, prereg_rec: dict,
                  time.time() - t0,
                  {"attempt": attempt_dir.name, "n_schedules": len(rows),
                   "complete": True}, status="done")
+    if time.perf_counter() > deadline:
+        _register_incomplete(len(rows), [], append_index=False)
+        print(f"[w1-cache] INCOMPLETE (budget exhausted during final "
+              f"registration): {len(rows)}/{len(jobs)} schedules")
+        return 2
     print(f"[w1-cache] root stats frames={identity['root_stats']['frames_fitted']} "
           f"files={stats_facts['n_train_rows_used']} -> {path_for_record(attempt_dir)}")
     return 0

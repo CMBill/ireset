@@ -311,7 +311,14 @@ def _verify_checkpoint_deep(ckpt_path: Path, att_dir: Path, cache_dir: Path,
     unreadable/non-mapping/structurally-invalid replay artifact is RECORDED
     as an unready reason instead of crashing the gate — invalid inputs are
     never replayed (a NaN probe_t reached run_fixed_probe and raised
-    IndexError out of the readiness script)."""
+    IndexError out of the readiness script).
+
+    Round-5 review fix 1: the structural gate validates the NESTED
+    containers and tensor dimensions BEFORE any field is read — the
+    round-4 gate marked a non-dict batch invalid but the finiteness loop
+    still called ``.items()`` on it (AttributeError), a scalar x0 reached
+    the diffusion shape check whose ``.shape[0]`` raised IndexError, and a
+    non-mapping last_probe raised AttributeError on ``.get``."""
     import math as _math
 
     import numpy as _np
@@ -396,13 +403,22 @@ def _verify_checkpoint_deep(ckpt_path: Path, att_dir: Path, cache_dir: Path,
     if not all(bool(torch.isfinite(p).all()) for p in
                [*m.parameters(), *cond.parameters()]):
         return problems + ["checkpoint_weights_not_finite"], None
-    # round-4 fix 2: STRUCTURAL validation of the replay inputs — a missing
-    # t/noise or a non-tensor batch value used to reach run_fixed_probe and
-    # raise, crashing the readiness script before any report was written
+    # round-4 fix 2 + round-5 fix 1: STRUCTURAL validation of the replay
+    # inputs — and of their NESTED containers/dimensions — before any field
+    # is read. A structurally-invalid artifact used to reach run_fixed_probe
+    # and raise, crashing the readiness script before any report was
+    # written; round-4 still left three crash paths (non-dict batch in the
+    # finiteness loop, scalar x0 in the diffusion shape check, non-mapping
+    # last_probe on .get)
     inputs_valid = True
     if not (isinstance(batch, dict) and batch and "x0" in batch
             and all(torch.is_tensor(v) for v in batch.values())):
         problems.append("probe_replay_input_invalid:batch")
+        inputs_valid = False
+    elif batch["x0"].ndim < 2:
+        # the registered payload is [batch, frames, channels] — a scalar or
+        # 1-d x0 cannot even carry the batch dimension the probe reads
+        problems.append("probe_replay_input_invalid:batch.x0_ndim")
         inputs_valid = False
     if model == "diffusion":
         for name in ("probe_t", "probe_noise"):
@@ -418,16 +434,24 @@ def _verify_checkpoint_deep(ckpt_path: Path, att_dir: Path, cache_dir: Path,
                 problems.append("probe_replay_input_invalid:probe_noise_shape")
                 inputs_valid = False
     # round-3 fix 1: finite replay INPUTS — a NaN x0/t/noise replays to NaN
-    # and the tolerance comparison below can never reject it
+    # and the tolerance comparison below can never reject it. The iteration
+    # itself is container-safe: a non-dict batch was already marked invalid
+    # above and simply has no readable fields to check
     finite_inputs = True
+    batch_items = list(batch.items()) if isinstance(batch, dict) else []
     for name, tensor in [("probe_t", rp.get("probe_t")),
                          ("probe_noise", rp.get("probe_noise")),
-                         *((f"batch.{k}", v)
-                           for k, v in (batch or {}).items())]:
+                         *((f"batch.{k}", v) for k, v in batch_items)]:
         if torch.is_tensor(tensor) and not bool(torch.isfinite(tensor).all()):
             problems.append(f"probe_replay_input_not_finite:{name}")
             finite_inputs = False
     recorded = rp.get("last_probe") or {}
+    if not isinstance(recorded, dict):
+        # a non-empty list/scalar last_probe is a reason, never an
+        # AttributeError from .get — the sanitized value keeps the report
+        # path alive and recorded_finite below reports the missing fields
+        problems.append("recorded_probe_not_a_mapping")
+        recorded = {}
     rec = recorded.get("motion_reconstruction")
     detail = {"replayed_probe": None, "recorded_last_probe": recorded}
     recorded_finite = isinstance(recorded, dict) and all(
@@ -496,9 +520,19 @@ def check_c(run_root: Path, cache: dict | None, prereg: dict) -> dict:
         # from the current manifest/cache — every model's replay batch is
         # bound to them bitwise (the declared list alone proved nothing)
         pilot6 = list(prereg.get("selection", {}).get("pilot6_from_a1", []))
-        expected_batch, rebuild_problems = _rebuild_small_probe_batch(
-            cache["dir"], PROJECT_ROOT / cache["record"]["training_manifest"]["path"],
-            pilot6)
+        # round-5 review fix 2: the rebuild shares check_b's failure mode —
+        # with one schedule cache file missing, check_b correctly returned
+        # unready but check_c re-constructed the same dataset and the
+        # exception escaped BEFORE any readiness report was written. A
+        # rebuild failure is now an explicit per-model unready reason
+        try:
+            expected_batch, rebuild_problems = _rebuild_small_probe_batch(
+                cache["dir"],
+                PROJECT_ROOT / cache["record"]["training_manifest"]["path"],
+                pilot6)
+        except Exception as exc:  # noqa: BLE001 -- recorded as the reason
+            expected_batch = None
+            rebuild_problems = [f"rebuild_failed:{type(exc).__name__}: {exc}"]
     for model in ("deterministic", "diffusion"):
         att = latest_attempt(run_root / "s0" / model)
         if att is None:
