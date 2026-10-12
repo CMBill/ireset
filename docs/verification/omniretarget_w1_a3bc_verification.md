@@ -368,7 +368,7 @@ s0_diff 1362.4 done/readiness 13.8）。测试 621→**628 passed + 1 skipped**�
 6. **崩溃窗口靠事前登记关闭**：attempt 分配到退出登记之间的崩溃只能靠"先写 running 行"
    兜底；历史核验按盘×索引×台账三方集合相等，"未知"必须是停止条件而非零。
 
-## 5R4. 第四轮审阅修复轮（2026-10-12，提交 `05b3f6e`；§5R3 的就绪判断与 A3/cache/S0 权威产物自此被本轮取代——§5R3 的 8 项修复与事实全部继续有效，仅"逐位相等"表述订正）
+## 5R4. 第四轮审阅修复轮（2026-10-12，提交 `05b3f6e`；§5R3 的就绪判断与 A3/cache/S0 权威产物自此被本轮取代——§5R3 的 8 项修复与事实全部继续有效，仅"逐位相等"表述订正）【本节权威链已被 §5R5 取代；4 项修复与工程事实继续有效】
 
 复核确认当前权威链五门通过、S0 结果成立（独立执行 87 项相关测试全过；真实工件的六段
 输入、扩散 t/noise、训练统计均已复核正确，未触发本轮缺口），但另发现 **3 项代码缺口
@@ -441,12 +441,76 @@ readiness 14.1）。测试 628→**632 passed + 1 skipped**（审阅文件 30→
    精确相等；CPU 重放↔记录值（跨进程重算）必有浮点差、只能称容差内一致——把后者写成
    "逐位相等"是登记失实，本轮第 4 项即为此类订正。
 
+## 5R5. 第五轮审阅修复轮（2026-10-12，实现提交 `a4c8aa5`；§5R4 的就绪判断与 A3/cache/S0 权威产物自此被本轮取代——§5R4 的 4 项修复与事实全部继续有效）
+
+复核确认新权威链五门及 S0 数值成立、r4 输入绑定与文档订正有效（独立执行 68 项 W1 相关
+测试全过），但另发现 **3 项 P2 缺口**，全部修复（新增 3 项反例 `tests/test_
+omniretarget_w1_review.py` 34→37 项，三项对修复前代码均失败实证；全量 632→**635 passed
++ 1 skipped**）：
+
+- **P2-r5-1 嵌套重放证据不使核验崩溃**（`_verify_checkpoint_deep`）：r4-2 的结构门标记
+  无效后**仍读取字段**——真实工件副本中非空列表 batch 在有限性循环 `.items()` 抛
+  AttributeError、标量 x0 到扩散形状检查 `.shape[0]` 抛 IndexError、非空列表 last_probe
+  到 `.get` 抛 AttributeError，三条路径都使 readiness 异常退出、报告写不出。现结构验证
+  覆盖**嵌套容器类型与张量维度**（batch 须非空 dict 全张量且 x0 `ndim>=2`——注册载荷是
+  [B,F,C]，标量/1-d 连批维都不携带，记 `probe_replay_input_invalid:batch.x0_ndim`）；
+  有限性循环仅对 dict 迭代（非 dict batch 已在上一步记因，无可读字段）；last_probe 非
+  映射记 `recorded_probe_not_a_mapping` 并净化为 `{}`（recorded_finite 随之显式报缺字段），
+  报告路径保持存活。
+- **P2-r5-2 首窗重建异常登记为未就绪**（`check_c`）：r4-1 新增的重建调用未捕获数据集
+  构建异常——缺一份日程缓存时 B 门如实返回 passed=false（`schedule_file_missing:*`），
+  但 C 门再次构建同一数据集抛出异常**先于任何报告落盘**（修复前该场景能正常返回未就绪，
+  r4-1 反而引入回归）。现重建失败转 `probe_batch_rebuild:rebuild_failed:<Type>: <msg>`
+  明确原因按模型报告（`expected_batch=None` 时同时记 `probe_replay_batch_rebuild_failed`），
+  报告生成路径保留。
+- **P2-r5-3 最终登记受截止判定**（`precompute_m3_cache.py`）：r4-3 的检查位于写盘之前
+  ——实测 5s 预算在 `cache_identity` 写盘阶段延迟 6s 仍 exit 0/complete=true/消费侧通过；
+  台账记 6s 而 identity 的 consumed_s 仍是写盘前快照（≈0），两本账不一致。现**登记先写**
+  （consumed_s 在写盘前刷新、覆盖最终哈希耗时）且**全部登记（identity 写盘+索引行+台账
+  行）完成后最终复查**；超限以登记时刻实测耗时把**同一 attempt** 的 identity/索引/台账
+  行原位改写为 incomplete（`_replace_index_row` 原位替换不增行——盘×索引×台账恒一 attempt
+  一行），exit 2，消费侧经 `cache_not_complete` 拒绝。write_incomplete 重构为共享
+  `_register_incomplete`（早期超限 append 索引行、晚期超限原位改写，consumed_s 均在登记
+  时刻实测）。
+
+**新权威链** `derived/experiments/omniretarget_first/20261012_a4c8aa5_w1_a3bc_reviewfix6/
+w1_reviewfix6/`（干净树 a4c8aa5；§5R4 链保留为被取代证据）：W0 2.5s；A3 attempt_001
+PASS（55/55 准入、denominator kept at 55，71.1s）；cache attempt_001（complete:true、
+consumed 53.8s/7200s、55 键控日程——与 §5R4 轮文件名 55/55 重叠且**内容逐位一致**：本轮
+只改 scripts/ 两文件与测试、均非 CONDITION_CODE_FILES，condition_code_sha256 不变
+（86781b47…）=**无 re-key，属预期**）；S0 双模型各 1000 步 PASS——确定性 1344.7s 趋势
+0.394223→0.013504、扩散 1365.0s 趋势 0.428729→0.011308（两模型 101 probe 曲线与 §5R4
+轮**逐位相等**=嵌套容器验证/重建保护/登记截止改动不触训练数值）、probe 101=完整日程
+0..1000、S0 合计 2709.7s≤3600s；readiness `decisions/attempt_001` 五门全 true、unmet=[]、
+两模型 identity_problems **空**（r4 绑定腿+r5 容器验证在真实证据上通过）、CPU 重放
+0.011500352993607521/0.008721409365534782 与工件记录末探 0.011500352062284946/
+0.008721405640244484 **容差内一致**（差 9.3e-10/3.7e-9，与 §5R4 轮重放值逐位相等）、
+summary 与工件记录末探逐位相等（r3-2 对账门）。台账 6 行且每 attempt 恰一行（w0 2.5/
+a3 71.1/cache 54.8 done complete:true/s0_det 1344.7 done/s0_diff 1365.0 done/
+readiness 15.1）。测试 632→**635 passed + 1 skipped**（审阅文件 34→37 项：非空列表
+batch/标量 x0/非空列表 last_probe 三形态只记原因不崩溃且 `replayed_probe=None` 或如实
+报缺字段、缺一份日程缓存时 B 门 schedule_file_missing+C 门 rebuild_failed 原因不异常、
+identity 写盘阶段 6s 延迟超 5s 预算登记 incomplete+consumed_s≥5 实测+索引一 attempt 恰
+一行+台账实际墙钟+消费侧拒）。
+
+工程事实（本轮新增）：
+1. **"标记无效"不等于"不再读取"**：结构门给坏证据打标后，后续代码仍按合法结构解引用
+   （`.items()`/`.shape[0]`/`.get`）=把异常处理让给坏数据本身；嵌套容器的类型与**张量
+   维度**（ndim，而非"is a tensor"）必须先于一切字段读取验证。
+2. **验证腿共享生产腿的失败模式就必须共享异常契约**：r4-1 的重建与 B 门构建同一数据集，
+   却没继承其 try/except——新增核验腿引入的不是额外保障而是新的崩溃路径；同一资源的多条
+   腿要么全部异常安全，要么新增腿就是单点故障。
+3. **"最后一个检查点"必须落在最后一项登记之后**：写盘/索引/台账在检查之后执行时，
+   检查守护的只是"检查前的时间"——identity 的 consumed 与台账的 wall 会各自记账、互相
+   矛盾（一个 ≈0 一个 6s）；登记先写、写完再查、超限**原位改写**（append 第二行会破坏
+   盘×索引×台账一行对账），三本账才在同一时刻对齐。
+
 ## 6. 就绪判断与后续边界（§10）
 
-【本节首段就绪指针已被 §5R4 第四轮审阅修复轮取代——权威就绪记录为
-`20261012_05b3f6e_w1_a3bc_reviewfix5/w1_reviewfix5/decisions/attempt_001/w1_readiness.json`
-（五门全 true，check_c 为重算门+checkpoint 重建重放门+summary/工件末探对账门+注册集
-重建绑定门）；本节其余边界表述继续有效】
+【本节首段就绪指针已被 §5R5 第五轮审阅修复轮取代——权威就绪记录为
+`20261012_a4c8aa5_w1_a3bc_reviewfix6/w1_reviewfix6/decisions/attempt_001/w1_readiness.json`
+（五门全 true，check_c 为重算门+checkpoint 重建重放门（含嵌套容器验证）+summary/工件
+末探对账门+注册集重建绑定门）；本节其余边界表述继续有效】
 `decisions/attempt_001/w1_readiness.json`：五门全 true、unmet=[]。就绪由事实重算
 （A3 行复算、缓存身份对账、双数据集真实构建、S0 门读取）；exit 0=记录完成。
 
