@@ -1,19 +1,19 @@
 # 文档索引
 
-整理日期：2026-10-11（最后更新 2026-10-11 第二轮审阅修复）。当前推进到 **W1 A3/B/C 两轮审阅修复完成：8 项新缺口修复+缓存 re-key 后权威链重建，`ready_for_w1_d=true`（新链 `20261011_a0dbfa1_w1_a3bc_reviewfix3`）；W1-D/E 正式训练尚未运行，最终可行性结论不变**。本页区分当前执行入口、保留的参考资料和历史归档。
+整理日期：2026-10-11（最后更新 2026-10-12 第三轮审阅修复）。当前推进到 **W1 A3/B/C 三轮审阅修复完成：第三轮 8 项缺口（4 P1+4 P2）修复+缓存 re-key 后权威链重建，`ready_for_w1_d=true`（新链 `20261012_027cb3e_w1_a3bc_reviewfix4`）；W1-D/E 正式训练尚未运行，最终可行性结论不变**。本页区分当前执行入口、保留的参考资料和历史归档。
 
 ## 当前入口
 
 | 文档 | 用途与状态 |
 | --- | --- |
 | [W1 弱动作监督 A3/B/C 方案](plans/omniretarget_w1_a3bc_plan.md) | 现行执行契约（v0.1）；A3/B/C 与 2026-10-12 审阅修复轮（12 项缺口全修）已执行，W1-D/E 契约固定但 `not_run` |
-| [W1 A3/B/C 验证记录](verification/omniretarget_w1_a3bc_verification.md) | 接口实现、57 项反例与正式运行的实际证据；§5R2 为第二轮审阅修复权威链（运行根 `20261011_a0dbfa1_w1_a3bc_reviewfix3/w1_reviewfix3`，就绪报告 `decisions/attempt_001`），§5R 链与旧链保留为被取代证据 |
+| [W1 A3/B/C 验证记录](verification/omniretarget_w1_a3bc_verification.md) | 接口实现、64 项反例与正式运行的实际证据；§5R3 为第三轮审阅修复权威链（运行根 `20261012_027cb3e_w1_a3bc_reviewfix4/w1_reviewfix4`，就绪报告 `decisions/attempt_001`），§5R2/§5R 链与旧链保留为被取代证据 |
 | [OmniRetarget 优先教师与初步训练总方案](plans/omniretarget_first_training_plan.md) | 父方案，约束来源裁决、W1 用途、训练和裸输出评估；原文字节是 A2 快照证据的一部分 |
 | [A2 收口与有限恢复方案](plans/omniretarget_a2_closure_plan.md) | 已执行阶段的实验契约，W1 入口依据；原文字节保留供 A2 证据复核 |
 | [A2 最新验证记录](verification/omniretarget_a2_closure_verification.md) | C0/C1/D0/G0/UR/C2 及六轮修复的实际证据；当前权威 C2 为 attempt_010 |
 | [项目整体实现方案](plans/interaction_retarget_impl_plan.md) | 项目目标、资产/坐标约定、模型与最终验收设计；当前实施顺序由 OmniRetarget 总方案和 W1 方案具体化 |
 
-当前事实：A1 冻结与配对已完成；原 U0 保持 `incomplete` 并停线；独立 UR 六段比较为完整 `no_quality_gain`；W1 按发布 original 数据、用途 `weak_motion_only` 完成注册/审计（55 段全准入、源箱几何应用登记尺度 0.68-0.80、质量按测量存在性契约（参考帧账本×intervals 复算）完整登记）、键控缓存（代码身份含距离实现、逐文件内容哈希+消费侧复验+complete 标志）与 train 统计、两模型 S0（各 1000 步、小集整批 24 样本/步、趋势 0.394→0.014/0.429→0.011 与上轮逐位一致、checkpoint 重建+固定 probe 重放核验、2558.9s≤1h），工程就绪门经深度重算式核验（loss 逐行/probe cadence/checkpoint 重放）在新链上 `ready_for_w1_d=true`。UR 标签不混入该来源；W1-D/E 正式训练与最终比较未运行。
+当前事实：A1 冻结与配对已完成；原 U0 保持 `incomplete` 并停线；独立 UR 六段比较为完整 `no_quality_gain`；W1 按发布 original 数据、用途 `weak_motion_only` 完成注册/审计（55 段全准入、源箱几何应用登记尺度 0.68-0.80、质量按测量存在性契约（参考帧账本×intervals 复算）完整登记）、键控缓存（代码身份含距离实现、逐文件内容哈希+消费侧复验+complete 标志）与 train 统计、两模型 S0（各 1000 步、小集整批 24 样本/步、趋势 0.394→0.014/0.429→0.011 与前两轮逐位一致、checkpoint 重建+固定 probe 重放核验+summary/工件末探逐位对账、2715.2s≤1h），工程就绪门经深度重算式核验（loss 逐行全字段存在+有限/完整 probe 日程/checkpoint 重放与对账）在新链上 `ready_for_w1_d=true`。UR 标签不混入该来源；W1-D/E 正式训练与最终比较未运行。
 
 [权威 C2](../derived/experiments/omniretarget_first/20261010_a39d763_a2_closure/decisions/attempt_010/a2_closure.json) 的 SHA-256 为 `34a392f92a9cda5b8317a08d5b5b486f750c5fc83933174d36d361cb7b1d0fa2`。实际证据位于 ignored 的 derived/，迁移仓库时需按资源和验证记录恢复，不能把文档链接存在视作实验产物已携带。
 

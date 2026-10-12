@@ -209,6 +209,9 @@ PASS（55/55 准入、源箱=A1 冻结 37/37 逐位、尺度入册、质量完�
 
 ## 5R2. 第二轮审阅修复轮（2026-10-11，提交 `a0dbfa1`；§5R 的就绪判断与 A3/cache/S0 权威产物自此被本轮取代——12 项修复本身继续有效）
 
+【本节权威产物又被下方 §5R3 第三轮审阅修复轮取代——re-key 因 w1_training.py 纳入
+S0_REQUIRED_LOSS_KEYS 常量再次发生、readiness C 门按更强谓词重算；8 项修复本身继续有效】
+
 独立复核确认源几何修正、训练统计与两模型 S0 结果成立（140 项相关测试、55 份缩放日程、
 47 段/527 标记、4,351 帧统计逐位一致；checkpoint 末次 probe 差值 0；"89"复算成立=demo×手侧
 整段二值序列变化数），但另发现 **8 项缺口（5 P1+3 P2）**，全部修复：
@@ -284,11 +287,90 @@ gap、质量存在性九反例+合法零参考侧）。
    被调方（distance_adapter），几何回退不触发 re-key；清单按 import 闭包而非按"谁定义协议"
    圈定。
 
+## 5R3. 第三轮审阅修复轮（2026-10-12，提交 `027cb3e`；§5R2 的就绪判断与 A3/cache/S0 权威产物自此被本轮取代——8 项修复本身继续有效）
+
+独立复跑确认 §5R2 权威链数值成立（57 项 W1 测试+60 项回归、4,351 帧统计、重放输入、
+扩散 t/noise 逐位一致，双模型重放误差 ≈0.01150036/0.00872141，S0 成本 2558.9s），但另发现
+**8 项缺口（4 P1+4 P2）**——全部是上轮修复引入或未闭合的核验谓词缺口，全部修复：
+
+- **P1-r3-1 重放有限性前置**（`w1_readiness._verify_checkpoint_deep`）：原实现先比容差
+  再看结果——probe_replay.pt 的 x0 改一个 NaN 元素，实际重放误差变 NaN 而
+  `abs(NaN−rec)>tol` 恒 False，check_c 仍 passed。现重放**输入**（batch 全张量+probe_t+
+  probe_noise）、**输出**（四误差字段）与工件**记录误差**全部 isfinite 前置，容差比较仅在
+  双侧有限后执行。
+- **P1-r3-2 趋势证据与重放工件对账**（同函数）：原实现只把重放结果与工件自己的
+  last_probe 比对——仅改 summary.probes 为 100→50 下降曲线（checkpoint/工件不动、日程/
+  有限/趋势全绿）仍过门。现 summary 末探必须与工件记录的 last_probe **步号+四误差字段
+  逐位相等**（同一次运行的两种序列化，精确相等是判据而非容差）。
+- **P1-r3-3 必需损失字段显式化**（`w1.S0_REQUIRED_LOSS_KEYS`）：原 all_finite 只查
+  **现存**字段有限+gnorm 存在——真实 1000 行缩为 {step,gnorm} 仍算完整证据。现按 W1 配置
+  （LossAssembler 恒 emit：pos/rot6d/joint/geodesic_rad2/vel/fk_m2/total；w_contact=0 下
+  contact 非法）锁定必需集合，`loss_fields_complete` 门先查存在再查有限。
+- **P1-r3-4 参考计数缺键即缺证**（`audit_omniretarget_training.quality_registration_complete`）：
+  原 `counts.get(side, <复算值>)` 把删除的键洗成复算值、`need=get(side,0)` 把缺键当零参考
+  ——真实 sub10 行删 `ref_grasp_frames.l`+`hand.l=None`（左手实有 46 帧参考）仍过；both
+  分母 3→0 并删双手测量同样被接受。现左右键**必须齐全**且等于区间复算值（缺键=
+  `ref_frames_key_missing`+对账不符双报），both 分母从 reference_intervals 复算**左右抓握
+  帧交集**（sub10=3），篡改 0/40 与复算不符即拒、交集>0 才允许有限测量、交集=0 只允许 None。
+- **P2-r3-5 probe 日程全量比对**：原谓词只证步号严格递增+cadence 整倍数——删 step=10 单点
+  后剩余仍满足。现步号列表必须**恰等于** `[0]+range(every, steps+1, every)` 完整日程
+  （以已完成步数为界）。
+- **P2-r3-6 缓存全阶段截止**（`precompute_m3_cache.run_w1`）：原截止只在块间检查——最后
+  一块（及后续 root_stats 工作）超预算仍 complete=true/consumed_s=1.2>1.0/exit 0。现块返回、
+  统计计算、最终登记三处查 deadline，任一超限走同一 incomplete 写入（complete:false+
+  `cache_budget_exhausted`+consumed_s 入册+exit 2，missing_demos 为空时如实登记"仅预算
+  超限"），不伪造统计。
+- **P2-r3-7 S0 预算判定独立于步数**（`w1_s0.run_s0_model`）：原 `budget_stopped =
+  越界 and step<cfg.steps`——真实完成 400 步+41 probe 后 checkpoint 阶段越界仍 passed。
+  现判定移至保存+重载检查**之后**且无条件于步数：保存、重放、最终登记都在预算内。
+- **P2-r3-8 缓存崩溃登记+三方历史**（`precompute_m3_cache`）：原 `_historical_cache_cost_s`
+  只数索引条数——worker 在 attempt 分配后抛异常留下无索引无台账的 attempt_001，历史读 0.0，
+  下次照常启动 attempt_002。现分配后**事前 running 台账行**（`_upsert_cost` 按 (stage,
+  attempt) 原位 upsert）+全退出口更新+崩溃写最小 identity/索引行/`crashed` 行后重抛；
+  历史改**盘×索引×台账三方**按 attempt 集合相等（盘上未登记尝试=未知=停止，未 keyed/
+  重复/running 残留行=未知）。
+
+**新权威链** `derived/experiments/omniretarget_first/20261012_027cb3e_w1_a3bc_reviewfix4/
+w1_reviewfix4/`（干净树 027cb3e；§5R2 链保留为被取代证据）：W0 2.5s；A3 attempt_001 PASS
+（55/55 准入、质量完整性按 r3-4 新谓词全过，73.1s）；cache attempt_001（complete:true、
+consumed 53.8s/7200s、55 键控日程——与 §5R2 轮文件名**零重叠**：w1_training.py 是
+CONDITION_CODE_FILES 成员，新增 S0_REQUIRED_LOSS_KEYS 常量即重键全部日程，re-key 实证）；
+S0 双模型各 1000 步 PASS——确定性 1352.8s 趋势 0.394223→0.013504、扩散 1362.4s 趋势
+0.428729→0.011308（与 §5R/§5R2 轮**逐位一致**=谓词/预算/台账改动不触训练数值）、probe
+101=完整日程 0..1000、probe_replay.pt 在册、S0 合计 2715.2s≤3600s；readiness
+`decisions/attempt_001` 五门全 true——C 门重算含 `probe_schedule_valid`（全量日程）/
+`loss_fields_complete` 双新门、`identity_problems` 空、checkpoint 重放 0.011500352062284946/
+0.008721405640244484 与 summary/artifact 末探**逐位相等**（对账门实证）。台账 6 行齐且
+每 attempt 恰一行（w0 2.5/a3 73.1/cache 54.9 done complete:true/s0_det 1352.8 done/
+s0_diff 1362.4 done/readiness 13.8）。测试 621→**628 passed + 1 skipped**（审阅文件
+23→30 项：NaN 重放输入+NaN 记录误差、伪造下降曲线保留真 checkpoint、{step,gnorm} 与
+{step,total,gnorm} 缩行、删 step-2 单点日程、最后一块 1.2s 超限 incomplete+无统计伪造+
+消费侧拒、完成目标步数后尾部越界（受控单调钟+保存钩子）、缓存崩溃登记+盘上未登记尝试
+拒绝启动；既有质量测试扩展缺键/both 分母篡改 0 与 40/合法零参考侧保留）。真实 manifest
+55/55 过 r3-4 新谓词，审阅者 sub10 双反例（46 帧缺键+both 3→0）精确命中。
+
+工程事实（本轮新增）：
+1. **NaN 比较 laundering**：`abs(NaN−x)>tol` 恒 False——一切容差判定必须以双侧 isfinite
+   为前置条件；重放的**输入**有限性与输出同等必要（NaN 输入必产 NaN 输出，但输入检查
+   独立定位污染源）。
+2. **同一测量的两种序列化必须对账**：summary（JSON）与工件（torch.save）来自同一次运行
+   的同一 Python float，精确相等是判据；不做该对账时"趋势证据"与"重放证据"可以各自为真
+   而互不相干（伪造曲线+真 checkpoint 的组合恰恰如此）。
+3. **"必需字段"必须是显式配置派生清单**：只查现存字段有限=把"测了什么"交给篡改者决定；
+   存在性（loss_fields_complete）与有限性（all_finite）分离成两道门。
+4. **证据字典的 `.get(key, default)` 是删除 laundering**：缺键落到复算值或零都把"缺证据"
+   变成"合法默认"；键的存在性本身是证据（缺键单独报因），值只与第三表示对账。
+5. **预算约束必须覆盖全部阶段边界并独立于任务完成**：块间检查漏最后一块与统计阶段；
+   `step==target` 不是预算豁免——保存/重放/登记都在预算内，超限即 incomplete。
+6. **崩溃窗口靠事前登记关闭**：attempt 分配到退出登记之间的崩溃只能靠"先写 running 行"
+   兜底；历史核验按盘×索引×台账三方集合相等，"未知"必须是停止条件而非零。
+
 ## 6. 就绪判断与后续边界（§10）
 
-【本节首段就绪指针已被 §5R2 第二轮审阅修复轮取代——权威就绪记录为
-`20261011_a0dbfa1_w1_a3bc_reviewfix3/w1_reviewfix3/decisions/attempt_001/w1_readiness.json`
-（五门全 true，check_c 为重算门+checkpoint 重建重放门）；本节其余边界表述继续有效】
+【本节首段就绪指针已被 §5R3 第三轮审阅修复轮取代——权威就绪记录为
+`20261012_027cb3e_w1_a3bc_reviewfix4/w1_reviewfix4/decisions/attempt_001/w1_readiness.json`
+（五门全 true，check_c 为重算门+checkpoint 重建重放门+summary/工件末探对账门）；本节
+其余边界表述继续有效】
 `decisions/attempt_001/w1_readiness.json`：五门全 true、unmet=[]。就绪由事实重算
 （A3 行复算、缓存身份对账、双数据集真实构建、S0 门读取）；exit 0=记录完成。
 
