@@ -441,7 +441,7 @@ readiness 14.1）。测试 628→**632 passed + 1 skipped**（审阅文件 30→
    精确相等；CPU 重放↔记录值（跨进程重算）必有浮点差、只能称容差内一致——把后者写成
    "逐位相等"是登记失实，本轮第 4 项即为此类订正。
 
-## 5R5. 第五轮审阅修复轮（2026-10-12，实现提交 `a4c8aa5`；§5R4 的就绪判断与 A3/cache/S0 权威产物自此被本轮取代——§5R4 的 4 项修复与事实全部继续有效）
+## 5R5. 第五轮审阅修复轮（2026-10-12，实现提交 `a4c8aa5`；§5R4 的就绪判断与 A3/cache/S0 权威产物自此被本轮取代——§5R4 的 4 项修复与事实全部继续有效）【本节权威链已被 §5R6 取代；3 项修复与工程事实继续有效】
 
 复核确认新权威链五门及 S0 数值成立、r4 输入绑定与文档订正有效（独立执行 68 项 W1 相关
 测试全过），但另发现 **3 项 P2 缺口**，全部修复（新增 3 项反例 `tests/test_
@@ -505,12 +505,75 @@ identity 写盘阶段 6s 延迟超 5s 预算登记 incomplete+consumed_s≥5 实
    矛盾（一个 ≈0 一个 6s）；登记先写、写完再查、超限**原位改写**（append 第二行会破坏
    盘×索引×台账一行对账），三本账才在同一时刻对齐。
 
+## 5R6. 第六轮审阅修复轮（2026-10-12，实现提交 `b91f9d0`；§5R5 的就绪判断与 A3/cache/S0 权威产物自此被本轮取代——§5R5 的 3 项修复与事实全部继续有效）
+
+复核确认新权威链五门及 S0 结果成立、上轮反例被拦截（独立执行 71 项 W1 相关测试全过，
+未触发本轮缺口），但另发现 **2 项 P2 边界缺口**，全部修复（新增 2 项反例 `tests/test_
+omniretarget_w1_review.py` 37→39 项，两项对修复前代码均失败实证；全量 635→**637 passed
++ 1 skipped**）：
+
+- **P2-r6-1 净化不得先对原始工件值求真值**（`_verify_checkpoint_deep`）：r5-1 的
+  `rp.get("last_probe") or {}` 在 isinstance 检查**之前**对原始值求 bool()——真实工件
+  副本中 last_probe 为多元素 Tensor 抛 RuntimeError、NumPy 数组抛 ValueError，readiness
+  恰在被该门标记的证据上崩溃、报告写不出。现原始值**先判类型**：仅 dict（或缺失 None）
+  才允许 `or` 净化（dict 真值无歧义），非映射记 `recorded_probe_not_a_mapping` 并净化
+  为 `{}`，报告路径保持存活（recorded_finite 随之显式报缺字段）。
+- **P2-r6-2 崩溃出口原位撤销完成标记+消费侧拒三方矛盾**（`precompute_m3_cache.py`
+  `_register_crashed_cache_attempt` + `w1_training.verify_cache_contents`）：崩溃处理
+  原只在 identity/索引**缺失**时登记——审阅实测在最终台账写入注入 6s 延迟后抛 OSError
+  （5s 预算）：identity 与索引已 complete=true 原样留存、台账记 crashed/complete=false，
+  消费核验（只信 identity 文件）passed=true，矛盾产物可消费。现崩溃出口按**已有登记的
+  状态**分派：缺失→最小 crashed 登记（原行为）；声称 complete→identity **原位改写**为
+  crashed（保留其余字段+`revoked_after_crash` 标记）、索引行经 `_replace_index_row`
+  **原位翻转**不增行；已 incomplete→不触碰。撤销写盘自身失败仍落台账 crashed 行。
+  消费侧 `verify_cache_contents` 新增三方矛盾腿：**显式** incomplete/crashed 的索引行
+  （`cache_index_contradicts_identity:<reason>`）或台账行
+  （`cache_ledger_contradicts_identity:<status>`）对照 complete=true identity 即拒；
+  缺 complete 字段的 legacy 索引行不构成矛盾（它什么都没声明）。`w1_training.py` 系
+  CONDITION_CODE_FILES 成员，本轮 re-key 属预期。
+
+**新权威链** `derived/experiments/omniretarget_first/20261012_b91f9d0_w1_a3bc_reviewfix7/
+w1_reviewfix7/`（干净树 b91f9d0；§5R5 链保留为被取代证据）：W0 2.4s；A3 attempt_001
+PASS（55/55 准入、denominator kept at 55，72.2s）；cache attempt_001 complete:true
+consumed 55.9/7200s——55 键控日程与 §5R5 轮**文件名零重叠**（condition_code_sha256
+86781b47…→33c090c9…：消费侧矛盾腿位于 w1_training.py=CONDITION_CODE_FILES 成员，
+**re-key 属预期**），但 55 份日程**内容逐位一致**、root_stats.npz 逐位相等（改动只触
+消费核验，不触推断/统计数值）；S0 双模型各 1000 步 PASS——确定性 1314.5s（motion_
+reconstruction 1.181996→0.011500）、扩散 1298.5s（1.474099→0.008721），两模型 101
+probe 曲线与 §5R5 轮**逐位相等**=本轮改动不触训练数值，probe 101=完整日程 0..1000、
+S0 合计 2613.0s≤3600s；readiness `decisions/attempt_001` 五门全 true、unmet=[]、两模型
+identity_problems **空**、CPU 重放 0.011500352993607521/0.008721409365534782 与工件
+记录末探 0.011500352062284946/0.008721405640244484 容差内一致（差 9.3e-10/3.7e-9，
+与 §5R5 轮重放值逐位相等）、summary 与工件记录末探逐位相等（r3-2 对账门）。台账 6 行
+且每 attempt 恰一行（w0 2.4/a3 72.2/cache 57.0 done complete:true/s0_det 1314.5 done/
+s0_diff 1298.5 done/readiness 15.4）。测试 635→**637 passed + 1 skipped**（审阅文件
+37→39 项：多元素 Tensor/ndarray last_probe 只记 recorded_probe_not_a_mapping+
+recorded_probe_not_finite 不崩溃、诚实工件回归无新因；注入最终台账写盘 6s 延迟+OSError
+后 identity/索引原位撤销 complete→crashed:OSError+revoked_after_crash、索引一 attempt
+恰一行、台账 crashed 行 wall_s≥5、消费侧经 cache_not_complete:crashed:OSError 拒；防御
+纵深腿——identity 伪装修回 complete 而台账 crashed 时以 cache_ledger_contradicts_
+identity 拒、仅索引行矛盾时以 cache_index_contradicts_identity 拒）。
+
+工程事实（本轮新增）：
+1. **净化默认值模式 `x or {}` 把类型检查排在真值求值之后**：`or` 先对左操作数求
+   bool()，多元素 Tensor/ndarray 的歧义真值让"检查前净化"恰在被检查的证据上崩溃——
+   未知容器的类型判定必须作用于**未求值**的原始值；dict 真值无歧义，确认类型后才可
+   `or` 净化。
+2. **崩溃处理必须覆盖"完成登记之后"的崩溃窗口**：只在"identity/索引缺失"时登记的
+   崩溃处理器，对最终登记阶段（identity/索引已写、台账写失败）留下 complete 残骸——
+   崩溃出口要按已有登记的状态分派（缺失→最小登记、声称 complete→原位撤销、已
+   incomplete→不触碰），撤销失败时由消费侧三方矛盾腿兜底。
+3. **三方状态的对账判据是"显式声明"而非"字段存在"**：缺 complete 字段的 legacy 索引
+   行什么都没声明、不构成矛盾；显式 False/crashed 对照 complete=true identity 才是
+   矛盾——把"缺字段"当矛盾会拒历史合法产物，放过"显式矛盾"才会留下可消费的崩溃残骸。
+
 ## 6. 就绪判断与后续边界（§10）
 
-【本节首段就绪指针已被 §5R5 第五轮审阅修复轮取代——权威就绪记录为
-`20261012_a4c8aa5_w1_a3bc_reviewfix6/w1_reviewfix6/decisions/attempt_001/w1_readiness.json`
-（五门全 true，check_c 为重算门+checkpoint 重建重放门（含嵌套容器验证）+summary/工件
-末探对账门+注册集重建绑定门）；本节其余边界表述继续有效】
+【本节首段就绪指针已被 §5R6 第六轮审阅修复轮取代——权威就绪记录为
+`20261012_b91f9d0_w1_a3bc_reviewfix7/w1_reviewfix7/decisions/attempt_001/w1_readiness.json`
+（五门全 true，check_c 为重算门+checkpoint 重建重放门（含嵌套容器与原始值类型验证）
++summary/工件末探对账门+注册集重建绑定门；check_b 缓存内容核验含三方矛盾腿）；本节
+其余边界表述继续有效】
 `decisions/attempt_001/w1_readiness.json`：五门全 true、unmet=[]。就绪由事实重算
 （A3 行复算、缓存身份对账、双数据集真实构建、S0 门读取）；exit 0=记录完成。
 
