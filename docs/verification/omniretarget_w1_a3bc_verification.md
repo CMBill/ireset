@@ -505,7 +505,7 @@ identity 写盘阶段 6s 延迟超 5s 预算登记 incomplete+consumed_s≥5 实
    矛盾（一个 ≈0 一个 6s）；登记先写、写完再查、超限**原位改写**（append 第二行会破坏
    盘×索引×台账一行对账），三本账才在同一时刻对齐。
 
-## 5R6. 第六轮审阅修复轮（2026-10-12，实现提交 `b91f9d0`；§5R5 的就绪判断与 A3/cache/S0 权威产物自此被本轮取代——§5R5 的 3 项修复与事实全部继续有效）
+## 5R6. 第六轮审阅修复轮（2026-10-12，实现提交 `b91f9d0`；§5R5 的就绪判断与 A3/cache/S0 权威产物自此被本轮取代——§5R5 的 3 项修复与事实全部继续有效）【本节权威链已被 §5R7 取代；2 项修复与工程事实继续有效】
 
 复核确认新权威链五门及 S0 结果成立、上轮反例被拦截（独立执行 71 项 W1 相关测试全过，
 未触发本轮缺口），但另发现 **2 项 P2 边界缺口**，全部修复（新增 2 项反例 `tests/test_
@@ -567,13 +567,62 @@ identity 拒、仅索引行矛盾时以 cache_index_contradicts_identity 拒）�
    行什么都没声明、不构成矛盾；显式 False/crashed 对照 complete=true identity 才是
    矛盾——把"缺字段"当矛盾会拒历史合法产物，放过"显式矛盾"才会留下可消费的崩溃残骸。
 
+## 5R7. 第七轮审阅修复轮（2026-10-12，实现提交 `21e5784`；§5R6 的就绪判断与 A3/cache/S0 权威产物自此被本轮取代——§5R6 的 2 项修复与事实全部继续有效）
+
+复核确认 §5R6 权威链五门及 S0 结果成立、两项修复有效（独立执行 73 项相关测试全过，
+55 份缓存重键/内容与统计量不变、S0 合计 2613s 核实），但另发现 **1 项 P2 缺口**，已
+修复（新增 1 项反例 `tests/test_omniretarget_w1_review.py` 39→40 项，对修复前代码失败
+实证；全量 637→**638 passed + 1 skipped**）：
+
+- **P2-r7-1 消费侧仍接受残留 `running` 台账行**（`verify_cache_contents` 台账腿）：
+  r6-2 的矛盾腿只拒 `status == "crashed"` 或 `complete is False`——**SIGKILL 不可捕获**，
+  在最终台账写盘前终止子进程时 r6 的崩溃出口原位撤销永不运行：identity/索引残留
+  complete=true，台账停在分配时的事前 `running` 行（wall_s=0）；生产端历史腿
+  （`_historical_cache_cost_s`，r3-8）早已把 running 残行判为**未知=停止**，消费核验却
+  passed=true——**同一台账行两处判定相反**。现台账腿的显式非完成集合扩为
+  `status in ("crashed", "running") or complete is False`（拒因
+  `cache_ledger_contradicts_identity:running`），缺 status/complete 字段的 legacy 行
+  （及 status=done 无 complete 的 fixture 形态）仍不构成矛盾。
+
+**新权威链** `derived/experiments/omniretarget_first/20261012_21e5784_w1_a3bc_reviewfix8/
+w1_reviewfix8/`（干净树 21e5784；§5R6 链保留为被取代证据）：W0 2.5s；A3 attempt_001
+PASS（55/55 准入、denominator kept at 55，74.6s）；cache attempt_001（complete:true、
+consumed 55.5s/7200s、55 键控日程——与 §5R6 轮文件名 **0/55 重叠=再次 re-key 属预期**
+（本轮消费腿位于 w1_training.py=CONDITION_CODE_FILES 成员，cond_code 33c090c9…→
+d73f411d…），逐 demo 内容哈希 **55/55 逐位一致**、root_stats.npz 逐位相等）；S0 双模型
+各 1000 步 PASS——确定性 1285.8s `motion_reconstruction` 1.181996→0.011500、扩散
+1275.5s 1.474099→0.008721（两模型 101 probe 曲线与 §5R6 轮**逐位相等**=改动不触训练
+数值；趋势 first20/last20 0.394223→0.013504 / 0.428729→0.011308 同前），S0 合计
+2561.3s≤3600s；readiness `decisions/attempt_001` 五门全 true、unmet=[]、两模型
+identity_problems **空**，CPU 重放 0.011500352993607521/0.008721409365534782 与工件
+记录末探 0.011500352062284946/0.008721405640244484 **容差内一致**（差 9.3e-10/
+3.7e-9，与 §5R6 轮重放值逐位相等）；台账 6 行且每 attempt 恰一行（w0 2.5/a3 74.6/
+cache 56.6 done complete:true/det 1285.8 done/diff 1275.5 done/readiness 15.2）。
+新 running 拒收在真实链上无误报（check_b 数据集构建消费该缓存通过）。测试 637→
+**638 passed + 1 skipped**（审阅文件 39→40 项：**真实子进程**跑完整缓存阶段、最终
+complete-true 台账写盘处停摆、父进程在 identity+索引 complete=true 落盘后 SIGKILL——
+残行经真实生产路径复现（identity complete=true/索引行 complete=true/台账
+status=running wall_s=0 n_schedules=0），修复前消费核验 `problems=[]` 完全可消费、
+修复后拒 `cache_ledger_contradicts_identity:running` 且无 `cache_not_complete`，生产端
+历史腿同步核验 unknown；legacy 兼容腿：台账行去掉 status/complete（或 status=done 无
+complete）不构成矛盾）。
+
+工程事实（本轮新增）：
+
+1. **不可捕获终止没有生产侧出口**：SIGKILL 下 `except BaseException` 永不运行，崩溃
+   出口的撤销/登记都不发生——事前 running 行成为"最终登记未落地"的唯一在盘证人，
+   防御只能落在还活着的进程（消费侧）身上。
+2. **"显式非完成声明"的集合必须跨腿一致**：running 在生产端历史腿是未知=停止、在
+   消费腿却被放行——同一行台账两处判定相反；三方状态对账的每条腿（生产历史腿/索引
+   腿/台账腿）要么共享同一声明集合，缺口就会在两腿之间制造不一致裁决。
+
 ## 6. 就绪判断与后续边界（§10）
 
-【本节首段就绪指针已被 §5R6 第六轮审阅修复轮取代——权威就绪记录为
-`20261012_b91f9d0_w1_a3bc_reviewfix7/w1_reviewfix7/decisions/attempt_001/w1_readiness.json`
+【本节首段就绪指针已被 §5R7 第七轮审阅修复轮取代——权威就绪记录为
+`20261012_21e5784_w1_a3bc_reviewfix8/w1_reviewfix8/decisions/attempt_001/w1_readiness.json`
 （五门全 true，check_c 为重算门+checkpoint 重建重放门（含嵌套容器与原始值类型验证）
-+summary/工件末探对账门+注册集重建绑定门；check_b 缓存内容核验含三方矛盾腿）；本节
-其余边界表述继续有效】
++summary/工件末探对账门+注册集重建绑定门；check_b 缓存内容核验含三方矛盾腿（台账
+crashed/running/complete=false 均拒））；本节其余边界表述继续有效】
 `decisions/attempt_001/w1_readiness.json`：五门全 true、unmet=[]。就绪由事实重算
 （A3 行复算、缓存身份对账、双数据集真实构建、S0 门读取）；exit 0=记录完成。
 
