@@ -1,12 +1,13 @@
 # 文档索引
 
-整理日期：2026-10-11（最后更新 2026-10-12 第七轮审阅修复）。当前推进到 **W1 A3/B/C 七轮审阅修复完成：第七轮 1 项 P2 边界缺口（消费侧漏拒 SIGKILL 残留 running 台账行）修复后权威链重建，`ready_for_w1_d=true`（新链 `20261012_21e5784_w1_a3bc_reviewfix8`）；W1-D/E 正式训练尚未运行，最终可行性结论不变**。本页区分当前执行入口、保留的参考资料和历史归档。
+整理日期：2026-10-11（最后更新 2026-10-13）。当前推进到 **W1 A3/B/C 七轮审阅修复完成，权威链 `20261012_21e5784_w1_a3bc_reviewfix8` 的 `ready_for_w1_d=true` 已复验；下一项 W1-D/E 正式训练与裸输出评估方案已起草，执行接口加固和正式运行均未开始**。本页区分当前执行入口、保留的参考资料和历史归档。
 
 ## 当前入口
 
 | 文档 | 用途与状态 |
 | --- | --- |
-| [W1 弱动作监督 A3/B/C 方案](plans/omniretarget_w1_a3bc_plan.md) | 现行执行契约（v0.1）；A3/B/C 与 2026-10-12 审阅修复轮（七轮共 30 项缺口+1 项文档订正全修）已执行，W1-D/E 契约固定但 `not_run` |
+| [W1 正式训练与裸输出评估方案](plans/omniretarget_w1_de_plan.md) | 下一项执行方案（v0.1，2026-10-13）；绑定 reviewfix8，明确 I0–I4 实施项、R0/R1 注册、两模型各 ≤4k/累计 ≤12h、val31 三方法及采样附表、val6 详细证据和 F 收口；本方案尚未实施，D/E 为 `not_run` |
+| [W1 弱动作监督 A3/B/C 方案](plans/omniretarget_w1_a3bc_plan.md) | 已执行的前置契约（v0.1）；A3/B/C 与 2026-10-12 审阅修复轮（七轮共 30 项缺口+1 项文档订正全修）已执行，D/E 基础契约由下一项方案具体化 |
 | [W1 A3/B/C 验证记录](verification/omniretarget_w1_a3bc_verification.md) | 接口实现、74 项相关测试与正式运行的实际证据；§5R7 为第七轮审阅修复权威链（运行根 `20261012_21e5784_w1_a3bc_reviewfix8/w1_reviewfix8`，就绪报告 `decisions/attempt_001`），§5R6/§5R5/§5R4/§5R3/§5R2/§5R 链与旧链保留为被取代证据 |
 | [OmniRetarget 优先教师与初步训练总方案](plans/omniretarget_first_training_plan.md) | 父方案，约束来源裁决、W1 用途、训练和裸输出评估；原文字节是 A2 快照证据的一部分 |
 | [A2 收口与有限恢复方案](plans/omniretarget_a2_closure_plan.md) | 已执行阶段的实验契约，W1 入口依据；原文字节保留供 A2 证据复核 |
@@ -19,14 +20,15 @@
 
 ## 冻结方案与进度说明
 
-两份 OmniRetarget 方案的首页状态保留其编写时快照；“收口尚未实施”等表述不代表当前进度。当前执行状态由本页、最新验证记录和其权威产物共同说明：A2 已完成收口，W1 仅起草。
+父方案、A2 收口方案和 W1 A3/B/C 方案的首页状态保留其编写时快照；“收口尚未实施”等表述不代表当前进度。当前执行状态由本页、最新验证记录和其权威产物共同说明：A2 已完成收口，W1 A3/B/C 已完成并通过七轮审阅，D/E 执行方案已起草且尚未实施。
 
-A2 的 `baseline/snapshots/attempt_006/evidence_files.json` 已按文件路径记录两份方案的完整哈希。本次不覆写其内容，也保留它们直接引用的文档路径：
+A2 的 `baseline/snapshots/attempt_006/evidence_files.json` 已按文件路径记录两份父方案的完整哈希；reviewfix8 的 `freeze/preregistration.json` 另冻结 W1 A3/B/C 方案。下列历史字节及它们直接引用的文档路径保留：
 
 | 冻结文档 | SHA-256 |
 | --- | --- |
 | `plans/omniretarget_first_training_plan.md` | `ca7cd4d8db553cac0057d1392c3238f0ca0fbfcbe4748f4c5946a3e650da2e84` |
 | `plans/omniretarget_a2_closure_plan.md` | `28fd40e43af0f524e5c2c23dc776a5a9b1b00bd872d75ee90442b5f41a8b81b3` |
+| `plans/omniretarget_w1_a3bc_plan.md` | `e7247e4b76d7cdfec04e288883dbdaccd868c7908108a8f2f5171839c766fc2f` |
 
 后续需要修改其协议时，应明确新版本、旧版本保存位置和证据引用关系，避免把历史核验锚点当作普通进度备注覆盖。
 
