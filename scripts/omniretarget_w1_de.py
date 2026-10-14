@@ -150,6 +150,10 @@ DOMAINS = {
 #: writes' latency so a kill after the seal lands cannot leave an
 #: undersampled done row (scaled up from observed write latencies per call).
 SEAL_TAIL_RESERVE_S = 1.0
+#: post-seal verification rounds: each round only continues when a write was
+#: slower than the previous reserve (latencies must keep growing), so the
+#: bound only matters under adversarial scheduling; exhaustion revokes.
+SEAL_VERIFY_ROUNDS = 4
 
 
 # --- cost ledger (§8.2/§8.3) ---------------------------------------------------
@@ -524,32 +528,70 @@ def finish_attempt(run_root: Path, stage: str, attempt_dir: Path,
         status = "incomplete"
         row = _publish(row)
 
-    def _seal(rw, st):
-        cost = time.perf_counter() - t0
-        if not overrun:
-            # Charge the reserve into the completion cost: a kill after the
-            # seal write lands leaves measured >= actual (conservative).
-            cost += reserve
+    def _write_terminal(rw, st, cost, res):
         rw = {**rw, "status": st, "measured_wall_s": cost,
-              "seal_tail_reserve_s": reserve}
+              "seal_tail_reserve_s": res}
         _tw(_replace_index_row, stage_root, attempt, rw)
         _tw(_upsert_cost, run_root, stage, attempt, cost,
             {**extra, "complete": rw.get("complete", False),
              "incomplete_reason": rw.get("incomplete_reason"),
-             "seal_tail_reserve_s": reserve}, st)
+             "seal_tail_reserve_s": res}, st)
         return rw
 
-    row = _seal(row, status)
-    # Post-seal deadline check AFTER the last registration (plan §8.2: the
-    # final index/ledger registration is itself covered). A seal write that
-    # crossed the deadline despite the reserve revokes the completion.
-    if not overrun and time.perf_counter() - t0 >= remaining:
+    def _rederive_reserve():
+        return max(SEAL_TAIL_RESERVE_S, 2.0 * max(write_s, default=0.0))
+
+    def _revoke(reason):
+        # Every terminal registration — including a revocation — charges a
+        # reserve covering its own final write; the verify loop below checks
+        # the coverage and leaves the row unknown when it cannot be proven.
+        nonlocal overrun, reserve
         overrun = True
-        row.update(complete=False,
-                   incomplete_reason="budget_exceeded_after_seal")
-        row = _stop_docs(row)
-        row = _publish(row)
-        row = _seal(row, "incomplete")
+        reserve = _rederive_reserve()
+        row.update(complete=False, incomplete_reason=reason)
+        _stop_docs(row)
+        _publish(row)
+        return _write_terminal(row, "incomplete",
+                               time.perf_counter() - t0 + reserve, reserve)
+
+    def _leave_unknown(rw):
+        # Cost coverage could not be proven within the round budget: the
+        # registration is left unpublished (status publishing) — non-
+        # consumable, so the domain history stays unknown instead of an
+        # under-counted consumable row.
+        rw.setdefault("incomplete_reason", "seal_tail_reserve_unverifiable")
+        _stop_docs(rw)
+        return _publish(rw)
+
+    # Terminal seal: the reserve is charged into EVERY terminal registration
+    # (completions and revocations alike) so a kill after the final write
+    # lands leaves measured >= actual.
+    reserve = _rederive_reserve()
+    row = _write_terminal(row, status, time.perf_counter() - t0 + reserve,
+                          reserve)
+    # Post-seal verification AFTER the last registration (plan §8.2: the
+    # final index/ledger registration is itself covered). The loop must BOTH
+    # enforce the deadline AND verify the charged reserve actually covered
+    # the seal writes — for completions AND revoked attempts alike: an
+    # undersampled registration is refreshed with the observed cost (reserve
+    # re-derived from the now larger write latencies), revoked when the
+    # refresh cannot be afforded, or left unknown when coverage cannot be
+    # proven. An under-counted cost must never survive into scheduling.
+    for _ in range(SEAL_VERIFY_ROUNDS):
+        post = time.perf_counter() - t0
+        if not overrun and post >= remaining:
+            row = _revoke("budget_exceeded_after_seal")
+            continue
+        if post <= row["measured_wall_s"]:
+            break  # the charged cost covers the actual elapsed time
+        reserve = _rederive_reserve()
+        if not overrun and post + reserve >= remaining:
+            # An honest re-registration would itself cross the deadline.
+            row = _revoke("seal_tail_reserve_insufficient")
+            continue
+        row = _write_terminal(row, status, post + reserve, reserve)
+    else:
+        row = _leave_unknown(row)
     return not overrun and row.get("complete", row.get("passed", False)) is True
 
 

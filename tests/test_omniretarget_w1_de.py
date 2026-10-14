@@ -1116,18 +1116,21 @@ import omniretarget_w1_de as drv
 # warm the imports finish_attempt pays for, so t0 is not eaten by them
 drv._registration_sha(run_root)
 
+t0 = time.perf_counter()
 real_upsert = drv._upsert_cost
 def delayed_seal_upsert(run_root, stage, attempt, wall, extra, status):
     if status == "done":
+        time.sleep(0.2)          # the seal write itself is slow
         real_upsert(run_root, stage, attempt, wall, extra, status)
-        (run_root / "sealed.marker").write_text(status)
+        (run_root / "sealed.marker").write_text(
+            repr(time.perf_counter() - t0))
         time.sleep(60)           # killed here: after the seal write landed
     return real_upsert(run_root, stage, attempt, wall, extra, status)
 drv._upsert_cost = delayed_seal_upsert
 
 budget = {{"total_s": 10.0, "historical_s": 0.0, "remaining_s": 5.0, "reserve_s": 0.0}}
 drv.finish_attempt(run_root, {stage!r}, attempt_dir,
-                   time.perf_counter(), budget,
+                   t0, budget,
                    {{"complete": True}}, {{}})
 """)
     request = {"run_root": str(run), "attempt_dir": str(run / "evaluation/raw/attempt_001")}
@@ -1150,7 +1153,9 @@ drv.finish_attempt(run_root, {stage!r}, attempt_dir,
             if child.poll() is not None:
                 break
             time.sleep(0.05)
-        assert marker.is_file() and marker.read_text() == "done"
+        assert marker.is_file()
+        landed_elapsed = float(marker.read_text())
+        assert landed_elapsed >= 0.2, marker.read_text()
         os.kill(child.pid, signal.SIGKILL)
     finally:
         child.wait()
@@ -1159,19 +1164,163 @@ drv.finish_attempt(run_root, {stage!r}, attempt_dir,
     assert entries and entries[-1]["status"] == "done", entries
     e = entries[-1]
     assert e.get("complete") is True
-    # the charged cost covers the delayed seal write: measured >= actual
-    assert e["measured_wall_s"] >= 0.2, e
-    assert e["seal_tail_reserve_s"] >= 0.2
+    # the charged cost covers the delayed seal write: measured >= the actual
+    # elapsed recorded by the child at the moment the write landed
+    assert e["measured_wall_s"] >= landed_elapsed, (e, landed_elapsed)
+    assert e["seal_tail_reserve_s"] >= landed_elapsed
     idx = json.loads((run / "evaluation/raw/attempts_index.json").read_text())["attempts"]
     assert idx[-1]["status"] == "done" and idx[-1]["complete"] is True
-    assert idx[-1]["measured_wall_s"] >= 0.2
-    assert idx[-1]["seal_tail_reserve_s"] >= 0.2
+    assert idx[-1]["measured_wall_s"] >= landed_elapsed
+    assert idx[-1]["seal_tail_reserve_s"] >= landed_elapsed
     # the completion is genuine and the cost conservative: consumable, and
     # the boundary is verifiable (measured >= any kill-point elapsed time)
     row, problems = drv.stage_state(run, stage, tmp_path)
     assert row is not None and not problems
     hist = drv.domain_history_cost_s(run, "e")
-    assert hist is not None and hist >= 0.2
+    assert hist is not None and hist >= landed_elapsed
+
+
+def test_finish_attempt_slow_seal_revoked_when_refresh_unaffordable(
+        tmp_path, monkeypatch):
+    """No-kill counterexample (the audited repro): a domain budget of 2.35s
+    with 1.2s-slow seal writes. The post-seal verification must not let an
+    undersampled cost survive into budget scheduling — for completions AND
+    revocations alike: attempt 1 cannot afford an honest re-registration
+    (actual 1.2s + re-derived reserve 2.4s >= remaining 2.35s) and is
+    revoked, and the revoked registration itself charges a reserve covering
+    its own final write, so the recorded cost provably covers the real
+    consumption. The budget is therefore exhausted when the next attempt is
+    scheduled — the over-consumption is visible instead of laundered (the
+    old code recorded ~2.02s for ~2.46s actual and allowed the next call)."""
+    world, run = _de_world(tmp_path, monkeypatch)
+    assert drv.stage_register(SimpleNamespace(
+        source_run_root=world["run"], run_root=run, plan="de_plan.md")) == 0
+    stage = drv.STAGES["raw-eval"]
+    original = drv._upsert_cost
+
+    def slow(*args, **kwargs):
+        if args[5] == "done":
+            time.sleep(1.2)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(drv, "_upsert_cost", slow)
+    reasons = []
+    for _ in range(2):
+        # remaining is derived BEFORE the attempt begins: a begun attempt's
+        # running row makes the history unknown (= stop) by design
+        hist = drv.domain_history_cost_s(run, "e") or 0.0
+        att = drv._begin_attempt(run, stage)
+        t0 = time.perf_counter()
+        assert not drv.finish_attempt(run, stage, att, t0,
+            {"remaining_s": 2.35 - hist}, {"complete": True}, {})
+        actual = time.perf_counter() - t0
+        rows = json.loads((att.parent / "attempts_index.json").read_text())["attempts"]
+        assert rows[-1]["status"] == "incomplete"
+        assert rows[-1]["complete"] is False
+        # the recorded cost covers the actual consumption of the attempt
+        assert rows[-1]["measured_wall_s"] >= actual
+        reasons.append(rows[-1]["incomplete_reason"])
+    # attempt 1: revoked (honest refresh unaffordable); attempt 2: refused
+    # at entry because attempt 1's verified cost exhausted the 2.35s budget
+    assert reasons == ["seal_tail_reserve_insufficient",
+                       "budget_exceeded_after_registration"], reasons
+    # the recorded cumulative history covers the actual consumption and the
+    # budget over-consumption is honestly visible (no under-counted done)
+    hist = drv.domain_history_cost_s(run, "e")
+    assert hist is not None and hist >= 2.35
+    costs = [c for c in json.loads((run / "costs.json").read_text())["invocations"]
+             if c["stage"] == stage]
+    assert all(c["status"] == "incomplete" and c["complete"] is False
+               for c in costs)
+
+
+def test_finish_attempt_revoked_registration_cost_is_covered(
+        tmp_path, monkeypatch):
+    """No-kill counterexample (the audited repro): budget 1.8s, the done
+    seal write delayed 1.2s, and the REVOKED registration's own incomplete
+    write delayed 0.8s. The revoked attempt's cost must be verified too —
+    the charged reserve covers the slow incomplete write, so the recorded
+    history provably covers the real consumption (~2.0s) instead of the
+    ~1.2s the old code recorded, and the scheduler cannot start a next call
+    against the exhausted budget."""
+    world, run = _de_world(tmp_path, monkeypatch)
+    assert drv.stage_register(SimpleNamespace(
+        source_run_root=world["run"], run_root=run, plan="de_plan.md")) == 0
+    stage = drv.STAGES["raw-eval"]
+    original = drv._upsert_cost
+
+    def slow(*args, **kwargs):
+        if args[5] == "done":
+            time.sleep(1.2)
+        elif args[5] == "incomplete":
+            time.sleep(0.8)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(drv, "_upsert_cost", slow)
+    hist = drv.domain_history_cost_s(run, "e") or 0.0
+    att = drv._begin_attempt(run, stage)
+    t0 = time.perf_counter()
+    assert not drv.finish_attempt(run, stage, att, t0,
+        {"remaining_s": 1.8 - hist}, {"complete": True}, {})
+    actual = time.perf_counter() - t0
+    rows = json.loads((att.parent / "attempts_index.json").read_text())["attempts"]
+    assert rows[-1]["status"] == "incomplete"
+    assert rows[-1]["incomplete_reason"] == "seal_tail_reserve_insufficient"
+    # the revoked registration's recorded cost covers its own slow write
+    assert rows[-1]["measured_wall_s"] >= actual, (rows[-1], actual)
+    assert rows[-1]["seal_tail_reserve_s"] >= 0.8
+    costs = [c for c in json.loads((run / "costs.json").read_text())["invocations"]
+             if c["stage"] == stage]
+    assert len(costs) == 1 and costs[-1]["measured_wall_s"] >= actual
+    row, problems = drv.stage_state(run, stage, world["root"])
+    assert not problems
+    # the consumed budget is provably gone: a next call is refused at entry
+    hist = drv.domain_history_cost_s(run, "e")
+    assert hist is not None and hist >= 1.8
+    att2 = drv._begin_attempt(run, stage)
+    assert not drv.finish_attempt(run, stage, att2, time.perf_counter(),
+        {"remaining_s": 1.8 - hist}, {"complete": True}, {})
+    rows = json.loads((att2.parent / "attempts_index.json").read_text())["attempts"]
+    assert rows[-1]["attempt"] == att2.name
+    assert rows[-1]["incomplete_reason"] == "budget_exceeded_after_registration"
+
+
+def test_finish_attempt_slow_seal_refresh_updates_recorded_cost(
+        tmp_path, monkeypatch):
+    """No-kill complement: when the honest re-registration IS affordable
+    (remaining 10s), the post-seal verification refreshes the terminal rows
+    with the observed cost plus a re-derived reserve instead of revoking —
+    the recorded cost then provably covers the slow seal write."""
+    world, run = _de_world(tmp_path, monkeypatch)
+    assert drv.stage_register(SimpleNamespace(
+        source_run_root=world["run"], run_root=run, plan="de_plan.md")) == 0
+    stage = drv.STAGES["raw-eval"]
+    att = drv._begin_attempt(run, stage)
+    original = drv._upsert_cost
+
+    def slow(*args, **kwargs):
+        if args[5] == "done":
+            time.sleep(1.2)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(drv, "_upsert_cost", slow)
+    t0 = time.perf_counter()
+    assert drv.finish_attempt(run, stage, att, t0,
+        {"remaining_s": 10.0}, {"complete": True}, {})
+    actual = time.perf_counter() - t0
+    rows = json.loads((att.parent / "attempts_index.json").read_text())["attempts"]
+    assert rows[-1]["status"] == "done" and rows[-1]["complete"] is True
+    assert rows[-1]["measured_wall_s"] >= 1.2
+    assert rows[-1]["seal_tail_reserve_s"] >= 1.2
+    assert rows[-1]["measured_wall_s"] >= actual - 0.05
+    costs = [c for c in json.loads((run / "costs.json").read_text())["invocations"]
+             if c["stage"] == stage]
+    assert len(costs) == 1 and costs[-1]["status"] == "done"
+    assert costs[-1]["measured_wall_s"] == rows[-1]["measured_wall_s"]
+    row, problems = drv.stage_state(run, stage, world["root"])
+    assert not problems
+    hist = drv.domain_history_cost_s(run, "e")
+    assert hist is not None and hist >= actual - 0.05
 
 
 def _in_process_spawn(monkeypatch):
