@@ -372,7 +372,126 @@ def _detail_curves(arrays: dict, clip, series: dict, report, validator) -> dict:
     first = min(firsts) if firsts else None
     curves["first_failure_frame"] = np.int64(-1 if first is None else first)
     curves["first_failure_marker"] = np.arange(T) == (-1 if first is None else first)
+    assert set(curves) == set(_DETAIL_CURVE_CONTRACT), sorted(
+        set(curves) ^ set(_DETAIL_CURVE_CONTRACT))
     return curves
+
+
+#: The delivered per-row curve artifact contract: every key the writer
+#: produces, with its validation kind. ``finite`` arrays are finite over all
+#: T frames; ``mask`` arrays are boolean; NaN-capable kinds must place their
+#: undefined entries exactly on the definition mask named by the kind
+#: (``velocity_defined``, ``seam_mask`` or a per-side reference mask);
+#: ``nan_or_finite`` permits all-NaN (no robot interval) but never inf.
+_DETAIL_CURVE_CONTRACT: dict[str, str] = {
+    "frame": "int", "time_s": "finite", "task_world": "finite",
+    "task_box": "finite", "fit_root_position_m": "finite",
+    "fit_root_rotation_deg": "finite", "fit_joint_mae_rad": "finite",
+    "fit_fk_mpjpe_box_m": "finite", "penetration_keyframe": "finite",
+    "box_ground": "finite", "root_excursion_m": "finite",
+    "root_path_length_m": "finite", "root_relative_teacher_drift_m": "finite",
+    "penetration_adaptive_max_m": "scalar_finite", "first_failure_frame": "scalar_int",
+    "window_starts": "int_array", "velocity_defined": "mask",
+    "seam_mask": "mask", "interior_velocity_reference": "mask",
+    "first_failure_marker": "mask", "both_reference": "mask",
+    "both_certified": "mask", "both_certified_overlap": "mask",
+    "base_linear_velocity_mps": "nan_velocity",
+    "base_angular_velocity_radps": "nan_velocity",
+    "joint_max_velocity_radps": "nan_velocity",
+    "seam_position_jump_m": "nan_seam", "seam_rotation_jump_deg": "nan_seam",
+    "seam_joint_jump_rad": "nan_seam",
+}
+for _side in ("l", "r"):
+    _DETAIL_CURVE_CONTRACT.update({
+        f"hand_gap_{_side}": "finite",
+        f"hand_reference_{_side}": "mask", f"hand_near_{_side}": "mask",
+        f"hand_certified_{_side}": "mask", f"certified_overlap_{_side}": "mask",
+        f"hand_relative_speed_{_side}": "nan_velocity",
+        f"hand_reference_drift_{_side}": f"nan_mask:hand_reference_{_side}",
+        f"hand_robot_anchor_drift_{_side}": "nan_or_finite",
+        f"foot_speed_{_side}": "nan_velocity",
+        f"foot_gap_{_side}": "finite",
+        f"foot_reference_support_{_side}": "mask",
+        f"foot_robot_support_{_side}": "mask",
+        f"foot_reference_drift_{_side}": f"nan_mask:foot_reference_support_{_side}",
+        f"foot_robot_anchor_drift_{_side}": "nan_or_finite",
+    })
+
+
+def _verify_detail_curves(arrays: dict, T: int, *, hand_gap_m=None) -> list[str]:
+    """Full required-field/shape/definition-mask verification of a curve
+    artifact — a hash-correct but stripped delivery is incomplete evidence."""
+    import numpy as np
+
+    problems = []
+    keys = set(arrays)
+    for missing in sorted(set(_DETAIL_CURVE_CONTRACT) - keys):
+        problems.append(f"curves_field_missing:{missing}")
+    for extra in sorted(keys - set(_DETAIL_CURVE_CONTRACT)):
+        problems.append(f"curves_field_unexpected:{extra}")
+    if problems:
+        return problems
+    for name, kind in _DETAIL_CURVE_CONTRACT.items():
+        a = arrays[name]
+        if kind.startswith("scalar"):
+            if a.shape != ():
+                problems.append(f"curves_field_not_scalar:{name}")
+            elif kind == "scalar_finite" and not np.isfinite(a):
+                problems.append(f"curves_field_nonfinite:{name}")
+            elif kind == "scalar_int" and not (
+                    np.issubdtype(a.dtype, np.integer) and int(a) >= -1):
+                problems.append(f"curves_field_not_integer:{name}")
+            continue
+        if a.ndim != 1 or (kind != "int_array" and a.shape[0] != T):
+            problems.append(f"curves_field_shape:{name}")
+            continue
+        if kind in ("int", "int_array"):
+            if not np.issubdtype(a.dtype, np.integer):
+                problems.append(f"curves_field_not_integer:{name}")
+            elif kind == "int_array" and len(a) and (a.min() < 0 or a.max() >= T):
+                problems.append(f"curves_field_out_of_range:{name}")
+            continue
+        finite = np.isfinite(a)
+        if kind == "finite" and not finite.all():
+            problems.append(f"curves_field_nonfinite:{name}")
+        elif kind == "mask":
+            if a.dtype != np.bool_:
+                problems.append(f"curves_field_not_mask:{name}")
+        elif kind == "nan_velocity":
+            if not np.array_equal(~finite, ~arrays["velocity_defined"]):
+                problems.append(f"curves_field_undefined_mask:{name}")
+        elif kind == "nan_seam":
+            if not np.array_equal(~finite, ~arrays["seam_mask"]):
+                problems.append(f"curves_field_undefined_mask:{name}")
+        elif kind.startswith("nan_mask:"):
+            if not np.array_equal(~finite, ~arrays[kind.split(":", 1)[1]]):
+                problems.append(f"curves_field_undefined_mask:{name}")
+        elif kind == "nan_or_finite" and not (finite | np.isnan(a)).all():
+            problems.append(f"curves_field_nonfinite:{name}")
+    if problems:
+        return problems
+    frame = arrays["frame"]
+    if not np.array_equal(frame, np.arange(T)):
+        problems.append("curves_frame_not_arange")
+    if not np.array_equal(arrays["velocity_defined"], np.arange(T) > 0):
+        problems.append("curves_velocity_defined_mask_invalid")
+    for side in ("l", "r"):
+        if not np.array_equal(arrays[f"certified_overlap_{side}"],
+                              arrays[f"hand_certified_{side}"] & arrays[f"hand_reference_{side}"]):
+            problems.append(f"curves_certified_overlap_invalid:{side}")
+        if hand_gap_m is not None and not np.array_equal(
+                arrays[f"hand_near_{side}"],
+                np.maximum(arrays[f"hand_gap_{side}"], 0) < hand_gap_m):
+            problems.append(f"curves_hand_near_invalid:{side}")
+    if not np.array_equal(arrays["both_certified_overlap"],
+                          arrays["both_reference"] & arrays["hand_certified_l"]
+                          & arrays["hand_certified_r"]):
+        problems.append("curves_both_intersection_invalid")
+    first = int(arrays["first_failure_frame"])
+    expected_marker = (np.arange(T) == first) if first >= 0 else np.zeros(T, dtype=bool)
+    if not np.array_equal(arrays["first_failure_marker"], expected_marker):
+        problems.append("curves_first_failure_marker_invalid")
+    return problems
 
 
 def _reference_product(clip, manifest_row: dict, path: Path,
@@ -398,6 +517,70 @@ def _reference_product(clip, manifest_row: dict, path: Path,
               source_derived_sha256=manifest_row["derived"]["sha256"],
               training_manifest_sha256=reg["training_manifest"]["sha256"])
     return _file_record(path, project_root)
+
+
+#: The delivered per-demo reference artifact contract (exact key set).
+_REFERENCE_FIELDS = frozenset({
+    "human_kpts_world", "source_box", "target_box",
+    "source_box_similarity_scale", "teacher_root", "teacher_joints",
+    "teacher_scene", "frame_dt", "reference_contact_flags",
+    "reference_intervals_json", "demo", "source_derived_sha256",
+    "training_manifest_sha256",
+})
+
+
+def _verify_reference_artifact(arrays: dict, row: dict, reg: dict,
+                               clip=None, manifest_row: dict | None = None) -> list[str]:
+    """Complete-field verification of a delivered reference artifact, with
+    bitwise binding to the FROZEN clip when the caller supplies one — a
+    hash-correct reference stripped of the source box, scale or teacher
+    trajectory is an incomplete delivery, not passing evidence."""
+    import numpy as np
+
+    problems = []
+    keys = set(arrays)
+    for missing in sorted(_REFERENCE_FIELDS - keys):
+        problems.append(f"reference_field_missing:{missing}")
+    for extra in sorted(keys - _REFERENCE_FIELDS):
+        problems.append(f"reference_field_unexpected:{extra}")
+    if problems:
+        return problems
+    if str(arrays["demo"]) != row.get("demo"):
+        problems.append("reference_demo_mismatch")
+    if str(arrays["training_manifest_sha256"]) != reg["training_manifest"]["sha256"]:
+        problems.append("reference_training_manifest_sha_mismatch")
+    if manifest_row is not None and str(arrays["source_derived_sha256"]) != manifest_row["derived"]["sha256"]:
+        problems.append("reference_source_derived_sha_mismatch")
+    scale = arrays["source_box_similarity_scale"]
+    if not ((np.isscalar(scale) or scale.shape == ())
+            and math.isfinite(float(scale)) and float(scale) > 0):
+        problems.append("reference_similarity_scale_invalid")
+    if clip is None:
+        return problems
+    cond = clip.condition.truncate(clip.T)
+    T = clip.T
+    expectations = {
+        "human_kpts_world": (cond.human_kps_world, (T, 52, 3)),
+        "source_box": (cond.source_obj_pose, (T, 7)),
+        "target_box": (cond.target_obj_pose, (T, 7)),
+        "teacher_root": (clip.root, (T, 7)),
+        "teacher_joints": (clip.q, (T, 29)),
+        "teacher_scene": (clip.scene_qpos(), (T, 43)),
+        "reference_contact_flags": (cond.contact_flags(), None),
+    }
+    for name, (want, shape) in expectations.items():
+        got = arrays[name]
+        if got.shape != want.shape or (shape is not None and got.shape != shape) \
+                or not np.array_equal(got, want):
+            problems.append(f"reference_not_frozen_clip:{name}")
+    if not (np.isscalar(arrays["frame_dt"]) or arrays["frame_dt"].shape == ()) \
+            or float(arrays["frame_dt"]) != cond.frame_dt:
+        problems.append("reference_frame_dt_not_frozen")
+    intervals = [{"effector": iv.effector, "start": iv.start, "end": iv.end,
+                  "support": iv.support} for iv in cond.schedule.intervals]
+    if str(arrays["reference_intervals_json"]) != json.dumps(intervals):
+        problems.append("reference_intervals_not_frozen")
+    return problems
 
 
 def _measure_unit(payload: dict) -> dict:

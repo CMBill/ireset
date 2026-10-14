@@ -262,3 +262,21 @@ F各状态分列：
 - [x] val6的18条主产物复用、曲线与两类真实回放完成；未执行train归因三例如实登记。
 - [x] F分别裁定训练、比较、有限动作基线和最终交互；后续建议自动执行=false。
 - [x] U0/UR、发布标签质量风险及自研路线历史边界保持；未宣称持续搬运、承重、RL跟踪或OmniRetarget端到端加速。
+
+## 9. 收口后独立审计修复轮（2026-10-14）
+
+外部独立审计确认质量负结果成立（97 链接、九份关键哈希、155 产物哈希、31 份 Teacher 内容与冻结标签一致、12 条代表产物重测无差异、选模与四预算域成立），另发现 5 项核验缺口（3 P1+2 P2）已全部修复。**Teacher 2/31、两模型 0/31、`motion_baseline=complete`（有限动作基线）、`final_interaction_method=not_ready`、归因不足的结论不变；本轮纯核验侧加固，未重跑任何生产阶段。**
+
+| 缺口 | 级别 | 修复 |
+| --- | --- | --- |
+| Teacher 产物未与冻结标签对账即复用自参考 FK | P1 | `recompute_w1_de_product` 对 teacher 行先做 `root/joints` 与冻结 clip 的**逐位对账**（`teacher_product_not_bitwise_frozen_label`），不一致即 `product_invalid`——平移 10cm 并更新哈希的临时副本不再能以自身 FK 洗白拟合 0 |
+| 完成台账在预算终检前发布 | P1 | `finish_attempt` 重排：预算裁决**先于**任何终态行发布；盘/索引/台账各恰一次写入。真实子进程 SIGKILL 反例（剩余预算 0.1s、写盘延迟超限）下残行只能为 running 或诚实裁决的 incomplete，`budget_exceeded_after_registration` 撤销也并入同一发布序列 |
+| F 只核 detail_f 历史 | P1 | `stage_finalize` 入口**重审全部四个预算域**（r0r1/d/e/detail_f）的盘×索引×台账三方对账与累计上限，计入本 attempt 之前；任一域历史未知（如未入账的 D 尝试）或超限即 `budget_domain_history_unknown/exceeded:<domain>`，closure 不可 complete；detail_f 自身不可用时也落盘 incomplete 记录而非裸退 |
+| val6 工件只查五项字段 | P2 | 新增 curves/reference **完整必需字段契约**：curves 46 键按类型（有限/掩码/速度 NaN 定义掩码/区间漂移 NaN=参考掩码外/整型）核形状与掩码一致性（`curves_field_missing/unexpected/undefined_mask/...`）；reference 13 键结构核验+生产入口逐位绑定冻结 clip（`reference_not_frozen_clip:*`）。删 52 字段或删源箱/尺度/教师轨迹的哈希正确残件均拒 |
+| 预算单测读到真实运行历史 | P2 | 预算/历史单测显式 monkeypatch `ireset.paths.PROJECT_ROOT` 至 tmp 沙箱（专项回归 151p/1f → 18p/0f）；生产跨运行累计语义不变 |
+
+反例测试：新增真实子进程 SIGKILL 复现（击杀点在第一次台账写盘处，修复前发布 done/complete=true）；合成链测试扩展四项篡改反例（未入账 D 尝试、curves 削字段、reference 削字段、teacher 平移 10cm），closure 夹具 reference 按完整契约真实化。测试链 790→**791 passed+1 skipped**（1791.54s）。
+
+**真实 RUN 复核（新契约下）**：31 份 Teacher 产物与冻结 clip 逐位相等（0 偏离）；18 条 curves 与 6 条 reference 工件完整字段/掩码/冻结绑定核验全部通过；四预算域历史可证且未超限（d 8657.97/43200、e 524.65/7200、detail_f 570.84/3600、r0r1 37.54/7200）；六 stage_state 无问题——权威 F 报告在新代码下结论不变。
+
+本轮工程事实：**自参考捷径的前提是被验证对象与参照逐位相等**（自参考测量只能证明"产物=产物"，冻结标签对账必须先行）；**完成声明必须在最后一个预算检查点之后单次发布**（检查点与发布之间的窗口内被杀，事前 running 行是唯一在盘证人）；**收口审计的预算域必须全覆盖**（只审计即将花费的域会让其他域的未入账尝试静默漂过）；**哈希正确≠交付完整**（产物完整性契约须枚举必需字段集与定义掩码，而非抽检五个键）；**测试不得消费生产台账**（跨运行累计接口在测试中必须隔离 PROJECT_ROOT）；**近似键名字典陷阱**（契约核验首版把 expectations 键写成 `human_kps_world` 漏 t，被合成链测试逮住——完整性契约自身的键名必须与写入端断言对齐，本契约由 `_detail_curves` 的 set 相等断言钉死）。

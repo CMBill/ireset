@@ -1390,6 +1390,17 @@ def recompute_w1_de_product(path, row: dict, registration: dict, clip, validator
     arrays, metadata = verification["arrays"], verification["metadata"]
     retry = _w1_de_retry(metadata)
     root, joints = arrays.get("root"), arrays.get("joints")
+    if row["method"] == "teacher" and (root is None or joints is None
+                                       or not np.array_equal(root, clip.root)
+                                       or not np.array_equal(joints, clip.q)):
+        # The FK self-reference shortcut below is only sound for the frozen
+        # label itself; a teacher product that deviates from clip.root/clip.q
+        # must never measure its own deviation away.
+        verification["problems"].append("teacher_product_not_bitwise_frozen_label")
+        verification["passed"] = False
+        out["row"] = {**base, "T": T, "status": "product_invalid",
+                      "measurement_gaps": verification["problems"]}
+        return out
     scene = arrays.get("scene")
     traj = (RobotTrajectory(root, joints, float(arrays["frame_dt"]), metadata)
             if root is not None and joints is not None else None)

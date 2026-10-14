@@ -158,13 +158,18 @@ def _negative_detail(tmp_path):
     negative = tmp_path / "negative.npz"
     detail._save_npz(negative, normalized_windows=np.full((1, 60, 38), np.nan))
     product = detail._file_record(negative, tmp_path)
-    reference = tmp_path / "reference.npz"
-    detail._save_npz(reference, human_kpts_world=cond.human_kps_world,
-                     source_box=cond.source_obj_pose, target_box=cond.target_obj_pose,
-                     source_box_similarity_scale=.75, teacher_root=root, teacher_joints=joints,
-                     teacher_scene=np.concatenate([root, joints, cond.target_obj_pose], 1),
-                     frame_dt=cond.frame_dt)
-    ref = detail._file_record(reference, tmp_path)
+    refs = {}
+    for demo in demos:
+        reference = tmp_path / f"reference__{demo}.npz"
+        detail._save_npz(reference, human_kpts_world=cond.human_kps_world,
+                         source_box=cond.source_obj_pose, target_box=cond.target_obj_pose,
+                         source_box_similarity_scale=.75, teacher_root=root, teacher_joints=joints,
+                         teacher_scene=np.concatenate([root, joints, cond.target_obj_pose], 1),
+                         frame_dt=cond.frame_dt, reference_contact_flags=np.zeros(T, dtype=bool),
+                         reference_intervals_json="[]", demo=demo,
+                         source_derived_sha256="2" * 64,
+                         training_manifest_sha256=reg["training_manifest"]["sha256"])
+        refs[demo] = detail._file_record(reference, tmp_path)
     main = [r for r in raw.w1_de_expected_matrix(reg) if r["matrix"] == "main"]
     sources, rows = [], []
     for wanted in main:
@@ -173,7 +178,7 @@ def _negative_detail(tmp_path):
         sources.append(source)
         rows.append({**wanted, "T": T, "status": "numerical_rejected", "scene_product": product,
                      "consistent_with_raw": True, "raw_standard_pass": False,
-                     "recomputed": source, "reference": ref, "curves": None,
+                     "recomputed": source, "reference": refs[wanted["demo"]], "curves": None,
                      "curve_unavailable_reason": "numerical rejection; original bytes retained"})
     raw_path = tmp_path / "raw.json"; driver.atomic_json(raw_path, {"rows": sources})
     from PIL import Image

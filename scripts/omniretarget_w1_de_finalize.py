@@ -19,7 +19,8 @@ import omniretarget_w1_de as driver  # noqa: E402
 from omniretarget_w1_de_detail import (  # noqa: E402
     _begin_attempt, _check_deadline, _expected_identity, _file_record, _finish,
     _json_safe, _load_clip, _load_indexed_report, _read_json, _record_path,
-    _representative_cases, _run_unit,
+    _representative_cases, _run_unit, _verify_detail_curves,
+    _verify_reference_artifact,
 )
 
 REPLAY_TOL = 1e-5
@@ -486,7 +487,12 @@ def _replay_selected_checkpoints(run: Path, project: Path, reg: dict,
 
 
 def _verify_detail(report: dict, reg: dict, raw_report_path: Path | None,
-                   raw_rows: list[dict], project: Path) -> dict:
+                   raw_rows: list[dict], project: Path, *,
+                   deadline: float | None = None,
+                   clip_loader=None) -> dict:
+    """clip_loader: production supplies _load_clip so every delivered
+    reference artifact is bound BITWISE to the frozen clip; without it only
+    the structural field/shape contract is verified (unit fixtures)."""
     import numpy as np
     import eval_generation as raw
     from ireset.data.a2_integrity import sha256_file
@@ -510,6 +516,14 @@ def _verify_detail(report: dict, reg: dict, raw_report_path: Path | None,
                 or (project / source.get("path", "")).resolve() != raw_report_path.resolve()):
             problems.append("detail_raw_report_binding_mismatch")
     raw_by_key = {r.get("key"): r for r in raw_rows if isinstance(r, dict)}
+    clips: dict[str, tuple] = {}
+
+    def _demo_clip(demo):
+        if demo not in clips:
+            _check_deadline(deadline)
+            clips[demo] = _load_clip(reg, project, demo)
+        return clips[demo]
+
     processed = 0
     for row in rows:
         key, source = row.get("key"), raw_by_key.get(row.get("key"))
@@ -535,18 +549,26 @@ def _verify_detail(report: dict, reg: dict, raw_report_path: Path | None,
                 continue
             try:
                 with np.load(path, allow_pickle=False) as z:
-                    if field == "reference":
-                        human, box = z["human_kpts_world"], z["target_box"]
-                        if (human.shape != (row["T"], 52, 3) or box.shape != (row["T"], 7)
-                                or not np.isfinite(human).all() or not np.isfinite(box).all()):
-                            raise ValueError("reference_shape_or_finite")
-                    else:
-                        if z["task_world"].shape != (row["T"],) or not np.isfinite(z["task_world"]).all():
-                            raise ValueError("task_curve_shape_or_finite")
-                        if not np.array_equal(z["both_certified_overlap"],
-                                              z["both_reference"] & z["hand_certified_l"] & z["hand_certified_r"]):
-                            raise ValueError("both_intersection")
-            except (OSError, ValueError, TypeError, KeyError) as exc:
+                    loaded = {k: z[k].copy() for k in z.files}
+                if field == "reference":
+                    clip, manifest_row = None, None
+                    if clip_loader is not None:
+                        try:
+                            _check_deadline(deadline)
+                            clip, manifest_row = _demo_clip(row.get("demo"))
+                        except TimeoutError:
+                            raise
+                        except (Exception, SystemExit) as exc:
+                            problems.append(f"{key}:reference_clip_unloadable:{type(exc).__name__}:{exc}")
+                    problems.extend(f"{key}:{p}" for p in _verify_reference_artifact(
+                        loaded, row, reg, clip, manifest_row))
+                else:
+                    problems.extend(f"{key}:{p}" for p in _verify_detail_curves(
+                        loaded, row["T"],
+                        hand_gap_m=reg["evaluation"]["validation_config"].get("hand_gap_m")))
+            except TimeoutError:
+                raise
+            except (OSError, ValueError, TypeError, KeyError, SystemExit) as exc:
                 problems.append(f"{key}:{field}_invalid:{type(exc).__name__}")
         processed += 1
     cases = _representative_cases(rows, reg["rosters"]["val6"])
@@ -608,11 +630,34 @@ def stage_finalize(args) -> int:
     reg_path = run / "freeze/execution_registration.json"
     reg = _read_json(reg_path)
     entry_problems = driver.verify_execution_registration(run, project)
-    budget = driver._budget_state(run, "detail_f")
+    # The closure re-audits EVERY budget domain's disk/index/ledger
+    # reconciliation and cumulative cap (unknown or exceeded history in any
+    # domain — not just detail_f — is an incomplete closure), computed before
+    # this attempt's own running row exists.
+    budget_audit, budget_problems = {}, []
+    for domain in sorted(driver.DOMAINS):
+        stages, budget_s, reserve_s = driver.DOMAINS[domain]
+        hist = driver.domain_history_cost_s(run, domain)
+        budget_audit[domain] = {"stages": list(stages), "budget_s": budget_s,
+                                "reserve_s": reserve_s, "historical_s": hist}
+        if hist is None:
+            budget_problems.append(f"budget_domain_history_unknown:{domain}")
+        elif hist > budget_s:
+            budget_problems.append(f"budget_domain_exceeded:{domain}")
+    try:
+        budget = driver._budget_state(run, "detail_f")
+    except SystemExit as exc:
+        # detail_f itself unknown/exhausted: record the refusal as an
+        # incomplete closure instead of exiting without a registered attempt
+        budget_problems.append(f"budget_domain_detail_f_unavailable:{exc}")
+        budget = {"total_s": driver.DETAIL_F_BUDGET_S, "historical_s": None,
+                  "remaining_s": 0.0, "reserve_s": driver.DETAIL_F_RESERVE_S}
     deadline = t0 + budget["remaining_s"] - budget["reserve_s"]
     attempt, output = _begin_attempt(run, "finalize", "w1_de_final.json", project)
     record = {"stage": "W1-D/E independent closure", "complete": False,
-              "problems": list(entry_problems), "budget_stopped": False,
+              "problems": [*entry_problems, *budget_problems],
+              "budget_domains": budget_audit,
+              "budget_stopped": False,
               "motion_baseline": "incomplete"}
     artifacts = {}
     try:
@@ -713,7 +758,9 @@ def stage_finalize(args) -> int:
                                          "complete": completeness["appendix_complete"] and not problems},
                       "product_verification": verified}
         record["evaluation"] = evaluation
-        detail = _verify_detail(detail_report, reg, raw_path, recomputed_rows, project)
+        detail = _verify_detail(detail_report, reg, raw_path, recomputed_rows,
+                                project, deadline=deadline,
+                                clip_loader=lambda demo: _load_clip(reg, project, demo))
         detail["problems"].extend(detail_problems)
         detail["complete"] = detail["complete"] and not detail_problems
         detail["attempt"] = (detail_att or {}).get("attempt")
@@ -723,7 +770,8 @@ def stage_finalize(args) -> int:
         record["checkpoint_replay"] = replay
         closure_complete = bool(training["training_complete"] and evaluation_complete
                                 and detail["complete"] and replay["complete"]
-                                and not record["budget_stopped"] and not entry_problems)
+                                and not record["budget_stopped"] and not entry_problems
+                                and not budget_problems)
         numerical_failures = sum(g["counts"]["numerical_rejected"] for g in aggregates.values())
         motion = "failed" if closure_complete and numerical_failures else "complete" if closure_complete else "incomplete"
         unmet = ["sustained two-hand carry and main-plan final task acceptance remain unproven"]

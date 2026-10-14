@@ -421,17 +421,11 @@ def finish_attempt(run_root: Path, stage: str, attempt_dir: Path,
             path = Path(PROJECT_ROOT) / row[key]
             if path.is_file():
                 row[f"{key}_sha256"] = sha256_file(path)
-    elapsed = time.perf_counter() - t0
-    row["measured_wall_s"] = elapsed
-    indexed = any(r["attempt"] == attempt for r in _index_rows(stage_root))
-    if indexed:
-        _replace_index_row(stage_root, attempt, row)
-    else:
-        append_stage_index(stage_root, row)
-    _upsert_cost(run_root, stage, attempt, elapsed,
-                 {**extra, "complete": row.get("complete", False)}, status)
-    measured = time.perf_counter() - t0
-    overrun = measured >= budget["remaining_s"]
+    # The deadline verdict is reached BEFORE any terminal row is published: a
+    # kill between the verdict and the single write below can only leave a
+    # running or an honestly-judged row on disk, never a done/complete=true
+    # claim the check had not yet authorised.
+    overrun = time.perf_counter() - t0 >= budget["remaining_s"]
     if overrun:
         reason = "budget_exceeded_after_registration"
         row.update(complete=False, incomplete_reason=reason, status="incomplete")
@@ -443,16 +437,20 @@ def finish_attempt(run_root: Path, stage: str, attempt_dir: Path,
                 doc = json.loads(path.read_text())
                 if isinstance(doc, dict):
                     doc.update(complete=False, incomplete_reason=reason,
-                               budget_stopped=True, measured_wall_s=measured)
+                               budget_stopped=True,
+                               measured_wall_s=time.perf_counter() - t0)
                     if isinstance(doc.get("completeness"), dict):
                         doc["completeness"].update(complete=False, budget_stopped=True)
                     atomic_json(path, doc)
                     row[f"{key}_sha256"] = sha256_file(path)
         status = "incomplete"
-    measured = time.perf_counter() - t0
-    row["measured_wall_s"] = measured
-    _replace_index_row(stage_root, attempt, row)
-    _upsert_cost(run_root, stage, attempt, measured,
+    row["measured_wall_s"] = time.perf_counter() - t0
+    indexed = any(r["attempt"] == attempt for r in _index_rows(stage_root))
+    if indexed:
+        _replace_index_row(stage_root, attempt, row)
+    else:
+        append_stage_index(stage_root, row)
+    _upsert_cost(run_root, stage, attempt, row["measured_wall_s"],
                  {**extra, "complete": row.get("complete", False),
                   "incomplete_reason": row.get("incomplete_reason")}, status)
     if not overrun and time.perf_counter() - t0 >= budget["remaining_s"]:

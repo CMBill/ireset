@@ -98,7 +98,17 @@ formal_validation_contract:
 
 # --- §10 budget / history --------------------------------------------------------
 
-def test_domain_history_rejects_unknown_and_bad_costs(tmp_path):
+def _isolate_project_root(monkeypatch, tmp_path):
+    """Point ireset.paths.PROJECT_ROOT at the test sandbox so the cumulative
+    budget/history interfaces never read the workspace's REAL W1-D/E run
+    (production keeps the cross-run accumulation; tests must not)."""
+    import ireset.paths as paths_mod
+    monkeypatch.setattr(paths_mod, "PROJECT_ROOT", tmp_path)
+    return tmp_path
+
+
+def test_domain_history_rejects_unknown_and_bad_costs(tmp_path, monkeypatch):
+    _isolate_project_root(monkeypatch, tmp_path)
     run = tmp_path / "run"
     det = run / "formal/deterministic"
     (det / "attempt_001").mkdir(parents=True)
@@ -141,6 +151,7 @@ def test_domain_history_rejects_unknown_and_bad_costs(tmp_path):
 
 
 def test_budget_state_refuses_unknown_or_exhausted(tmp_path, monkeypatch):
+    _isolate_project_root(monkeypatch, tmp_path)
     run = tmp_path / "run"
     det = run / "formal/deterministic"
     (det / "attempt_001").mkdir(parents=True)
@@ -727,6 +738,74 @@ def test_stage_train_budget_exceeded_flips_complete_in_place(
 
 # --- the full synthetic chain (register -> D -> E -> detail -> finalize) ------------
 
+def test_finish_attempt_publication_waits_for_deadline_verdict(tmp_path):
+    """Real-subprocess counterexample (SIGKILL): the child publishes the
+    terminal ledger row and stalls. A kill inside the stall must never leave
+    a done/complete=true claim that the budget verdict had not yet
+    authorised — the completion declaration is published only AFTER the
+    deadline check, in a single write."""
+    import os
+    import signal
+    import subprocess
+
+    run = tmp_path / "run"
+    (run / "freeze").mkdir(parents=True)
+    (run / "freeze/execution_registration.json").write_text("{}")
+    stage = "w1_de_raw_eval"
+    drv._begin_attempt(run, stage)
+    script = tmp_path / "stall_child.py"
+    script.write_text(f"""\
+import sys, time
+sys.path.insert(0, {str(REPO / 'src')!r})
+sys.path.insert(0, {str(REPO / 'scripts')!r})
+import omniretarget_w1_de as drv
+
+real_upsert = drv._upsert_cost
+def stalling_upsert(run_root, stage, attempt, wall, extra, status):
+    real_upsert(run_root, stage, attempt, wall, extra, status)
+    (run_root / "published.marker").write_text(status)
+    time.sleep(60)
+drv._upsert_cost = stalling_upsert
+
+budget = {{"total_s": 10.0, "historical_s": 0.0, "remaining_s": 0.1, "reserve_s": 0.0}}
+drv.finish_attempt(run_root, {stage!r}, attempt_dir,
+                   time.perf_counter() - 1.0, budget,
+                   {{"complete": True}}, {{}})
+""")
+    request = {"run_root": str(run), "attempt_dir": str(run / "evaluation/raw/attempt_001")}
+    (tmp_path / "payload.json").write_text(json.dumps(request))
+    child = subprocess.Popen(
+        [sys.executable, "-c",
+         (f"import sys, json; from pathlib import Path; "
+          f"sys.path.insert(0, {str(REPO / 'src')!r}); "
+          f"sys.path.insert(0, {str(REPO / 'scripts')!r}); "
+          f"payload = json.load(open({str(tmp_path / 'payload.json')!r})); "
+          f"run_root = Path(payload['run_root']); "
+          f"attempt_dir = Path(payload['attempt_dir']); "
+          f"exec(open({str(script)!r}).read())")],
+        cwd=str(REPO))
+    try:
+        marker = run / "published.marker"
+        for _ in range(300):
+            if marker.is_file():
+                break
+            if child.poll() is not None:
+                break
+            time.sleep(0.05)
+        assert marker.is_file(), "child never published a ledger row"
+        os.kill(child.pid, signal.SIGKILL)
+    finally:
+        child.wait()
+    entries = [e for e in json.loads((run / "costs.json").read_text())["invocations"]
+               if e.get("stage") == stage]
+    assert entries, "the running row must survive as evidence"
+    e = entries[-1]
+    # the published claim is incomplete (verdict first), never done/complete
+    assert not (e.get("status") == "done" and e.get("complete") is True), e
+    assert e.get("status") == "incomplete" and e.get("complete") is False
+    idx = json.loads((run / "evaluation/raw/attempts_index.json").read_text())["attempts"]
+    assert idx[-1]["complete"] is False and idx[-1]["status"] == "incomplete"
+
 def _in_process_spawn(monkeypatch):
     """Fake _spawn that runs the spawned entry IN-PROCESS on the synthetic
     world (the real subprocess path is exercised by the real R/D/E/F run;
@@ -921,3 +1000,109 @@ def test_de_full_chain_synthetic(tmp_path, monkeypatch):
     assert final2["motion_baseline"] == "incomplete"
     assert any("raw_standard_pass" in p
                for p in final2["evaluation"]["recompute_problems"])
+
+    # COUNTEREXAMPLE (budget audit): an unregistered disk attempt in a
+    # NON-detail_f domain (a stray D attempt with no index/ledger row) makes
+    # the D history unknown — the closure re-audits every domain, not only
+    # the one it is about to spend
+    (de_run / "formal/deterministic/attempt_002").mkdir()
+    code = fin_mod.stage_finalize(SimpleNamespace(run_root=de_run,
+                                                  allow_new_attempt=False))
+    assert code == 2
+    fin_rows = json.loads((fin_dir / "attempts_index.json").read_text())["attempts"]
+    final3 = json.loads((fin_dir / fin_rows[-1]["attempt"]
+                         / "w1_de_final.json").read_text())
+    assert final3["complete"] is False
+    assert "budget_domain_history_unknown:d" in final3["problems"]
+    assert final3["budget_domains"]["d"]["historical_s"] is None
+    shutil_rmtree(de_run / "formal/deterministic/attempt_002")
+
+    # COUNTEREXAMPLE (curves completeness): a hash-correct curve artifact
+    # stripped to the five formerly spot-checked fields is an incomplete
+    # delivery — the full required field set, shapes and definition masks
+    # are verified
+    detail_idx_path = de_run / "evaluation/detail_val6/attempts_index.json"
+    detail_idx = json.loads(detail_idx_path.read_text())
+    detail_report_path = detail_dir / "detail_report.json"
+    detail_rep = json.loads(detail_report_path.read_text())
+    curves_row = next(r for r in detail_rep["rows"] if r.get("curves"))
+    curves_path = world["root"] / curves_row["curves"]["path"]
+    with np.load(curves_path, allow_pickle=False) as z:
+        kept = {k: z[k].copy() for k in ("task_world", "both_certified_overlap",
+                                         "both_reference", "hand_certified_l",
+                                         "hand_certified_r")}
+    with open(curves_path, "wb") as stream:
+        np.savez(stream, **kept)
+    new_sha = _sha(curves_path)
+    for r in detail_rep["rows"]:
+        if isinstance(r.get("curves"), dict) and r["curves"]["path"] == curves_row["curves"]["path"]:
+            r["curves"]["sha256"] = new_sha
+    detail_report_path.write_text(json.dumps(detail_rep, default=float))
+    for idx_row in detail_idx["attempts"]:
+        if idx_row.get("attempt") == "attempt_001":
+            idx_row.setdefault("artifacts", {})[curves_row["curves"]["path"]] = new_sha
+            idx_row["report_sha256"] = _sha(detail_report_path)
+    detail_idx_path.write_text(json.dumps(detail_idx))
+    code = fin_mod.stage_finalize(SimpleNamespace(run_root=de_run,
+                                                  allow_new_attempt=False))
+    assert code == 2
+    fin_rows = json.loads((fin_dir / "attempts_index.json").read_text())["attempts"]
+    final4 = json.loads((fin_dir / fin_rows[-1]["attempt"]
+                         / "w1_de_final.json").read_text())
+    assert any(p.endswith(":curves_field_missing:task_box")
+               for p in final4["detail"]["problems"])
+
+    # COUNTEREXAMPLE (reference completeness): a hash-correct reference
+    # artifact stripped of the source box, scale and teacher trajectory is
+    # incomplete — the reference is bound bitwise to the frozen clip
+    ref_row = next(r for r in detail_rep["rows"] if r.get("reference"))
+    ref_path = world["root"] / ref_row["reference"]["path"]
+    with np.load(ref_path, allow_pickle=False) as z:
+        kept = {k: z[k].copy() for k in ("human_kpts_world", "target_box")}
+    with open(ref_path, "wb") as stream:
+        np.savez(stream, **kept)
+    ref_sha = _sha(ref_path)
+    for r in detail_rep["rows"]:
+        if isinstance(r.get("reference"), dict) and r["reference"]["path"] == ref_row["reference"]["path"]:
+            r["reference"]["sha256"] = ref_sha
+    detail_report_path.write_text(json.dumps(detail_rep, default=float))
+    for idx_row in detail_idx["attempts"]:
+        if idx_row.get("attempt") == "attempt_001":
+            if ref_row["reference"]["path"] in idx_row.get("artifacts", {}):
+                idx_row["artifacts"][ref_row["reference"]["path"]] = ref_sha
+            idx_row["report_sha256"] = _sha(detail_report_path)
+    detail_idx_path.write_text(json.dumps(detail_idx))
+    code = fin_mod.stage_finalize(SimpleNamespace(run_root=de_run,
+                                                  allow_new_attempt=False))
+    assert code == 2
+    fin_rows = json.loads((fin_dir / "attempts_index.json").read_text())["attempts"]
+    final5 = json.loads((fin_dir / fin_rows[-1]["attempt"]
+                         / "w1_de_final.json").read_text())
+    assert any(p.endswith(":reference_field_missing:source_box")
+               for p in final5["detail"]["problems"])
+
+    # COUNTEREXAMPLE (teacher label binding): a teacher product whose root
+    # deviates 10 cm from the frozen clip is not self-verifiable evidence —
+    # the FK self-reference shortcut requires a bitwise reconciliation first
+    teacher_row = next(r for r in rows if r["method"] == "teacher")
+    teacher_path = world["root"] / teacher_row["product"]["path"]
+    with np.load(teacher_path, allow_pickle=False) as z:
+        tarrays = {k: z[k].copy() for k in z.files}
+    tarrays["root"] = tarrays["root"].copy()
+    tarrays["root"][:, 0] += 0.10
+    tarrays["scene"] = np.concatenate(
+        [tarrays["root"], tarrays["joints"], tarrays["target_box"]], axis=1)
+    with open(teacher_path, "wb") as stream:
+        np.savez(stream, **tarrays)
+    import eval_generation as eg
+    import omniretarget_w1_de_detail as detail_mod
+    clip, _ = detail_mod._load_clip(reg, world["root"], teacher_row["demo"])
+    measured = eg.recompute_w1_de_product(
+        teacher_path,
+        {**teacher_row, "product": {**teacher_row["product"],
+                                    "sha256": _sha(teacher_path)}},
+        reg, clip, validator=None, replayer=None,
+        project_root=world["root"],
+        expected_identity=teacher_row["product"]["identity"])
+    assert measured["row"]["status"] == "product_invalid"
+    assert "teacher_product_not_bitwise_frozen_label" in measured["row"]["measurement_gaps"]
