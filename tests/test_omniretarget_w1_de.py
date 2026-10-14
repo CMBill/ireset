@@ -806,6 +806,84 @@ drv.finish_attempt(run_root, {stage!r}, attempt_dir,
     idx = json.loads((run / "evaluation/raw/attempts_index.json").read_text())["attempts"]
     assert idx[-1]["complete"] is False and idx[-1]["status"] == "incomplete"
 
+
+def test_finish_attempt_pending_row_survives_sigkill_before_final_verdict(
+        tmp_path, monkeypatch):
+    """Real-subprocess counterexample (SIGKILL), NOT-yet-overrun variant: the
+    budget is generous when publication starts, and the kill lands between
+    the pending write and the final-verdict write. The pending row (status
+    running) must survive and be NON-CONSUMABLE — stage_state flags it and
+    the domain history is unknown — instead of leaving a done/complete=true
+    claim whose final check never ran."""
+    import os
+    import signal
+    import subprocess
+
+    _isolate_project_root(monkeypatch, tmp_path)
+    run = tmp_path / "run"
+    (run / "freeze").mkdir(parents=True)
+    (run / "freeze/execution_registration.json").write_text("{}")
+    stage = "w1_de_raw_eval"
+    drv._begin_attempt(run, stage)
+    script = tmp_path / "stall_child.py"
+    script.write_text(f"""\
+import sys, time
+sys.path.insert(0, {str(REPO / 'src')!r})
+sys.path.insert(0, {str(REPO / 'scripts')!r})
+import omniretarget_w1_de as drv
+
+real_replace = drv._replace_index_row
+calls = {{"n": 0}}
+def stalling_replace(stage_root, attempt, entry):
+    calls["n"] += 1
+    if calls["n"] >= 2:
+        (run_root / "phase2.marker").write_text("before_final_verdict")
+        time.sleep(60)
+    return real_replace(stage_root, attempt, entry)
+drv._replace_index_row = stalling_replace
+
+budget = {{"total_s": 60.0, "historical_s": 0.0, "remaining_s": 60.0, "reserve_s": 0.0}}
+drv.finish_attempt(run_root, {stage!r}, attempt_dir,
+                   time.perf_counter(), budget,
+                   {{"complete": True}}, {{}})
+""")
+    request = {"run_root": str(run), "attempt_dir": str(run / "evaluation/raw/attempt_001")}
+    (tmp_path / "payload.json").write_text(json.dumps(request))
+    child = subprocess.Popen(
+        [sys.executable, "-c",
+         (f"import sys, json; from pathlib import Path; "
+          f"sys.path.insert(0, {str(REPO / 'src')!r}); "
+          f"sys.path.insert(0, {str(REPO / 'scripts')!r}); "
+          f"payload = json.load(open({str(tmp_path / 'payload.json')!r})); "
+          f"run_root = Path(payload['run_root']); "
+          f"attempt_dir = Path(payload['attempt_dir']); "
+          f"exec(open({str(script)!r}).read())")],
+        cwd=str(REPO))
+    try:
+        marker = run / "phase2.marker"
+        for _ in range(300):
+            if marker.is_file():
+                break
+            if child.poll() is not None:
+                break
+            time.sleep(0.05)
+        assert marker.is_file(), "child never reached the final-verdict write"
+        os.kill(child.pid, signal.SIGKILL)
+    finally:
+        child.wait()
+    entries = [e for e in json.loads((run / "costs.json").read_text())["invocations"]
+               if e.get("stage") == stage]
+    assert entries and entries[-1]["status"] == "running", entries
+    assert entries[-1]["complete"] is False
+    assert entries[-1]["measured_wall_s"] >= 0
+    idx = json.loads((run / "evaluation/raw/attempts_index.json").read_text())["attempts"]
+    assert idx[-1]["status"] == "running" and idx[-1]["complete"] is False
+    row, problems = drv.stage_state(run, stage, tmp_path)
+    assert "attempt_running" in problems
+    # the pending row is not consumable budget history: unknown = stop
+    assert drv.domain_history_cost_s(run, "e") is None
+
+
 def _in_process_spawn(monkeypatch):
     """Fake _spawn that runs the spawned entry IN-PROCESS on the synthetic
     world (the real subprocess path is exercised by the real R/D/E/F run;
@@ -1027,6 +1105,8 @@ def test_de_full_chain_synthetic(tmp_path, monkeypatch):
     detail_rep = json.loads(detail_report_path.read_text())
     curves_row = next(r for r in detail_rep["rows"] if r.get("curves"))
     curves_path = world["root"] / curves_row["curves"]["path"]
+    curves_orig_bytes = curves_path.read_bytes()
+    curves_orig_sha = curves_row["curves"]["sha256"]
     with np.load(curves_path, allow_pickle=False) as z:
         kept = {k: z[k].copy() for k in ("task_world", "both_certified_overlap",
                                          "both_reference", "hand_certified_l",
@@ -1051,12 +1131,28 @@ def test_de_full_chain_synthetic(tmp_path, monkeypatch):
                          / "w1_de_final.json").read_text())
     assert any(p.endswith(":curves_field_missing:task_box")
                for p in final4["detail"]["problems"])
+    # restore the complete curve artifact for the later counterexamples
+    curves_path.write_bytes(curves_orig_bytes)
+    detail_rep = json.loads(detail_report_path.read_text())
+    for r in detail_rep["rows"]:
+        if isinstance(r.get("curves"), dict) and r["curves"]["path"] == curves_row["curves"]["path"]:
+            r["curves"]["sha256"] = curves_orig_sha
+    detail_report_path.write_text(json.dumps(detail_rep, default=float))
+    detail_idx = json.loads(detail_idx_path.read_text())
+    for idx_row in detail_idx["attempts"]:
+        if idx_row.get("attempt") == "attempt_001":
+            if curves_row["curves"]["path"] in idx_row.get("artifacts", {}):
+                idx_row["artifacts"][curves_row["curves"]["path"]] = curves_orig_sha
+            idx_row["report_sha256"] = _sha(detail_report_path)
+    detail_idx_path.write_text(json.dumps(detail_idx))
 
     # COUNTEREXAMPLE (reference completeness): a hash-correct reference
     # artifact stripped of the source box, scale and teacher trajectory is
     # incomplete — the reference is bound bitwise to the frozen clip
     ref_row = next(r for r in detail_rep["rows"] if r.get("reference"))
     ref_path = world["root"] / ref_row["reference"]["path"]
+    ref_orig_bytes = ref_path.read_bytes()
+    ref_orig_sha = ref_row["reference"]["sha256"]
     with np.load(ref_path, allow_pickle=False) as z:
         kept = {k: z[k].copy() for k in ("human_kpts_world", "target_box")}
     with open(ref_path, "wb") as stream:
@@ -1080,6 +1176,20 @@ def test_de_full_chain_synthetic(tmp_path, monkeypatch):
                          / "w1_de_final.json").read_text())
     assert any(p.endswith(":reference_field_missing:source_box")
                for p in final5["detail"]["problems"])
+    # restore the complete reference artifact for the later counterexamples
+    ref_path.write_bytes(ref_orig_bytes)
+    detail_rep = json.loads(detail_report_path.read_text())
+    for r in detail_rep["rows"]:
+        if isinstance(r.get("reference"), dict) and r["reference"]["path"] == ref_row["reference"]["path"]:
+            r["reference"]["sha256"] = ref_orig_sha
+    detail_report_path.write_text(json.dumps(detail_rep, default=float))
+    detail_idx = json.loads(detail_idx_path.read_text())
+    for idx_row in detail_idx["attempts"]:
+        if idx_row.get("attempt") == "attempt_001":
+            if ref_row["reference"]["path"] in idx_row.get("artifacts", {}):
+                idx_row["artifacts"][ref_row["reference"]["path"]] = ref_orig_sha
+            idx_row["report_sha256"] = _sha(detail_report_path)
+    detail_idx_path.write_text(json.dumps(detail_idx))
 
     # COUNTEREXAMPLE (teacher label binding): a teacher product whose root
     # deviates 10 cm from the frozen clip is not self-verifiable evidence —
@@ -1106,3 +1216,114 @@ def test_de_full_chain_synthetic(tmp_path, monkeypatch):
         expected_identity=teacher_row["product"]["identity"])
     assert measured["row"]["status"] == "product_invalid"
     assert "teacher_product_not_bitwise_frozen_label" in measured["row"]["measurement_gaps"]
+
+    # COUNTEREXAMPLE (frozen similarity scale): rewriting the reference
+    # artifact's similarity_scale to 1.0 and re-hashing it must not pass —
+    # the delivered scale must BE the frozen derived clip's scale
+    # (restore the full reference first)
+    detail_rep = json.loads((detail_dir / "detail_report.json").read_text())
+    detail_idx = json.loads((de_run / "evaluation/detail_val6/attempts_index.json").read_text())
+    detail_idx_path = de_run / "evaluation/detail_val6/attempts_index.json"
+    detail_report_path = detail_dir / "detail_report.json"
+    scale_row = next(r for r in detail_rep["rows"] if isinstance(r.get("reference"), dict))
+    scale_path = world["root"] / scale_row["reference"]["path"]
+    with np.load(scale_path, allow_pickle=False) as z:
+        sarrays = {k: z[k].copy() for k in z.files}
+    frozen_scale = float(sarrays["source_box_similarity_scale"])
+    sarrays["source_box_similarity_scale"] = np.float64(1.0)
+    with open(scale_path, "wb") as stream:
+        np.savez(stream, **sarrays)
+    scale_sha = _sha(scale_path)
+    assert frozen_scale != 1.0
+    for r in detail_rep["rows"]:
+        if isinstance(r.get("reference"), dict) and r["reference"]["path"] == scale_row["reference"]["path"]:
+            r["reference"]["sha256"] = scale_sha
+    detail_report_path.write_text(json.dumps(detail_rep, default=float))
+    for idx_row in detail_idx["attempts"]:
+        if idx_row.get("attempt") == "attempt_001":
+            if scale_row["reference"]["path"] in idx_row.get("artifacts", {}):
+                idx_row["artifacts"][scale_row["reference"]["path"]] = scale_sha
+            idx_row["report_sha256"] = _sha(detail_report_path)
+    detail_idx_path.write_text(json.dumps(detail_idx))
+    code = fin_mod.stage_finalize(SimpleNamespace(run_root=de_run,
+                                                  allow_new_attempt=False))
+    assert code == 2
+    fin_rows = json.loads((fin_dir / "attempts_index.json").read_text())["attempts"]
+    final6 = json.loads((fin_dir / fin_rows[-1]["attempt"]
+                         / "w1_de_final.json").read_text())
+    assert any(":reference_similarity_scale_not_frozen" in p
+               for p in final6["detail"]["problems"])
+    # restore the frozen scale for the remaining counterexamples
+    sarrays["source_box_similarity_scale"] = np.float64(frozen_scale)
+    with open(scale_path, "wb") as stream:
+        np.savez(stream, **sarrays)
+    restored_sha = _sha(scale_path)
+    detail_rep = json.loads(detail_report_path.read_text())
+    for r in detail_rep["rows"]:
+        if isinstance(r.get("reference"), dict) and r["reference"]["path"] == scale_row["reference"]["path"]:
+            r["reference"]["sha256"] = restored_sha
+    detail_report_path.write_text(json.dumps(detail_rep, default=float))
+    detail_idx = json.loads(detail_idx_path.read_text())
+    for idx_row in detail_idx["attempts"]:
+        if idx_row.get("attempt") == "attempt_001":
+            if scale_row["reference"]["path"] in idx_row.get("artifacts", {}):
+                idx_row["artifacts"][scale_row["reference"]["path"]] = restored_sha
+            idx_row["report_sha256"] = _sha(detail_report_path)
+    detail_idx_path.write_text(json.dumps(detail_idx))
+
+    # COUNTEREXAMPLE (Inf is not an undefined slot): replacing the first
+    # frame's undefined NaN velocity with +Inf must be rejected before the
+    # NaN definition mask comparison
+    detail_rep = json.loads(detail_report_path.read_text())
+    inf_row = next(r for r in detail_rep["rows"] if isinstance(r.get("curves"), dict))
+    inf_path = world["root"] / inf_row["curves"]["path"]
+    with np.load(inf_path, allow_pickle=False) as z:
+        carrays = {k: z[k].copy() for k in z.files}
+    carrays["base_linear_velocity_mps"][0] = np.inf
+    with open(inf_path, "wb") as stream:
+        np.savez(stream, **carrays)
+    inf_sha = _sha(inf_path)
+    for r in detail_rep["rows"]:
+        if isinstance(r.get("curves"), dict) and r["curves"]["path"] == inf_row["curves"]["path"]:
+            r["curves"]["sha256"] = inf_sha
+    detail_report_path.write_text(json.dumps(detail_rep, default=float))
+    detail_idx = json.loads(detail_idx_path.read_text())
+    for idx_row in detail_idx["attempts"]:
+        if idx_row.get("attempt") == "attempt_001":
+            if inf_row["curves"]["path"] in idx_row.get("artifacts", {}):
+                idx_row["artifacts"][inf_row["curves"]["path"]] = inf_sha
+            idx_row["report_sha256"] = _sha(detail_report_path)
+    detail_idx_path.write_text(json.dumps(detail_idx))
+    code = fin_mod.stage_finalize(SimpleNamespace(run_root=de_run,
+                                                  allow_new_attempt=False))
+    assert code == 2
+    fin_rows = json.loads((fin_dir / "attempts_index.json").read_text())["attempts"]
+    final7 = json.loads((fin_dir / fin_rows[-1]["attempt"]
+                         / "w1_de_final.json").read_text())
+    assert any(p.endswith(":curves_field_infinite:base_linear_velocity_mps")
+               for p in final7["detail"]["problems"])
+
+    # COUNTEREXAMPLE (detail_f history unknown at finalize): a stray
+    # unregistered attempt under the finalize stage directory makes the
+    # detail_f history unknown — the closure must REGISTER its own refusal
+    # as a terminal incomplete attempt (no running residue, no TypeError)
+    # instead of crashing without a record
+    stray = de_run / "decisions/attempt_099"
+    stray.mkdir()
+    code = fin_mod.stage_finalize(SimpleNamespace(run_root=de_run,
+                                                  allow_new_attempt=False))
+    assert code == 2
+    fin_rows = json.loads((fin_dir / "attempts_index.json").read_text())["attempts"]
+    final8 = json.loads((fin_dir / fin_rows[-1]["attempt"]
+                         / "w1_de_final.json").read_text())
+    assert final8["complete"] is False
+    assert any(p in final8["problems"] for p in
+               ("budget_domain_history_unknown:detail_f",
+                "budget_domain_detail_f_unavailable"))
+    assert final8["budget_domains"]["detail_f"]["historical_s"] is None
+    fin_state, fin_state_problems = drv.stage_state(
+        de_run, drv.STAGES["finalize"], world["root"])
+    assert not fin_state_problems, fin_state_problems
+    assert fin_state["status"] in ("incomplete", "crashed")
+    assert fin_state["complete"] is False
+    shutil_rmtree(stray)

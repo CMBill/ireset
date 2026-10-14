@@ -140,8 +140,11 @@ def _finish(run_root: Path, stage_name: str, attempt: Path, report_path: Path,
     driver.atomic_json(report_path, _json_safe(report))
     row = {"report": _record_path(report_path, project_root),
            "complete": report.get("complete") is True, "artifacts": artifacts or {}}
-    extra = {"complete": row["complete"], "budget_consumed_cumulative_s":
-             budget["historical_s"] + time.perf_counter() - t0}
+    hist = budget.get("historical_s")
+    extra = {"complete": row["complete"],
+             "budget_consumed_cumulative_s":
+                 (hist + time.perf_counter() - t0)
+                 if isinstance(hist, (int, float)) else None}
     if exc is not None:
         return driver.crash_attempt(run_root, driver.STAGES[stage_name],
                                     attempt, t0, budget, row, extra, exc)
@@ -457,14 +460,18 @@ def _verify_detail_curves(arrays: dict, T: int, *, hand_gap_m=None) -> list[str]
         elif kind == "mask":
             if a.dtype != np.bool_:
                 problems.append(f"curves_field_not_mask:{name}")
-        elif kind == "nan_velocity":
-            if not np.array_equal(~finite, ~arrays["velocity_defined"]):
-                problems.append(f"curves_field_undefined_mask:{name}")
-        elif kind == "nan_seam":
-            if not np.array_equal(~finite, ~arrays["seam_mask"]):
-                problems.append(f"curves_field_undefined_mask:{name}")
-        elif kind.startswith("nan_mask:"):
-            if not np.array_equal(~finite, ~arrays[kind.split(":", 1)[1]]):
+        elif kind in ("nan_velocity", "nan_seam") or kind.startswith("nan_mask:"):
+            # Undefined entries are NaN ONLY: ±Inf is a bad measurement, not
+            # an undefined slot, and must be rejected before the mask compare.
+            if kind == "nan_velocity":
+                mask = arrays["velocity_defined"]
+            elif kind == "nan_seam":
+                mask = arrays["seam_mask"]
+            else:
+                mask = arrays[kind.split(":", 1)[1]]
+            if np.isinf(a).any():
+                problems.append(f"curves_field_infinite:{name}")
+            elif not np.array_equal(np.isnan(a), ~mask):
                 problems.append(f"curves_field_undefined_mask:{name}")
         elif kind == "nan_or_finite" and not (finite | np.isnan(a)).all():
             problems.append(f"curves_field_nonfinite:{name}")
@@ -530,11 +537,13 @@ _REFERENCE_FIELDS = frozenset({
 
 
 def _verify_reference_artifact(arrays: dict, row: dict, reg: dict,
-                               clip=None, manifest_row: dict | None = None) -> list[str]:
+                               clip=None, manifest_row: dict | None = None,
+                               project_root=None) -> list[str]:
     """Complete-field verification of a delivered reference artifact, with
-    bitwise binding to the FROZEN clip when the caller supplies one — a
-    hash-correct reference stripped of the source box, scale or teacher
-    trajectory is an incomplete delivery, not passing evidence."""
+    bitwise binding to the FROZEN clip and the frozen derived scale when the
+    caller supplies them — a hash-correct reference stripped of the source
+    box, scale or teacher trajectory is an incomplete delivery, not passing
+    evidence."""
     import numpy as np
 
     problems = []
@@ -549,12 +558,23 @@ def _verify_reference_artifact(arrays: dict, row: dict, reg: dict,
         problems.append("reference_demo_mismatch")
     if str(arrays["training_manifest_sha256"]) != reg["training_manifest"]["sha256"]:
         problems.append("reference_training_manifest_sha_mismatch")
-    if manifest_row is not None and str(arrays["source_derived_sha256"]) != manifest_row["derived"]["sha256"]:
-        problems.append("reference_source_derived_sha_mismatch")
     scale = arrays["source_box_similarity_scale"]
     if not ((np.isscalar(scale) or scale.shape == ())
             and math.isfinite(float(scale)) and float(scale) > 0):
         problems.append("reference_similarity_scale_invalid")
+    elif manifest_row is not None and project_root is not None:
+        # Positive is not enough: the delivered scale must BE the frozen
+        # derived clip's similarity_scale (bitwise, same source file).
+        try:
+            with np.load(Path(project_root) / manifest_row["derived"]["path"],
+                         allow_pickle=False) as z:
+                want_scale = float(z["similarity_scale"])
+            if float(scale) != want_scale:
+                problems.append("reference_similarity_scale_not_frozen")
+        except (OSError, ValueError, KeyError, TypeError):
+            problems.append("reference_similarity_scale_unreadable")
+    if manifest_row is not None and str(arrays["source_derived_sha256"]) != manifest_row["derived"]["sha256"]:
+        problems.append("reference_source_derived_sha_mismatch")
     if clip is None:
         return problems
     cond = clip.condition.truncate(clip.T)

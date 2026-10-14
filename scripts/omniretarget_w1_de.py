@@ -421,11 +421,24 @@ def finish_attempt(run_root: Path, stage: str, attempt_dir: Path,
             path = Path(PROJECT_ROOT) / row[key]
             if path.is_file():
                 row[f"{key}_sha256"] = sha256_file(path)
-    # The deadline verdict is reached BEFORE any terminal row is published: a
-    # kill between the verdict and the single write below can only leave a
-    # running or an honestly-judged row on disk, never a done/complete=true
-    # claim the check had not yet authorised.
+    # Two-phase publication: the terminal done/complete=true claim is written
+    # only AFTER the final deadline check, and that check runs only after the
+    # pending row is on disk. A SIGKILL anywhere in between leaves the pending
+    # running row — non-consumable (unknown history) by every consumer.
     overrun = time.perf_counter() - t0 >= budget["remaining_s"]
+    if not overrun:
+        indexed = any(r["attempt"] == attempt for r in _index_rows(stage_root))
+        pending = {**row, "status": "running", "complete": False,
+                   "measured_wall_s": time.perf_counter() - t0}
+        if indexed:
+            _replace_index_row(stage_root, attempt, pending)
+        else:
+            append_stage_index(stage_root, pending)
+        _upsert_cost(run_root, stage, attempt, pending["measured_wall_s"],
+                     {**extra, "complete": False}, "running")
+        # Final verdict AFTER all prior registration writes: registration time
+        # itself counts against the budget.
+        overrun = time.perf_counter() - t0 >= budget["remaining_s"]
     if overrun:
         reason = "budget_exceeded_after_registration"
         row.update(complete=False, incomplete_reason=reason, status="incomplete")
@@ -445,8 +458,7 @@ def finish_attempt(run_root: Path, stage: str, attempt_dir: Path,
                     row[f"{key}_sha256"] = sha256_file(path)
         status = "incomplete"
     row["measured_wall_s"] = time.perf_counter() - t0
-    indexed = any(r["attempt"] == attempt for r in _index_rows(stage_root))
-    if indexed:
+    if any(r["attempt"] == attempt for r in _index_rows(stage_root)):
         _replace_index_row(stage_root, attempt, row)
     else:
         append_stage_index(stage_root, row)

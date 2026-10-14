@@ -272,7 +272,7 @@ F各状态分列：
 | Teacher 产物未与冻结标签对账即复用自参考 FK | P1 | `recompute_w1_de_product` 对 teacher 行先做 `root/joints` 与冻结 clip 的**逐位对账**（`teacher_product_not_bitwise_frozen_label`），不一致即 `product_invalid`——平移 10cm 并更新哈希的临时副本不再能以自身 FK 洗白拟合 0 |
 | 完成台账在预算终检前发布 | P1 | `finish_attempt` 重排：预算裁决**先于**任何终态行发布；盘/索引/台账各恰一次写入。真实子进程 SIGKILL 反例（剩余预算 0.1s、写盘延迟超限）下残行只能为 running 或诚实裁决的 incomplete，`budget_exceeded_after_registration` 撤销也并入同一发布序列 |
 | F 只核 detail_f 历史 | P1 | `stage_finalize` 入口**重审全部四个预算域**（r0r1/d/e/detail_f）的盘×索引×台账三方对账与累计上限，计入本 attempt 之前；任一域历史未知（如未入账的 D 尝试）或超限即 `budget_domain_history_unknown/exceeded:<domain>`，closure 不可 complete；detail_f 自身不可用时也落盘 incomplete 记录而非裸退 |
-| val6 工件只查五项字段 | P2 | 新增 curves/reference **完整必需字段契约**：curves 46 键按类型（有限/掩码/速度 NaN 定义掩码/区间漂移 NaN=参考掩码外/整型）核形状与掩码一致性（`curves_field_missing/unexpected/undefined_mask/...`）；reference 13 键结构核验+生产入口逐位绑定冻结 clip（`reference_not_frozen_clip:*`）。删 52 字段或删源箱/尺度/教师轨迹的哈希正确残件均拒 |
+| val6 工件只查五项字段 | P2 | 新增 curves/reference **完整必需字段契约**：curves 57 键按类型（有限/掩码/速度 NaN 定义掩码/区间漂移 NaN=参考掩码外/整型）核形状与掩码一致性（`curves_field_missing/unexpected/undefined_mask/...`）；reference 13 键结构核验+生产入口逐位绑定冻结 clip（`reference_not_frozen_clip:*`）。删 52 字段或删源箱/尺度/教师轨迹的哈希正确残件均拒 |
 | 预算单测读到真实运行历史 | P2 | 预算/历史单测显式 monkeypatch `ireset.paths.PROJECT_ROOT` 至 tmp 沙箱（专项回归 151p/1f → 18p/0f）；生产跨运行累计语义不变 |
 
 反例测试：新增真实子进程 SIGKILL 复现（击杀点在第一次台账写盘处，修复前发布 done/complete=true）；合成链测试扩展四项篡改反例（未入账 D 尝试、curves 削字段、reference 削字段、teacher 平移 10cm），closure 夹具 reference 按完整契约真实化。测试链 790→**791 passed+1 skipped**（1791.54s）。
@@ -280,3 +280,16 @@ F各状态分列：
 **真实 RUN 复核（新契约下）**：31 份 Teacher 产物与冻结 clip 逐位相等（0 偏离）；18 条 curves 与 6 条 reference 工件完整字段/掩码/冻结绑定核验全部通过；四预算域历史可证且未超限（d 8657.97/43200、e 524.65/7200、detail_f 570.84/3600、r0r1 37.54/7200）；六 stage_state 无问题——权威 F 报告在新代码下结论不变。
 
 本轮工程事实：**自参考捷径的前提是被验证对象与参照逐位相等**（自参考测量只能证明"产物=产物"，冻结标签对账必须先行）；**完成声明必须在最后一个预算检查点之后单次发布**（检查点与发布之间的窗口内被杀，事前 running 行是唯一在盘证人）；**收口审计的预算域必须全覆盖**（只审计即将花费的域会让其他域的未入账尝试静默漂过）；**哈希正确≠交付完整**（产物完整性契约须枚举必需字段集与定义掩码，而非抽检五个键）；**测试不得消费生产台账**（跨运行累计接口在测试中必须隔离 PROJECT_ROOT）；**近似键名字典陷阱**（契约核验首版把 expectations 键写成 `human_kps_world` 漏 t，被合成链测试逮住——完整性契约自身的键名必须与写入端断言对齐，本契约由 `_detail_curves` 的 set 相等断言钉死）。
+
+### 9.1 第二轮复核修复（2026-10-14，1 P1+3 P2）
+
+对首轮修复的二次审计发现 4 项残留缺口并全部修复；结论仍不变（Teacher 2/31、两模型 0/31、`not_ready`、归因不足），真实 31 Teacher/18 curves/6 reference 与四预算域复核通过。
+
+| 残留缺口 | 级别 | 修复 |
+| --- | --- | --- |
+| 发布后终检仍有 SIGKILL 窗口 | P1 | 首轮只把检查移到发布前，但**登记本身耗时 0.2s** 仍可把剩余 0.1s 耗尽——发布 done/complete=true 后的递归撤销在 SIGKILL 下永不运行，残行为可消费完成声明（计费仅 0.00025s 过早采样）。现 `finish_attempt` 改为**两阶段发布**：先写不可消费的 pending 行（status=running、complete=false、实测成本），终检（覆盖全部登记耗时）通过后才原位发布终态；击杀落在任何窗口都只留下 running 行（消费侧=未知=停止）或检查已通过的终态。反例覆盖两个形态：发布前已超时（残行 incomplete）与**发布前未超时**（在终检写盘处击杀，残行 running、`stage_state` 报 attempt_running、域历史 None） |
+| detail_f 未知历史回退崩溃 | P2 | 首轮回退把 `historical_s=None` 传入共享 `_finish`，`historical_s + elapsed` 抛 TypeError 且异常出口重复失败——报告虽落盘但索引/台账残 running。现 `_finish` 对未知历史记 `budget_consumed_cumulative_s=None` 并正常登记本次可测成本与 incomplete 终态；反例（decisions 下未入账 stray attempt）验证 finalize 落盘 terminal incomplete 且 `stage_state` 干净 |
+| 参考箱尺度只查正数 | P2 | `source_box_similarity_scale` 从真实 0.7995248 改 1.0 并更新哈希仍过生产核验。现 reference 工件尺度与**冻结 derived npz 的 similarity_scale 逐位对账**（`reference_similarity_scale_not_frozen`，_load_clip 已哈希锁定 derived 源） |
+| NaN 掩码允许 Inf 混入 | P2 | `nan_velocity/nan_seam/nan_mask` 用 `~isfinite` 对定义掩码，首帧合法 NaN 换 ±Inf 仍过。现**先拒 ±Inf**（`curves_field_infinite`）再用 `isnan` 对定义掩码——未定义位置是 NaN 且仅是 NaN，Inf 是坏测量不是未定义槽 |
+
+测试链 791→**792 passed+1 skipped**。第二轮工程事实：**发布前检查不够——检查必须覆盖登记自身的耗时**（两阶段 pending→终态发布使"检查点之后"与"最后写入之后"合一，原子替换保证击杀落在窗口内只留 pending）；**未知历史的收口登记本身不能依赖已知历史**（回退路径的记账字段必须容忍 None）；**正数≠冻结值**（尺度这类从冻结源复制的标量同样需要逐位对账，与数组字段同一标准）；**`~isfinite` 不是 NaN 掩码**（Inf 与 NaN 同属非有限，未定义槽的合法形态必须显式限定为 NaN）。

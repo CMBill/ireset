@@ -561,7 +561,7 @@ def _verify_detail(report: dict, reg: dict, raw_report_path: Path | None,
                         except (Exception, SystemExit) as exc:
                             problems.append(f"{key}:reference_clip_unloadable:{type(exc).__name__}:{exc}")
                     problems.extend(f"{key}:{p}" for p in _verify_reference_artifact(
-                        loaded, row, reg, clip, manifest_row))
+                        loaded, row, reg, clip, manifest_row, project_root=project))
                 else:
                     problems.extend(f"{key}:{p}" for p in _verify_detail_curves(
                         loaded, row["T"],
