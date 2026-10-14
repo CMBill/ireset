@@ -1014,6 +1014,166 @@ def test_finish_attempt_publication_overrun_revokes_before_seal(
     assert hist is not None and hist >= 0.03
 
 
+def test_finish_attempt_seal_delay_cannot_publish_completion(tmp_path, monkeypatch):
+    """Seal-tail counterexample (no kill), the audited repro: remaining
+    budget 0.1s, the final done ledger write would be delayed 0.2s. The
+    completion must never be sealed — the pre-seal check reserves the
+    seal-tail bound, so the attempt is revoked to an honest incomplete
+    BEFORE any done write is attempted (the injected delay never fires)."""
+    world, run = _de_world(tmp_path, monkeypatch)
+    assert drv.stage_register(SimpleNamespace(
+        source_run_root=world["run"], run_root=run, plan="de_plan.md")) == 0
+    stage = drv.STAGES["raw-eval"]
+    att = drv._begin_attempt(run, stage)
+    original = drv._upsert_cost
+    fired = {"done": 0}
+
+    def slow(*args, **kwargs):
+        if args[5] == "done":
+            fired["done"] += 1
+            time.sleep(0.2)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(drv, "_upsert_cost", slow)
+    assert not drv.finish_attempt(run, stage, att, time.perf_counter(),
+        {"remaining_s": 0.1}, {"complete": True}, {})
+    assert fired["done"] == 0, "no done write may be attempted"
+    rows = json.loads((att.parent / "attempts_index.json").read_text())["attempts"]
+    assert len(rows) == 1 and rows[0]["status"] == "incomplete"
+    assert rows[0]["complete"] is False
+    assert rows[0]["incomplete_reason"] == "budget_exceeded_before_seal"
+    costs = [c for c in json.loads((run / "costs.json").read_text())["invocations"]
+             if c["stage"] == stage]
+    assert len(costs) == 1 and costs[-1]["status"] == "incomplete"
+    row, problems = drv.stage_state(run, stage, world["root"])
+    assert not problems
+    assert drv.domain_history_cost_s(run, "e") is not None
+
+
+def test_finish_attempt_post_seal_check_revokes_crossed_seal(tmp_path, monkeypatch):
+    """Seal-tail counterexample (no kill, seal crossed despite the reserve):
+    the pre-seal check passes (elapsed + reserve < remaining), but the done
+    seal write itself is delayed past the deadline. The post-seal check —
+    which runs AFTER the last index/ledger registration, per plan §8.2 —
+    must revoke the completion and re-seal an honest incomplete whose
+    measured cost covers the delayed write."""
+    world, run = _de_world(tmp_path, monkeypatch)
+    assert drv.stage_register(SimpleNamespace(
+        source_run_root=world["run"], run_root=run, plan="de_plan.md")) == 0
+    stage = drv.STAGES["raw-eval"]
+    att = drv._begin_attempt(run, stage)
+    original = drv._upsert_cost
+
+    def slow(*args, **kwargs):
+        if args[5] == "done":
+            time.sleep(1.1)          # seal write crosses remaining (1.05s)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(drv, "_upsert_cost", slow)
+    assert not drv.finish_attempt(run, stage, att, time.perf_counter(),
+        {"remaining_s": 1.05}, {"complete": True}, {})
+    rows = json.loads((att.parent / "attempts_index.json").read_text())["attempts"]
+    assert len(rows) == 1 and rows[0]["status"] == "incomplete"
+    assert rows[0]["complete"] is False
+    assert rows[0]["incomplete_reason"] == "budget_exceeded_after_seal"
+    assert rows[0]["measured_wall_s"] >= 1.1
+    costs = [c for c in json.loads((run / "costs.json").read_text())["invocations"]
+             if c["stage"] == stage]
+    assert len(costs) == 1 and costs[-1]["status"] == "incomplete"
+    assert costs[-1]["measured_wall_s"] >= 1.1
+    row, problems = drv.stage_state(run, stage, world["root"])
+    assert not problems
+    hist = drv.domain_history_cost_s(run, "e")
+    assert hist is not None and hist >= 1.1
+
+
+def test_finish_attempt_kill_after_seal_write_lands_leaves_conservative_row(
+        tmp_path, monkeypatch):
+    """Real-subprocess counterexample (SIGKILL) at the seal: the completion
+    legitimately affords its seal (remaining 5s >> elapsed + reserve), the
+    done seal ledger write is delayed 0.2s, and the kill lands right AFTER
+    the done write has landed — before the post-seal check could run. The
+    leftover done row must be conservative: its charged cost
+    (elapsed + seal_tail_reserve_s) covers the seal write itself, making the
+    completion/cost boundary verifiable instead of an undersampled done."""
+    import os
+    import signal
+    import subprocess
+
+    _isolate_project_root(monkeypatch, tmp_path)
+    run = tmp_path / "run"
+    (run / "freeze").mkdir(parents=True)
+    (run / "freeze/execution_registration.json").write_text("{}")
+    stage = "w1_de_raw_eval"
+    drv._begin_attempt(run, stage)
+    script = tmp_path / "stall_child.py"
+    script.write_text(f"""\
+import sys, time
+sys.path.insert(0, {str(REPO / 'src')!r})
+sys.path.insert(0, {str(REPO / 'scripts')!r})
+import omniretarget_w1_de as drv
+
+# warm the imports finish_attempt pays for, so t0 is not eaten by them
+drv._registration_sha(run_root)
+
+real_upsert = drv._upsert_cost
+def delayed_seal_upsert(run_root, stage, attempt, wall, extra, status):
+    if status == "done":
+        real_upsert(run_root, stage, attempt, wall, extra, status)
+        (run_root / "sealed.marker").write_text(status)
+        time.sleep(60)           # killed here: after the seal write landed
+    return real_upsert(run_root, stage, attempt, wall, extra, status)
+drv._upsert_cost = delayed_seal_upsert
+
+budget = {{"total_s": 10.0, "historical_s": 0.0, "remaining_s": 5.0, "reserve_s": 0.0}}
+drv.finish_attempt(run_root, {stage!r}, attempt_dir,
+                   time.perf_counter(), budget,
+                   {{"complete": True}}, {{}})
+""")
+    request = {"run_root": str(run), "attempt_dir": str(run / "evaluation/raw/attempt_001")}
+    (tmp_path / "payload.json").write_text(json.dumps(request))
+    child = subprocess.Popen(
+        [sys.executable, "-c",
+         (f"import sys, json; from pathlib import Path; "
+          f"sys.path.insert(0, {str(REPO / 'src')!r}); "
+          f"sys.path.insert(0, {str(REPO / 'scripts')!r}); "
+          f"payload = json.load(open({str(tmp_path / 'payload.json')!r})); "
+          f"run_root = Path(payload['run_root']); "
+          f"attempt_dir = Path(payload['attempt_dir']); "
+          f"exec(open({str(script)!r}).read())")],
+        cwd=str(REPO))
+    try:
+        marker = run / "sealed.marker"
+        for _ in range(300):
+            if marker.is_file():
+                break
+            if child.poll() is not None:
+                break
+            time.sleep(0.05)
+        assert marker.is_file() and marker.read_text() == "done"
+        os.kill(child.pid, signal.SIGKILL)
+    finally:
+        child.wait()
+    entries = [e for e in json.loads((run / "costs.json").read_text())["invocations"]
+               if e.get("stage") == stage]
+    assert entries and entries[-1]["status"] == "done", entries
+    e = entries[-1]
+    assert e.get("complete") is True
+    # the charged cost covers the delayed seal write: measured >= actual
+    assert e["measured_wall_s"] >= 0.2, e
+    assert e["seal_tail_reserve_s"] >= 0.2
+    idx = json.loads((run / "evaluation/raw/attempts_index.json").read_text())["attempts"]
+    assert idx[-1]["status"] == "done" and idx[-1]["complete"] is True
+    assert idx[-1]["measured_wall_s"] >= 0.2
+    assert idx[-1]["seal_tail_reserve_s"] >= 0.2
+    # the completion is genuine and the cost conservative: consumable, and
+    # the boundary is verifiable (measured >= any kill-point elapsed time)
+    row, problems = drv.stage_state(run, stage, tmp_path)
+    assert row is not None and not problems
+    hist = drv.domain_history_cost_s(run, "e")
+    assert hist is not None and hist >= 0.2
+
+
 def _in_process_spawn(monkeypatch):
     """Fake _spawn that runs the spawned entry IN-PROCESS on the synthetic
     world (the real subprocess path is exercised by the real R/D/E/F run;

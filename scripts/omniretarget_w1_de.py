@@ -145,6 +145,11 @@ DOMAINS = {
     "detail_f": (("w1_de_detail", "w1_de_finalize"),
                  DETAIL_F_BUDGET_S, DETAIL_F_RESERVE_S),
 }
+#: floor for the seal-tail reserve (§8.2): a completion must afford its own
+#: final index/ledger registration; the charged reserve bounds the seal
+#: writes' latency so a kill after the seal lands cannot leave an
+#: undersampled done row (scaled up from observed write latencies per call).
+SEAL_TAIL_RESERVE_S = 1.0
 
 
 # --- cost ledger (§8.2/§8.3) ---------------------------------------------------
@@ -425,16 +430,28 @@ def finish_attempt(run_root: Path, stage: str, attempt_dir: Path,
             path = Path(PROJECT_ROOT) / row[key]
             if path.is_file():
                 row[f"{key}_sha256"] = sha256_file(path)
-    # Three-phase publication. Phase 1: pending pre-registration (running/
+    # Four-phase publication. Phase 1: pending pre-registration (running/
     # complete=false). Phase 2: the terminal content is published under the
-    # dedicated NON-CONSUMABLE status "publishing" — the final deadline check
-    # has not yet run over that write, so no consumer may treat it as a
-    # terminal claim. The check runs AFTER the publication (covering its own
-    # duration) and only then is the row sealed in place to the terminal
-    # status with the cost refreshed over the publication writes. A SIGKILL
-    # anywhere before the seal leaves a "publishing" row — rejected by every
-    # consumer (final check pending -> unknown history).
+    # dedicated NON-CONSUMABLE status "publishing" — the deadline check has
+    # not yet run over that write. Phase 3 (seal): after the publication
+    # check passes, the row is sealed to the terminal status; the completion
+    # must PROVE it can afford its own seal — the pre-seal check reserves a
+    # tail bound (floor + 2x the write latencies observed in this call) and
+    # the charged cost covers the seal writes, so a SIGKILL right after the
+    # seal write lands cannot leave an undersampled completion. Phase 4: the
+    # post-seal deadline check runs AFTER the last registration (plan §8.2)
+    # and revokes a completion whose seal write itself crossed the deadline;
+    # revocations re-publish under "publishing" and re-seal incomplete — the
+    # safe direction. A SIGKILL anywhere before a done seal leaves a
+    # running/publishing row (non-consumable); after it lands, the charged
+    # cost bounds the residual tail by the recorded seal_tail_reserve_s.
     remaining = budget["remaining_s"]
+    write_s: list[float] = []
+
+    def _tw(fn, *args):
+        start = time.perf_counter()
+        fn(*args)
+        write_s.append(time.perf_counter() - start)
 
     def _stop_docs(rw):
         for key in ("report", "summary"):
@@ -458,13 +475,12 @@ def finish_attempt(run_root: Path, stage: str, attempt_dir: Path,
         rw = {**rw, "status": "publishing",
               "measured_wall_s": time.perf_counter() - t0}
         if any(r["attempt"] == attempt for r in _index_rows(stage_root)):
-            _replace_index_row(stage_root, attempt, rw)
+            _tw(_replace_index_row, stage_root, attempt, rw)
         else:
-            append_stage_index(stage_root, rw)
-        _upsert_cost(run_root, stage, attempt, rw["measured_wall_s"],
-                     {**extra, "complete": rw.get("complete", False),
-                      "incomplete_reason": rw.get("incomplete_reason")},
-                     "publishing")
+            _tw(append_stage_index, stage_root, rw)
+        _tw(_upsert_cost, run_root, stage, attempt, rw["measured_wall_s"],
+            {**extra, "complete": rw.get("complete", False),
+             "incomplete_reason": rw.get("incomplete_reason")}, "publishing")
         return rw
 
     overrun = time.perf_counter() - t0 >= remaining
@@ -472,11 +488,11 @@ def finish_attempt(run_root: Path, stage: str, attempt_dir: Path,
         pending = {**row, "status": "running", "complete": False,
                    "measured_wall_s": time.perf_counter() - t0}
         if any(r["attempt"] == attempt for r in _index_rows(stage_root)):
-            _replace_index_row(stage_root, attempt, pending)
+            _tw(_replace_index_row, stage_root, attempt, pending)
         else:
-            append_stage_index(stage_root, pending)
-        _upsert_cost(run_root, stage, attempt, pending["measured_wall_s"],
-                     {**extra, "complete": False}, "running")
+            _tw(append_stage_index, stage_root, pending)
+        _tw(_upsert_cost, run_root, stage, attempt, pending["measured_wall_s"],
+            {**extra, "complete": False}, "running")
         # Verdict AFTER the pending registration: registration time itself
         # counts against the budget.
         overrun = time.perf_counter() - t0 >= remaining
@@ -486,9 +502,9 @@ def finish_attempt(run_root: Path, stage: str, attempt_dir: Path,
         row = _stop_docs(row)
         status = "incomplete"
     row = _publish(row)
-    # Final deadline check AFTER the terminal publication: the publication
-    # writes themselves count against the budget, so a completion whose
-    # publication crossed the deadline is revoked before the seal.
+    # Deadline check AFTER the terminal publication: the publication writes
+    # themselves count against the budget, so a completion whose publication
+    # crossed the deadline is revoked before the seal.
     if not overrun and time.perf_counter() - t0 >= remaining:
         overrun = True
         row.update(complete=False,
@@ -496,14 +512,44 @@ def finish_attempt(run_root: Path, stage: str, attempt_dir: Path,
         row = _stop_docs(row)
         status = "incomplete"
         row = _publish(row)
-    # Seal: every write above is now covered by the final check; refresh the
-    # measured cost over the publication writes and flip to the terminal
-    # status. The seal writes are the last tail this process cannot observe.
-    row = {**row, "status": status, "measured_wall_s": time.perf_counter() - t0}
-    _replace_index_row(stage_root, attempt, row)
-    _upsert_cost(run_root, stage, attempt, row["measured_wall_s"],
-                 {**extra, "complete": row.get("complete", False),
-                  "incomplete_reason": row.get("incomplete_reason")}, status)
+    # Seal-tail reserve: bound the latency of the seal writes from the write
+    # latencies already observed in this call (floor covers the cold case).
+    reserve = max(SEAL_TAIL_RESERVE_S, 2.0 * max(write_s, default=0.0))
+    if not overrun and time.perf_counter() - t0 + reserve >= remaining:
+        # The completion cannot afford its own seal registration.
+        overrun = True
+        row.update(complete=False,
+                   incomplete_reason="budget_exceeded_before_seal")
+        row = _stop_docs(row)
+        status = "incomplete"
+        row = _publish(row)
+
+    def _seal(rw, st):
+        cost = time.perf_counter() - t0
+        if not overrun:
+            # Charge the reserve into the completion cost: a kill after the
+            # seal write lands leaves measured >= actual (conservative).
+            cost += reserve
+        rw = {**rw, "status": st, "measured_wall_s": cost,
+              "seal_tail_reserve_s": reserve}
+        _tw(_replace_index_row, stage_root, attempt, rw)
+        _tw(_upsert_cost, run_root, stage, attempt, cost,
+            {**extra, "complete": rw.get("complete", False),
+             "incomplete_reason": rw.get("incomplete_reason"),
+             "seal_tail_reserve_s": reserve}, st)
+        return rw
+
+    row = _seal(row, status)
+    # Post-seal deadline check AFTER the last registration (plan §8.2: the
+    # final index/ledger registration is itself covered). A seal write that
+    # crossed the deadline despite the reserve revokes the completion.
+    if not overrun and time.perf_counter() - t0 >= remaining:
+        overrun = True
+        row.update(complete=False,
+                   incomplete_reason="budget_exceeded_after_seal")
+        row = _stop_docs(row)
+        row = _publish(row)
+        row = _seal(row, "incomplete")
     return not overrun and row.get("complete", row.get("passed", False)) is True
 
 
