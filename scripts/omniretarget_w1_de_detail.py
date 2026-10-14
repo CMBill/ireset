@@ -103,7 +103,7 @@ def _load_indexed_report(run_root: Path, stage_name: str,
         return row, path, {}, problems + [f"report_unreadable:{type(exc).__name__}"]
     if row.get("complete") is not True:
         problems.append("attempt_incomplete")
-    if row.get("status") in ("crashed", "running", "timeout", "incomplete"):
+    if row.get("status") in ("crashed", "running", "publishing", "timeout", "incomplete"):
         problems.append(f"attempt_state:{row['status']}")
     if report.get("crashed") or report.get("budget_stopped"):
         problems.append("report_noncompletion_state")

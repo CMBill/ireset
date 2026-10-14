@@ -293,3 +293,22 @@ F各状态分列：
 | NaN 掩码允许 Inf 混入 | P2 | `nan_velocity/nan_seam/nan_mask` 用 `~isfinite` 对定义掩码，首帧合法 NaN 换 ±Inf 仍过。现**先拒 ±Inf**（`curves_field_infinite`）再用 `isnan` 对定义掩码——未定义位置是 NaN 且仅是 NaN，Inf 是坏测量不是未定义槽 |
 
 测试链 791→**792 passed+1 skipped**。第二轮工程事实：**发布前检查不够——检查必须覆盖登记自身的耗时**（两阶段 pending→终态发布使"检查点之后"与"最后写入之后"合一，原子替换保证击杀落在窗口内只留 pending）；**未知历史的收口登记本身不能依赖已知历史**（回退路径的记账字段必须容忍 None）；**正数≠冻结值**（尺度这类从冻结源复制的标量同样需要逐位对账，与数组字段同一标准）；**`~isfinite` 不是 NaN 掩码**（Inf 与 NaN 同属非有限，未定义槽的合法形态必须显式限定为 NaN）。
+
+### 9.2 第三轮复核修复（2026-10-14，1 P1：终态发布后的击杀窗口）
+
+对第二轮修复（`abb8c02`）的复核确认三项 P2 成立，但 **P1 发布窗口仍未关闭**：终态（done/complete=true）写盘本身仍在最后一次截止检查之前——独立子进程复现（剩余预算 0.1s、终态 done 台账写盘延迟 0.2s、落盘后立即 SIGKILL）得到实际耗时 ~0.220s 而记录成本仅 0.003s、索引与台账均 done/complete=true、`stage_state` 无问题、域历史被接受；发布后的递归撤销在 SIGKILL 下永不运行。两阶段设计只把检查移到 pending 登记之后，其后的终态写盘仍可耗尽预算。
+
+**修复：三阶段发布（pending → publishing → seal）。** `finish_attempt` 现按以下序列发布：
+
+1. **Phase 1（pending 预登记）**：running/complete=false 行（不变）。
+2. **Phase 2（终态内容发布，不可消费）**：终态内容（含 done/complete=true）以专用状态 **`publishing`** 写入索引与台账并携带实测成本——此时最后一次截止检查尚未覆盖这次写盘，任何消费腿都不得将其视为终态。
+3. **终检（在终态发布之后）**：截止判定覆盖发布写盘自身的耗时；未超时但发布越界的完成声明被撤销为 `budget_exceeded_after_publication` 并以 publishing 重新发布（方向安全）。
+4. **Phase 3（seal）**：终检通过后原位翻转为真实终态并刷新实测成本（覆盖发布写盘耗时）；seal 写盘是进程自身无法观测的最后尾巴。
+
+消费侧拒收：`stage_state` 对 publishing 行报 `attempt_final_check_pending`；`_local_domain_history_cost_s` 对索引 publishing 行返回 None（未知=停止）；detail 的 `_load_indexed_report` 把 publishing 纳入显式非完成状态集合。真实 RUN 的历史行不携带 publishing 状态（legacy 兼容，与既有"缺声明字段的 legacy 行不构成矛盾"教义一致），复核不受影响。
+
+**反例测试**：新增真实子进程击杀反例（**击杀点在终态写盘落盘之后**——预算宽裕起跑、终态写盘延迟 0.2s 越界、落盘后立即击杀）：盘上确有 done/complete=true 内容但状态为 publishing、实测成本 0.003s<0.1s（写盘自身耗时未入账），`stage_state` 报 `attempt_final_check_pending`、域历史 None——**未完成最后截止检查的状态不可消费**；新增进程内互补反例（终态发布写盘越界且未被击杀）：终检撤销完成声明、seal 为诚实 incomplete（`budget_exceeded_after_publication`），单行索引/台账、实测成本 ≥0.03s 且作为诚实预算历史可消费。原有两形态反例（发布前已超时/终检写盘处击杀）随三阶段语义更新断言（残行均 publishing 或 running，均不可消费）。
+
+**真实 RUN 复核（新消费腿下）**：六 stage_state 无问题、四预算域历史可证且数值逐位不变（r0r1 37.54/7200、d 8657.97/43200、e 524.65/7200、detail_f 570.84/3600）——权威 F 报告结论不变（Teacher 2/31、两模型 0/31、`motion_baseline=complete`、`final_interaction_method=not_ready`、归因不足）。测试链 792→**794 passed+1 skipped**（1971.24s）。
+
+本轮工程事实：**"检查点之后"与"最后一次写盘之后"无法由两次写盘合一**——终态内容必须先以显式未封口状态落盘、终检覆盖该写盘、通过后才原位封口；击杀落在封口前留下的是**自我声明未完成检查**的行（publishing），消费侧按显式非完成集合拒收（与 running 同一教义：不可捕获终止没有生产侧出口，事前行是唯一在盘证人）；seal 写盘自身是任何登记协议都无法事后观测的最后尾巴——这是不可捕获终止下预算记账的固有时钟边界，其成本量级由实测写盘延迟界定（本轮反例中 0.2s 延迟被终检捕获，残行不可消费）。另实测：子进程首次调用 `finish_attempt` 时函数内延迟导入（`ireset.data.a2_integrity`/`ireset.paths`）耗时 ~0.37s 且计入 t0 起算的预算——反例子进程必须先暖导入再采样 t0，否则入口检查即误判超时。

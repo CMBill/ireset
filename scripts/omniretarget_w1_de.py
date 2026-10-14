@@ -294,6 +294,10 @@ def _local_domain_history_cost_s(run_root: Path, domain: str) -> float | None:
                 return None
             for attempt, e in ledger.items():
                 row = index[attempt]
+                if row.get("status") == "publishing":
+                    # Terminal content published but the final deadline check
+                    # never sealed it — non-consumable, unknown = stop.
+                    return None
                 if strict:
                     model = stage.removeprefix("w1_de_train_") if stage.startswith("w1_de_train_") else None
                     scope = {"stage": stage, "model": model, "attempt": attempt}
@@ -421,53 +425,85 @@ def finish_attempt(run_root: Path, stage: str, attempt_dir: Path,
             path = Path(PROJECT_ROOT) / row[key]
             if path.is_file():
                 row[f"{key}_sha256"] = sha256_file(path)
-    # Two-phase publication: the terminal done/complete=true claim is written
-    # only AFTER the final deadline check, and that check runs only after the
-    # pending row is on disk. A SIGKILL anywhere in between leaves the pending
-    # running row — non-consumable (unknown history) by every consumer.
-    overrun = time.perf_counter() - t0 >= budget["remaining_s"]
-    if not overrun:
-        indexed = any(r["attempt"] == attempt for r in _index_rows(stage_root))
-        pending = {**row, "status": "running", "complete": False,
-                   "measured_wall_s": time.perf_counter() - t0}
-        if indexed:
-            _replace_index_row(stage_root, attempt, pending)
-        else:
-            append_stage_index(stage_root, pending)
-        _upsert_cost(run_root, stage, attempt, pending["measured_wall_s"],
-                     {**extra, "complete": False}, "running")
-        # Final verdict AFTER all prior registration writes: registration time
-        # itself counts against the budget.
-        overrun = time.perf_counter() - t0 >= budget["remaining_s"]
-    if overrun:
-        reason = "budget_exceeded_after_registration"
-        row.update(complete=False, incomplete_reason=reason, status="incomplete")
+    # Three-phase publication. Phase 1: pending pre-registration (running/
+    # complete=false). Phase 2: the terminal content is published under the
+    # dedicated NON-CONSUMABLE status "publishing" — the final deadline check
+    # has not yet run over that write, so no consumer may treat it as a
+    # terminal claim. The check runs AFTER the publication (covering its own
+    # duration) and only then is the row sealed in place to the terminal
+    # status with the cost refreshed over the publication writes. A SIGKILL
+    # anywhere before the seal leaves a "publishing" row — rejected by every
+    # consumer (final check pending -> unknown history).
+    remaining = budget["remaining_s"]
+
+    def _stop_docs(rw):
         for key in ("report", "summary"):
-            if not row.get(key):
+            if not rw.get(key):
                 continue
-            path = Path(PROJECT_ROOT) / row[key]
+            path = Path(PROJECT_ROOT) / rw[key]
             if path.is_file():
                 doc = json.loads(path.read_text())
                 if isinstance(doc, dict):
-                    doc.update(complete=False, incomplete_reason=reason,
+                    doc.update(complete=False,
+                               incomplete_reason=rw["incomplete_reason"],
                                budget_stopped=True,
                                measured_wall_s=time.perf_counter() - t0)
                     if isinstance(doc.get("completeness"), dict):
                         doc["completeness"].update(complete=False, budget_stopped=True)
                     atomic_json(path, doc)
-                    row[f"{key}_sha256"] = sha256_file(path)
+                    rw[f"{key}_sha256"] = sha256_file(path)
+        return rw
+
+    def _publish(rw):
+        rw = {**rw, "status": "publishing",
+              "measured_wall_s": time.perf_counter() - t0}
+        if any(r["attempt"] == attempt for r in _index_rows(stage_root)):
+            _replace_index_row(stage_root, attempt, rw)
+        else:
+            append_stage_index(stage_root, rw)
+        _upsert_cost(run_root, stage, attempt, rw["measured_wall_s"],
+                     {**extra, "complete": rw.get("complete", False),
+                      "incomplete_reason": rw.get("incomplete_reason")},
+                     "publishing")
+        return rw
+
+    overrun = time.perf_counter() - t0 >= remaining
+    if not overrun:
+        pending = {**row, "status": "running", "complete": False,
+                   "measured_wall_s": time.perf_counter() - t0}
+        if any(r["attempt"] == attempt for r in _index_rows(stage_root)):
+            _replace_index_row(stage_root, attempt, pending)
+        else:
+            append_stage_index(stage_root, pending)
+        _upsert_cost(run_root, stage, attempt, pending["measured_wall_s"],
+                     {**extra, "complete": False}, "running")
+        # Verdict AFTER the pending registration: registration time itself
+        # counts against the budget.
+        overrun = time.perf_counter() - t0 >= remaining
+    if overrun:
+        row.update(complete=False,
+                   incomplete_reason="budget_exceeded_after_registration")
+        row = _stop_docs(row)
         status = "incomplete"
-    row["measured_wall_s"] = time.perf_counter() - t0
-    if any(r["attempt"] == attempt for r in _index_rows(stage_root)):
-        _replace_index_row(stage_root, attempt, row)
-    else:
-        append_stage_index(stage_root, row)
+    row = _publish(row)
+    # Final deadline check AFTER the terminal publication: the publication
+    # writes themselves count against the budget, so a completion whose
+    # publication crossed the deadline is revoked before the seal.
+    if not overrun and time.perf_counter() - t0 >= remaining:
+        overrun = True
+        row.update(complete=False,
+                   incomplete_reason="budget_exceeded_after_publication")
+        row = _stop_docs(row)
+        status = "incomplete"
+        row = _publish(row)
+    # Seal: every write above is now covered by the final check; refresh the
+    # measured cost over the publication writes and flip to the terminal
+    # status. The seal writes are the last tail this process cannot observe.
+    row = {**row, "status": status, "measured_wall_s": time.perf_counter() - t0}
+    _replace_index_row(stage_root, attempt, row)
     _upsert_cost(run_root, stage, attempt, row["measured_wall_s"],
                  {**extra, "complete": row.get("complete", False),
                   "incomplete_reason": row.get("incomplete_reason")}, status)
-    if not overrun and time.perf_counter() - t0 >= budget["remaining_s"]:
-        return finish_attempt(run_root, stage, attempt_dir, t0, budget,
-                              {**row, "complete": False}, extra, "incomplete")
     return not overrun and row.get("complete", row.get("passed", False)) is True
 
 
@@ -498,6 +534,8 @@ def stage_state(run_root: Path, stage: str, project_root: Path) -> tuple[dict | 
         terminal_statuses = ("done", "crashed", "timeout", "incomplete")
         if e.get("status") == "running" or row.get("status") == "running":
             problems.append("attempt_running")
+        elif (e.get("status") == "publishing" or row.get("status") == "publishing"):
+            problems.append("attempt_final_check_pending")
         elif e.get("status") not in terminal_statuses or row.get("status") not in terminal_statuses:
             problems.append("attempt_status_invalid")
         elif e["status"] != row["status"]:

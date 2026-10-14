@@ -738,16 +738,18 @@ def test_stage_train_budget_exceeded_flips_complete_in_place(
 
 # --- the full synthetic chain (register -> D -> E -> detail -> finalize) ------------
 
-def test_finish_attempt_publication_waits_for_deadline_verdict(tmp_path):
-    """Real-subprocess counterexample (SIGKILL): the child publishes the
-    terminal ledger row and stalls. A kill inside the stall must never leave
-    a done/complete=true claim that the budget verdict had not yet
-    authorised — the completion declaration is published only AFTER the
-    deadline check, in a single write."""
+def test_finish_attempt_publication_waits_for_deadline_verdict(tmp_path, monkeypatch):
+    """Real-subprocess counterexample (SIGKILL), already-overrun variant: the
+    budget was exhausted before publication started, and the kill lands
+    inside a stall right after the terminal publication write. The row on
+    disk must be the NON-CONSUMABLE publishing row (final deadline check
+    never sealed it) — never a terminal done/complete claim, and the domain
+    history must stay unknown."""
     import os
     import signal
     import subprocess
 
+    _isolate_project_root(monkeypatch, tmp_path)
     run = tmp_path / "run"
     (run / "freeze").mkdir(parents=True)
     (run / "freeze/execution_registration.json").write_text("{}")
@@ -798,13 +800,17 @@ drv.finish_attempt(run_root, {stage!r}, attempt_dir,
         child.wait()
     entries = [e for e in json.loads((run / "costs.json").read_text())["invocations"]
                if e.get("stage") == stage]
-    assert entries, "the running row must survive as evidence"
+    assert entries, "the publishing row must survive as evidence"
     e = entries[-1]
-    # the published claim is incomplete (verdict first), never done/complete
-    assert not (e.get("status") == "done" and e.get("complete") is True), e
-    assert e.get("status") == "incomplete" and e.get("complete") is False
+    # published but unsealed: non-consumable, never done/complete
+    assert e.get("status") == "publishing", e
+    assert e.get("complete") is False
     idx = json.loads((run / "evaluation/raw/attempts_index.json").read_text())["attempts"]
-    assert idx[-1]["complete"] is False and idx[-1]["status"] == "incomplete"
+    assert idx[-1]["status"] == "publishing" and idx[-1]["complete"] is False
+    row, problems = drv.stage_state(run, stage, tmp_path)
+    assert row is not None
+    assert "attempt_final_check_pending" in problems
+    assert drv.domain_history_cost_s(run, "e") is None
 
 
 def test_finish_attempt_pending_row_survives_sigkill_before_final_verdict(
@@ -882,6 +888,130 @@ drv.finish_attempt(run_root, {stage!r}, attempt_dir,
     assert "attempt_running" in problems
     # the pending row is not consumable budget history: unknown = stop
     assert drv.domain_history_cost_s(run, "e") is None
+
+
+def test_finish_attempt_kill_after_terminal_write_lands_leaves_unsealed_row(
+        tmp_path, monkeypatch):
+    """Real-subprocess counterexample (SIGKILL), the audited window: the
+    budget is generous when publication starts, the terminal (done content)
+    publication write itself is slow and crosses the deadline, and the kill
+    lands right AFTER the terminal write has landed — before the final
+    deadline check could run or revoke. The done/complete=true content IS on
+    disk, but under the non-consumable publishing status: stage_state flags
+    it and the domain history is unknown, so the undersampled cost can never
+    be consumed as a completion claim."""
+    import os
+    import signal
+    import subprocess
+
+    _isolate_project_root(monkeypatch, tmp_path)
+    run = tmp_path / "run"
+    (run / "freeze").mkdir(parents=True)
+    (run / "freeze/execution_registration.json").write_text("{}")
+    stage = "w1_de_raw_eval"
+    drv._begin_attempt(run, stage)
+    script = tmp_path / "stall_child.py"
+    script.write_text(f"""\
+import sys, time
+sys.path.insert(0, {str(REPO / 'src')!r})
+sys.path.insert(0, {str(REPO / 'scripts')!r})
+import omniretarget_w1_de as drv
+
+# warm the imports finish_attempt pays for, so t0 is not eaten by them
+drv._registration_sha(run_root)
+
+real_upsert = drv._upsert_cost
+def slow_publishing_upsert(run_root, stage, attempt, wall, extra, status):
+    if status == "publishing":
+        time.sleep(0.2)          # the terminal write itself crosses the budget
+    real_upsert(run_root, stage, attempt, wall, extra, status)
+    if status == "publishing":
+        (run_root / "published.marker").write_text(status)
+        time.sleep(60)           # killed here: after the write, before the check
+drv._upsert_cost = slow_publishing_upsert
+
+budget = {{"total_s": 10.0, "historical_s": 0.0, "remaining_s": 0.1, "reserve_s": 0.0}}
+drv.finish_attempt(run_root, {stage!r}, attempt_dir,
+                   time.perf_counter(), budget,
+                   {{"complete": True}}, {{}})
+""")
+    request = {"run_root": str(run), "attempt_dir": str(run / "evaluation/raw/attempt_001")}
+    (tmp_path / "payload.json").write_text(json.dumps(request))
+    child = subprocess.Popen(
+        [sys.executable, "-c",
+         (f"import sys, json; from pathlib import Path; "
+          f"sys.path.insert(0, {str(REPO / 'src')!r}); "
+          f"sys.path.insert(0, {str(REPO / 'scripts')!r}); "
+          f"payload = json.load(open({str(tmp_path / 'payload.json')!r})); "
+          f"run_root = Path(payload['run_root']); "
+          f"attempt_dir = Path(payload['attempt_dir']); "
+          f"exec(open({str(script)!r}).read())")],
+        cwd=str(REPO))
+    try:
+        marker = run / "published.marker"
+        for _ in range(300):
+            if marker.is_file():
+                break
+            if child.poll() is not None:
+                break
+            time.sleep(0.05)
+        assert marker.is_file() and marker.read_text() == "publishing"
+        os.kill(child.pid, signal.SIGKILL)
+    finally:
+        child.wait()
+    entries = [e for e in json.loads((run / "costs.json").read_text())["invocations"]
+               if e.get("stage") == stage]
+    assert entries, "the publishing row must survive as evidence"
+    e = entries[-1]
+    # the done content landed — but unsealed and with the write's own cost
+    # missing from the recorded measurement (sampled before the slow write)
+    assert e.get("status") == "publishing", e
+    assert e.get("complete") is True
+    assert e.get("measured_wall_s") < 0.1
+    idx = json.loads((run / "evaluation/raw/attempts_index.json").read_text())["attempts"]
+    assert idx[-1]["status"] == "publishing" and idx[-1]["complete"] is True
+    # ... and it is NOT consumable: unsealed terminal content is rejected
+    row, problems = drv.stage_state(run, stage, tmp_path)
+    assert row is not None
+    assert "attempt_final_check_pending" in problems
+    assert drv.domain_history_cost_s(run, "e") is None
+
+
+def test_finish_attempt_publication_overrun_revokes_before_seal(
+        tmp_path, monkeypatch):
+    """In-process complement of the kill test: when the terminal publication
+    write itself crosses the deadline, the final check (which runs AFTER the
+    publication) must revoke the completion and seal an honest incomplete
+    row — the recursive post-publication revocation must not be the only
+    guard, because it never runs under SIGKILL."""
+    world, run = _de_world(tmp_path, monkeypatch)
+    assert drv.stage_register(SimpleNamespace(
+        source_run_root=world["run"], run_root=run, plan="de_plan.md")) == 0
+    stage = drv.STAGES["raw-eval"]
+    att = drv._begin_attempt(run, stage)
+    original = drv._upsert_cost
+    delayed = {"done": False}
+
+    def slow(*args, **kwargs):
+        if args and len(args) >= 6 and args[5] == "publishing" and not delayed["done"]:
+            delayed["done"] = True
+            time.sleep(0.03)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(drv, "_upsert_cost", slow)
+    assert not drv.finish_attempt(run, stage, att, time.perf_counter(),
+        {"remaining_s": 0.01}, {"complete": True}, {})
+    rows = json.loads((att.parent / "attempts_index.json").read_text())["attempts"]
+    assert len(rows) == 1 and rows[0]["complete"] is False
+    assert rows[0]["status"] == "incomplete"
+    assert rows[0]["incomplete_reason"] == "budget_exceeded_after_publication"
+    costs = json.loads((run / "costs.json").read_text())["invocations"]
+    assert len([c for c in costs if c["stage"] == stage]) == 1
+    assert costs[-1]["status"] == "incomplete"
+    assert costs[-1]["measured_wall_s"] >= 0.03
+    # the revoked attempt is honest, consumable budget history
+    hist = drv.domain_history_cost_s(run, "e")
+    assert hist is not None and hist >= 0.03
 
 
 def _in_process_spawn(monkeypatch):
