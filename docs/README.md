@@ -1,34 +1,38 @@
 # 文档索引
 
-整理日期：2026-10-11（最后更新 2026-10-13）。当前推进到 **W1 A3/B/C 七轮审阅修复完成，权威链 `20261012_21e5784_w1_a3bc_reviewfix8` 的 `ready_for_w1_d=true` 已复验；下一项 W1-D/E 正式训练与裸输出评估方案已起草，执行接口加固和正式运行均未开始**。本页区分当前执行入口、保留的参考资料和历史归档。
+整理日期：2026-10-11（最后更新 2026-10-13）。当前 **W1-D/E 实现及正式运行已完成：两模型各 4,000 步，93 主键+62 扩散附键和 val6/F 证据完整；Teacher raw 通过 2/31，两个模型主 seed 均通过 0/31，最终交互方法 `not_ready`**。权威运行根为 `20261013_be00c50_w1_de`；A3/B/C 的 reviewfix8 链继续作为已复验的只读前置。本页区分当前结果、冻结执行契约、保留的参考资料和历史归档。
 
 ## 当前入口
 
 | 文档 | 用途与状态 |
 | --- | --- |
-| [W1 正式训练与裸输出评估方案](plans/omniretarget_w1_de_plan.md) | 下一项执行方案（v0.1，2026-10-13）；绑定 reviewfix8，明确 I0–I4 实施项、R0/R1 注册、两模型各 ≤4k/累计 ≤12h、val31 三方法及采样附表、val6 详细证据和 F 收口；本方案尚未实施，D/E 为 `not_run` |
-| [W1 弱动作监督 A3/B/C 方案](plans/omniretarget_w1_a3bc_plan.md) | 已执行的前置契约（v0.1）；A3/B/C 与 2026-10-12 审阅修复轮（七轮共 30 项缺口+1 项文档订正全修）已执行，D/E 基础契约由下一项方案具体化 |
+| [W1 D/E 验证记录](verification/omniretarget_w1_de_verification.md) | 最新交付：I0–I4及790 passed+1 skipped；R0/R1事实复验；两模型各4k及完整val31选模；155条raw、18条val6及F独立重测/重放。动作基线证据complete，模型raw均0/31，最终交互not_ready |
+| [W1 正式训练与裸输出评估方案](plans/omniretarget_w1_de_plan.md) | 已执行并冻结的契约（v0.1，2026-10-13）；绑定reviewfix8，固定I0–I4、R0/R1、每模型4k/累计12h、val31主/附表和val6/F。首页not_run是起草时快照，实际结果见验证记录 |
+| [W1 弱动作监督 A3/B/C 方案](plans/omniretarget_w1_a3bc_plan.md) | 已执行的前置契约（v0.1）；A3/B/C与2026-10-12七轮审阅（30项缺口+1项文档订正全修）继续有效，reviewfix8作为D/E的只读SOURCE |
 | [W1 A3/B/C 验证记录](verification/omniretarget_w1_a3bc_verification.md) | 接口实现、74 项相关测试与正式运行的实际证据；§5R7 为第七轮审阅修复权威链（运行根 `20261012_21e5784_w1_a3bc_reviewfix8/w1_reviewfix8`，就绪报告 `decisions/attempt_001`），§5R6/§5R5/§5R4/§5R3/§5R2/§5R 链与旧链保留为被取代证据 |
 | [OmniRetarget 优先教师与初步训练总方案](plans/omniretarget_first_training_plan.md) | 父方案，约束来源裁决、W1 用途、训练和裸输出评估；原文字节是 A2 快照证据的一部分 |
 | [A2 收口与有限恢复方案](plans/omniretarget_a2_closure_plan.md) | 已执行阶段的实验契约，W1 入口依据；原文字节保留供 A2 证据复核 |
 | [A2 最新验证记录](verification/omniretarget_a2_closure_verification.md) | C0/C1/D0/G0/UR/C2 及六轮修复的实际证据；当前权威 C2 为 attempt_010 |
 | [项目整体实现方案](plans/interaction_retarget_impl_plan.md) | 项目目标、资产/坐标约定、模型与最终验收设计；当前实施顺序由 OmniRetarget 总方案和 W1 方案具体化 |
 
-当前事实：A1 冻结与配对已完成；原 U0 保持 `incomplete` 并停线；独立 UR 六段比较为完整 `no_quality_gain`；W1 按发布 original 数据、用途 `weak_motion_only` 完成注册/审计（55 段全准入、源箱几何应用登记尺度 0.68-0.80、质量按测量存在性契约（参考帧账本×intervals 复算）完整登记）、键控缓存（代码身份含距离实现、逐文件内容哈希+消费侧复验+complete 标志、最终登记受截止判定+崩溃出口原位撤销与三方矛盾拒收（台账 crashed/running/complete=false 均拒、legacy 缺字段行兼容））与 train 统计、两模型 S0（各 1000 步、小集整批 24 样本/步、motion_reconstruction 1.182→0.0115/1.474→0.0087 与前六轮逐位一致、checkpoint 重建+固定 probe 重放核验（重放与记录值容差内一致，逐位相等的是 summary/工件两种序列化的记录值）+注册六段首窗与扩散 t/noise 生成器复现逐位绑定+嵌套容器/原始值类型验证与重建异常登记、2561.3s≤1h），工程就绪门经深度重算式核验（loss 逐行全字段存在+有限/完整 probe 日程/checkpoint 重放与对账/注册集重建绑定）在新链上 `ready_for_w1_d=true`（本轮消费侧矛盾腿位于 CONDITION_CODE_FILES 成员，日程 re-key 属预期且内容与前轮逐位一致）。UR 标签不混入该来源；W1-D/E 正式训练与最终比较未运行。
+当前事实：A1冻结与配对完成；原U0保持 `incomplete` 并停线，独立UR为完整 `no_quality_gain`。W1按published original/`weak_motion_only`完成A3/B/C及七轮修复，reviewfix8的55段准入、尺度正确的源箱条件、键控日程、train统计和两模型S0继续有效；D/E的R0又从当前文件重算四项前置事实并通过，未重写SOURCE。
+
+W1-D/E正式链为 `derived/experiments/omniretarget_first/20261013_be00c50_w1_de/`。两模型各4,000真实更新、16次loss验证及4次完整val31生成，best均step4000；教师拟合宏为0.12204454/0.11134759m。E的155键、val6的18主产物和F独立核验完整，原始数值均有效；质量主比较Teacher2/31、模型各0/31，持续双手交互未证实。D累计8657.971s≤12h、E524.652s≤2h、detail+F570.840s≤1h。归因证据仍不足，没有自动续训、扩数据或处理教师；UR标签未混入来源。运行使用内容哈希固定的未提交实现，快照可还原，运行HEAD本身不等于实现提交。
 
 [权威 C2](../derived/experiments/omniretarget_first/20261010_a39d763_a2_closure/decisions/attempt_010/a2_closure.json) 的 SHA-256 为 `34a392f92a9cda5b8317a08d5b5b486f750c5fc83933174d36d361cb7b1d0fa2`。实际证据位于 ignored 的 derived/，迁移仓库时需按资源和验证记录恢复，不能把文档链接存在视作实验产物已携带。
 
 ## 冻结方案与进度说明
 
-父方案、A2 收口方案和 W1 A3/B/C 方案的首页状态保留其编写时快照；“收口尚未实施”等表述不代表当前进度。当前执行状态由本页、最新验证记录和其权威产物共同说明：A2 已完成收口，W1 A3/B/C 已完成并通过七轮审阅，D/E 执行方案已起草且尚未实施。
+父方案、A2收口方案、W1 A3/B/C方案和W1 D/E方案首页保留编写时快照；“尚未实施”及 `not_run` 不代表当前进度。当前结果由本页、最新验证记录和权威产物共同说明：A2已收口，A3/B/C七轮修复完成，D/E正式链及F完整结束，最终交互方法未就绪。
 
-A2 的 `baseline/snapshots/attempt_006/evidence_files.json` 已按文件路径记录两份父方案的完整哈希；reviewfix8 的 `freeze/preregistration.json` 另冻结 W1 A3/B/C 方案。下列历史字节及它们直接引用的文档路径保留：
+A2的 `baseline/snapshots/attempt_006/evidence_files.json` 按路径冻结两份父方案；reviewfix8的 `freeze/preregistration.json` 冻结A3/B/C方案；D/E的 `freeze/execution_registration.json` 冻结D/E方案。下列字节及直接引用路径保留：
 
 | 冻结文档 | SHA-256 |
 | --- | --- |
 | `plans/omniretarget_first_training_plan.md` | `ca7cd4d8db553cac0057d1392c3238f0ca0fbfcbe4748f4c5946a3e650da2e84` |
 | `plans/omniretarget_a2_closure_plan.md` | `28fd40e43af0f524e5c2c23dc776a5a9b1b00bd872d75ee90442b5f41a8b81b3` |
 | `plans/omniretarget_w1_a3bc_plan.md` | `e7247e4b76d7cdfec04e288883dbdaccd868c7908108a8f2f5171839c766fc2f` |
+| `plans/omniretarget_w1_de_plan.md` | `bed1e62d5c85579e96b94695cbbbb067cb79a820f18b9b692d21bda9c1ec1525` |
 
 后续需要修改其协议时，应明确新版本、旧版本保存位置和证据引用关系，避免把历史核验锚点当作普通进度备注覆盖。
 
@@ -59,4 +63,4 @@ A2 的 `baseline/snapshots/attempt_006/evidence_files.json` 已按文件路径�
 
 新增执行方案写入 plans/，明确日期、范围、真实前置证据、预期集合、预算、停止条件和当前状态。实施后在 verification/ 写实际结果，关联方案和产物；方案存在不等于实施完成。
 
-归档前检查冻结哈希及当前引用，更新文档相对链接和项目导航，并核对本地文件链接与标题锚点。涉及已有证据锚点的文件先保留历史字节和引用关系，再建立新版本。本次没有修改代码、配置、资源或实验数据。
+归档前检查冻结哈希及当前引用，更新文档相对链接和项目导航，并核对本地文件链接与标题锚点。涉及已有证据锚点的文件先保留历史字节和引用关系，再建立新版本。当前结果登记在正式链结束后编辑文档；源资源、父方案、SOURCE与既有实验产物保持原字节。

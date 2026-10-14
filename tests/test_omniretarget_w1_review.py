@@ -817,13 +817,20 @@ def _formal_trainer(tmp_path, macro_sequence, complete_sequence):
                       micro_batch=2, num_workers=0, seed=11, val_seed=13,
                       loss=LossWeights(w_contact=0.0))
     calls = {"i": 0}
+    demos = ["demo0", "demo1"]
 
     def formal_eval(model, conditioner):
         i = calls["i"]
         calls["i"] += 1
-        return {"n_expected": 31, "n_ok": 31 if complete_sequence[i] else 12,
-                "macro_mpjpe_m": macro_sequence[i], "per_demo": []}
+        complete = complete_sequence[i]
+        rows = [{"demo": demo, "T": 60, "status": "ok" if complete else "failed",
+                 "numerical_valid": complete,
+                 "mpjpe_m": macro_sequence[i] if complete else None} for demo in demos]
+        return {"n_expected": len(demos), "n_ok": len(demos) if complete else 0,
+                "macro_mpjpe_m": macro_sequence[i] if complete else None, "per_demo": rows}
 
+    formal_eval.expected_demos = demos
+    formal_eval.demo_lengths = {demo: 60 for demo in demos}
     out = tmp_path / f"out_{abs(hash((tuple(macro_sequence), id(tmp_path))))}"
     tr = Trainer(cfg, _tokenizer_for_losses(), _FakeDS(8), _FakeDS(4),
                  out, identity={"experiment_id": "x"},
