@@ -1285,6 +1285,44 @@ def test_finish_attempt_revoked_registration_cost_is_covered(
     assert rows[-1]["incomplete_reason"] == "budget_exceeded_after_registration"
 
 
+def test_finish_attempt_unverifiable_seal_leaves_unknown_and_fails(
+        tmp_path, monkeypatch):
+    """Controlled-clock counterexample: every terminal write is slower than
+    the doubling reserve (1.2s/3s/7s), so the verify loop exhausts its
+    rounds and cannot prove the cost. The registration must end as
+    NON-CONSUMABLE unknown (publishing, complete=false) AND the call must
+    FAIL — the caller may not exit 0 on an unsealed registration."""
+    world, run = _de_world(tmp_path, monkeypatch)
+    assert drv.stage_register(SimpleNamespace(
+        source_run_root=world["run"], run_root=run, plan="de_plan.md")) == 0
+    stage = drv.STAGES["raw-eval"]
+    att = drv._begin_attempt(run, stage)
+    monkeypatch.setattr(drv, "SEAL_VERIFY_ROUNDS", 2)
+    original = drv._upsert_cost
+    delays = iter([1.2, 3.0, 7.0])
+
+    def slow(*args, **kwargs):
+        if args[5] == "done":
+            time.sleep(next(delays))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(drv, "_upsert_cost", slow)
+    assert not drv.finish_attempt(run, stage, att, time.perf_counter(),
+        {"remaining_s": 100.0}, {"complete": True}, {})
+    rows = json.loads((att.parent / "attempts_index.json").read_text())["attempts"]
+    assert rows[-1]["status"] == "publishing"
+    assert rows[-1]["complete"] is False
+    assert rows[-1]["incomplete_reason"] == "seal_tail_reserve_unverifiable"
+    costs = [c for c in json.loads((run / "costs.json").read_text())["invocations"]
+             if c["stage"] == stage]
+    assert costs[-1]["status"] == "publishing"
+    assert costs[-1]["complete"] is False
+    # the unsealed registration is non-consumable: unknown history = stop
+    row, problems = drv.stage_state(run, stage, world["root"])
+    assert "attempt_final_check_pending" in problems
+    assert drv.domain_history_cost_s(run, "e") is None
+
+
 def test_finish_attempt_slow_seal_refresh_updates_recorded_cost(
         tmp_path, monkeypatch):
     """No-kill complement: when the honest re-registration IS affordable

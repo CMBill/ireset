@@ -360,3 +360,11 @@ F各状态分列：
 **真实 RUN 复核（新口径下）**：六 stage_state 无问题、四预算域历史可证且数值逐位不变（r0r1 37.54/7200、d 8657.97/43200、e 524.65/7200、detail_f 570.84/3600）——legacy 行不携带 `seal_tail_reserve_s`/`publishing`（不溯及既往），权威 F 报告结论不变（Teacher 2/31、两模型 0/31、`motion_baseline=complete`、`final_interaction_method=not_ready`、归因不足）。测试链 799→**800 passed+1 skipped**（1938.92s）。
 
 本轮工程事实：**撤销不是核验豁免**（任何终态登记——完成、撤销、崩溃——的最后一次写盘都在"最后登记之后检查截止"的字面契约内，撤销路径的少计成本同样污染调度）；**统一计费使撤销行的成本上界而非下界出错**（`_revoke` 重推导预留并计入封口，慢撤销写盘落盘后被杀也留下保守行）；**不可证明的成本以 unknown 收场而非可信的谎言**（publishing 残行=自我声明未封口=历史未知=调度停止，与"事前 running 行是唯一在盘证人"同一教义的封口版）；**少计成本的调度后果本身就是反例断言**（修复前"调度器仍允许下一次调用"，修复后下一次调用在入口被已核验的保守成本拒绝——历史诚实性直接决定调度正确性）。
+
+### 9.6 第七轮复核修复（2026-10-14，1 P2：不可验证的收口仍返回成功）
+
+对六轮修复的复验确认两个精确反例与 P2 证据修复成立，但发现 unknown 收口路径的调用方契约缺口：`_leave_unknown` 把登记留为 publishing 时**保留 complete=true** 且不改变返回值——受控时钟复现（终态写盘延迟依次 1.2/3/7/15/31s，循环耗尽）最终历史为 unknown、报告 complete=false，但 `finish_attempt` 仍返回 True，调用方据此退出 0。消费侧拒收虽然有效（publishing 非可消费、历史 unknown=停止），但生产侧的完成声明与返回值自我矛盾。
+
+**修复**：`_leave_unknown` 现撤销完成声明（row 与发布行 `complete=false`，reason `seal_tail_reserve_unverifiable`）并使调用**失败返回**——不可封口的登记既不能被消费、也不能被当作成功。**反例测试**：受控时钟（`SEAL_VERIFY_ROUNDS=2`、终态写盘延迟 1.2/3/7s 逐一超过倍增预留）——返回 False、行 publishing/complete=false/`seal_tail_reserve_unverifiable`、`stage_state` 报 `attempt_final_check_pending`、域历史 None。真实 RUN 复核不受影响（legacy 行不携带新字段，六 stage_state 无问题、四预算域逐位不变，权威 F 报告结论不变：Teacher 2/31、两模型 0/31、`motion_baseline=complete`、`final_interaction_method=not_ready`、归因不足）。测试链 800→**801 passed+1 skipped**（2106.73s）。
+
+本轮工程事实：**unknown 收口必须同时是调用失败**（"不可证明"的生产侧出口是失败返回+非可消费登记+自我一致的 complete=false 三件套——消费侧拒收兜底不等于生产侧可以自相矛盾地宣称成功）；**循环耗尽的语义是"登记未封口"而非"完成"**（publishing 残行承载的声明必须与其状态一致）。

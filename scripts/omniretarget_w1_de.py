@@ -558,7 +558,10 @@ def finish_attempt(run_root: Path, stage: str, attempt_dir: Path,
         # Cost coverage could not be proven within the round budget: the
         # registration is left unpublished (status publishing) — non-
         # consumable, so the domain history stays unknown instead of an
-        # under-counted consumable row.
+        # under-counted consumable row. The completion claim is withdrawn
+        # and the call FAILS: the caller must not exit 0 on an unsealed
+        # registration.
+        rw.update(complete=False)
         rw.setdefault("incomplete_reason", "seal_tail_reserve_unverifiable")
         _stop_docs(rw)
         return _publish(rw)
