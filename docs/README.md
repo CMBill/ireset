@@ -1,13 +1,14 @@
 # 文档索引
 
-整理日期：2026-10-11（最后更新 2026-10-15）。当前 **W1-D/E/F 及失败归因诊断已完成：原 Teacher raw 通过 2/31，两个模型主 seed 均通过 0/31，最终交互方法仍为 `not_ready`**。新诊断固定13段/78轨迹，确认三窗贡献遗漏与最短弧旋转分支切换，并发现融合前显著预测残差；教师主要瓶颈的主张仍不获支持。原权威运行根 `20261013_be00c50_w1_de` 与 A3/B/C reviewfix8 保持只读，新诊断单列 `20261015_9000ac8_w1_attribution`。
+整理日期：2026-10-11（最后更新 2026-10-19）。当前 **W1-D/E/F、失败归因诊断与旋转融合 v2 验证均已完成：原 Teacher raw 通过 2/31，两个模型主 seed 均通过 0/31，最终交互方法仍为 `not_ready`**。新诊断固定13段/78轨迹，确认三窗贡献遗漏与最短弧旋转分支切换，并发现融合前显著预测残差；随后的 `w1_rotation_path_nlerp_v2` 实验完整封口，但已知案例仍有两项失败（Det frame120 拒收、Diffusion frame108 7.5926 rad/s > 7）；2026-10-19 审计修复轮修正 11 项统计/收口缺口后以 r10 重跑，GQ 为 **3/26 配对通过、94 项退化、0 缺口**，按注册条件 V 未执行，候选 `integration_eligible=false`。原权威运行根 `20261013_be00c50_w1_de`、A3/B/C reviewfix8、归因运行 `20261015_9000ac8_w1_attribution` 与旋转融合 SOURCE/旧证据保持只读。
 
 ## 当前入口
 
 | 文档 | 用途与状态 |
 | --- | --- |
-| [W1 旋转融合与固定 checkpoint 验证方案](plans/omniretarget_w1_rotation_fusion_plan.md) | 下一项交付物，v0.1仅起草：唯一固定路径NLERP候选，I/R/S/V/F；S为117行固定窗/表示对照，V为155行完整val31；累计7200s、训练0步，分列机制、质量与接入资格，尚未实施/注册/执行 |
-| [W1 失败归因验证记录](verification/omniretarget_w1_attribution_verification.md) | 最新交付：13段/78轨迹，523只读锚不变，26组保存窗对照重建、14条原产物逐位重放；确认两类局部旋转融合机制，预测侧残差仍在，标签主要瓶颈不获支持；相关159项测试通过 |
+| [W1 旋转融合验证记录](verification/omniretarget_w1_rotation_fusion_verification.md) | 最新交付：`w1_rotation_path_nlerp_v2` 的完整 I/R/S/V/F，权威运行 r10（2026-10-19 审计修复 11 项缺口后重跑）。S 117/117（116 measured + 1 拒收），V0/V1 各26/26逐位重放，V2位置/关节25/25逐位；GS 因 Det frame120 blend_norm=0.462 拒收与 Diffusion frame108 7.5926 rad/s 失败，V 条件未执行；GQ 修正为3/26通过、94项退化、0缺口；F 重推39/39、重测116/116、54项合成测试通过；候选 `integration_eligible=false`，最终交互 `not_ready`；全量877 passed+1 skipped |
+| [W1 旋转融合与固定 checkpoint 验证方案](plans/omniretarget_w1_rotation_fusion_plan.md) | 已执行并冻结的契约（v0.1，2026-10-15）：唯一固定路径NLERP候选、117/155固定键集、7200s预算、训练0步与接入门；实际结果见验证记录，方案字节不改 |
+| [W1 失败归因验证记录](verification/omniretarget_w1_attribution_verification.md) | 13段/78轨迹，523只读锚不变，26组保存窗对照重建、14条原产物逐位重放；确认两类局部旋转融合机制，预测侧残差仍在，标签主要瓶颈不获支持；相关159项测试通过 |
 | [W1 失败归因执行方案](plans/omniretarget_w1_attribution_plan.md) | 已登记并执行的诊断契约；固定train6/val6/已知案例、两份best、seed7/DDIM25及3600s预算。全贡献SLERP仅作诊断，不自动采用或启动训练 |
 | [W1 D/E 验证记录](verification/omniretarget_w1_de_verification.md) | I0–I4及七轮收口修复，全量801 passed+1 skipped；R0/R1事实复验；两模型各4k及完整val31选模；155条raw、18条val6及F独立重测/重放。动作基线证据complete，模型raw均0/31，最终交互not_ready |
 | [W1 正式训练与裸输出评估方案](plans/omniretarget_w1_de_plan.md) | 已执行并冻结的契约（v0.1，2026-10-13）；绑定reviewfix8，固定I0–I4、R0/R1、每模型4k/累计12h、val31主/附表和val6/F。首页not_run是起草时快照，实际结果见验证记录 |
@@ -24,7 +25,7 @@ W1-D/E正式链为 `derived/experiments/omniretarget_first/20261013_be00c50_w1_d
 
 2026-10-15归因诊断完整结束，成本416.249s≤3600s、训练步数0。已知案例frame108的旋转跳变在全贡献对照中由29.715°/99.652°降为1.471°/1.682°；但两窗相对π分支切换仍造成158.324°跳变，且26条模型轨迹的解码窗已存在穿透。train6教师拟合仍约5.8–5.9cm，模型对照仍train6/val6各0/6，部分穿透反而恶化。三个Teacher往返未过注册旋转精度门，负结果原样保留；其最坏手部FK误差约0.124mm。下一候选是单独规定/验证生产旋转融合与拒收契约，再分离剩余学习/条件/覆盖问题；没有自动续训、扩数据、处理教师或替换融合器。
 
-下一阶段的详细执行契约已起草为[旋转融合验证方案](plans/omniretarget_w1_rotation_fusion_plan.md)：独立模块固定窗口路径符号、融合全部正权重，先做保存窗机制/精度保护，再以原best/seed7/DDIM25做完整val31同窗比较和独立收口。接入资格要求逐段不退化，算法拒收保留在31段分母中；计划编写本身没有启动I/R/S/V/F，也没有切换默认生产入口。
+旋转融合 v2 已按[执行方案](plans/omniretarget_w1_rotation_fusion_plan.md)完成 I/R/S/V/F。2026-10-19 独立审计在 r7 上发现 8 P1+3 P2 缺口，修复后以 r10 重跑权威链（`20261019_worktree_w1_rotation_fusion_r10`）：116 条 measured product、全部 path 与 metrics 与 r7 逐位相同，唯一差异是 seam 元数据由每秒角度改为每帧角度；固定窗矩阵 117 行完整，V0/V1 各26/26逐位重放、V2位置/关节25/25逐位、Teacher往返3个既有负门保留且无新增；known case 中 Deterministic V2 在 frame120 因 blend_norm=0.462 被拒收、Diffusion V2 在 107→108 为 7.5926 rad/s（>7），GS 失败，V 按注册条件未执行；S 的 GQ 修正为 **3/26 配对通过、94项退化、0证据缺口**（89→93、90→93 与 `sub10_063/diffusion` 右脚漂移均登记，111→110 不再误报）。F 重推39/39、重测116/116、54项合成测试通过，`experiment_complete=true`、`integration_eligible=false`、最终交互 `not_ready`；r10 成本413.582s，同 cohort 累计1,963.290s≤7,200s。没有切换默认生产入口、没有训练或改教师。完整证据与成本见[验证记录](verification/omniretarget_w1_rotation_fusion_verification.md)。
 
 [权威 C2](../derived/experiments/omniretarget_first/20261010_a39d763_a2_closure/decisions/attempt_010/a2_closure.json) 的 SHA-256 为 `34a392f92a9cda5b8317a08d5b5b486f750c5fc83933174d36d361cb7b1d0fa2`。实际证据位于 ignored 的 derived/，迁移仓库时需按资源和验证记录恢复，不能把文档链接存在视作实验产物已携带。
 
@@ -41,6 +42,7 @@ A2的 `baseline/snapshots/attempt_006/evidence_files.json` 按路径冻结两份
 | `plans/omniretarget_w1_a3bc_plan.md` | `e7247e4b76d7cdfec04e288883dbdaccd868c7908108a8f2f5171839c766fc2f` |
 | `plans/omniretarget_w1_de_plan.md` | `bed1e62d5c85579e96b94695cbbbb067cb79a820f18b9b692d21bda9c1ec1525` |
 | `plans/omniretarget_w1_attribution_plan.md` | `4bf026c71311f6d169bcc9d8cb2c9383c601d2f0a93d22febf60a74482542be4` |
+| `plans/omniretarget_w1_rotation_fusion_plan.md` | `c6aad7cc6f71ee0c7de70f331626e22647bd872c2f0200f4415cda7f0931a822` |
 
 后续需要修改其协议时，应明确新版本、旧版本保存位置和证据引用关系，避免把历史核验锚点当作普通进度备注覆盖。
 
