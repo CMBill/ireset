@@ -1,12 +1,15 @@
 # 文档索引
 
-整理日期：2026-10-11（最后更新 2026-10-13）。当前 **W1-D/E 实现及正式运行已完成：两模型各 4,000 步，93 主键+62 扩散附键和 val6/F 证据完整；Teacher raw 通过 2/31，两个模型主 seed 均通过 0/31，最终交互方法 `not_ready`**。权威运行根为 `20261013_be00c50_w1_de`；A3/B/C 的 reviewfix8 链继续作为已复验的只读前置。本页区分当前结果、冻结执行契约、保留的参考资料和历史归档。
+整理日期：2026-10-11（最后更新 2026-10-15）。当前 **W1-D/E/F 及失败归因诊断已完成：原 Teacher raw 通过 2/31，两个模型主 seed 均通过 0/31，最终交互方法仍为 `not_ready`**。新诊断固定13段/78轨迹，确认三窗贡献遗漏与最短弧旋转分支切换，并发现融合前显著预测残差；教师主要瓶颈的主张仍不获支持。原权威运行根 `20261013_be00c50_w1_de` 与 A3/B/C reviewfix8 保持只读，新诊断单列 `20261015_9000ac8_w1_attribution`。
 
 ## 当前入口
 
 | 文档 | 用途与状态 |
 | --- | --- |
-| [W1 D/E 验证记录](verification/omniretarget_w1_de_verification.md) | 最新交付：I0–I4及790 passed+1 skipped；R0/R1事实复验；两模型各4k及完整val31选模；155条raw、18条val6及F独立重测/重放。动作基线证据complete，模型raw均0/31，最终交互not_ready |
+| [W1 旋转融合与固定 checkpoint 验证方案](plans/omniretarget_w1_rotation_fusion_plan.md) | 下一项交付物，v0.1仅起草：唯一固定路径NLERP候选，I/R/S/V/F；S为117行固定窗/表示对照，V为155行完整val31；累计7200s、训练0步，分列机制、质量与接入资格，尚未实施/注册/执行 |
+| [W1 失败归因验证记录](verification/omniretarget_w1_attribution_verification.md) | 最新交付：13段/78轨迹，523只读锚不变，26组保存窗对照重建、14条原产物逐位重放；确认两类局部旋转融合机制，预测侧残差仍在，标签主要瓶颈不获支持；相关159项测试通过 |
+| [W1 失败归因执行方案](plans/omniretarget_w1_attribution_plan.md) | 已登记并执行的诊断契约；固定train6/val6/已知案例、两份best、seed7/DDIM25及3600s预算。全贡献SLERP仅作诊断，不自动采用或启动训练 |
+| [W1 D/E 验证记录](verification/omniretarget_w1_de_verification.md) | I0–I4及七轮收口修复，全量801 passed+1 skipped；R0/R1事实复验；两模型各4k及完整val31选模；155条raw、18条val6及F独立重测/重放。动作基线证据complete，模型raw均0/31，最终交互not_ready |
 | [W1 正式训练与裸输出评估方案](plans/omniretarget_w1_de_plan.md) | 已执行并冻结的契约（v0.1，2026-10-13）；绑定reviewfix8，固定I0–I4、R0/R1、每模型4k/累计12h、val31主/附表和val6/F。首页not_run是起草时快照，实际结果见验证记录 |
 | [W1 弱动作监督 A3/B/C 方案](plans/omniretarget_w1_a3bc_plan.md) | 已执行的前置契约（v0.1）；A3/B/C与2026-10-12七轮审阅（30项缺口+1项文档订正全修）继续有效，reviewfix8作为D/E的只读SOURCE |
 | [W1 A3/B/C 验证记录](verification/omniretarget_w1_a3bc_verification.md) | 接口实现、74 项相关测试与正式运行的实际证据；§5R7 为第七轮审阅修复权威链（运行根 `20261012_21e5784_w1_a3bc_reviewfix8/w1_reviewfix8`，就绪报告 `decisions/attempt_001`），§5R6/§5R5/§5R4/§5R3/§5R2/§5R 链与旧链保留为被取代证据 |
@@ -17,15 +20,19 @@
 
 当前事实：A1冻结与配对完成；原U0保持 `incomplete` 并停线，独立UR为完整 `no_quality_gain`。W1按published original/`weak_motion_only`完成A3/B/C及七轮修复，reviewfix8的55段准入、尺度正确的源箱条件、键控日程、train统计和两模型S0继续有效；D/E的R0又从当前文件重算四项前置事实并通过，未重写SOURCE。
 
-W1-D/E正式链为 `derived/experiments/omniretarget_first/20261013_be00c50_w1_de/`。两模型各4,000真实更新、16次loss验证及4次完整val31生成，best均step4000；教师拟合宏为0.12204454/0.11134759m。E的155键、val6的18主产物和F独立核验完整，原始数值均有效；质量主比较Teacher2/31、模型各0/31，持续双手交互未证实。D累计8657.971s≤12h、E524.652s≤2h、detail+F570.840s≤1h。归因证据仍不足，没有自动续训、扩数据或处理教师；UR标签未混入来源。运行使用内容哈希固定的未提交实现，快照可还原，运行HEAD本身不等于实现提交。
+W1-D/E正式链为 `derived/experiments/omniretarget_first/20261013_be00c50_w1_de/`。两模型各4,000真实更新、16次loss验证及4次完整val31生成，best均step4000；教师拟合宏为0.12204454/0.11134759m。E的155键、val6的18主产物和F独立核验完整，原始数值均有效；质量主比较Teacher2/31、模型各0/31，持续双手交互未证实。D累计8657.971s≤12h、E524.652s≤2h、detail+F570.840s≤1h。原F记录的归因不足保留为当时结论；新诊断详见下一段。UR标签未混入来源。原运行使用内容哈希固定的未提交实现，快照可还原，运行HEAD本身不等于实现提交。
+
+2026-10-15归因诊断完整结束，成本416.249s≤3600s、训练步数0。已知案例frame108的旋转跳变在全贡献对照中由29.715°/99.652°降为1.471°/1.682°；但两窗相对π分支切换仍造成158.324°跳变，且26条模型轨迹的解码窗已存在穿透。train6教师拟合仍约5.8–5.9cm，模型对照仍train6/val6各0/6，部分穿透反而恶化。三个Teacher往返未过注册旋转精度门，负结果原样保留；其最坏手部FK误差约0.124mm。下一候选是单独规定/验证生产旋转融合与拒收契约，再分离剩余学习/条件/覆盖问题；没有自动续训、扩数据、处理教师或替换融合器。
+
+下一阶段的详细执行契约已起草为[旋转融合验证方案](plans/omniretarget_w1_rotation_fusion_plan.md)：独立模块固定窗口路径符号、融合全部正权重，先做保存窗机制/精度保护，再以原best/seed7/DDIM25做完整val31同窗比较和独立收口。接入资格要求逐段不退化，算法拒收保留在31段分母中；计划编写本身没有启动I/R/S/V/F，也没有切换默认生产入口。
 
 [权威 C2](../derived/experiments/omniretarget_first/20261010_a39d763_a2_closure/decisions/attempt_010/a2_closure.json) 的 SHA-256 为 `34a392f92a9cda5b8317a08d5b5b486f750c5fc83933174d36d361cb7b1d0fa2`。实际证据位于 ignored 的 derived/，迁移仓库时需按资源和验证记录恢复，不能把文档链接存在视作实验产物已携带。
 
 ## 冻结方案与进度说明
 
-父方案、A2收口方案、W1 A3/B/C方案和W1 D/E方案首页保留编写时快照；“尚未实施”及 `not_run` 不代表当前进度。当前结果由本页、最新验证记录和权威产物共同说明：A2已收口，A3/B/C七轮修复完成，D/E正式链及F完整结束，最终交互方法未就绪。
+父方案、A2收口方案、W1 A3/B/C方案和W1 D/E方案首页保留编写时快照；“尚未实施”及 `not_run` 不代表当前进度。当前结果由本页、最新验证记录和权威产物共同说明：A2已收口，A3/B/C七轮修复完成，D/E正式链、F及随后归因诊断完整结束，最终交互方法未就绪。
 
-A2的 `baseline/snapshots/attempt_006/evidence_files.json` 按路径冻结两份父方案；reviewfix8的 `freeze/preregistration.json` 冻结A3/B/C方案；D/E的 `freeze/execution_registration.json` 冻结D/E方案。下列字节及直接引用路径保留：
+A2的 `baseline/snapshots/attempt_006/evidence_files.json` 按路径冻结两份父方案；reviewfix8的 `freeze/preregistration.json` 冻结A3/B/C方案；D/E的 `freeze/execution_registration.json` 冻结D/E方案；失败归因的 `freeze/registration.json` 冻结归因方案和诊断入口。下列字节及直接引用路径保留：
 
 | 冻结文档 | SHA-256 |
 | --- | --- |
@@ -33,6 +40,7 @@ A2的 `baseline/snapshots/attempt_006/evidence_files.json` 按路径冻结两份
 | `plans/omniretarget_a2_closure_plan.md` | `28fd40e43af0f524e5c2c23dc776a5a9b1b00bd872d75ee90442b5f41a8b81b3` |
 | `plans/omniretarget_w1_a3bc_plan.md` | `e7247e4b76d7cdfec04e288883dbdaccd868c7908108a8f2f5171839c766fc2f` |
 | `plans/omniretarget_w1_de_plan.md` | `bed1e62d5c85579e96b94695cbbbb067cb79a820f18b9b692d21bda9c1ec1525` |
+| `plans/omniretarget_w1_attribution_plan.md` | `4bf026c71311f6d169bcc9d8cb2c9383c601d2f0a93d22febf60a74482542be4` |
 
 后续需要修改其协议时，应明确新版本、旧版本保存位置和证据引用关系，避免把历史核验锚点当作普通进度备注覆盖。
 
