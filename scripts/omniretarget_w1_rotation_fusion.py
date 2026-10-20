@@ -41,6 +41,7 @@ import omniretarget_w1_de as driver
 from ireset.data.a2_integrity import sha256_file
 from ireset.model.rotation_fusion import (
     ANGULAR_SPEED_LIMIT_RADPS,
+    FRAME_DT_DEFAULT,
     MIN_BLEND_NORM,
     PATH_AMBIGUITY_DOT,
     PROTOCOL,
@@ -119,6 +120,10 @@ def read_json(path: Path):
     return json.loads(Path(path).read_text())
 
 
+def _mapping(value) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
 def write_json(path: Path, data, *, exclusive: bool = False) -> None:
     driver.atomic_json(Path(path), attribution.safe_json(data), exclusive=exclusive)
 
@@ -135,12 +140,19 @@ def full_sha(path: Path) -> str:
     return sha256_file(Path(path))
 
 
+def cohort_root() -> Path:
+    """Single registration scope; sibling scans cannot be reset by moving roots."""
+    return (ROOT / "derived/experiments/omniretarget_first").resolve()
+
+
 def guard_run(path: Path, *sources: Path) -> Path:
     """Resolve to an independent, empty derived experiment directory."""
     path = Path(path).expanduser().resolve()
     derived = (ROOT / "derived").resolve()
     if not path.is_relative_to(derived):
         raise ValueError("run root must resolve under derived/")
+    if path.parent != cohort_root():
+        raise ValueError("run root must be a direct child of the cohort root")
     for source in sources:
         source = Path(source).resolve()
         if path == source or path.is_relative_to(source) or source.is_relative_to(path):
@@ -418,14 +430,33 @@ def _stage_history(run: Path, stage: str) -> float | None:
                 return None
             if e.get("status") not in ("done", "crashed", "timeout", "incomplete"):
                 return None
-            measured = e.get("measured_wall_s", e.get("wall_s"))
-            if not (isinstance(measured, (int, float)) and not isinstance(measured, bool)
-                    and math.isfinite(float(measured)) and measured >= 0):
+            measured = e.get("measured_wall_s")
+            rounded = e.get("wall_s")
+            index_measured = index_row.get("measured_wall_s")
+            if not (_num_cost(measured) and _num_cost(rounded)
+                    and _num_cost(index_measured)):
                 return None
+            # Same attempt, same cost: the index and ledger must agree on the
+            # unrounded measurement, and the ledger's rounded field must be its
+            # own serialization of that measurement.  Status agreement alone
+            # would let one side be rewritten to zero.
+            if float(index_measured) != float(measured):
+                return None
+            if float(rounded) != round(float(measured), 1):
+                return None
+            if "wall_s" in index_row:
+                if not _num_cost(index_row["wall_s"]) \
+                        or float(index_row["wall_s"]) != round(float(measured), 1):
+                    return None
             total += float(measured)
         return total
     except (OSError, ValueError, TypeError, KeyError):
         return None
+
+
+def _num_cost(value) -> bool:
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(float(value)) and float(value) >= 0)
 
 
 def _total_history(run: Path) -> float | None:
@@ -439,10 +470,21 @@ def _total_history(run: Path) -> float | None:
 
 
 def _cohort_history(run: Path, cohort: str) -> dict:
-    """Same-cohort prior runs in sibling directories; unknown history stops."""
+    """Same-cohort prior runs in the fixed cohort root; unknown history stops."""
     runs, by_stage, total = [], {}, 0.0
-    for sibling in sorted(Path(run).resolve().parent.iterdir()):
-        if sibling == Path(run).resolve() or not sibling.is_dir():
+    run_resolved = Path(run).resolve()
+    base = cohort_root()
+    if run_resolved.is_relative_to(base):
+        if run_resolved.parent != base:
+            return {"known": False, "reason": "run_not_in_cohort_root",
+                    "runs": runs}
+        scope = base
+    else:
+        scope = run_resolved.parent
+    if not scope.is_dir():
+        return {"known": True, "runs": runs, "stage_cost_s": {}, "total_s": 0.0}
+    for sibling in sorted(scope.iterdir()):
+        if sibling == run_resolved or not sibling.is_dir():
             continue
         reg_path = sibling / "freeze/execution_registration.json"
         if not reg_path.is_file():
@@ -909,11 +951,13 @@ def _decoded_from_npz(path: Path) -> tuple[tuple[np.ndarray, np.ndarray, np.ndar
 
 
 def _save_fusion_path(path: Path, decoded, starts: list[int], result,
-                      rejection: RotationFusionRejected | None = None) -> dict:
+                      rejection: RotationFusionRejected | None = None,
+                      *, frame_dt: float = FRAME_DT_DEFAULT) -> dict:
     """Full path evidence: original/lifted quats, signs, alpha, norms, speed."""
     payload = {
         "original_pos": decoded[0], "original_quat": decoded[1], "original_q": decoded[2],
         "starts": np.asarray(starts, dtype=np.int64),
+        "frame_dt": np.asarray(float(frame_dt)),
     }
     if result is not None:
         # alpha_matrix is [N,T]; inactive entries are exactly zero and the
@@ -1198,7 +1242,9 @@ def fixed_unit(run: Path, demo: str, out: Path, deadline: float) -> dict:
                                  STRIDE, clip.condition.frame_dt)
         except RotationFusionRejected as exc:
             path_npz = out / f"{model}_V2_path.npz"
-            path_evidence = _save_fusion_path(path_npz, decoded, starts, None, rejection=exc)
+            path_evidence = _save_fusion_path(
+                path_npz, decoded, starts, None, rejection=exc,
+                frame_dt=clip.condition.frame_dt)
             model_facts.update(v2_status="algorithm_rejected",
                                v2_rejection=path_evidence["rejection"])
             rows.append(_row_from_measurement(
@@ -1225,7 +1271,9 @@ def fixed_unit(run: Path, demo: str, out: Path, deadline: float) -> dict:
                 consumer_eligible=v2.consumer_eligible,
             )
             path_npz = out / f"{model}_V2_path.npz"
-            path_evidence = _save_fusion_path(path_npz, decoded, starts, v2)
+            path_evidence = _save_fusion_path(
+                path_npz, decoded, starts, v2,
+                frame_dt=clip.condition.frame_dt)
             metric = measure(v2_root, v2_joints, f"{model}:V2")
             product = out / f"{model}_V2.npz"
             _save_product(product, v2_root, v2_joints, metric)
@@ -1264,7 +1312,9 @@ def fixed_unit(run: Path, demo: str, out: Path, deadline: float) -> dict:
                               oracle_starts, T, STRIDE, clip.condition.frame_dt)
     except RotationFusionRejected as exc:
         path_npz = out / "roundtrip_V2_path.npz"
-        path_evidence = _save_fusion_path(path_npz, oracle[0], oracle_starts, None, rejection=exc)
+        path_evidence = _save_fusion_path(
+            path_npz, oracle[0], oracle_starts, None, rejection=exc,
+            frame_dt=clip.condition.frame_dt)
         rt_binding.update(v2_status="algorithm_rejected",
                           v2_rejection=path_evidence["rejection"])
         rows.append(_row_from_measurement(
@@ -1282,7 +1332,9 @@ def fixed_unit(run: Path, demo: str, out: Path, deadline: float) -> dict:
             v2_world_position_bitwise=bool(np.array_equal(rt2_root[:, :3], rt0_root[:, :3])),
             fusion_temporal_pass=rt2.fusion_temporal_pass)
         path_npz = out / "roundtrip_V2_path.npz"
-        path_evidence = _save_fusion_path(path_npz, oracle[0], oracle_starts, rt2)
+        path_evidence = _save_fusion_path(
+            path_npz, oracle[0], oracle_starts, rt2,
+            frame_dt=clip.condition.frame_dt)
         rt2_metric = measure(rt2_root, rt2_joints, "roundtrip:V2")
         rt2_product = out / "roundtrip_V2.npz"
         _save_product(rt2_product, rt2_root, rt2_joints, rt2_metric)
@@ -1292,7 +1344,8 @@ def fixed_unit(run: Path, demo: str, out: Path, deadline: float) -> dict:
 
     # Known-case mechanism measurements are recorded even when they are bad.
     if demo == KNOWN_CASE:
-        facts["known_case"] = _known_case_facts(rows, out)
+        facts["known_case"] = _known_case_facts(
+            rows, out, frame_dt=clip.condition.frame_dt)
 
     result = {"demo": demo, "group": group, "T": T, "starts": starts,
               "rows": rows, "facts": facts, "status": "ok",
@@ -1306,8 +1359,13 @@ def fixed_unit(run: Path, demo: str, out: Path, deadline: float) -> dict:
     return result
 
 
-def _known_case_facts(rows: list[dict], scene_dir: Path) -> dict:
-    """Report available frame speeds or the registered rejection, never crash."""
+def _known_case_facts(rows: list[dict], scene_dir: Path,
+                      frame_dt: float | None = None) -> dict:
+    """Recompute frame speeds from the fused rotation, never from a saved array.
+
+    Availability follows the row's recomputed status: a rejected path has no
+    consumable rotation regardless of which arrays a file happens to contain.
+    """
     known = {}
     for model in MODELS:
         row = next((r for r in rows
@@ -1316,18 +1374,53 @@ def _known_case_facts(rows: list[dict], scene_dir: Path) -> dict:
         if row is None or not path.is_file():
             known[model] = {"available": False, "reason": "v2_row_or_path_missing"}
             continue
-        rejection = (row.get("path_evidence") or {}).get("rejection")
-        with np.load(path, allow_pickle=False) as z:
-            if "angular_speed_radps" not in z.files:
-                known[model] = {
-                    "available": False, "rejection": rejection,
-                    "rejection_frame": (int(z["rejection_frame"])
-                                        if "rejection_frame" in z.files else None),
-                }
-                continue
-            speed = np.asarray(z["angular_speed_radps"])
+        rej_raw = _mapping(row.get("path_evidence")).get("rejection")
+        rejection = rej_raw if isinstance(rej_raw, dict) else None
+        status = row.get("status")
+        if status == "algorithm_rejected":
+            known[model] = {
+                "available": False, "reason": "algorithm_rejected",
+                "rejection": rejection,
+                "rejection_frame": (rejection or {}).get("frame"),
+            }
+            continue
+        if status != "measured":
+            known[model] = {"available": False,
+                            "reason": f"v2_status:{status}", "rejection": rejection}
+            continue
+        try:
+            with np.load(path, allow_pickle=False) as z:
+                if "fused_quat_clip" not in z.files:
+                    known[model] = {"available": False,
+                                    "reason": "fused_rotation_missing"}
+                    continue
+                fused_quat = np.array(z["fused_quat_clip"])
+                stored_dt = (float(z["frame_dt"]) if "frame_dt" in z.files else None)
+                saved_speed = (np.array(z["angular_speed_radps"])
+                               if "angular_speed_radps" in z.files else None)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            known[model] = {"available": False,
+                            "reason": f"path_unreadable:{type(exc).__name__}"}
+            continue
+        dt = frame_dt if frame_dt is not None else stored_dt
+        if not (_num_cost(dt) and float(dt) > 0):
+            known[model] = {"available": False, "reason": "frame_dt_missing_or_invalid"}
+            continue
+        if fused_quat.ndim != 2 or fused_quat.shape[1] != 4 \
+                or not np.isfinite(fused_quat).all():
+            known[model] = {"available": False, "reason": "fused_rotation_invalid"}
+            continue
+        speed = angular_speed_radps(fused_quat, float(dt))
+        speed_reproducible = bool(
+            saved_speed is not None and saved_speed.shape == speed.shape
+            and np.array_equal(saved_speed, speed))
+        dt_matches = (None if stored_dt is None
+                      else bool(stored_dt == float(dt)))
         known[model] = {
-            "available": True,
+            "available": True, "recomputed_from_fused_rotation": True,
+            "frame_dt": float(dt), "frame_dt_recorded": stored_dt is not None,
+            "frame_dt_matches_artifact": dt_matches,
+            "speed_array_reproducible": speed_reproducible,
             "frame_107_108_radps": float(speed[107]) if len(speed) > 107 else None,
             "frame_113_114_radps": float(speed[113]) if len(speed) > 113 else None,
             "global_max_radps": float(speed.max()) if len(speed) else None,
@@ -1428,7 +1521,7 @@ def _fixed_gs(reg: dict, rows: list[dict], scene_facts: dict,
         key = row.get("key")
         status = row.get("status")
         if status == "algorithm_rejected":
-            rej = (row.get("path_evidence") or {}).get("rejection")
+            rej = (_mapping(row.get("path_evidence"))).get("rejection")
             if (not isinstance(rej, dict) or not rej.get("code")
                     or rej.get("prefix_length") is None):
                 gaps.append(f"rejection_evidence_missing:{key}")
@@ -1436,9 +1529,10 @@ def _fixed_gs(reg: dict, rows: list[dict], scene_facts: dict,
         if status != "measured":
             gaps.append(f"row_not_measured:{key}")
             continue
-        if not row.get("metrics") or row["metrics"].get("measurement_gaps"):
+        metrics = _mapping(row.get("metrics"))
+        if not metrics or metrics.get("measurement_gaps"):
             gaps.append(f"row_measurement_incomplete:{key}")
-        gaps += [f"row_metrics_missing:{key}:{g}" for g in _metric_gaps(row.get("metrics"))]
+        gaps += [f"row_metrics_missing:{key}:{g}" for g in _metric_gaps(metrics)]
         rec = row.get("product") or {}
         if not rec.get("path") or full_sha(ROOT / rec["path"]) != rec.get("sha256"):
             gaps.append(f"row_product_drift:{key}")
@@ -1446,20 +1540,21 @@ def _fixed_gs(reg: dict, rows: list[dict], scene_facts: dict,
         for model in MODELS:
             for version in ("V0", "V1"):
                 row = by_key.get(f"model:{demo}:{model}:{version}")
-                if row is None or not (row.get("binding") or {}).get(f"{version.lower()}_bitwise"):
+                if row is None or not _mapping(row.get("binding")).get(
+                        f"{version.lower()}_bitwise"):
                     failures.append(f"replay_not_bitwise:{demo}:{model}:{version}")
             v2 = by_key.get(f"model:{demo}:{model}:V2")
             if v2 is None:
                 failures.append(f"v2_row_missing:{demo}:{model}")
             elif v2.get("status") == "measured":
-                binding = v2.get("binding") or {}
+                binding = _mapping(v2.get("binding"))
                 if not binding.get("v2_position_joint_bitwise"):
                     failures.append(f"v2_changed_positions_or_joints:{demo}:{model}")
                 if not binding.get("inputs_unmodified"):
                     failures.append(f"v2_mutated_inputs:{demo}:{model}")
         v0 = by_key.get(f"roundtrip:{demo}:V0")
         v2 = by_key.get(f"roundtrip:{demo}:V2")
-        if v0 is None or not (v0.get("binding") or {}).get("v0_bitwise"):
+        if v0 is None or not _mapping(v0.get("binding")).get("v0_bitwise"):
             failures.append(f"roundtrip_replay_not_bitwise:{demo}")
         v0_fail, v2_fail = _roundtrip_fail(v0), _roundtrip_fail(v2)
         if v2_fail and not v0_fail:
@@ -1490,6 +1585,10 @@ def _fixed_gs(reg: dict, rows: list[dict], scene_facts: dict,
         info = known.get(model) or {}
         if not info.get("available"):
             failures.append(f"known_case_v2_not_computable:{model}")
+        elif info.get("speed_array_reproducible") is False:
+            failures.append(f"known_case_speed_array_not_reproducible:{model}")
+        elif info.get("frame_dt_matches_artifact") is False:
+            failures.append(f"known_case_frame_dt_not_reproducible:{model}")
         elif info.get("frame_107_108_radps") is None:
             gaps.append(f"known_case_frame_missing:{model}")
         elif info["frame_107_108_radps"] > ANGULAR_SPEED_LIMIT_RADPS:
@@ -1685,12 +1784,12 @@ def gq_compare(demo: str, model: str, v0: dict | None, v2: dict | None) -> dict:
     if failures or gaps:
         return {"demo": demo, "model": model, "passed": False,
                 "failures": failures, "evidence_gaps": gaps, "facts": {}}
-    a, b = v0.get("metrics") or {}, v2.get("metrics") or {}
+    a, b = _mapping(v0.get("metrics")), _mapping(v2.get("metrics"))
     facts = {"v0_raw_standard_pass": bool(a.get("raw_standard_pass")),
              "v2_raw_standard_pass": bool(b.get("raw_standard_pass"))}
     # Hard failures: V2 may not add a validator failure that V0 did not have.
-    strict0 = a.get("robot_strict") or {}
-    strict2 = b.get("robot_strict") or {}
+    strict0 = _mapping(a.get("robot_strict"))
+    strict2 = _mapping(b.get("robot_strict"))
     if "failed_checks" not in strict0 or "failed_checks" not in strict2:
         gaps.append(f"gq_strict_checks_missing:{demo}:{model}")
     new_failed = sorted(set(strict2.get("failed_checks") or [])
@@ -1698,23 +1797,30 @@ def gq_compare(demo: str, model: str, v0: dict | None, v2: dict | None) -> dict:
     if new_failed:
         failures.append(f"gq_new_validator_failures:{demo}:{model}:{new_failed}")
     facts["new_validator_failures"] = new_failed
-    if (a.get("task") or {}).get("gate_pass") and not (b.get("task") or {}).get("gate_pass"):
+    if _mapping(a.get("task")).get("gate_pass") \
+            and not _mapping(b.get("task")).get("gate_pass"):
         failures.append(f"gq_new_task_failure:{demo}:{model}")
     if a.get("raw_standard_pass") and not b.get("raw_standard_pass"):
         failures.append(f"gq_new_raw_failure:{demo}:{model}")
     _compare_lower(failures, gaps, f"penetration_max:{demo}:{model}",
-                   (a.get("penetration") or {}).get("max_m"),
-                   (b.get("penetration") or {}).get("max_m"))
+                   _mapping(a.get("penetration")).get("max_m"),
+                   _mapping(b.get("penetration")).get("max_m"))
     _compare_count_not_increase(failures, gaps, f"keyframe_violation_count:{demo}:{model}",
                                 v0.get("keyframe_penetration_count"),
                                 v2.get("keyframe_penetration_count"))
+    hands0, hands2 = _mapping(a.get("hands")), _mapping(b.get("hands"))
+    feet0, feet2 = _mapping(a.get("feet")), _mapping(b.get("feet"))
     for side in ("l", "r"):
-        h0, h2 = (a.get("hands") or {}).get(side), (b.get("hands") or {}).get(side)
+        h0, h2 = hands0.get(side), hands2.get(side)
         if h0 is None:
             if h2 is not None:
                 gaps.append(f"gq_hand_reference_changed:{demo}:{model}:{side}")
+        elif not isinstance(h0, dict):
+            gaps.append(f"gq_hand_measurement_invalid:{demo}:{model}:{side}")
         elif h2 is None:
             failures.append(f"gq_lost_hand_measurement:{demo}:{model}:{side}")
+        elif not isinstance(h2, dict):
+            failures.append(f"gq_hand_measurement_invalid:{demo}:{model}:{side}")
         else:
             for field in ("gap_p95_m", "drift_max_m", "relative_speed_max_mps",
                           "relative_speed_p95_mps"):
@@ -1723,18 +1829,22 @@ def gq_compare(demo: str, model: str, v0: dict | None, v2: dict | None) -> dict:
             for field in ("certified_frames", "certified_overlap_frames"):
                 _compare_count(failures, gaps, f"hands_{side}_{field}:{demo}:{model}",
                                h0.get(field), h2.get(field))
-        f0, f2 = (a.get("feet") or {}).get(side), (b.get("feet") or {}).get(side)
+        f0, f2 = feet0.get(side), feet2.get(side)
         if f0 is None:
             if f2 is not None:
                 gaps.append(f"gq_foot_reference_changed:{demo}:{model}:{side}")
+        elif not isinstance(f0, dict):
+            gaps.append(f"gq_foot_measurement_invalid:{demo}:{model}:{side}")
         elif f2 is None:
             failures.append(f"gq_lost_foot_measurement:{demo}:{model}:{side}")
+        elif not isinstance(f2, dict):
+            failures.append(f"gq_foot_measurement_invalid:{demo}:{model}:{side}")
         else:
             for field in ("gap_p95_m", "drift_max_m", "speed_p95_mps"):
                 _compare_lower(failures, gaps,
                                f"feet_{side}_{field}:{demo}:{model}",
                                f0.get(field), f2.get(field))
-    both0, both2 = a.get("both") or {}, b.get("both") or {}
+    both0, both2 = _mapping(a.get("both")), _mapping(b.get("both"))
     denominator0 = both0.get("denominator_frames")
     denominator2 = both2.get("denominator_frames")
     valid0 = (isinstance(denominator0, int) and not isinstance(denominator0, bool)
@@ -1752,16 +1862,16 @@ def gq_compare(demo: str, model: str, v0: dict | None, v2: dict | None) -> dict:
         _compare_lower(failures, gaps, f"both_valid_coverage:{demo}:{model}",
                        both0.get("valid_coverage"), both2.get("valid_coverage"))
     _compare_lower(failures, gaps, f"teacher_fit:{demo}:{model}",
-                   (a.get("fitting") or {}).get("teacher_fit_fk_mpjpe_box_m"),
-                   (b.get("fitting") or {}).get("teacher_fit_fk_mpjpe_box_m"))
+                   _mapping(a.get("fitting")).get("teacher_fit_fk_mpjpe_box_m"),
+                   _mapping(b.get("fitting")).get("teacher_fit_fk_mpjpe_box_m"))
     for side in ("l", "r"):
         _compare_lower(failures, gaps, f"hand_fk_{side}:{demo}:{model}",
-                       (v0.get("hand_fk_mean_m") or {}).get(side),
-                       (v2.get("hand_fk_mean_m") or {}).get(side))
+                       _mapping(v0.get("hand_fk_mean_m")).get(side),
+                       _mapping(v2.get("hand_fk_mean_m")).get(side))
     for field in ("world_mpjpe_p95_m", "world_mpjpe_max_m"):
         _compare_lower(failures, gaps, f"task_{field}:{demo}:{model}",
-                       (a.get("task") or {}).get(field),
-                       (b.get("task") or {}).get(field))
+                       _mapping(a.get("task")).get(field),
+                       _mapping(b.get("task")).get(field))
     _compare_lower(failures, gaps, f"root_angular_speed:{demo}:{model}",
                    v0.get("angular_velocity_max_radps"),
                    v2.get("angular_velocity_max_radps"))
@@ -1900,7 +2010,9 @@ def val31_unit(run: Path, demo: str, out: Path, deadline: float) -> dict:
                                  STRIDE, clip.condition.frame_dt)
         except RotationFusionRejected as exc:
             path_npz = out / f"{model}_V2_path.npz"
-            path_evidence = _save_fusion_path(path_npz, decoded, starts, None, rejection=exc)
+            path_evidence = _save_fusion_path(
+                path_npz, decoded, starts, None, rejection=exc,
+                frame_dt=clip.condition.frame_dt)
             binding.update(v2_status="algorithm_rejected",
                            v2_rejection=path_evidence["rejection"])
             rows.append(_row_from_measurement(
@@ -1922,7 +2034,9 @@ def val31_unit(run: Path, demo: str, out: Path, deadline: float) -> dict:
                 blend_norm_min=float(np.min(v2.diagnostics["blend_norm"])),
             )
             path_npz = out / f"{model}_V2_path.npz"
-            path_evidence = _save_fusion_path(path_npz, decoded, starts, v2)
+            path_evidence = _save_fusion_path(
+                path_npz, decoded, starts, v2,
+                frame_dt=clip.condition.frame_dt)
             v2_metric = measure(v2_root, v2_joints, f"{model}:V2")
             v2_product = out / f"{model}_V2.npz"
             _save_product(v2_product, v2_root, v2_joints, v2_metric)
@@ -2214,6 +2328,21 @@ def _finalize(run: Path) -> bool:
     product_problems = _verify_rows_products(fixed_rows) + _verify_rows_products(val_rows)
     failures += [f"product:{x}" for x in product_problems]
 
+    frozen_replays = {"fixed_windows": _verify_frozen_replays(
+        reg, "fixed-windows", run, fixed_rows, fixed_section["meta"],
+        deadline, clip_for_demo)}
+    if not val_not_run:
+        frozen_replays["val31"] = _verify_frozen_replays(
+            reg, "val31", run, val_rows, val_section["meta"],
+            deadline, clip_for_demo)
+    for section, report in frozen_replays.items():
+        failures += [f"frozen_replay:{section}:{x}" for x in report["failures"]]
+        gaps += [f"frozen_replay:{section}:{x}" for x in report["evidence_gaps"]]
+        if report["checked"] != report["expected"]:
+            failures.append(
+                f"frozen_replay:{section}:checked_{report['checked']}_of_"
+                f"{report['expected']}")
+
     v2_recomputed = {"fixed_windows": _recompute_samples(
         run, "fixed-windows", reg, fixed_rows, fixed_section["meta"],
         deadline, clip_for_demo)}
@@ -2247,10 +2376,14 @@ def _finalize(run: Path) -> bool:
     fixed_gq = _gq_rows(reg, verified_fixed_rows, reg["demos"])
     if fixed_gq != fixed_summary.get("gq"):
         gaps.append("fixed_gq_not_reproducible")
+    known_dt = None
+    if KNOWN_CASE in (reg.get("demos") or []):
+        known_dt = clip_for_demo(KNOWN_CASE).condition.frame_dt
     known_case = _known_case_facts(
         [r for r in verified_fixed_rows
          if str(r.get("key", "")).startswith(f"model:{KNOWN_CASE}:")],
-        fixed_section["root_dir"] / KNOWN_CASE)
+        fixed_section["root_dir"] / KNOWN_CASE,
+        frame_dt=known_dt)
     try:
         synthetic_tests = _run_synthetic_tests(deadline)
     except subprocess.TimeoutExpired:
@@ -2265,6 +2398,15 @@ def _finalize(run: Path) -> bool:
         synthetic_tests.get("returncode") == 0)
     if recomputed_gs != fixed_summary.get("gs"):
         gaps.append("fixed_gs_not_reproducible")
+    if val_not_run:
+        # The skip is legal only while the independently recomputed GS fails.
+        if recomputed_gs.get("passed"):
+            failures.append("val31_skipped_despite_gs_pass")
+        if attribution.safe_json(val_summary.get("fixed_window_gs")) \
+                != attribution.safe_json(recomputed_gs):
+            gaps.append("val31_skip_gate_not_reproducible")
+        if val_summary.get("runs") != 0 or val_summary.get("units"):
+            failures.append("val31_skip_not_empty")
 
     if val_not_run:
         val_gq = {"passed": False, "rows": {}, "failures": ["gq_missing"],
@@ -2310,9 +2452,14 @@ def _finalize(run: Path) -> bool:
                   "gq": val_gq,
                   "counts": val_summary.get("counts")},
         "recompute": v2_recomputed, "remeasure": remeasure_record,
+        "frozen_replays": frozen_replays,
         "verification": {
             "fixed_scene_keys": len(fixed_rows),
             "val31_scene_keys": len(val_rows),
+            "frozen_replays": {
+                section: {k: v for k, v in report.items()
+                          if k not in ("failures", "evidence_gaps")}
+                for section, report in frozen_replays.items()},
             "recompute": {
                 section: {k: v for k, v in report.items()
                           if k not in ("failures", "evidence_gaps")}
@@ -2371,8 +2518,20 @@ def _scene_section(run: Path, stage: str, reg: dict) -> dict:
         except (OSError, ValueError, TypeError):
             failures.append(f"scene_result_unreadable:{demo}")
             continue
+        if not isinstance(result, dict):
+            failures.append(f"scene_result_not_a_mapping:{demo}")
+            continue
         if result.get("status") != "ok":
             failures.append(f"scene_not_ok:{demo}:{result.get('status')}")
+            continue
+        starts = result.get("starts")
+        if not isinstance(starts, list) or not all(
+                isinstance(v, int) and not isinstance(v, bool) for v in starts):
+            failures.append(f"scene_starts_invalid:{demo}")
+            continue
+        T = result.get("T")
+        if not isinstance(T, int) or isinstance(T, bool) or T < 1:
+            failures.append(f"scene_T_invalid:{demo}")
             continue
         scene_rows = result.get("rows")
         if (not isinstance(scene_rows, list)
@@ -2430,8 +2589,10 @@ def _run_synthetic_tests(deadline: float) -> dict:
 
 
 def _recompute_samples(run: Path, stage: str, reg: dict, rows: list[dict],
-                       meta: dict, deadline: float, clip_for_demo) -> dict:
+                       meta: dict, deadline: float, clip_for_demo,
+                       attribution_for_demo=None) -> dict:
     """Rebuild every V2 path from decoded windows and bind it to its product."""
+    source_for = attribution_for_demo or _attribution_result
     section = "fixed_windows" if stage == "fixed-windows" else "val31"
     expected_keys = [k for k in reg["expected_keys"][section] if k.endswith(":V2")]
     root_dir = run / ("fixed_windows/attempt_001/scenes"
@@ -2451,16 +2612,30 @@ def _recompute_samples(run: Path, stage: str, reg: dict, rows: list[dict],
             failures.append(f"recompute_scene_missing:{demo}")
             continue
         _deadline(deadline, f"recompute:{key}")
-        evidence = row.get("path_evidence") or {}
-        path_rec = evidence.get("path") or {}
+        evidence = _mapping(row.get("path_evidence"))
+        path_rec = _mapping(evidence.get("path"))
         path = ROOT / path_rec.get("path", "")
         if not path_rec.get("path") or not path.is_file() \
                 or full_sha(path) != path_rec.get("sha256"):
             failures.append(f"path_missing_or_drifted:{key}")
             continue
         scene_dir = root_dir / demo
+        source_windows = None
+        if stage == "fixed-windows" and key.startswith("model:"):
+            model = key.split(":")[2]
+            try:
+                att = source_for(demo)
+            except (OSError, ValueError, TypeError):
+                failures.append(f"decoded_window_source_unreadable:{key}")
+                continue
+            source_windows = ((att.get("models") or {}).get(model) or {}).get("windows")
+            if not isinstance(source_windows, dict) \
+                    or _registered_artifact_path(reg, source_windows) is None:
+                failures.append(f"decoded_window_not_registered:{key}")
+                continue
         try:
-            decoded, starts = _decoded_from_windows_for_row(scene_dir, row, result)
+            decoded, starts = _decoded_from_windows_for_row(
+                scene_dir, row, result, source_windows)
         except (OSError, ValueError, KeyError, TypeError) as exc:
             failures.append(f"decoded_windows_unreadable:{key}:{type(exc).__name__}")
             continue
@@ -2555,7 +2730,7 @@ def _recompute_samples(run: Path, stage: str, reg: dict, rows: list[dict],
             failures.append(f"recomputed_window_signs:{key}")
         if not np.all(closed_geodesic_deg(recomputed.quat, saved_quat) <= 1e-9):
             failures.append(f"recomputed_rotation:{key}")
-        product_rec = row.get("product") or {}
+        product_rec = _mapping(row.get("product"))
         product_path = ROOT / product_rec.get("path", "")
         if not product_rec.get("path") or not product_path.is_file() \
                 or full_sha(product_path) != product_rec.get("sha256"):
@@ -2597,10 +2772,176 @@ def _recompute_samples(run: Path, stage: str, reg: dict, rows: list[dict],
             "measured": measured, "rejected": rejected}
 
 
-def _decoded_from_windows_for_row(scene_dir: Path, row: dict, result: dict):
-    binding = row.get("binding") or {}
+def _attribution_result(demo: str) -> dict:
+    return read_json(ATTRIBUTION / "diagnosis/attempt_001" / demo / "result.json")
+
+
+def _recorded_file_path(rec) -> Path | None:
+    if not isinstance(rec, dict):
+        return None
+    raw = rec.get("path")
+    if not isinstance(raw, str) or not raw:
+        return None
+    path = Path(raw) if Path(raw).is_absolute() else ROOT / raw
+    if not path.is_file() or full_sha(path) != rec.get("sha256"):
+        return None
+    return path
+
+
+def _registered_artifact_path(reg: dict, rec) -> Path | None:
+    """Resolve a record only when it is the registered, still-identical bytes."""
+    path = _recorded_file_path(rec)
+    if path is None:
+        return None
+    anchor = (reg.get("anchors") or {}).get(record_path(path))
+    if anchor is None or rec.get("sha256") != anchor:
+        return None
+    return path
+
+
+def _verify_frozen_replays(reg: dict, stage: str, run_root: Path,
+                           rows: list[dict], meta: dict,
+                           deadline: float, clip_for_demo,
+                           attribution_for_demo=None) -> dict:
+    """Bind every V0/V1 product and consumed window to its frozen source.
+
+    The S-stage booleans are declarations.  F recomputes the replay from the
+    registered windows and compares both the saved product and the recomputed
+    world state with the frozen attribution/raw product, bit for bit.
+    """
+    section = "fixed_windows" if stage == "fixed-windows" else "val31"
+    root_dir = Path(run_root) / ("fixed_windows/attempt_001/scenes"
+                                 if stage == "fixed-windows"
+                                 else "val31/attempt_001/demos")
+    source_for = attribution_for_demo or _attribution_result
+    failures, gaps, checked = [], [], 0
+    by_key = {row.get("key"): row for row in rows}
+    if len(by_key) != len(rows):
+        failures.append(f"{section}_scene_keys_duplicated")
+    keys = []
+    for key in reg["expected_keys"][section]:
+        if section == "fixed_windows" and (
+                (key.startswith("model:") and key.endswith((":V0", ":V1")))
+                or (key.startswith("roundtrip:") and key.endswith(":V0"))):
+            keys.append(key)
+        elif section == "val31" and key.startswith("model:") and key.endswith(":V0"):
+            keys.append(key)
+    for key in keys:
+        row = by_key.get(key)
+        if row is None:
+            failures.append(f"frozen_replay_row_missing:{key}")
+            continue
+        if row.get("status") != "measured":
+            failures.append(
+                f"frozen_replay_row_not_measured:{key}:{row.get('status')}")
+            continue
+        demo = key.split(":")[1]
+        result = meta.get(demo)
+        if not isinstance(result, dict):
+            gaps.append(f"frozen_replay_scene_missing:{demo}")
+            continue
+        _deadline(deadline, f"frozen-replay:{key}")
+        source_windows = None
+        version = key.split(":")[2] if key.startswith("roundtrip:") else key.split(":")[3]
+        if key.startswith("model:"):
+            model = key.split(":")[2]
+            if section == "fixed_windows":
+                try:
+                    att = source_for(demo)
+                except (OSError, ValueError, TypeError):
+                    failures.append(f"frozen_replay_attribution_unreadable:{demo}")
+                    continue
+                variant = model if version == "V0" else f"{model}_all_contributors"
+                hits = [r for r in (att.get("rows") or [])
+                        if isinstance(r, dict) and r.get("variant") == variant]
+                if len(hits) != 1:
+                    failures.append(f"frozen_replay_source_row_missing:{key}")
+                    continue
+                source_record = hits[0].get("product") or {}
+                source_windows = ((att.get("models") or {}).get(model) or {}).get("windows")
+            else:
+                try:
+                    source_record = _original_row(demo, model, SEED).get("product") or {}
+                except (OSError, ValueError, TypeError):
+                    failures.append(f"frozen_replay_source_row_missing:{key}")
+                    continue
+        else:
+            try:
+                att = source_for(demo)
+            except (OSError, ValueError, TypeError):
+                failures.append(f"frozen_replay_attribution_unreadable:{demo}")
+                continue
+            hits = [r for r in (att.get("rows") or [])
+                    if isinstance(r, dict) and r.get("variant") == "teacher_roundtrip"]
+            if len(hits) != 1:
+                failures.append(f"frozen_replay_source_row_missing:{key}")
+                continue
+            source_record = hits[0].get("product") or {}
+        source_path = _registered_artifact_path(reg, source_record)
+        if source_path is None:
+            failures.append(f"frozen_source_not_registered:{key}")
+            continue
+        if source_windows is not None \
+                and _registered_artifact_path(reg, source_windows) is None:
+            failures.append(f"frozen_replay_window_not_registered:{key}")
+            continue
+        try:
+            frozen_root, frozen_joints = _load_product(source_path)
+        except (OSError, ValueError, KeyError, TypeError):
+            failures.append(f"frozen_source_unreadable:{key}")
+            continue
+        product_path = _recorded_file_path(row.get("product"))
+        if product_path is None:
+            failures.append(f"frozen_replay_product_missing:{key}")
+            continue
+        try:
+            saved_root, saved_joints = _load_product(product_path)
+        except (OSError, ValueError, KeyError, TypeError):
+            failures.append(f"frozen_replay_product_unreadable:{key}")
+            continue
+        if not (np.array_equal(saved_root, frozen_root)
+                and np.array_equal(saved_joints, frozen_joints)):
+            failures.append(f"frozen_replay_product_replaced:{key}")
+            continue
+        try:
+            decoded, starts = _decoded_from_windows_for_row(
+                root_dir / demo, row, result, source_windows)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            failures.append(
+                f"frozen_replay_windows_unreadable:{key}:{type(exc).__name__}")
+            continue
+        expected_starts = [int(v) for v in (result.get("starts") or [])]
+        if starts != expected_starts:
+            failures.append(f"frozen_replay_starts_differ:{key}")
+            continue
+        clip = clip_for_demo(demo)
+        if key.startswith("roundtrip:") or version == "V0":
+            fused = _v0_fuse(decoded, starts, result["T"])
+        else:
+            fused = _v1_fuse(decoded, starts, result["T"])
+        world_root, world_joints = attribution.world_state(
+            *fused[:3], clip.condition.world_from_clip)
+        if not (np.array_equal(world_root, frozen_root)
+                and np.array_equal(world_joints, frozen_joints)):
+            failures.append(f"frozen_replay_not_bitwise:{key}")
+            continue
+        checked += 1
+    return {"failures": failures, "evidence_gaps": gaps,
+            "checked": checked, "expected": len(keys)}
+
+
+def _decoded_from_windows_for_row(scene_dir: Path, row: dict, result: dict,
+                                  source_windows: dict | None = None):
+    binding = _mapping(row.get("binding"))
     rec = binding.get("decoded_window")
     if rec:
+        if not isinstance(rec, dict):
+            raise ValueError("decoded window record is not a mapping")
+        if source_windows is not None:
+            if not isinstance(source_windows, dict) \
+                    or rec.get("path") != source_windows.get("path") \
+                    or rec.get("sha256") != source_windows.get("sha256"):
+                raise ValueError("decoded window is not the registered source")
         path = ROOT / rec.get("path", "")
         if not rec.get("path") or not path.is_file() \
                 or full_sha(path) != rec.get("sha256"):
@@ -2661,15 +3002,27 @@ def _remeasure_rows(reg: dict, rows: list[dict], deadline: float,
         validator, replayer, clip, teacher_scene, teacher_kpts = context_for_demo(demo)
         try:
             with np.load(path, allow_pickle=False) as z:
+                if "root" not in z.files or "joints" not in z.files:
+                    raise KeyError("root/joints")
                 root, joints = np.array(z["root"]), np.array(z["joints"])
-        except (OSError, ValueError):
+            if root.ndim != 2 or root.shape[1] != 7 \
+                    or joints.ndim != 2 or joints.shape[1] != 29:
+                raise ValueError("product array shape invalid")
+        except (OSError, ValueError, KeyError, TypeError):
             failures.append(f"remeasure_product_unreadable:{key}")
             out_rows.append(new_row)
             continue
-        metric = _measure_clip(
-            validator, replayer, clip, teacher_scene, teacher_kpts,
-            root, joints, demo, reg["task_gate_tol_m"], deadline,
-            f"remeasure:{key}")
+        try:
+            metric = _measure_clip(
+                validator, replayer, clip, teacher_scene, teacher_kpts,
+                root, joints, demo, reg["task_gate_tol_m"], deadline,
+                f"remeasure:{key}")
+        except (OSError, ValueError, KeyError, IndexError, AttributeError,
+                TypeError) as exc:
+            failures.append(
+                f"remeasure_failed:{key}:{type(exc).__name__}")
+            out_rows.append(new_row)
+            continue
         if metric.get("status") != "measured":
             gaps.append(f"remeasure_incomplete:{key}")
             out_rows.append(new_row)
@@ -2715,6 +3068,8 @@ def main() -> int:
         register(args.run_root)
         return 0
     run = args.run_root.expanduser().resolve()
+    if run.parent != cohort_root():
+        raise SystemExit("run root must be a direct child of the cohort root")
     if not (run / "freeze/execution_registration.json").is_file():
         raise SystemExit("run is not registered")
     if args.stage in ("fixed-window-unit", "val31-unit"):

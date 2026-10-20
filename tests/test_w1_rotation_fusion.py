@@ -273,13 +273,20 @@ def test_rows_are_emitted_in_registered_order():
     assert fusion._ordered_rows(duplicate, expected) == duplicate
 
 
-def test_known_case_facts_reports_rejection_and_frame_speeds(tmp_path):
-    np.savez_compressed(tmp_path / "deterministic_V2_path.npz",
-                        rejection_frame=np.asarray(120))
-    speed = np.full(150, 0.1)
-    speed[107] = 0.5
-    speed[113] = 0.7
+def test_known_case_facts_recompute_from_fused_rotation(tmp_path):
+    T = 150
+    angle = np.linspace(0.0, 1.0, T)
+    quat = np.stack([np.cos(angle / 2), np.zeros(T), np.zeros(T),
+                     np.sin(angle / 2)], axis=1)
+    from ireset.model.rotation_fusion import angular_speed_radps
+    speed = angular_speed_radps(quat, 1 / 30)
+    np.savez_compressed(
+        tmp_path / "deterministic_V2_path.npz",
+        rejection_frame=np.asarray(120), fused_quat_clip=quat,
+        frame_dt=np.asarray(1 / 30),
+        angular_speed_radps=np.zeros_like(speed))
     np.savez_compressed(tmp_path / "diffusion_V2_path.npz",
+                        fused_quat_clip=quat, frame_dt=np.asarray(1 / 30),
                         angular_speed_radps=speed)
     rows = [
         {"key": f"model:{fusion.KNOWN_CASE}:deterministic:V2",
@@ -289,12 +296,30 @@ def test_known_case_facts_reports_rejection_and_frame_speeds(tmp_path):
         {"key": f"model:{fusion.KNOWN_CASE}:diffusion:V2",
          "status": "measured", "path_evidence": {"rejection": None}},
     ]
-    facts = fusion._known_case_facts(rows, tmp_path)
+    facts = fusion._known_case_facts(rows, tmp_path, frame_dt=1 / 30)
+    # A rejected row is not computable even if the file carries a speed array.
     assert facts["deterministic"]["available"] is False
     assert facts["deterministic"]["rejection"]["code"] == "quaternion_blend_ill_conditioned"
     assert facts["diffusion"]["available"] is True
-    assert facts["diffusion"]["frame_107_108_radps"] == pytest.approx(0.5)
-    assert facts["diffusion"]["frame_113_114_radps"] == pytest.approx(0.7)
+    assert facts["diffusion"]["recomputed_from_fused_rotation"] is True
+    assert facts["diffusion"]["frame_107_108_radps"] == pytest.approx(
+        float(speed[107]))
+    assert facts["diffusion"]["frame_113_114_radps"] == pytest.approx(
+        float(speed[113]))
+    assert facts["diffusion"]["speed_array_reproducible"] is True
+
+    np.savez_compressed(tmp_path / "diffusion_V2_path.npz",
+                        fused_quat_clip=quat, frame_dt=np.asarray(1 / 30),
+                        angular_speed_radps=np.zeros_like(speed))
+    tampered = fusion._known_case_facts(rows, tmp_path, frame_dt=1 / 30)
+    assert tampered["diffusion"]["available"] is True
+    # The speed is the recomputed one, and the saved array is flagged.
+    assert tampered["diffusion"]["frame_107_108_radps"] == pytest.approx(
+        float(speed[107]))
+    assert tampered["diffusion"]["speed_array_reproducible"] is False
+
+    wrong_dt = fusion._known_case_facts(rows, tmp_path, frame_dt=1 / 60)
+    assert wrong_dt["diffusion"]["frame_dt_matches_artifact"] is False
 
 
 def test_roundtrip_absolute_gate_boundaries():
@@ -481,20 +506,29 @@ def _synthetic_v2_path(tmp_path):
 
 
 def _synthetic_recompute(tmp_path, path, scene, result_doc, wfc, target_box, key,
-                         product=None):
+                         product=None, attribution_doc=None):
     from types import SimpleNamespace
+    from ireset.data.a2_integrity import sha256_file
     row = result_doc["rows"][0]
     row["path_evidence"]["path"] = fusion.file_record(path)
     if product is not None:
         row["product"] = fusion.file_record(product)
     (scene / "result.json").write_text(json.dumps(result_doc))
+    decoded_rec = row["binding"]["decoded_window"]
+    decoded_path = Path(decoded_rec["path"])
+    if attribution_doc is None:
+        attribution_doc = {"models": {"deterministic": {"windows": decoded_rec}},
+                           "rows": []}
     reg = {"demos": ["demo"], "val31": [],
-           "expected_keys": {"fixed_windows": [key], "val31": []}}
+           "expected_keys": {"fixed_windows": [key], "val31": []},
+           "anchors": {fusion.record_path(decoded_path):
+                       sha256_file(decoded_path)}}
     clip = SimpleNamespace(condition=SimpleNamespace(
         world_from_clip=wfc, target_obj_pose=target_box, frame_dt=1 / 30))
     return fusion._recompute_samples(
         tmp_path, "fixed-windows", reg, result_doc["rows"],
-        {"demo": result_doc}, time.perf_counter() + 60, lambda demo: clip)
+        {"demo": result_doc}, time.perf_counter() + 60, lambda demo: clip,
+        attribution_for_demo=lambda demo: attribution_doc)
 
 
 def test_recompute_samples_rejects_tampered_lift_records(tmp_path):
@@ -536,13 +570,19 @@ def test_recompute_samples_reproduces_and_checks_rejection_prefix(tmp_path):
            "binding": {"decoded_window": fusion.file_record(decoded_path)}}
     result_doc = {"T": T, "starts": starts, "status": "ok", "rows": [row]}
     (scene / "result.json").write_text(json.dumps(result_doc))
+    from ireset.data.a2_integrity import sha256_file
     reg = {"demos": ["demo"], "val31": [],
-           "expected_keys": {"fixed_windows": [key], "val31": []}}
+           "expected_keys": {"fixed_windows": [key], "val31": []},
+           "anchors": {fusion.record_path(decoded_path):
+                       sha256_file(decoded_path)}}
+    att_doc = {"models": {"deterministic": {
+        "windows": row["binding"]["decoded_window"]}}, "rows": []}
     from types import SimpleNamespace
     clip = SimpleNamespace(condition=SimpleNamespace(frame_dt=1 / 30))
     report = fusion._recompute_samples(
         tmp_path, "fixed-windows", reg, result_doc["rows"],
-        {"demo": result_doc}, time.perf_counter() + 60, lambda demo: clip)
+        {"demo": result_doc}, time.perf_counter() + 60, lambda demo: clip,
+        attribution_for_demo=lambda demo: att_doc)
     assert not report["failures"], report["failures"]
     assert report["checked"] == 1 and report["rejected"] == 1
 
@@ -554,7 +594,8 @@ def test_recompute_samples_reproduces_and_checks_rejection_prefix(tmp_path):
     (scene / "result.json").write_text(json.dumps(result_doc))
     report = fusion._recompute_samples(
         tmp_path, "fixed-windows", reg, result_doc["rows"],
-        {"demo": result_doc}, time.perf_counter() + 60, lambda demo: clip)
+        {"demo": result_doc}, time.perf_counter() + 60, lambda demo: clip,
+        attribution_for_demo=lambda demo: att_doc)
     assert any("rejection_prefix" in f for f in report["failures"])
 
 
@@ -692,18 +733,20 @@ def test_scene_section_requires_registered_key_matrix(tmp_path):
     key = "teacher:demo"
     reg = {"demos": ["demo"], "val31": [],
            "expected_keys": {"fixed_windows": [key], "val31": []}}
-    result = {"status": "ok", "rows": [{"key": key}]}
+    result = {"status": "ok", "rows": [{"key": key}],
+              "T": 60, "starts": [0]}
     (scene / "result.json").write_text(json.dumps(result))
     section = fusion._scene_section(run, "fixed-windows", reg)
     assert section["rows"] and not section["failures"]
 
     (scene / "result.json").write_text(json.dumps(
-        {"status": "ok", "rows": []}))
+        {"status": "ok", "rows": [], "T": 60, "starts": [0]}))
     section = fusion._scene_section(run, "fixed-windows", reg)
     assert any("key_matrix" in f for f in section["failures"])
 
     (scene / "result.json").write_text(json.dumps(
-        {"status": "ok", "rows": [{"key": key}, {"key": key}]}))
+        {"status": "ok", "rows": [{"key": key}, {"key": key}],
+         "T": 60, "starts": [0]}))
     section = fusion._scene_section(run, "fixed-windows", reg)
     assert any("duplicated" in f for f in section["failures"])
 
@@ -845,8 +888,9 @@ def test_finalize_reports_register_gap_without_unbound_errors(tmp_path, monkeypa
         "measured": 0, "expected_measured": 0})
     monkeypatch.setattr(fusion, "_gq_rows", lambda reg, rows, demos: {
         "passed": True, "rows": {}, "failures": [], "evidence_gaps": []})
-    monkeypatch.setattr(fusion, "_known_case_facts", lambda rows, scene: {
-        "deterministic": {"available": False}})
+    monkeypatch.setattr(fusion, "_known_case_facts",
+                        lambda rows, scene, frame_dt=None: {
+                            "deterministic": {"available": False}})
     monkeypatch.setattr(fusion, "_run_synthetic_tests", lambda deadline: {
         "command": "x", "returncode": 0, "stdout_tail": "", "wall_s": 0.0})
     captured = {}
@@ -864,6 +908,8 @@ def test_finalize_reports_register_gap_without_unbound_errors(tmp_path, monkeypa
         (run / "decisions/attempt_001/fusion_final.json").read_text())
     assert final["experiment_complete"] is False
     assert "register_stage_incomplete" in final["failures"]
+    # A passing recomputed GS cannot coexist with a skipped V.
+    assert "val31_skipped_despite_gs_pass" in final["failures"]
     assert captured["scene_facts"] == {
         fusion.KNOWN_CASE: {"known_case": {
             "deterministic": {"available": False}}}}
@@ -877,7 +923,9 @@ def test_recompute_samples_rejects_drifted_decoded_window(tmp_path):
     decoded_path.write_bytes(decoded_path.read_bytes() + b"drift")
     report = _synthetic_recompute(tmp_path, path, scene, result_doc, wfc,
                                   target_box, key, product)
-    assert any("decoded_windows_unreadable" in f for f in report["failures"])
+    assert any(("decoded_windows_unreadable" in f)
+               or ("decoded_window_not_registered" in f)
+               for f in report["failures"])
 
 
 def test_cohort_history_charges_sealed_unregistered_attempt(tmp_path):
@@ -939,3 +987,235 @@ def test_killed_pre_registered_attempt_stops_new_cohort_run(tmp_path):
     history = fusion._cohort_history(base / "new", cohort)
     assert not history["known"]
     assert "unregistered_attempt" in history["reason"]
+
+
+def test_fixed_gs_rejects_nonreproducible_known_case_speed_array(tmp_path):
+    rows, facts, rec = _gs_rows(tmp_path)
+    reg = {"demos": DEMOS, "expected_keys": {
+        "fixed_windows": fusion._expected_keys(DEMOS, VAL31)["fixed_windows"]}}
+    bad = json.loads(json.dumps(facts))
+    bad[fusion.KNOWN_CASE]["known_case"]["diffusion"][
+        "speed_array_reproducible"] = False
+    verdict = fusion._fixed_gs(reg, rows, bad, True)
+    assert not verdict["passed"]
+    assert any("known_case_speed_array_not_reproducible:diffusion" in f
+               for f in verdict["failures"])
+
+
+def _frozen_replay_fixture(tmp_path):
+    """One demo with frozen V0/V1/roundtrip products and one decoded window."""
+    from types import SimpleNamespace
+
+    demo, T, F = "demo", 60, 60
+    starts = [0]
+    pos = np.zeros((1, F, 3))
+    quat = np.tile(np.array([1.0, 0.0, 0.0, 0.0]), (1, F, 1))
+    joints = np.zeros((1, F, 29))
+    decoded = (pos, quat, joints)
+    decoded_path = tmp_path / "decoded.npz"
+    np.savez_compressed(decoded_path, decoded_pos=pos, decoded_quat=quat,
+                        decoded_q=joints, starts=np.asarray(starts))
+    decoded_rec = fusion.file_record(decoded_path)
+
+    v0 = fusion._v0_fuse(decoded, starts, T)
+    v1 = fusion._v1_fuse(decoded, starts, T)
+    wfc = np.eye(4)
+    world0 = fusion.attribution.world_state(*v0[:3], wfc)
+    world1 = fusion.attribution.world_state(*v1[:3], wfc)
+
+    sources = {}
+    for name, (root, joint) in {
+            "v0_det": world0, "v1_det": world1,
+            "v0_diff": world0, "v1_diff": world1,
+            "roundtrip": world0}.items():
+        path = tmp_path / f"{name}.npz"
+        np.savez_compressed(path, root=root, joints=joint)
+        sources[name] = fusion.file_record(path)
+
+    att = {"rows": [
+        {"variant": "deterministic", "product": sources["v0_det"]},
+        {"variant": "deterministic_all_contributors", "product": sources["v1_det"]},
+        {"variant": "diffusion", "product": sources["v0_diff"]},
+        {"variant": "diffusion_all_contributors", "product": sources["v1_diff"]},
+        {"variant": "teacher_roundtrip", "product": sources["roundtrip"]},
+    ], "models": {
+        "deterministic": {"windows": decoded_rec},
+        "diffusion": {"windows": decoded_rec},
+    }}
+    rows = []
+    short = {"deterministic": "det", "diffusion": "diff"}
+    for model in ("deterministic", "diffusion"):
+        for version, name in (("V0", f"v0_{short[model]}"),
+                              ("V1", f"v1_{short[model]}")):
+            rows.append({
+                "key": f"model:{demo}:{model}:{version}",
+                "status": "measured", "product": sources[name],
+                "binding": {"decoded_window": decoded_rec,
+                            f"{version.lower()}_bitwise": True}})
+    rows.append({"key": f"roundtrip:{demo}:V0", "status": "measured",
+                 "product": sources["roundtrip"],
+                 "binding": {"oracle_windows": decoded_rec, "v0_bitwise": True}})
+    keys = fusion._expected_keys([demo], [])["fixed_windows"]
+    anchors = {}
+    for rec in list(sources.values()) + [decoded_rec]:
+        p = Path(rec["path"])
+        anchors[fusion.record_path(p)] = rec["sha256"]
+    reg = {"expected_keys": {"fixed_windows": keys, "val31": []},
+           "anchors": anchors}
+    run = tmp_path / "run"
+    (run / "fixed_windows/attempt_001/scenes" / demo).mkdir(parents=True)
+    meta = {demo: {"T": T, "starts": starts, "status": "ok", "rows": rows}}
+    clip = SimpleNamespace(condition=SimpleNamespace(
+        world_from_clip=wfc, target_obj_pose=np.zeros((T, 7)), frame_dt=1 / 30))
+    return (reg, run, rows, meta, clip, att, sources, demo, decoded_path)
+
+
+def test_frozen_replay_binds_products_to_the_registered_source(tmp_path):
+    (reg, run, rows, meta, clip, att, sources, demo, decoded_path) = \
+        _frozen_replay_fixture(tmp_path)
+    report = fusion._verify_frozen_replays(
+        reg, "fixed-windows", run, rows, meta, time.perf_counter() + 60,
+        lambda d: clip, attribution_for_demo=lambda d: att)
+    assert not report["failures"], report["failures"]
+    assert report["checked"] == report["expected"] == 5
+
+    # Replace the V0 product with a different product but keep v0_bitwise=True.
+    with np.load(sources["roundtrip"]["path"], allow_pickle=False) as z:
+        altered_root = np.array(z["root"]) + 0.5
+        altered_joints = np.array(z["joints"])
+    swapped = tmp_path / "swapped.npz"
+    np.savez_compressed(swapped, root=altered_root, joints=altered_joints)
+    row = next(r for r in rows if r["key"] == f"model:{demo}:deterministic:V0")
+    row["product"] = fusion.file_record(swapped)
+    report = fusion._verify_frozen_replays(
+        reg, "fixed-windows", run, rows, meta, time.perf_counter() + 60,
+        lambda d: clip, attribution_for_demo=lambda d: att)
+    assert any(f"frozen_replay_product_replaced:model:{demo}:deterministic:V0"
+               in f for f in report["failures"])
+
+
+def test_frozen_replay_binds_window_to_registered_attribution_source(tmp_path):
+    (reg, run, rows, meta, clip, att, sources, demo, decoded_path) = \
+        _frozen_replay_fixture(tmp_path)
+    alt = tmp_path / "decoded_alt.npz"
+    with np.load(decoded_path, allow_pickle=False) as z:
+        arrays = {k: np.array(z[k]) for k in z.files}
+    arrays["decoded_pos"] = arrays["decoded_pos"] + 1.0
+    np.savez_compressed(alt, **arrays)
+    alt_rec = fusion.file_record(alt)
+    reg["anchors"][fusion.record_path(alt)] = alt_rec["sha256"]
+    row = next(r for r in rows if r["key"] == f"model:{demo}:deterministic:V0")
+    row["binding"]["decoded_window"] = alt_rec
+    report = fusion._verify_frozen_replays(
+        reg, "fixed-windows", run, rows, meta, time.perf_counter() + 60,
+        lambda d: clip, attribution_for_demo=lambda d: att)
+    assert any("frozen_replay_windows_unreadable" in f
+               or "frozen_replay_not_bitwise" in f
+               for f in report["failures"])
+
+
+def test_recompute_rejects_self_consistent_but_unregistered_window(tmp_path):
+    decoded_path, path, scene, product, result_doc, wfc, target_box, key = \
+        _synthetic_v2_path(tmp_path)
+    row = result_doc["rows"][0]
+    original_rec = row["binding"]["decoded_window"]
+    alt = tmp_path / "decoded_alt.npz"
+    with np.load(decoded_path, allow_pickle=False) as z:
+        arrays = {k: np.array(z[k]) for k in z.files}
+    arrays["decoded_quat"] = arrays["decoded_quat"] * np.array([1, -1, 1, 1])
+    np.savez_compressed(alt, **arrays)
+    alt_rec = fusion.file_record(alt)
+    row["binding"]["decoded_window"] = alt_rec
+    (scene / "result.json").write_text(json.dumps(result_doc))
+    from types import SimpleNamespace
+    reg = {"demos": ["demo"], "val31": [],
+           "expected_keys": {"fixed_windows": [key], "val31": []},
+           "anchors": {fusion.record_path(Path(original_rec["path"])):
+                       original_rec["sha256"],
+                       fusion.record_path(alt): alt_rec["sha256"]}}
+    att = {"models": {"deterministic": {"windows": original_rec}}, "rows": []}
+    clip = SimpleNamespace(condition=SimpleNamespace(
+        world_from_clip=wfc, target_obj_pose=target_box, frame_dt=1 / 30))
+    report = fusion._recompute_samples(
+        tmp_path, "fixed-windows", reg, result_doc["rows"],
+        {"demo": result_doc}, time.perf_counter() + 60, lambda d: clip,
+        attribution_for_demo=lambda d: att)
+    assert any("decoded_windows_unreadable" in f
+               for f in report["failures"])
+
+
+def test_cohort_root_is_fixed_and_enforced(tmp_path, monkeypatch):
+    monkeypatch.setattr(fusion, "ROOT", tmp_path)
+    base = tmp_path / "derived/experiments/omniretarget_first"
+    base.mkdir(parents=True)
+    assert fusion.guard_run(base / "run_new") == (base / "run_new").resolve()
+    other = tmp_path / "derived/experiments/other"
+    other.mkdir(parents=True)
+    with pytest.raises(ValueError, match="cohort root"):
+        fusion.guard_run(other / "run_other")
+    nested = base / "nested" / "run"
+    history = fusion._cohort_history(nested, "c" * 64)
+    assert history["known"] is False
+    assert history["reason"] == "run_not_in_cohort_root"
+
+    cohort = "c" * 64
+    prior = base / "run_a"
+    (prior / "freeze/attempt_001").mkdir(parents=True)
+    (prior / "freeze/execution_registration.json").write_text(json.dumps({
+        "execution_id": fusion.EXECUTION_ID, "cohort_id": cohort}))
+    fusion._write_index(prior, [{
+        "stage": "register", "attempt": "attempt_001", "status": "done",
+        "complete": True, "measured_wall_s": 100.0}])
+    fusion._write_ledger(prior, [{
+        "stage": "register", "attempt": "attempt_001", "status": "done",
+        "complete": True, "wall_s": 100.0, "measured_wall_s": 100.0,
+        "scope": {"stage": "register", "attempt": "attempt_001"}}])
+    history = fusion._cohort_history(base / "run_new", cohort)
+    assert history["known"]
+    assert history["total_s"] == pytest.approx(100.0)
+
+
+def test_stage_history_rejects_index_ledger_cost_disagreement(tmp_path):
+    run = tmp_path / "run"
+    (run / "fixed_windows/attempt_001").mkdir(parents=True)
+    index = {"stage": "fixed-windows", "attempt": "attempt_001",
+             "status": "done", "complete": True, "measured_wall_s": 1790.0}
+    ledger = {"stage": "fixed-windows", "attempt": "attempt_001",
+              "status": "done", "complete": True,
+              "measured_wall_s": 0.0, "wall_s": 0.0}
+    fusion._write_index(run, [index])
+    fusion._write_ledger(run, [ledger])
+    assert fusion._stage_history(run, "fixed-windows") is None
+
+    ledger["measured_wall_s"] = 1790.0
+    ledger["wall_s"] = 0.0
+    fusion._write_ledger(run, [ledger])
+    assert fusion._stage_history(run, "fixed-windows") is None
+
+    ledger["wall_s"] = 1790.0
+    fusion._write_ledger(run, [ledger])
+    assert fusion._stage_history(run, "fixed-windows") == pytest.approx(1790.0)
+
+
+def test_scene_section_rejects_non_mapping_result(tmp_path):
+    run = tmp_path
+    scene = run / "fixed_windows/attempt_001/scenes/demo"
+    scene.mkdir(parents=True)
+    reg = {"demos": ["demo"], "val31": [],
+           "expected_keys": {"fixed_windows": ["teacher:demo"], "val31": []}}
+    (scene / "result.json").write_text("[]")
+    section = fusion._scene_section(run, "fixed-windows", reg)
+    assert any("scene_result_not_a_mapping:demo" in f
+               for f in section["failures"])
+
+
+def test_remeasure_reports_product_missing_root_instead_of_crashing(tmp_path):
+    product = tmp_path / "no_root.npz"
+    np.savez_compressed(product, joints=np.zeros((60, 29)))
+    row = {"key": "teacher:demo", "status": "measured",
+           "product": fusion.file_record(product)}
+    report = fusion._remeasure_rows(
+        {"task_gate_tol_m": 0.4}, [row], time.perf_counter() + 60,
+        lambda demo: (None, None, None, None, None))
+    assert any("remeasure_product_unreadable:teacher:demo" in f
+               for f in report["failures"])

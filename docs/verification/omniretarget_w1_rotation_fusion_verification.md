@@ -4,7 +4,9 @@
 
 状态：**实验完整；实现契约（GS）未通过；V 按注册条件未执行；候选不具备接入资格；最终交互方法仍 `not_ready`。** 本轮训练步数 0，未改生产默认入口、未重训练、未扩数据、未处理或重生成教师、未使用 test31。
 
-本轮同时完成了 2026-10-19 审计修复：11 项缺口（8 P1 + 3 P2）全部修复，**候选不接入生产的结论不变**，但 S 的 GQ 统计与 F 收口核验已按修正口径重算。r7/r9 保留为被取代证据，r10 为权威运行。
+本轮同时完成了 2026-10-19 第一轮审计修复：11 项缺口（8 P1 + 3 P2）全部修复，**候选不接入生产的结论不变**，但 S 的 GQ 统计与 F 收口核验已按修正口径重算。r7/r9 保留为被取代证据，r10 为权威运行。
+
+2026-10-19 第二轮独立审计在 r10 上又发现 **7 项缺口（4 P1 + 3 P2）**，已全部修复并有 8 项新反例；r10 的度量与“不接入”结论经只读沙箱复验成立。由于注册的 S 阶段累计预算不足以再完成一次完整 S（详见 §0.5），本轮**没有生成 r11**，r10 仍是实验权威；第二轮修复的证据由 62 项测试与 r10 的只读重推/重测承担。
 
 ## 0. 结论摘要
 
@@ -54,6 +56,63 @@ r10 与 r7 的 117 行逐键对比：
 - 116 条 measured 行的 **product SHA-256 逐位相同**；全部 path evidence SHA-256 逐位相同；metrics 逐位相同。
 - 唯一差异是 116 行的 `seam_rotation_max_deg` 元数据（r7 为每秒角度，r10 为每帧角度，比值恰 30）。
 - 因此审计修复只改变统计/核验口径，没有改变候选融合输出或质量测量。
+
+### 0.4 第二轮审计修复：7 项缺口（4 P1 + 3 P2）
+
+独立审计在 r10 上复验确认其度量与“不接入”结论成立，但发现 7 项核验缺口。全部修复如下；r10 仍是实验权威，本轮是验证代码修复，不产生新的注册 stage。
+
+| # | 审计发现 | 修复 |
+| --- | --- | --- |
+| 1 | GS 直接信任 path 工件保存的 `angular_speed_radps`；给拒收路径补零数组、把 Diff 数组清零并同步哈希即可翻门 | `_known_case_facts` 只从 `fused_quat_clip` 用 clip 的 `frame_dt` 重算速度；可计算性由行的重推状态决定（`algorithm_rejected` 一律不可计算）。保存的速度数组仅作一致性检查，`speed_array_reproducible=false` 直接成为 GS 失败。新 path 工件写入 `frame_dt` |
+| 2 | V0/V1 冻结对照只检查 `v0_bitwise`/`v1_bitwise` 布尔声明；替换产品与度量后 GQ 从失败变通过 | 新增 `_verify_frozen_replays`：65 条固定窗重放（13 段 × (2 模型 × V0/V1 + 往返 V0)）从已登记锚解析冻结产品，先逐位核对 S 保存产品的 `root`/`joints`，再从 decoded 窗口重算世界系并逐位对账；仅声明为 true 不再充分 |
+| 3 | decoded 哈希只与行内自报值比较；替换成任意自洽的新窗口、重建 path/产品/度量仍通过 | 固定窗模型行的 `decoded_window` 必须与归因注册的窗口记录 path+sha 完全一致且该记录在 635 锚内；`_recompute_samples` 对不匹配直接记 `decoded_window_not_registered`，不再接受自洽替代窗口 |
+| 4 | 同 cohort 历史只扫描当前根的同级目录；换父目录即得已知零成本与完整 1800s | 固定 `cohort_root()=derived/experiments/omniretarget_first`；注册与所有 stage 的运行根必须是其直接子目录，历史扫描固定根；嵌套/外部根为 `unknown` 并停止 |
+| 5 | 盘×索引×台账只比较状态/完成，不比较成本；索引 1790s、台账 0s 仍判 known | 每个 attempt 的索引实测成本、台账实测成本必须逐位相等，台账 `wall_s` 必须等于 `round(measured,1)`；任一不一致即历史未知 |
+| 6 | F 只信 V 的状态字符串；GS 重推为 true 时 V 仍可保持 `not_run_due_to_contract_gate` 而 complete | GS 重推通过且 V 未执行 → `val31_skipped_despite_gs_pass`；跳过记录必须与重推 GS 一致，且 `runs=0`、`units=[]` |
+| 7 | `scene result.json=[]` 抛 AttributeError，产品 NPZ 缺 `root` 抛 KeyError，F 中断并留下 running 历史 | scene 结果必须是映射且 `T`/`starts` 合法；重测前检查产品必需字段与形状；重测异常登记为 `remeasure_failed` 失败，不中断报告 |
+
+新增/改写 8 项反例测试，覆盖上述攻击形态及正常对照；rotation 相关测试从 54 增至 **62 passed**。
+
+### 0.5 第二轮复验范围与预算边界
+
+**只读沙箱复验 r10 证据（不是新注册 stage，也不是 r11 权威）：**
+
+- `_scene_section` 重建 117 行、0 失败；
+- `_verify_frozen_replays` **65/65**（冻结 V0/V1/往返产品与 committed 产品逐位一致，重算世界系亦一致）；
+- `_recompute_samples` **39/39**（38 measured + 1 拒收），0 失败、0 缺口；
+- `_remeasure_rows` **116/116**，完整 metrics 与行字段 0 失败、0 缺口；
+- GQ **3/26 通过、94 项失败、0 证据缺口**，与 r10 summary 逐位相等；
+- GS **false**，失败集合与 r10 完全相同：`known_case_v2_not_computable:deterministic`、`known_case_frame_108_over_speed:diffusion`（重算 **7.592587796611633 rad/s** > 7）；
+- V 的跳过在 GS=false 下合法；r10 的 `runs=0`/`units=[]` 与 `fixed_window_gs` 记录保持不变。
+
+r10 的 path 产物早于本轮 `frame_dt` 落盘，重算速度使用 clip 的权威 `1/30`，`frame_dt_recorded=false`、一致性字段为 `None`（不作矛盾）；新 S 会写入该字段。沙箱只读检查不写 r10、不创建新 run、不计入 stage 尝试或 cohort 成本，也不冒充完整 r11。
+
+复验方式（只读）：加载 r10 的注册与 117 行，按 demo 构建 clip/validator/replayer 上下文，依次调用 `_scene_section`、`_verify_frozen_replays`、`_recompute_samples`、`_remeasure_rows`、`_gq_rows` 与 `_fixed_gs`；known-case 使用 clip 的 `frame_dt`，V 使用 r10 的 `not_run_due_to_contract_gate` 记录。所有比较均为逐位或既有 metrics 对账，未对 r10 目录写入。
+
+需要明确：新 S 的 known-case 事实包含 `frame_dt_recorded`、`recomputed_from_fused_rotation` 等新字段，r10 的旧 `gs` JSON 与新代码重推的完整 `facts` 不逐字段相等；沙箱比较的是门裁决与失败集合，不是把新事实冒充旧封口。新的完整 F 只能在新的完整 S 上重新封口；本轮因预算未执行，不能声称 r10 已被新代码重新封口为 complete。
+
+**三处真实数据攻击的沙箱复现（只读 r10，篡改仅在工作内存/临时目录）：**
+
+| 审计攻击 | 新代码结果 |
+| --- | --- |
+| 将 known-case Diffusion path 的 `angular_speed_radps` 清零并同步哈希 | 从 `fused_quat_clip` 重算仍得 **7.592587796611633 rad/s**；`speed_array_reproducible=false`；GS 失败 `known_case_speed_array_not_reproducible:diffusion`（Det 拒收不可计算） |
+| 将 `sub10_largebox_063/diffusion` 的 V0 产品替换为 V2 产品、保留 `v0_bitwise=true` | `_verify_frozen_replays` 报 `frozen_replay_product_replaced:model:sub10_largebox_063:diffusion:V0`（恰 1 项） |
+| 将 `sub3_largebox_001/deterministic` 的 V2 decoded 窗口改为旋转 +0.01 rad 的自洽副本 | `_recompute_samples` 报 `decoded_windows_unreadable:model:sub3_largebox_001:deterministic:V2:ValueError`（未接受替代窗口） |
+
+
+**为什么没有 r11：** 按固定 cohort 根重算历史（同一 SOURCE、协议、参数、seed/DDIM）：
+
+| 阶段 | 已花 / 累计上限 |
+| --- | ---: |
+| R | 66.705s / 600s |
+| **S** | **1,513.866s / 1,800s** |
+| V | 7.198s / 3,600s |
+| F | 375.520s / 1,200s |
+| 总计 | 1,963.290s / 7,200s |
+
+S 阶段剩余 286.134s；扣除注册的 60s 收口预留后，可用 226.134s。而 r10 的 S 台账成本为 **252.156s**（13 个单元墙钟合计 238.113s），且本轮合成测试从 38 项增至 62 项（约 9s，v2 前为 4.45s）。在计划 §10“阶段上限不互借、所有尝试累计、子进程顺序执行”下，新的完整 S 无法在上限内完成。
+
+因此本轮**没有**启动注定 incomplete 的 r11 S，也没有通过换父目录、换 run 名、改协议参数、开新 cohort 或把失败尝试洗成零成本来取得新预算；这些路径正是 P1-4/P2-5 修复要封堵的。r10 保持实验权威；第二轮修复的代码证据由 62 项测试与上述只读沙箱复验承担。若必须产生新的完整权威运行，需要另立有版本的计划/预算修订并显式保留本 cohort 的全部历史尝试与成本，不能在本轮静默重置。
 
 ## 1. 注册、身份与只读前置
 
@@ -152,7 +211,7 @@ S 的 GS 未通过，按注册条件 V **未执行**：
 - 重推前验证 decoded window / oracle window 工件哈希；重建结果提升到世界系后与产品 `root`/`joints` 逐位绑定，并核对 `world_from_clip`、`target_box`、`window_starts`。替换 V2 产品为 V0 会触发 `product_not_bound_to_recomputed_path`。
 - 用原独立验收器重测全部 **116/116** 条 measured 行（Teacher + V0/V1/V2 + 往返）：完整 metrics 以及 root/joint 误差、手部 FK、角速度、seam 单步角、关键帧违规计数全部逐位对账；0 失败、0 证据缺口。
 - scene 结果按注册键集重建：117 键精确、无重复；`rows.json` 与 summary rows 必须与 scene 结果逐位一致。清空 rows 或删除 scene 会阻断 complete。
-- GS 的 known-case 事实从实际 path 工件重建，合成数学测试在 F 重新运行（54 passed）；V 的 GQ 从重测后的 verified rows 重建（V 未执行时为 `gq_missing`）。summary 的 `gs`/`gq` 只作为可复现性交叉检查。
+- GS 的 known-case 事实从实际 path 工件重建，合成数学测试在 F 重新运行（r10 封口时为 54 passed；第二轮修复后为 62 passed，沙箱复验的 GS 失败集合不变）；V 的 GQ 从重测后的 verified rows 重建（V 未执行时为 `gq_missing`）。summary 的 `gs`/`gq` 只作为可复现性交叉检查。
 - 635 项锚在 F 收口时再次重哈希不变；四个 stage 的盘×索引×台账一致；无 running/publishing 残行。每个 stage 事前写 running 登记，`accounting_schema=pre_registered_v1`。
 - 最终文件：`decisions/attempt_001/fusion_final.json`，SHA-256 `055432bf9d201408175a1b560ec9a69cdc01f3879fc9be6f7ff25247f56b9abe`。`failures=[]`、`evidence_gaps=[]`；`blocking_findings` 97 项（2 项 GS + 94 项 GQ + 1 项 V 条件未执行标记）。
 
@@ -162,9 +221,9 @@ r10 实测：R 7.466s、S 252.156s、V 2.419s、F 151.541s，合计 **413.582s**
 
 ## 6. 测试
 
-- `tests/test_rotation_fusion.py` 17 项 + `tests/test_w1_rotation_fusion.py` 37 项，合计 **54 passed**（8.44s）。新增反例覆盖：违规计数方向、手部无参考时脚部独立检查、完整 metrics/行字段对账、scene 键集/空行、产品世界系绑定、解码窗哈希、失败阻断 complete、GS 从 path 重建、事前登记、盘×索引×台账、未注册封口尝试计费、SIGKILL 中止新运行、V 跳过封口失败传播、gaps 初始化、seam 单步角。
-- 相关回归（rotation + generation + attribution + W1-D/E closure/driver/numerics/raw）：**229 passed**（50.95s）。
-- 全项目套件：`uv run --locked pytest tests/ -q` → **877 passed, 1 skipped**（1957.17s；32:37）。较上轮 861 增加 16 项，正好对应审计修复新增的反例。
+- `tests/test_rotation_fusion.py` 17 项 + `tests/test_w1_rotation_fusion.py` **45 项**，合计 **62 passed**（9.02s）。第二轮新增 8 项反例：GS 速度数组不可复现、冻结 V0/V1 产品替换、未注册 decoded 窗口、固定 cohort 根、索引/台账成本数值矛盾、非映射 scene 结果、产品缺 `root`、V 跳过与 GS 通过矛盾；既有 54 项继续覆盖违规计数方向、手部无参考时脚部独立检查、完整 metrics/行字段对账、scene 键集/空行、产品世界系绑定、失败阻断 complete、GS 从 path 重建、事前登记、盘×索引×台账、未注册封口尝试计费、SIGKILL 中止新运行、V 跳过封口失败传播、gaps 初始化、seam 单步角。
+- 相关回归（rotation + generation + attribution + W1-D/E closure/raw/numerics）：**221 passed**（36.30s）。
+- 全项目套件：`uv run --locked pytest tests/ -q` → **885 passed, 1 skipped**（1979.08s；32:59）。较上轮 877 增加 8 项，对应第二轮反例。
 
 ## 7. 边界与下一步
 
@@ -172,5 +231,6 @@ r10 实测：R 7.466s、S 252.156s、V 2.419s、F 151.541s，合计 **413.582s**
 - 已知案例仍有 Deterministic frame 120 拒收与 Diffusion frame 108 的 7.59 rad/s；26 条保存窗的预测侧残差仍在（归因已确认），融合规则不能替代模型/条件侧改进。
 - GQ 的 94 项退化表明全贡献固定路径不是质量中性修复；任何后续融合候选必须另立预注册，明确处理近反极点 NLERP 放大/拒收和接触质量代价，不能在本注册上就地调参或重跑。
 - 审计修复只改变统计/核验口径：r10 与 r7 的 product/path/metrics 逐位相同（除 seam 元数据）；r7/r9 保留为被取代证据，r8 前缀保留为 pre-schema 缺陷证据。
+- 第二轮修复仍是验证代码修复：r10 的 117 行产品/路径/metrics 未变，沙箱重推 39/39、重测 116/116、冻结重放 65/65 与 GQ 3/26/94 均成立；**没有新注册 stage、没有 r11、没有用任何方式重置 cohort 预算**。S 阶段 1,513.866/1,800s 的累计上限是未生成 r11 的直接原因（可用 226.134s < 实测 252.156s），详见 §0.5。
 - 原 U0 `incomplete`、UR `no_quality_gain`、原 F `not_ready` 继续有效；`next_action.auto_execute=false`。
 - 旧 SOURCE、归因 523 锚、155 原产物和本方案字节保持不变；本记录是新增证据，不回写冻结方案。
