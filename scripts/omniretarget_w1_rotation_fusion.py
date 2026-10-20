@@ -45,6 +45,7 @@ from ireset.model.rotation_fusion import (
     MIN_BLEND_NORM,
     PATH_AMBIGUITY_DOT,
     PROTOCOL,
+    QUAT_NORM_TOL,
     RotationFusionRejected,
     angular_speed_radps,
     fuse_windows_v2,
@@ -1407,10 +1408,28 @@ def _known_case_facts(rows: list[dict], scene_dir: Path,
             known[model] = {"available": False, "reason": "frame_dt_missing_or_invalid"}
             continue
         if fused_quat.ndim != 2 or fused_quat.shape[1] != 4 \
+                or not np.issubdtype(fused_quat.dtype, np.floating) \
                 or not np.isfinite(fused_quat).all():
             known[model] = {"available": False, "reason": "fused_rotation_invalid"}
             continue
-        speed = angular_speed_radps(fused_quat, float(dt))
+        try:
+            norms = np.linalg.norm(fused_quat, axis=1)
+            norm_invalid = (not np.isfinite(norms).all()
+                            or np.any(norms < 1e-12)
+                            or np.any(np.abs(norms - 1.0) > QUAT_NORM_TOL))
+        except (TypeError, ValueError, FloatingPointError):
+            norm_invalid = True
+        if norm_invalid:
+            known[model] = {"available": False,
+                            "reason": "fused_rotation_norm_invalid"}
+            continue
+        try:
+            speed = angular_speed_radps(fused_quat, float(dt))
+        except (ValueError, TypeError, FloatingPointError) as exc:
+            known[model] = {
+                "available": False,
+                "reason": f"rotation_speed_failed:{type(exc).__name__}"}
+            continue
         speed_reproducible = bool(
             saved_speed is not None and saved_speed.shape == speed.shape
             and np.array_equal(saved_speed, speed))
@@ -1509,6 +1528,21 @@ def _ordered_rows(rows: list[dict], expected: list[str]) -> list[dict]:
     return [by_key[key] for key in expected]
 
 
+def _teacher_status_failures(rows: list[dict],
+                             demos: list[str]) -> list[str]:
+    by_key = {row.get("key"): row for row in rows}
+    failures = []
+    for demo in demos:
+        key = f"teacher:{demo}"
+        row = by_key.get(key)
+        if row is None:
+            failures.append(f"teacher_row_missing:{key}")
+        elif row.get("status") != "measured":
+            failures.append(
+                f"teacher_row_not_measured:{key}:{row.get('status')}")
+    return failures
+
+
 def _fixed_gs(reg: dict, rows: list[dict], scene_facts: dict,
               synthetic_ok: bool) -> dict:
     failures, gaps = [], []
@@ -1517,10 +1551,14 @@ def _fixed_gs(reg: dict, rows: list[dict], scene_facts: dict,
     if keys != expected:
         failures.append("fixed_key_matrix_mismatch")
     by_key = {row.get("key"): row for row in rows}
+    failures += _teacher_status_failures(rows, reg["demos"])
     for row in rows:
         key = row.get("key")
         status = row.get("status")
         if status == "algorithm_rejected":
+            if not str(key).endswith(":V2"):
+                failures.append(f"non_v2_algorithm_rejection:{key}")
+                continue
             rej = (_mapping(row.get("path_evidence"))).get("rejection")
             if (not isinstance(rej, dict) or not rej.get("code")
                     or rej.get("prefix_length") is None):
@@ -1707,6 +1745,7 @@ def fixed_stage(run: Path) -> bool:
     }
     if keys != expected:
         failures.append("fixed_key_matrix_mismatch")
+    failures += _teacher_status_failures(out_rows, reg["demos"])
     known_case = _known_case_facts(
         [r for r in out_rows
          if str(r.get("key", "")).startswith(f"model:{KNOWN_CASE}:")],
@@ -1719,8 +1758,9 @@ def fixed_stage(run: Path) -> bool:
         {"key": row["key"],
          "rejection": (row.get("path_evidence") or {}).get("rejection")}
         for row in out_rows if row.get("status") == "algorithm_rejected"]
-    summary["failures"] = failures + gs["failures"]
-    summary["evidence_gaps"] = list(failures) + list(gs.get("evidence_gaps", []))
+    summary["failures"] = list(dict.fromkeys(failures + gs["failures"]))
+    summary["evidence_gaps"] = list(dict.fromkeys(
+        list(failures) + list(gs.get("evidence_gaps", []))))
     evidence_complete = bool(not failures and keys == expected
                              and not gs.get("evidence_gaps"))
     summary["complete"] = bool(evidence_complete)
@@ -2151,6 +2191,12 @@ def val31_stage(run: Path) -> bool:
     }
     if keys != expected:
         failures.append("val31_key_matrix_mismatch")
+    failures += _teacher_status_failures(out_rows, reg["val31"])
+    for row in out_rows:
+        if row.get("status") == "algorithm_rejected" \
+                and not str(row.get("key", "")).endswith(":V2"):
+            failures.append(
+                f"non_v2_algorithm_rejection:{row.get('key')}")
     for row in out_rows:
         if row.get("status") == "measured":
             summary_gaps = _metric_gaps(row.get("metrics"))
@@ -2343,6 +2389,19 @@ def _finalize(run: Path) -> bool:
                 f"frozen_replay:{section}:checked_{report['checked']}_of_"
                 f"{report['expected']}")
 
+    teacher_labels = {"fixed_windows": _verify_teacher_labels(
+        reg, "fixed-windows", fixed_rows, deadline, clip_for_demo)}
+    if not val_not_run:
+        teacher_labels["val31"] = _verify_teacher_labels(
+            reg, "val31", val_rows, deadline, clip_for_demo)
+    for section, report in teacher_labels.items():
+        failures += [f"teacher_label:{section}:{x}" for x in report["failures"]]
+        gaps += [f"teacher_label:{section}:{x}" for x in report["evidence_gaps"]]
+        if report["checked"] != report["expected"]:
+            failures.append(
+                f"teacher_label:{section}:checked_{report['checked']}_of_"
+                f"{report['expected']}")
+
     v2_recomputed = {"fixed_windows": _recompute_samples(
         run, "fixed-windows", reg, fixed_rows, fixed_section["meta"],
         deadline, clip_for_demo)}
@@ -2359,10 +2418,14 @@ def _finalize(run: Path) -> bool:
                 f"{report['expected']}")
 
     remeasure = {"fixed_windows": _remeasure_rows(
-        reg, fixed_rows, deadline, context_for_demo)}
+        reg, fixed_rows, deadline, context_for_demo,
+        allowed_rejected=set(
+            v2_recomputed["fixed_windows"].get("rejected_keys") or ()))}
     if not val_not_run:
         remeasure["val31"] = _remeasure_rows(
-            reg, val_rows, deadline, context_for_demo)
+            reg, val_rows, deadline, context_for_demo,
+            allowed_rejected=set(
+                v2_recomputed["val31"].get("rejected_keys") or ()))
     for section, report in remeasure.items():
         failures += [f"remeasure:{section}:{x}" for x in report["failures"]]
         gaps += [f"remeasure:{section}:{x}" for x in report["evidence_gaps"]]
@@ -2453,6 +2516,7 @@ def _finalize(run: Path) -> bool:
                   "counts": val_summary.get("counts")},
         "recompute": v2_recomputed, "remeasure": remeasure_record,
         "frozen_replays": frozen_replays,
+        "teacher_labels": teacher_labels,
         "verification": {
             "fixed_scene_keys": len(fixed_rows),
             "val31_scene_keys": len(val_rows),
@@ -2460,6 +2524,10 @@ def _finalize(run: Path) -> bool:
                 section: {k: v for k, v in report.items()
                           if k not in ("failures", "evidence_gaps")}
                 for section, report in frozen_replays.items()},
+            "teacher_labels": {
+                section: {k: v for k, v in report.items()
+                          if k not in ("failures", "evidence_gaps")}
+                for section, report in teacher_labels.items()},
             "recompute": {
                 section: {k: v for k, v in report.items()
                           if k not in ("failures", "evidence_gaps")}
@@ -2588,6 +2656,31 @@ def _run_synthetic_tests(deadline: float) -> dict:
     }
 
 
+def _finite_float_array(value, shape) -> bool:
+    return (isinstance(value, np.ndarray) and value.shape == shape
+            and np.issubdtype(value.dtype, np.floating)
+            and bool(np.isfinite(value).all()))
+
+
+def _path_array_problems(pos, quat, joints, T: int) -> list[str]:
+    problems = []
+    if not _finite_float_array(pos, (T, 3)):
+        problems.append("fused_pos_clip")
+    if not _finite_float_array(quat, (T, 4)):
+        problems.append("fused_quat_clip")
+    else:
+        try:
+            norms = np.linalg.norm(quat, axis=1)
+            if not np.isfinite(norms).all() or np.any(norms < 1e-12) \
+                    or np.any(np.abs(norms - 1.0) > QUAT_NORM_TOL):
+                problems.append("fused_quat_clip")
+        except (TypeError, ValueError, FloatingPointError):
+            problems.append("fused_quat_clip")
+    if not _finite_float_array(joints, (T, 29)):
+        problems.append("fused_joints_clip")
+    return problems
+
+
 def _recompute_samples(run: Path, stage: str, reg: dict, rows: list[dict],
                        meta: dict, deadline: float, clip_for_demo,
                        attribution_for_demo=None) -> dict:
@@ -2598,6 +2691,7 @@ def _recompute_samples(run: Path, stage: str, reg: dict, rows: list[dict],
     root_dir = run / ("fixed_windows/attempt_001/scenes"
                       if stage == "fixed-windows" else "val31/attempt_001/demos")
     failures, gaps, checked, measured, rejected = [], [], 0, 0, 0
+    rejected_keys = []
     by_key = {row.get("key"): row for row in rows}
     if len(by_key) != len(rows):
         failures.append(f"{stage}_scene_keys_duplicated")
@@ -2687,6 +2781,7 @@ def _recompute_samples(run: Path, stage: str, reg: dict, rows: list[dict],
                                 failures.append(f"rejection_prefix:{key}:{name}")
                 except (OSError, ValueError):
                     failures.append(f"rejection_prefix_unreadable:{key}")
+            rejected_keys.append(key)
             checked += 1
             rejected += 1
             continue
@@ -2711,6 +2806,14 @@ def _recompute_samples(run: Path, stage: str, reg: dict, rows: list[dict],
         except (OSError, ValueError):
             failures.append(f"path_unreadable:{key}")
             continue
+        saved_problems = _path_array_problems(
+            saved_pos, saved_quat, saved_joints, result["T"])
+        recomputed_problems = _path_array_problems(
+            recomputed.pos, recomputed.quat, recomputed.joints, result["T"])
+        failures += [f"path_array_invalid:{key}:{name}"
+                     for name in saved_problems]
+        failures += [f"recomputed_array_invalid:{key}:{name}"
+                     for name in recomputed_problems]
         if evidence.get("fusion_temporal_pass") != recomputed.fusion_temporal_pass:
             failures.append(f"fusion_temporal_drifted:{key}")
         if evidence.get("consumer_eligible") != recomputed.consumer_eligible:
@@ -2728,8 +2831,17 @@ def _recompute_samples(run: Path, stage: str, reg: dict, rows: list[dict],
         if not np.array_equal(np.asarray(recomputed.diagnostics["window_signs"]),
                               saved_signs):
             failures.append(f"recomputed_window_signs:{key}")
-        if not np.all(closed_geodesic_deg(recomputed.quat, saved_quat) <= 1e-9):
-            failures.append(f"recomputed_rotation:{key}")
+        if "fused_quat_clip" not in saved_problems \
+                and "fused_quat_clip" not in recomputed_problems:
+            try:
+                drift = closed_geodesic_deg(recomputed.quat, saved_quat)
+                if not np.all(np.isfinite(drift)) \
+                        or not np.all(drift <= 1e-9):
+                    failures.append(f"recomputed_rotation:{key}")
+            except (ValueError, TypeError, FloatingPointError) as exc:
+                failures.append(
+                    f"recomputed_rotation_unreadable:{key}:"
+                    f"{type(exc).__name__}")
         product_rec = _mapping(row.get("product"))
         product_path = ROOT / product_rec.get("path", "")
         if not product_rec.get("path") or not product_path.is_file() \
@@ -2769,7 +2881,8 @@ def _recompute_samples(run: Path, stage: str, reg: dict, rows: list[dict],
         measured += 1
     return {"failures": failures, "evidence_gaps": gaps,
             "checked": checked, "expected": len(expected_keys),
-            "measured": measured, "rejected": rejected}
+            "measured": measured, "rejected": rejected,
+            "rejected_keys": rejected_keys}
 
 
 def _attribution_result(demo: str) -> dict:
@@ -2797,6 +2910,82 @@ def _registered_artifact_path(reg: dict, rec) -> Path | None:
     if anchor is None or rec.get("sha256") != anchor:
         return None
     return path
+
+
+def _verify_teacher_labels(reg: dict, stage: str, rows: list[dict],
+                           deadline: float, clip_for_demo) -> dict:
+    """Bind every teacher product bit-for-bit to the frozen clip label."""
+    section = "fixed_windows" if stage == "fixed-windows" else "val31"
+    demos = reg["demos"] if stage == "fixed-windows" else reg["val31"]
+    expected_keys = [f"teacher:{demo}" for demo in demos]
+    by_key = {row.get("key"): row for row in rows}
+    failures = ([f"{section}_scene_keys_duplicated"]
+                if len(by_key) != len(rows) else [])
+    gaps, checked = [], 0
+    for key in expected_keys:
+        row = by_key.get(key)
+        if row is None:
+            failures.append(f"teacher_row_missing:{key}")
+            continue
+        if row.get("status") != "measured":
+            failures.append(
+                f"teacher_row_not_measured:{key}:{row.get('status')}")
+            continue
+        demo = key.split(":", 1)[1]
+        _deadline(deadline, f"teacher-label:{key}")
+        clip = clip_for_demo(demo)
+        product_path = _recorded_file_path(row.get("product"))
+        if product_path is None:
+            failures.append(f"teacher_product_missing:{key}")
+            continue
+        try:
+            with np.load(product_path, allow_pickle=False) as z:
+                if "root" not in z.files or "joints" not in z.files:
+                    raise KeyError("root/joints")
+                root = np.array(z["root"])
+                joints = np.array(z["joints"])
+                world_from_clip = (np.array(z["world_from_clip"])
+                                   if "world_from_clip" in z.files else None)
+                target_box = (np.array(z["target_box"])
+                              if "target_box" in z.files else None)
+                starts = (np.array(z["window_starts"])
+                          if "window_starts" in z.files else None)
+        except (OSError, ValueError, KeyError, TypeError):
+            failures.append(f"teacher_product_unreadable:{key}")
+            continue
+        if not np.array_equal(root, clip.root):
+            failures.append(f"teacher_root_not_frozen_label:{key}")
+        if not np.array_equal(joints, clip.q):
+            failures.append(f"teacher_joints_not_frozen_label:{key}")
+        if world_from_clip is not None and not np.array_equal(
+                world_from_clip, clip.condition.world_from_clip):
+            failures.append(f"teacher_world_frame_drifted:{key}")
+        if target_box is not None and not np.array_equal(
+                target_box, clip.condition.target_obj_pose):
+            failures.append(f"teacher_target_drifted:{key}")
+        if starts is not None and not np.array_equal(
+                starts, np.asarray(clip_starts(clip.T), dtype=np.int64)):
+            failures.append(f"teacher_starts_drifted:{key}")
+        binding = _mapping(row.get("binding"))
+        if stage == "fixed-windows":
+            if binding.get("frozen_label_root_sha256") != \
+                    hashlib.sha256(clip.root.tobytes()).hexdigest():
+                failures.append(f"teacher_binding_root_drifted:{key}")
+            if binding.get("frozen_label_q_sha256") != \
+                    hashlib.sha256(clip.q.tobytes()).hexdigest():
+                failures.append(f"teacher_binding_joints_drifted:{key}")
+        else:
+            if binding.get("frozen_label_root_bitwise") is not True:
+                failures.append(f"teacher_binding_root_drifted:{key}")
+            if binding.get("frozen_label_joints_bitwise") is not True:
+                failures.append(f"teacher_binding_joints_drifted:{key}")
+            if _registered_artifact_path(
+                    reg, binding.get("original_product")) is None:
+                failures.append(
+                    f"teacher_original_product_not_registered:{key}")
+        checked += 1
+    return {"failures": failures, "evidence_gaps": gaps,
+            "checked": checked, "expected": len(expected_keys)}
 
 
 def _verify_frozen_replays(reg: dict, stage: str, run_root: Path,
@@ -2973,8 +3162,13 @@ def closed_geodesic_deg(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 
 def _remeasure_rows(reg: dict, rows: list[dict], deadline: float,
-                    context_for_demo) -> dict:
-    """Re-measure every measured row and reconcile every GQ-facing field."""
+                    context_for_demo, allowed_rejected=None) -> dict:
+    """Re-measure every measured row and reconcile every GQ-facing field.
+
+    An algorithm rejection is skipped only when F independently reproduced it
+    for a V2 path; every other status is a verification failure.
+    """
+    allowed = set(allowed_rejected or ())
     failures, gaps = [], []
     expected_measured = 0
     measured = 0
@@ -2984,6 +3178,8 @@ def _remeasure_rows(reg: dict, rows: list[dict], deadline: float,
         key = row.get("key")
         status = row.get("status")
         if status == "algorithm_rejected":
+            if not str(key).endswith(":V2") or key not in allowed:
+                failures.append(f"remeasure_unexpected_rejection:{key}")
             out_rows.append(new_row)
             continue
         if status != "measured":

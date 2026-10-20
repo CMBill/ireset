@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import sys
@@ -1219,3 +1220,175 @@ def test_remeasure_reports_product_missing_root_instead_of_crashing(tmp_path):
         lambda demo: (None, None, None, None, None))
     assert any("remeasure_product_unreadable:teacher:demo" in f
                for f in report["failures"])
+
+
+def _teacher_label_fixture(tmp_path):
+    from types import SimpleNamespace
+    demo, T = "demo", 60
+    root = np.zeros((T, 7), dtype=np.float64)
+    root[:, 3] = 1.0
+    joints = np.zeros((T, 29), dtype=np.float64)
+    wfc = np.eye(4)
+    target = np.zeros((T, 7), dtype=np.float64)
+    product = tmp_path / "teacher.npz"
+    np.savez_compressed(product, root=root, joints=joints,
+                        world_from_clip=wfc, target_box=target,
+                        window_starts=np.asarray([0], dtype=np.int64))
+    row = {"key": f"teacher:{demo}", "status": "measured",
+           "product": fusion.file_record(product),
+           "binding": {
+               "frozen_label_root_sha256":
+                   hashlib.sha256(root.tobytes()).hexdigest(),
+               "frozen_label_q_sha256":
+                   hashlib.sha256(joints.tobytes()).hexdigest()}}
+    reg = {"demos": [demo], "val31": [],
+           "expected_keys": {"fixed_windows": [row["key"]], "val31": []}}
+    clip = SimpleNamespace(
+        root=root, q=joints, T=T,
+        condition=SimpleNamespace(world_from_clip=wfc,
+                                  target_obj_pose=target))
+    return reg, row, product, clip, demo
+
+
+def test_teacher_labels_bind_products_to_the_frozen_clip(tmp_path):
+    reg, row, product, clip, demo = _teacher_label_fixture(tmp_path)
+    report = fusion._verify_teacher_labels(
+        reg, "fixed-windows", [row], time.perf_counter() + 60,
+        lambda d: clip)
+    assert not report["failures"], report["failures"]
+    assert report["checked"] == report["expected"] == 1
+
+    # The audit attack: put a real model product in the teacher slot while
+    # keeping a measured status and synchronized metrics.
+    with np.load(product, allow_pickle=False) as z:
+        arrays = {k: np.array(z[k]) for k in z.files}
+    arrays["root"] = arrays["root"] + 0.5
+    np.savez_compressed(product, **arrays)
+    row["product"] = fusion.file_record(product)
+    report = fusion._verify_teacher_labels(
+        reg, "fixed-windows", [row], time.perf_counter() + 60,
+        lambda d: clip)
+    assert any(f"teacher_root_not_frozen_label:teacher:{demo}" in f
+               for f in report["failures"])
+
+    # A rejection label cannot hide the teacher row from re-measurement.
+    row["status"] = "algorithm_rejected"
+    row["product"] = None
+    report = fusion._verify_teacher_labels(
+        reg, "fixed-windows", [row], time.perf_counter() + 60,
+        lambda d: clip)
+    assert any(f"teacher_row_not_measured:teacher:{demo}:algorithm_rejected" in f
+               for f in report["failures"])
+
+
+def test_teacher_labels_val31_bind_the_original_teacher_product(tmp_path):
+    reg, row, product, clip, demo = _teacher_label_fixture(tmp_path)
+    original = tmp_path / "original_teacher.npz"
+    np.savez_compressed(original, root=clip.root, joints=clip.q)
+    rec = fusion.file_record(original)
+    row["binding"] = {
+        "frozen_label_root_bitwise": True,
+        "frozen_label_joints_bitwise": True,
+        "original_product": rec,
+    }
+    reg["demos"], reg["val31"] = [], [demo]
+    reg["expected_keys"] = {"fixed_windows": [], "val31": [row["key"]]}
+    reg["anchors"] = {fusion.record_path(original): rec["sha256"]}
+    report = fusion._verify_teacher_labels(
+        reg, "val31", [row], time.perf_counter() + 60, lambda d: clip)
+    assert report["checked"] == report["expected"] == 1
+    assert not report["failures"], report["failures"]
+
+    reg["anchors"] = {}
+    report = fusion._verify_teacher_labels(
+        reg, "val31", [row], time.perf_counter() + 60, lambda d: clip)
+    assert any(f"teacher_original_product_not_registered:teacher:{demo}" in f
+               for f in report["failures"])
+
+
+def test_fixed_gs_rejects_teacher_and_non_v2_algorithm_rejection(tmp_path):
+    rows, facts, rec = _gs_rows(tmp_path)
+    reg = {"demos": DEMOS, "expected_keys": {
+        "fixed_windows": fusion._expected_keys(DEMOS, VAL31)["fixed_windows"]}}
+    bad = [dict(r) for r in rows]
+    teacher = next(r for r in bad if r["key"].startswith("teacher:"))
+    teacher.update(status="algorithm_rejected", product=None,
+                   path_evidence={"path": rec, "rejection": {
+                       "code": "fake", "prefix_length": 0}})
+    verdict = fusion._fixed_gs(reg, bad, facts, True)
+    assert not verdict["passed"]
+    assert any("teacher_row_not_measured" in f for f in verdict["failures"])
+    assert any("non_v2_algorithm_rejection" in f for f in verdict["failures"])
+
+    # A genuine V2 rejection remains a legal registered outcome.
+    allowed = [dict(r) for r in rows]
+    v2 = next(r for r in allowed
+              if r["key"] == f"model:{DEMOS[3]}:deterministic:V2")
+    v2.update(status="algorithm_rejected", product=None,
+              path_evidence={"path": rec, "rejection": {
+                  "code": "fake", "prefix_length": 0}})
+    assert fusion._fixed_gs(reg, allowed, facts, True)["passed"]
+
+
+def test_remeasure_only_skips_independently_recomputed_v2_rejections(tmp_path):
+    context = (None, None, None, None, None)
+    teacher = {"key": "teacher:demo", "status": "algorithm_rejected",
+               "product": None}
+    report = fusion._remeasure_rows(
+        {"task_gate_tol_m": 0.4}, [teacher], time.perf_counter() + 60,
+        lambda demo: context)
+    assert any("remeasure_unexpected_rejection:teacher:demo" in f
+               for f in report["failures"])
+
+    v2 = {"key": "model:demo:deterministic:V2",
+          "status": "algorithm_rejected", "product": None}
+    report = fusion._remeasure_rows(
+        {"task_gate_tol_m": 0.4}, [v2], time.perf_counter() + 60,
+        lambda demo: context, allowed_rejected={v2["key"]})
+    assert not report["failures"], report["failures"]
+    assert report["measured"] == report["expected_measured"] == 0
+
+
+def test_recompute_reports_zero_norm_saved_quaternion_instead_of_crashing(
+        tmp_path):
+    decoded_path, path, scene, product, result_doc, wfc, target_box, key = \
+        _synthetic_v2_path(tmp_path)
+    with np.load(path, allow_pickle=False) as z:
+        arrays = {k: np.array(z[k]) for k in z.files}
+    arrays["fused_quat_clip"] = np.zeros_like(arrays["fused_quat_clip"])
+    np.savez_compressed(path, **arrays)
+    report = _synthetic_recompute(tmp_path, path, scene, result_doc, wfc,
+                                  target_box, key, product)
+    assert any(f"path_array_invalid:{key}:fused_quat_clip" in f
+               for f in report["failures"])
+    assert report["checked"] == 1 and report["measured"] == 1
+
+    # A non-numeric array is a malformed artifact, not an exception path.
+    arrays["fused_quat_clip"] = np.full(
+        (len(arrays["fused_quat_clip"]), 4), "x", dtype="<U1")
+    np.savez_compressed(path, **arrays)
+    report = _synthetic_recompute(tmp_path, path, scene, result_doc, wfc,
+                                  target_box, key, product)
+    assert any(f"path_array_invalid:{key}:fused_quat_clip" in f
+               for f in report["failures"])
+    assert report["checked"] == 1 and report["measured"] == 1
+
+
+def test_known_case_facts_rejects_zero_norm_fused_rotation(tmp_path):
+    T = 150
+    np.savez_compressed(
+        tmp_path / "deterministic_V2_path.npz",
+        fused_quat_clip=np.zeros((T, 4)), frame_dt=np.asarray(1 / 30))
+    rows = [{"key": f"model:{fusion.KNOWN_CASE}:deterministic:V2",
+             "status": "measured", "path_evidence": {"rejection": None}}]
+    facts = fusion._known_case_facts(rows, tmp_path, frame_dt=1 / 30)
+    assert facts["deterministic"]["available"] is False
+    assert "norm" in facts["deterministic"]["reason"]
+
+    np.savez_compressed(
+        tmp_path / "deterministic_V2_path.npz",
+        fused_quat_clip=np.full((T, 4), "x", dtype="<U1"),
+        frame_dt=np.asarray(1 / 30))
+    facts = fusion._known_case_facts(rows, tmp_path, frame_dt=1 / 30)
+    assert facts["deterministic"]["available"] is False
+    assert facts["deterministic"]["reason"] == "fused_rotation_invalid"
