@@ -1275,6 +1275,14 @@ def _reduce(values: list[float], reducer: str) -> float:
 
 def aggregate_window_rows(rows: Sequence[Mapping], plan: Mapping,
                           *, value_key: str = "metrics") -> dict:
+    """Equal-demo macro over the COMPLETE expected window set.
+
+    A demo contributes only when its measured starts are exactly the
+    registered starts (no missing, duplicate or extra window) and every
+    required metric is present and valid in every one of its windows. A
+    partial subset never publishes a non-null macro; the micro/missing
+    counts remain visible.
+    """
     expected = {"train6": 6, "val6": 6, "known_case": 1}
     out = {}
     for group, n_demo in expected.items():
@@ -1284,17 +1292,33 @@ def aggregate_window_rows(rows: Sequence[Mapping], plan: Mapping,
         for model in MODELS:
             model_rows = [r for r in group_rows if r.get("model") == model]
             for category in ("all", "regular", "tail"):
+                category_key = "inference" if category == "all" else category
                 selected = [r for r in model_rows
-                            if category == "all" or r.get("kind") == category]
-                stats = {}
+                            if (category == "all" or r.get("kind") == category)
+                            and r.get("status") == "measured"]
+                by_demo = {demo: [r for r in selected if r.get("demo") == demo]
+                           for demo in demos}
+                expected_starts = {
+                    demo: list(plan["per_demo"][demo][category_key])
+                    for demo in demos}
+                keys_complete = {}
                 missing = []
+                for demo in demos:
+                    got = [int(r.get("window_start")) for r in by_demo[demo]]
+                    complete = (len(got) == len(set(got))
+                                and sorted(got) == sorted(expected_starts[demo]))
+                    keys_complete[demo] = complete
+                    if not complete:
+                        missing.append(f"{demo}:window_keys")
+                stats = {}
                 for spec in WINDOW_METRICS:
                     per_demo = {}
                     for demo in demos:
+                        if not keys_complete[demo]:
+                            continue
                         vals = []
-                        for r in selected:
-                            if r.get("demo") != demo:
-                                continue
+                        ok = True
+                        for r in by_demo[demo]:
                             payload = (r.get(value_key) if value_key in r else r) or {}
                             v = _metric_value(payload, spec.path)
                             if (isinstance(v, (int, float)) and not isinstance(v, bool)
@@ -1302,10 +1326,11 @@ def aggregate_window_rows(rows: Sequence[Mapping], plan: Mapping,
                                     and (spec.reducer != "count"
                                          or float(v).is_integer())):
                                 vals.append(float(v))
-                        if vals:
+                            else:
+                                ok = False
+                                missing.append(f"{demo}:{spec.path}")
+                        if ok and vals:
                             per_demo[demo] = _reduce(vals, spec.reducer)
-                        else:
-                            missing.append(f"{demo}:{spec.path}")
                     stats[spec.path] = {
                         "per_demo": per_demo,
                         "macro_equal_demo": (float(np.mean(list(per_demo.values())))
@@ -1314,11 +1339,21 @@ def aggregate_window_rows(rows: Sequence[Mapping], plan: Mapping,
                         "n_demo_expected": len(demos),
                         "reducer": spec.reducer,
                     }
+                n_expected = _expected_windows(plan, group, category, model)
                 measured = len(selected)
                 out[group][f"{model}|{category}"] = {
-                    "n_expected_windows": _expected_windows(plan, group, category, model),
+                    "n_expected_windows": n_expected,
                     "n_measured_windows": measured,
-                    "n_missing_windows": max(0, _expected_windows(plan, group, category, model) - measured),
+                    "n_missing_windows": max(0, n_expected - measured),
+                    "n_unexpected_windows": max(0, measured - n_expected),
+                    "n_not_measured_windows": sum(
+                        1 for r in model_rows
+                        if (category == "all" or r.get("kind") == category)
+                        and r.get("status") != "measured"),
+                    "window_keys_complete": all(keys_complete.values()),
+                    "metrics_complete": all(
+                        block["macro_equal_demo"] is not None
+                        for block in stats.values()),
                     "metrics": stats, "missing": missing[:50],
                 }
     return out
@@ -1339,55 +1374,203 @@ def _expected_windows(plan: Mapping, group: str, category: str, model: str) -> i
     return total
 
 
+def _group_demos(plan: Mapping, group: str) -> list[str]:
+    return list(plan[group]) if group != "known_case" else [plan["known_case"]]
+
+
+def _probe_metric_macro(rows: Sequence[Mapping], plan: Mapping, group: str,
+                        probe: str, getter) -> dict:
+    """Equal-demo mean over the complete fixed probe matrix for one group.
+
+    ``diffusion_denoise`` has five registered t rows per window, so a demo
+    is complete only when every registered start appears exactly five times
+    with finite metric values. Micro (window-level) values are never a
+    substitute for this macro.
+    """
+    demos = _group_demos(plan, group)
+    per_demo = {}
+    for demo in demos:
+        expected = list(plan["per_demo"][demo]["inference"])
+        selected = [r for r in rows if r.get("group") == group
+                    and r.get("probe") == probe and r.get("demo") == demo
+                    and r.get("metrics") is not None]
+        starts = [int(r.get("start")) for r in selected]
+        repetitions = len(DENOISE_TIMESTEPS) if probe == "diffusion_denoise" else 1
+        complete = (len(starts) == repetitions * len(expected)
+                    and sorted(starts) == sorted(expected) * repetitions)
+        if not complete:
+            continue
+        vals = [getter(r) for r in selected]
+        if not all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                   and math.isfinite(float(v)) for v in vals):
+            continue
+        per_demo[demo] = float(np.mean(np.asarray(vals, dtype=np.float64)))
+    return {
+        "per_demo": per_demo,
+        "macro_equal_demo": (float(np.mean(list(per_demo.values())))
+                             if len(per_demo) == len(demos) else None),
+        "n_demo_measured": len(per_demo),
+        "n_demo_expected": len(demos),
+    }
+
+
+def _probe_rows_expected(plan: Mapping, group: str, probe: str) -> int:
+    demos = _group_demos(plan, group)
+    repetitions = len(DENOISE_TIMESTEPS) if probe == "diffusion_denoise" else 1
+    return repetitions * sum(len(plan["per_demo"][d]["inference"]) for d in demos)
+
+
 def aggregate_probe_rows(rows: Sequence[Mapping], plan: Mapping) -> dict:
-    out = {"probe_classes": {}, "groups": {}}
+    """Per-probe group summary with equal-demo macro as the primary statistic."""
+    out = {"aggregation": {"primary": "macro_equal_demo",
+                           "supplemental": "micro_equal_window"},
+           "probe_classes": {}, "groups": {}}
     for probe in PROBE_NAMES:
         selected = [r for r in rows if r.get("probe") == probe]
         out["probe_classes"][probe] = {
             "n_expected": (325 if probe == "diffusion_denoise" else 65),
-            "n_measured": len(selected),
-            "n_execution_failed": sum(r.get("status") == "execution_failed" for r in selected),
+            "n_measured": sum(r.get("status") == "measured" for r in selected),
+            "n_execution_failed": sum(r.get("status") == "execution_failed"
+                                      for r in selected),
         }
     for group in ("train6", "val6", "known_case"):
         for probe in PROBE_NAMES:
             selected = [r for r in rows
                         if r.get("group") == group and r.get("probe") == probe
                         and r.get("metrics") is not None]
-            vals = [float(r["metrics"]["physical"]["fk"]["mpjpe_m"]) for r in selected]
+            vals = [float(r["metrics"]["physical"]["fk"]["mpjpe_m"])
+                    for r in selected]
+            macro = _probe_metric_macro(
+                rows, plan, group, probe,
+                lambda r: r["metrics"]["physical"]["fk"]["mpjpe_m"])
+            n_expected = _probe_rows_expected(plan, group, probe)
             out["groups"][f"{group}|{probe}"] = {
                 "n": len(selected),
+                "n_expected": n_expected,
+                "n_missing": max(0, n_expected - len(selected)),
+                "n_unexpected": max(0, len(selected) - n_expected),
                 "fk_mpjpe_mean_m": float(np.mean(vals)) if vals else None,
+                "fk_mpjpe_macro_equal_demo": macro["macro_equal_demo"],
+                "macro": macro,
             }
     return out
 
 
-def denoise_snr_table(rows: Sequence[Mapping]) -> dict:
-    """Per-t error-vs-SNR facts; no cross-t average replacement."""
-    out = {}
-    for t in DENOISE_TIMESTEPS:
-        selected = [r for r in rows if r.get("probe") == "diffusion_denoise"
-                    and r.get("t") == t and r.get("metrics") is not None]
-        if not selected:
-            out[str(t)] = None
+def _snr_block(rows: Sequence[Mapping], plan: Mapping | None, probe: str,
+               n_expected: int, *, t: int | None = None) -> dict | None:
+    selected = [r for r in rows if r.get("probe") == probe
+                and r.get("metrics") is not None
+                and (t is None or r.get("t") == t)]
+    if not selected:
+        return None
+    micro_total = float(np.mean([r["metrics"]["loss"]["total"]
+                                 for r in selected]))
+    micro_fk = float(np.mean([r["metrics"]["physical"]["fk"]["mpjpe_m"]
+                              for r in selected]))
+    block = {
+        "n": len(selected),
+        "n_expected": n_expected,
+        "n_missing": max(0, n_expected - len(selected)),
+        "micro_equal_window": {
+            "normalized_total_mean": micro_total,
+            "fk_mpjpe_mean_m": micro_fk,
+        },
+        "per_group": {},
+    }
+    if t is not None:
+        block["alpha_cumprod"] = float(selected[0]["alpha_cumprod"])
+        block["snr"] = float(selected[0]["snr"])
+    if plan is not None:
+        block["normalized_total_macro_equal_demo"] = _all_group_macro(
+            rows, plan, probe, t, lambda r: r["metrics"]["loss"]["total"])
+        block["fk_mpjpe_macro_equal_demo"] = _all_group_macro(
+            rows, plan, probe, t,
+            lambda r: r["metrics"]["physical"]["fk"]["mpjpe_m"])
+        for group in ("train6", "val6", "known_case"):
+            members = [r for r in selected if r.get("group") == group]
+            block["per_group"][group] = {
+                "n": len(members),
+                "normalized_total_mean": (float(np.mean(
+                    [r["metrics"]["loss"]["total"] for r in members]))
+                    if members else None),
+                "fk_mpjpe_mean_m": (float(np.mean(
+                    [r["metrics"]["physical"]["fk"]["mpjpe_m"] for r in members]))
+                    if members else None),
+                "normalized_total_macro_equal_demo": _group_probe_macro(
+                    rows, plan, group, probe, t,
+                    lambda r: r["metrics"]["loss"]["total"]),
+                "fk_mpjpe_macro_equal_demo": _group_probe_macro(
+                    rows, plan, group, probe, t,
+                    lambda r: r["metrics"]["physical"]["fk"]["mpjpe_m"]),
+            }
+    return block
+
+
+def _group_probe_macro(rows: Sequence[Mapping], plan: Mapping, group: str,
+                       probe: str, t: int | None, getter):
+    demos = _group_demos(plan, group)
+    per_demo = {}
+    repetitions = len(DENOISE_TIMESTEPS) if probe == "diffusion_denoise" else 1
+    for demo in demos:
+        expected = list(plan["per_demo"][demo]["inference"])
+        selected = [r for r in rows if r.get("group") == group
+                    and r.get("probe") == probe and r.get("demo") == demo
+                    and r.get("metrics") is not None
+                    and (t is None or r.get("t") == t)]
+        starts = [int(r.get("start")) for r in selected]
+        if t is not None:
+            complete = (len(starts) == len(expected)
+                        and sorted(starts) == sorted(expected))
+        else:
+            complete = (len(starts) == repetitions * len(expected)
+                        and sorted(starts) == sorted(expected) * repetitions)
+        if not complete:
             continue
-        out[str(t)] = {
-            "n": len(selected),
-            "alpha_cumprod": float(selected[0]["alpha_cumprod"]),
-            "snr": float(selected[0]["snr"]),
-            "normalized_total_mean": float(np.mean(
-                [r["metrics"]["loss"]["total"] for r in selected])),
-            "fk_mpjpe_mean_m": float(np.mean(
-                [r["metrics"]["physical"]["fk"]["mpjpe_m"] for r in selected])),
-        }
-    gen = [r for r in rows if r.get("probe") == "diffusion_ddim25"
-           and r.get("metrics") is not None]
-    out["ddim25"] = ({
-        "n": len(gen),
-        "normalized_total_mean": float(np.mean(
-            [r["metrics"]["loss"]["total"] for r in gen])),
-        "fk_mpjpe_mean_m": float(np.mean(
-            [r["metrics"]["physical"]["fk"]["mpjpe_m"] for r in gen])),
-    } if gen else None)
+        vals = [getter(r) for r in selected]
+        if not all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                   and math.isfinite(float(v)) for v in vals):
+            continue
+        per_demo[demo] = float(np.mean(np.asarray(vals, dtype=np.float64)))
+    return (float(np.mean(list(per_demo.values())))
+            if len(per_demo) == len(demos) else None)
+
+
+def _all_group_macro(rows: Sequence[Mapping], plan: Mapping, probe: str,
+                     t: int | None, getter):
+    """Macro over all 13 registered demos (train6/val6/known), never mixed groups."""
+    demos = list(plan["train6"]) + list(plan["val6"]) + [plan["known_case"]]
+    per_demo = {}
+    repetitions = len(DENOISE_TIMESTEPS) if probe == "diffusion_denoise" else 1
+    for demo in demos:
+        expected = list(plan["per_demo"][demo]["inference"])
+        selected = [r for r in rows if r.get("probe") == probe
+                    and r.get("demo") == demo and r.get("metrics") is not None
+                    and (t is None or r.get("t") == t)]
+        starts = [int(r.get("start")) for r in selected]
+        if t is not None:
+            complete = (len(starts) == len(expected)
+                        and sorted(starts) == sorted(expected))
+        else:
+            complete = (len(starts) == repetitions * len(expected)
+                        and sorted(starts) == sorted(expected) * repetitions)
+        if not complete:
+            continue
+        vals = [getter(r) for r in selected]
+        if not all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                   and math.isfinite(float(v)) for v in vals):
+            continue
+        per_demo[demo] = float(np.mean(np.asarray(vals, dtype=np.float64)))
+    return (float(np.mean(list(per_demo.values())))
+            if len(per_demo) == len(demos) else None)
+
+
+def denoise_snr_table(rows: Sequence[Mapping], plan: Mapping | None = None) -> dict:
+    """Per-t error-vs-SNR facts; equal-demo macro is primary, micro supplemental."""
+    out = {"aggregation": {"primary": "macro_equal_demo",
+                           "supplemental": "micro_equal_window"}}
+    for t in DENOISE_TIMESTEPS:
+        out[str(t)] = _snr_block(rows, plan, "diffusion_denoise", 65, t=t)
+    out["ddim25"] = _snr_block(rows, plan, "diffusion_ddim25", 65)
     return out
 
 
@@ -1447,12 +1630,14 @@ def attribution_judgement(*, w_summary: Mapping | None, p_summary: Mapping | Non
     snr = (p_summary or {}).get("denoise_snr") or {}
     ddim = snr.get("ddim25")
     high = snr.get(str(DENOISE_TIMESTEPS[-1]))
-    if ddim and high:
+    ddim_total = (ddim or {}).get("normalized_total_macro_equal_demo")
+    high_total = (high or {}).get("normalized_total_macro_equal_demo")
+    if ddim_total is not None and high_total is not None:
         mechanisms["denoise_sampling"] = {
-            "ddim_total_mean": float(ddim["normalized_total_mean"]),
-            "t999_total_mean": float(high["normalized_total_mean"]),
-            "ddim_minus_t999": float(ddim["normalized_total_mean"] - high["normalized_total_mean"]),
-            "supported": bool(ddim["normalized_total_mean"] > high["normalized_total_mean"]),
+            "ddim_total_macro_equal_demo": float(ddim_total),
+            "t999_total_macro_equal_demo": float(high_total),
+            "ddim_minus_t999": float(ddim_total - high_total),
+            "supported": bool(ddim_total > high_total),
         }
     else:
         mechanisms["denoise_sampling"] = {"supported": None,
@@ -1525,28 +1710,49 @@ def _nested(doc, path: str):
 
 
 def summarize_pairs(pairs: Sequence[Mapping]) -> dict:
+    """Pair summary with per-(demo, model, frame) identity.
+
+    Windows from different demos/models must never share a frame bucket; the
+    earlier frame-only key silently collapsed the 13-demo matrix. A merged
+    model view over (demo, frame) is reported separately and is never the
+    primary statistic.
+    """
     if not pairs:
         return {"n": 0, "max_position_diff_m": None,
                 "max_rotation_diff_deg": None, "max_joint_max_rad": None,
                 "frames_with_any_pair_above_limits": 0,
-                "triple_window_frames": 0}
+                "triple_window_frames": 0,
+                "merged_model_frames_above_limits": 0,
+                "merged_model_triple_window_frames": 0,
+                "aggregation": "per_demo_model_frame"}
     pos = np.asarray([p["position_diff_m"] for p in pairs], dtype=np.float64)
     rot = np.asarray([p["rotation_diff_deg"] for p in pairs], dtype=np.float64)
     joint = np.asarray([p["joint_max_rad"] for p in pairs], dtype=np.float64)
     above = np.asarray([p["position_diff_m"] > ATTRIBUTION_COMPARATORS["cross_window_position_m"]
                         or p["rotation_diff_deg"] > ATTRIBUTION_COMPARATORS["cross_window_rotation_deg"]
                         for p in pairs], dtype=bool)
-    by_frame: dict[int, set[int]] = {}
+    by_frame: dict[tuple[str, str, int], set[int]] = {}
+    by_frame_merged: dict[tuple[str, int], set[int]] = {}
     for p in pairs:
-        by_frame.setdefault(int(p["global_frame"]), set()).update(
-            (int(p["window_i"]), int(p["window_j"])))
+        frame = int(p["global_frame"])
+        demo, model = str(p["demo"]), str(p["model"])
+        windows = (int(p["window_i"]), int(p["window_j"]))
+        by_frame.setdefault((demo, model, frame), set()).update(windows)
+        by_frame_merged.setdefault((demo, frame), set()).update(windows)
     return {
         "n": len(pairs),
         "max_position_diff_m": float(pos.max()),
         "max_rotation_diff_deg": float(rot.max()),
         "max_joint_max_rad": float(joint.max()),
-        "frames_with_any_pair_above_limits": int(len({p["global_frame"]
-                                                      for p, hit in zip(pairs, above) if hit})),
+        "frames_with_any_pair_above_limits": int(len({
+            (p["demo"], p["model"], p["global_frame"])
+            for p, hit in zip(pairs, above) if hit})),
         "triple_window_frames": int(sum(1 for windows in by_frame.values()
                                         if len(windows) >= 3)),
+        "merged_model_frames_above_limits": int(len({
+            (p["demo"], p["global_frame"])
+            for p, hit in zip(pairs, above) if hit})),
+        "merged_model_triple_window_frames": int(sum(
+            1 for windows in by_frame_merged.values() if len(windows) >= 3)),
+        "aggregation": "per_demo_model_frame",
     }

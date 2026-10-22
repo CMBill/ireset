@@ -383,8 +383,11 @@ def test_aggregation_keeps_expected_denominator_and_never_shrinks_macro():
     assert rec["n_expected_windows"] == 26
     assert rec["n_measured_windows"] == 1
     assert rec["n_missing_windows"] == 25
+    assert rec["window_keys_complete"] is False
+    assert rec["metrics_complete"] is False
     assert rec["metrics"]["physical.fk.mpjpe_m"]["macro_equal_demo"] is None
-    assert rec["metrics"]["physical.fk.mpjpe_m"]["n_demo_measured"] == 1
+    # A partially covered demo cannot enter the equal-demo macro at all.
+    assert rec["metrics"]["physical.fk.mpjpe_m"]["n_demo_measured"] == 0
 
 
 def test_attribution_marks_mixed_and_insufficient_without_a_responsibility_share():
@@ -794,23 +797,52 @@ def test_window_matrix_lift_is_per_window_not_a_2d_call():
     assert np.allclose(out.reshape(-1, 7), flat, atol=1e-12)
 
 
+def _full_window_payload(fk=0.02):
+    return {
+        "loss": {k: 0.0 for k in ("total", "pos", "rot6d", "joint",
+                                   "geodesic_rad2", "vel", "fk_m2")},
+        "physical": {
+            "root_position": {"rmse_m": 0.0, "max_m": 0.0},
+            "root_rotation": {"mean_deg": 0.0, "max_deg": 0.0},
+            "joints": {"mae_rad": 0.0, "max_abs_rad": 0.0},
+            "fk": {"mpjpe_m": fk, "max_m": 0.0},
+            "hand_fk_m": {"l": 0.0, "r": 0.0},
+        },
+        "geometry": {
+            "penetration": {"max_m": 0.0, "violation_frames": 0,
+                            "new_violation_frames": 0,
+                            "shared_violation_frames": 0},
+            "hand_gap": {"l": {"min_m": 0.05}, "r": {"min_m": 0.05}},
+            "foot_gap": {"l": {"min_m": 0.05}, "r": {"min_m": 0.05}},
+        },
+    }
+
+
 def test_aggregation_accepts_direct_metrics_rows_used_by_w():
     plan = pc.build_window_plan(T_BY_DEMO, TRAIN6, VAL6, KNOWN)
     rows = []
     for demo in TRAIN6:
-        rows.append({
-            "status": "measured", "demo": demo, "model": "deterministic",
-            "window_start": 0, "kind": "regular", "group": "train6",
-            "physical": {"fk": {"mpjpe_m": 0.02}},
-            "geometry": {"penetration": {
-                "max_m": 0.0, "violation_frames": 0,
-                "new_violation_frames": 0, "shared_violation_frames": 0}},
-            "loss": {},
-        })
+        for start in plan["per_demo"][demo]["regular"]:
+            rows.append({
+                "status": "measured", "demo": demo, "model": "deterministic",
+                "window_start": start, "kind": "regular", "group": "train6",
+                **_full_window_payload(0.02),
+            })
     out = pc.aggregate_window_rows(rows, plan)
     rec = out["train6"]["deterministic|regular"]
-    assert rec["n_missing_windows"] == 20
-    assert rec["metrics"]["physical.fk.mpjpe_m"]["macro_equal_demo"] == pytest.approx(0.02)
+    assert rec["n_missing_windows"] == 0
+    assert rec["window_keys_complete"] is True
+    assert rec["metrics_complete"] is True
+    assert rec["metrics"]["physical.fk.mpjpe_m"]["macro_equal_demo"] \
+        == pytest.approx(0.02)
+    # Dropping one expected window from one demo makes the complete macro
+    # unavailable again; a shrunk denominator must never publish a macro.
+    shrunk = rows[:-1]
+    out = pc.aggregate_window_rows(shrunk, plan)
+    rec = out["train6"]["deterministic|regular"]
+    assert rec["n_missing_windows"] == 1
+    assert rec["window_keys_complete"] is False
+    assert rec["metrics"]["physical.fk.mpjpe_m"]["macro_equal_demo"] is None
 
 
 def test_curve_file_comparison_detects_tamper_and_missing(tmp_path):
@@ -849,3 +881,448 @@ def test_probe_curve_writer_creates_parent_and_session_counts_recompute(tmp_path
     assert counts["ddim_sessions"] == 1
     assert counts["network_forwards"] == 28
     assert counts["high_level_calls"] == 4
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-22 audit counterexamples (6 P1 + 8 P2)
+# ---------------------------------------------------------------------------
+
+def test_same_cohort_attempt_cap_counts_all_runs_and_blocks_a_new_attempt(
+        tmp_path, monkeypatch):
+    d = _import_script()
+    monkeypatch.setattr(d, "ROOT", tmp_path)
+    base = tmp_path / "derived/experiments/omniretarget_first"
+    base.mkdir(parents=True)
+    target = base / "target"; target.mkdir()
+    sibling = base / "sibling"; sibling.mkdir()
+    import time
+    for attempt in ("attempt_001", "attempt_002"):
+        (sibling / "freeze" / attempt).mkdir(parents=True)
+        d._preregister_attempt(sibling, "register", attempt, time.perf_counter(),
+                               cohort="cohort",
+                               deadline=time.perf_counter() + 100)
+        assert d._finish_stage(
+            sibling, "register", attempt, time.perf_counter(),
+            {"remaining_s": 100.0},
+            {"complete": True, "status": "done"}, {}) is True
+    history = d._cohort_history(target, "cohort")
+    assert history["known"] is True
+    assert history["stage_attempts"]["register"] == 2
+    with pytest.raises(SystemExit):
+        d.budget_for(target, "register", history)
+    # Another stage has its own cap and is not charged by the register attempts.
+    assert d.budget_for(target, "saved-windows", history)["used_attempts"] == 0
+
+
+def test_unit_entry_requires_an_active_registered_parent(tmp_path, monkeypatch):
+    d = _import_script()
+    monkeypatch.setattr(d, "ROOT", tmp_path)
+    run = tmp_path / "run"; run.mkdir()
+    demo = "demo"
+    reg = {"demos": [demo], "cohort_id": "cohort", "anchors": {}}
+    monkeypatch.setattr(d, "verify_registration", lambda path: reg)
+    import time
+    deadline = time.perf_counter() + 30
+    out = run / "probes/attempt_001/units" / demo
+    with pytest.raises(SystemExit):
+        d.probe_unit_cli(run, demo, out, deadline)
+    d._preregister_attempt(run, "probes", "attempt_001", time.perf_counter(),
+                           cohort="cohort", deadline=deadline)
+    (run / "probes/attempt_001").mkdir(parents=True, exist_ok=True)
+    assert d._unit_admission(run, "probes", demo, out,
+                             deadline)["attempt"] == "attempt_001"
+    with pytest.raises(SystemExit):
+        d._unit_admission(run, "probes", demo, run / "outside", deadline)
+    with pytest.raises(SystemExit):
+        d._unit_admission(run, "probes", demo, out, deadline + 100)
+    out.mkdir(parents=True)
+    with pytest.raises(SystemExit):
+        d._unit_admission(run, "probes", demo, out, deadline)
+    # The same admission applies to the saved-window unit entry.
+    out_w = run / "saved_windows/attempt_001/units" / demo
+    with pytest.raises(SystemExit):
+        d.saved_window_unit(run, demo, out_w, deadline)
+    d._preregister_attempt(run, "saved-windows", "attempt_001",
+                           time.perf_counter(), cohort="cohort",
+                           deadline=deadline)
+    (run / "saved_windows/attempt_001").mkdir(parents=True, exist_ok=True)
+    out_w.mkdir(parents=True)
+    assert d._unit_admission(run, "saved-windows", demo, out_w,
+                             deadline)["attempt"] == "attempt_001"
+
+
+def test_probes_refuse_to_start_before_w_is_complete(tmp_path, monkeypatch):
+    d = _import_script()
+    run = tmp_path / "run"; run.mkdir()
+    reg = {"cohort_id": "cohort", "demos": [], "anchors": {}}
+    monkeypatch.setattr(d, "verify_registration", lambda path: reg)
+    monkeypatch.setattr(
+        d, "stage_state",
+        lambda path, stage: (({"status": "done", "complete": True}, [])
+                             if stage == "register" else (None, ["no_attempts"])))
+    called = {"budget": 0}
+
+    def budget(*args, **kwargs):
+        called["budget"] += 1
+        return {"remaining_s": 100.0}
+
+    monkeypatch.setattr(d, "budget_for", budget)
+    with pytest.raises(SystemExit):
+        d.probes_stage(run)
+    assert called["budget"] == 0
+    assert not (run / "probes").exists()
+
+
+def test_finalize_writes_honest_incomplete_without_w_and_p(tmp_path, monkeypatch):
+    d = _import_script()
+    run = tmp_path / "run"; run.mkdir()
+    reg = {"cohort_id": "cohort", "demos": [], "anchors": {},
+           "train6": [], "val6": [], "known_case": "x",
+           "window_plan": {"per_demo": {}}}
+    (run / "freeze").mkdir()
+    (run / "freeze/execution_registration.json").write_text(json.dumps(reg))
+    monkeypatch.setattr(d, "verify_registration", lambda path: reg)
+    monkeypatch.setattr(
+        d, "stage_state",
+        lambda path, stage: (({"status": "done", "complete": True}, [])
+                             if stage == "register" else (None, ["no_attempts"])))
+    monkeypatch.setattr(d, "_cohort_history", lambda path, cohort: {
+        "known": True, "runs": [], "stage_cost_s": {}, "stage_attempts": {},
+        "total_s": 0.0})
+    monkeypatch.setattr(d, "budget_for", lambda path, stage, cohort: {
+        "remaining_s": 100.0, "reserve_s": 1.0})
+    monkeypatch.setattr(d, "_run_synthetic_tests", lambda deadline: {
+        "returncode": 0, "passed": 1, "wall_s": 0.0})
+    monkeypatch.setattr(d, "_write_tables", lambda *args, **kwargs: None)
+    assert d.finalize_stage(run) is False
+    final = run / "decisions/attempt_001/prediction_consistency_final.json"
+    assert final.is_file()
+    doc = json.loads(final.read_text())
+    assert doc["status"] == "incomplete"
+    assert doc["complete"] is False
+    assert doc["complete_evidence"] is False
+    assert doc["diagnosis_complete"] is False
+    assert doc["implementation_contract_passed"] is False
+    assert doc["replay_counts"]["units"] == 0
+    assert any("saved-windows" in g for g in doc["evidence_gaps"])
+    assert any(":probes:" in g for g in doc["evidence_gaps"])
+    assert any("f_model_replay_skipped" in g for g in doc["evidence_gaps"])
+
+
+def test_pair_frame_counts_are_per_demo_and_model():
+    def pair(demo, model, frame, i, j, pos=0.0, rot=0.0):
+        return {"demo": demo, "model": model, "global_frame": frame,
+                "window_i": i, "window_j": j,
+                "position_diff_m": pos, "rotation_diff_deg": rot,
+                "joint_max_rad": 0.0}
+    pairs = [
+        pair("A", "deterministic", 0, 0, 1, pos=0.05),
+        pair("A", "deterministic", 30, 0, 1),
+        pair("A", "deterministic", 30, 1, 2),
+        pair("A", "deterministic", 30, 0, 2),
+        pair("B", "deterministic", 0, 0, 1, pos=0.05),
+        pair("B", "deterministic", 30, 0, 1),
+        pair("A", "diffusion", 0, 0, 1, rot=2.0),
+    ]
+    out = pc.summarize_pairs(pairs)
+    assert out["frames_with_any_pair_above_limits"] == 3
+    assert out["triple_window_frames"] == 1
+    assert out["merged_model_frames_above_limits"] == 2
+    assert out["merged_model_triple_window_frames"] == 1
+    assert out["aggregation"] == "per_demo_model_frame"
+
+
+def _probe_rows_for_macro():
+    plan = pc.build_window_plan(T_BY_DEMO, TRAIN6, VAL6, KNOWN)
+    demos = list(plan["train6"]) + list(plan["val6"]) + [plan["known_case"]]
+    values = {demo: 0.1 * (i + 1) for i, demo in enumerate(demos)}
+    rows = []
+    for demo in demos:
+        group = plan["groups"][demo]
+        value = values[demo]
+        for start in plan["per_demo"][demo]["inference"]:
+            base = {"demo": demo, "group": group, "start": start,
+                    "status": "measured"}
+            rows.append({**base, "probe": "deterministic_generation",
+                         "t": None,
+                         "metrics": {"loss": {"total": value},
+                                     "physical": {"fk": {"mpjpe_m": value}}}})
+            for t in pc.DENOISE_TIMESTEPS:
+                rows.append({**base, "probe": "diffusion_denoise", "t": int(t),
+                             "alpha_cumprod": 0.5, "snr": 1.0,
+                             "metrics": {"loss": {"total": value},
+                                         "physical": {"fk": {"mpjpe_m": value}}}})
+            rows.append({**base, "probe": "diffusion_ddim25", "t": None,
+                         "metrics": {"loss": {"total": value},
+                                     "physical": {"fk": {"mpjpe_m": value}}}})
+    return plan, rows, values
+
+
+def test_probe_summary_publishes_demo_equal_macro_not_window_micro():
+    plan, rows, values = _probe_rows_for_macro()
+    out = pc.aggregate_probe_rows(rows, plan)
+    expected = float(np.mean([values[d] for d in plan["train6"]]))
+    rec = out["groups"]["train6|deterministic_generation"]
+    assert rec["n"] == 32 and rec["n_expected"] == 32
+    assert rec["fk_mpjpe_macro_equal_demo"] == pytest.approx(expected)
+    assert rec["fk_mpjpe_mean_m"] != pytest.approx(expected)
+    shrunk = [r for r in rows
+              if not (r["probe"] == "deterministic_generation"
+                      and r["demo"] == plan["train6"][0]
+                      and r["start"] == plan["per_demo"][plan["train6"][0]]["inference"][0])]
+    out = pc.aggregate_probe_rows(shrunk, plan)
+    rec = out["groups"]["train6|deterministic_generation"]
+    assert rec["n_missing"] == 1
+    assert rec["fk_mpjpe_macro_equal_demo"] is None
+
+
+def test_denoise_snr_table_is_grouped_and_demo_equal():
+    plan, rows, values = _probe_rows_for_macro()
+    table = pc.denoise_snr_table(rows, plan)
+    expected = float(np.mean(list(values.values())))
+    assert table["0"]["n"] == 65 and table["0"]["n_expected"] == 65
+    assert table["0"]["normalized_total_macro_equal_demo"] == pytest.approx(expected)
+    assert table["0"]["micro_equal_window"]["normalized_total_mean"] \
+        != pytest.approx(expected)
+    assert table["0"]["per_group"]["train6"][
+        "normalized_total_macro_equal_demo"] \
+        == pytest.approx(float(np.mean([values[d] for d in plan["train6"]])))
+    assert table["ddim25"]["normalized_total_macro_equal_demo"] \
+        == pytest.approx(expected)
+
+
+def test_compare_rejects_nan_and_fractional_counts():
+    d = _import_script()
+    assert d._compare_metric_docs({"x": float("nan")}, {"x": 1.0}, "r")
+    assert d._compare_metric_docs({"x": float("nan")},
+                                  {"x": float("nan")}, "r")
+    assert d._compare_metric_docs({"n": 3.0000005}, {"n": 3}, "r")
+    assert d._compare_metric_docs({"n": 3.0}, {"n": 3}, "r")
+    assert d._compare_metric_docs({"fk_mpjpe_m": 0.01},
+                                  {"fk_mpjpe_m": 0.0100005}, "r") == []
+    assert d._compare_metric_docs(
+        {"n": 3, "fk_mpjpe_m": 0.01},
+        {"n": np.int64(3), "fk_mpjpe_m": np.float32(0.01)}, "r") == []
+    assert d._compare_pair({"f": float("nan")}, {"f": float("nan")}, "p")
+    assert d._compare_pair({"f": 3.0000005}, {"f": 3}, "p")
+    problems = d._compare_probe_rows(
+        "x", [{"key": "k", "status": "measured", "metrics": None}],
+        [{"key": "k", "status": "measured", "metrics": None}])
+    assert any("metrics_missing" in p for p in problems)
+
+
+def test_probe_row_requirements_and_top_level_fact_binding():
+    d = _import_script()
+    assert d._probe_row_problems(None, "d", "k")
+    assert any("metrics_missing" in p for p in d._probe_row_problems(
+        {"status": "measured", "metrics": None}, "d", "k"))
+    assert any("not_measured" in p for p in d._probe_row_problems(
+        {"status": "execution_failed", "metrics": None}, "d", "k"))
+    metrics = {"oracle_absolute": {
+        "position_max_m": 1.2e-7, "joints_max_rad": 5.1e-7,
+        "rotation_max_deg": 0.02426, "position_pass": True,
+        "joints_pass": True, "rotation_pass": False}}
+    row = {"oracle_absolute": {
+        "position_max_m": 0.0, "joints_max_rad": 0.0,
+        "rotation_max_deg": 0.0, "position_pass": True,
+        "joints_pass": True, "rotation_pass": True}}
+    assert d._compare_bound_fact(row, metrics, "oracle_absolute", "f")
+    summary = d._oracle_summary([{
+        "key": "teacher|d|0", "probe": "teacher_roundtrip",
+        "status": "measured", "metrics": {
+            "physical": {"fk": {"mpjpe_m": 1e-7}}, **metrics}}])
+    assert summary["failed"] == ["teacher|d|0"]
+    assert summary["max_rotation_deg"] == pytest.approx(0.02426)
+
+
+def test_denoise_inputs_are_rebuilt_from_registered_t_and_epsilon():
+    d = _import_script()
+    from diffusers import DDPMScheduler
+    scheduler = DDPMScheduler(num_train_timesteps=1000,
+                              beta_schedule="scaled_linear",
+                              beta_start=1e-4, beta_end=0.02,
+                              prediction_type="sample", clip_sample=False)
+    demo, start = "sub10_largebox_063", 0
+    x0 = identity_x0()[None]
+    eps, seed = pc.epsilon_for_window(demo, start, device="cpu")
+    t = np.asarray(pc.DENOISE_TIMESTEPS, dtype=np.int64)
+    alpha = scheduler.alphas_cumprod.numpy()[t]
+    snr = alpha / np.maximum(1.0 - alpha, 1e-12)
+    eps_rep = eps[None].repeat(len(pc.DENOISE_TIMESTEPS), 1, 1)
+    x_t = scheduler.add_noise(
+        torch.as_tensor(x0).repeat(len(pc.DENOISE_TIMESTEPS), 1, 1),
+        eps_rep, torch.tensor(t)).numpy()
+    block = {"epsilon": eps.numpy(), "x_t": x_t, "seed": seed, "t": t,
+             "alpha_cumprod": alpha, "snr": snr,
+             "epsilon_sha256": pc.array_sha256(eps.numpy()),
+             "x_t_sha256": pc.array_sha256(x_t)}
+    inputs = {f"denoise_{start}_{k}": v for k, v in block.items()}
+    problems, bound = d._verify_denoise_inputs(demo, [start], x0, inputs,
+                                               scheduler)
+    assert problems == [] and start in bound
+    tampered = {k: (v.copy() if isinstance(v, np.ndarray) else v)
+                for k, v in block.items()}
+    tampered["epsilon"] = tampered["epsilon"] + np.float32(0.01)
+    tampered["epsilon_sha256"] = pc.array_sha256(tampered["epsilon"])
+    problems, _ = d._verify_denoise_inputs(
+        demo, [start], x0,
+        {f"denoise_{start}_{k}": v for k, v in tampered.items()}, scheduler)
+    assert any("epsilon_value" in p for p in problems)
+    zero = np.zeros_like(t)
+    alpha0 = scheduler.alphas_cumprod.numpy()[zero]
+    snr0 = alpha0 / np.maximum(1.0 - alpha0, 1e-12)
+    x_t0 = scheduler.add_noise(
+        torch.as_tensor(x0).repeat(len(pc.DENOISE_TIMESTEPS), 1, 1),
+        eps_rep, torch.tensor(zero)).numpy()
+    tampered = dict(block)
+    tampered.update(t=zero, alpha_cumprod=alpha0, snr=snr0, x_t=x_t0,
+                    x_t_sha256=pc.array_sha256(x_t0))
+    problems, _ = d._verify_denoise_inputs(
+        demo, [start], x0,
+        {f"denoise_{start}_{k}": v for k, v in tampered.items()}, scheduler)
+    assert any("t_registered" in p for p in problems)
+
+
+def test_replay_tolerance_failure_enters_the_gate():
+    d = _import_script()
+    rows = []
+    for probe in ("deterministic_generation", "diffusion_ddim25"):
+        for _ in range(65):
+            rows.append({
+                "probe": probe, "status": "measured", "metrics": {},
+                "replay": {"normalized_max_abs": 0.0,
+                           "decoded_max_abs": {"pos": 0.0, "q": 0.0},
+                           "rotation_max_deg": 0.0,
+                           "normalized_bitwise": True,
+                           "decoded_bitwise": {"pos": True, "quat": True,
+                                               "q": True},
+                           "tolerance_pass": True}})
+    rows[0]["replay"]["normalized_max_abs"] = 0.1
+    rows[0]["replay"]["tolerance_pass"] = False
+    problems, replay = d._replay_gate(rows)
+    assert any("baseline_window_replay_mismatch:deterministic" in p
+               for p in problems)
+    assert replay["deterministic"]["tolerance"] == 64
+
+
+def test_ddim_network_forward_count_is_counted_not_hardcoded():
+    d = _import_script()
+
+    class FakeModel:
+        def forward(self, *args, **kwargs):
+            return torch.zeros((1, 60, 38))
+
+        def sample(self, *args, **kwargs):
+            self.forward()
+            self.forward()
+            return torch.zeros((1, 60, 38))
+
+    class FakeGenerator:
+        def __init__(self):
+            self.model = FakeModel()
+
+        def _sample_windows(self, batch, seed):
+            return (None, None), self.model.sample(batch, seed)
+
+    out, stats = d._capture_session(FakeGenerator(), {}, "diffusion", 7,
+                                    __import__("time").perf_counter() + 30)
+    assert stats["network_forwards"] == 2
+    assert out["normalized"].shape == (1, 60, 38)
+
+
+def test_budget_revocation_retracts_report_completion_claims(tmp_path):
+    d = _import_script()
+    run = tmp_path / "run"; run.mkdir()
+    (run / "freeze/attempt_001").mkdir(parents=True)
+    report = run / "freeze/attempt_001/report.json"
+    report.write_text(json.dumps({
+        "status": "done", "complete": True, "complete_evidence": True,
+        "diagnosis_complete": True, "implementation_contract_passed": True,
+        "evidence_gaps": []}))
+    import time
+    d._preregister_attempt(run, "register", "attempt_001",
+                           time.perf_counter(), cohort="cohort",
+                           deadline=time.perf_counter() + 100)
+    assert d._finish_stage(
+        run, "register", "attempt_001", time.perf_counter(),
+        {"remaining_s": 0.0},
+        {"complete": True, "status": "done", "report": str(report)}, {}) is False
+    doc = json.loads(report.read_text())
+    assert doc["status"] == "incomplete" and doc["complete"] is False
+    assert doc["complete_evidence"] is False
+    assert doc["diagnosis_complete"] is False
+    assert doc["implementation_contract_passed"] is False
+    assert any("budget_revoked" in g for g in doc["evidence_gaps"])
+    row, _ = d.stage_state(run, "register")
+    assert row["complete"] is False
+
+
+def test_budget_before_seal_also_retracts_the_report(tmp_path):
+    d = _import_script()
+    run = tmp_path / "run"; run.mkdir()
+    (run / "freeze/attempt_001").mkdir(parents=True)
+    report = run / "freeze/attempt_001/report.json"
+    report.write_text(json.dumps({
+        "status": "done", "complete": True, "complete_evidence": True,
+        "diagnosis_complete": True, "implementation_contract_passed": True,
+        "evidence_gaps": []}))
+    import time
+    d._preregister_attempt(run, "register", "attempt_001",
+                           time.perf_counter(), cohort="cohort",
+                           deadline=time.perf_counter() + 100)
+    assert d._finish_stage(
+        run, "register", "attempt_001", time.perf_counter(),
+        {"remaining_s": 0.5},
+        {"complete": True, "status": "done", "report": str(report)}, {}) is False
+    doc = json.loads(report.read_text())
+    assert doc["complete"] is False and doc["status"] == "incomplete"
+    assert any("budget_revoked" in g for g in doc["evidence_gaps"])
+    row, _ = d.stage_state(run, "register")
+    assert row["complete"] is False
+
+
+def test_unknown_seal_path_retracts_and_stays_nonconsumable(tmp_path, monkeypatch):
+    d = _import_script()
+    monkeypatch.setattr(d.driver, "SEAL_VERIFY_ROUNDS", 0)
+    run = tmp_path / "run"; run.mkdir()
+    (run / "freeze/attempt_001").mkdir(parents=True)
+    report = run / "freeze/attempt_001/report.json"
+    report.write_text(json.dumps({
+        "status": "done", "complete": True, "complete_evidence": True,
+        "diagnosis_complete": True, "implementation_contract_passed": True,
+        "evidence_gaps": []}))
+    import time
+    d._preregister_attempt(run, "register", "attempt_001",
+                           time.perf_counter(), cohort="cohort",
+                           deadline=time.perf_counter() + 100)
+    assert d._finish_stage(
+        run, "register", "attempt_001", time.perf_counter(),
+        {"remaining_s": 100.0},
+        {"complete": True, "status": "done", "report": str(report)}, {}) is False
+    doc = json.loads(report.read_text())
+    assert doc["complete"] is False and doc["status"] == "incomplete"
+    assert any("seal_tail_reserve_unverifiable" in g
+               for g in doc["evidence_gaps"])
+    row, problems = d.stage_state(run, "register")
+    assert row["status"] == "publishing"
+    assert "attempt_final_check_pending" in problems
+
+
+def test_unretractable_report_leaves_nonconsumable_incomplete(tmp_path):
+    d = _import_script()
+    run = tmp_path / "run"; run.mkdir()
+    (run / "freeze/attempt_001").mkdir(parents=True)
+    report = run / "freeze/attempt_001/report.json"
+    report.write_text("not valid json")
+    import time
+    d._preregister_attempt(run, "register", "attempt_001",
+                           time.perf_counter(), cohort="cohort",
+                           deadline=time.perf_counter() + 100)
+    assert d._finish_stage(
+        run, "register", "attempt_001", time.perf_counter(),
+        {"remaining_s": 0.0},
+        {"complete": True, "status": "done", "report": str(report)}, {}) is False
+    row, _ = d.stage_state(run, "register")
+    assert row["complete"] is False
+    assert row["status"] == "incomplete"
+    assert "report_retraction_failed" in row.get("incomplete_reason", "")

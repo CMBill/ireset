@@ -56,6 +56,7 @@ KNOWN_CASE = "sub16_largebox_048"
 SEED, DDIM_STEPS = 7, 25
 WINDOW, STRIDE = 60, 30
 TOTAL_BUDGET_S = 7200.0
+STAGE_ATTEMPT_LIMIT = 2
 STAGE_BUDGETS = {
     "register": (600.0, 60.0),
     "saved-windows": (1800.0, 120.0),
@@ -372,7 +373,8 @@ def _registration_sha(run: Path) -> str | None:
 
 
 def _preregister_attempt(run: Path, stage: str, attempt: str, t0: float,
-                         *, cohort: str | None = None) -> None:
+                         *, cohort: str | None = None,
+                         deadline: float | None = None) -> None:
     if cohort is not None and not (run / "cohort.json").is_file():
         write_json(run / "cohort.json", {"execution_id": EXECUTION_ID,
                                          "cohort_id": cohort})
@@ -381,13 +383,18 @@ def _preregister_attempt(run: Path, stage: str, attempt: str, t0: float,
              "measured_wall_s": elapsed,
              "accounting_schema": ACCOUNTING_SCHEMA,
              "execution_registration_sha256": _registration_sha(run)}
+    if deadline is not None:
+        entry["deadline_s"] = float(deadline)
     if cohort is not None:
         entry["cohort_id"] = cohort
     if any(r.get("stage") == stage and r.get("attempt") == attempt for r in _index(run)):
         _replace_index(run, stage, attempt, entry)
     else:
         _append_index(run, stage, attempt, entry)
-    extra = {"complete": False, "accounting_schema": ACCOUNTING_SCHEMA}
+    extra = {"complete": False, "accounting_schema": ACCOUNTING_SCHEMA,
+             "execution_registration_sha256": _registration_sha(run)}
+    if deadline is not None:
+        extra["deadline_s"] = float(deadline)
     if cohort is not None:
         extra["cohort_id"] = cohort
     _upsert_cost(run, stage, attempt, elapsed, extra, "running")
@@ -494,6 +501,25 @@ def _stage_history(run: Path, stage: str) -> float | None:
         return None
 
 
+def _stage_attempts(run: Path, stage: str) -> int | None:
+    """Attempt count only when disk/index/ledger agree exactly."""
+    try:
+        ledger = _stage_ledger_rows(run, stage)
+        index = [r for r in _index(run) if r.get("stage") == stage]
+        disk = _disk_attempts(run, stage)
+        ledger_by = {e.get("attempt") for e in ledger}
+        index_by = {r.get("attempt") for r in index}
+        if None in ledger_by or None in index_by:
+            return None
+        if len(ledger_by) != len(ledger) or len(index_by) != len(index):
+            return None
+        if set(disk) != ledger_by or set(disk) != index_by:
+            return None
+        return len(disk)
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+
+
 def _total_history(run: Path) -> float | None:
     total = 0.0
     for stage in STAGE_BUDGETS:
@@ -505,13 +531,14 @@ def _total_history(run: Path) -> float | None:
 
 
 def _cohort_history(run: Path, cohort: str) -> dict:
-    runs, by_stage, total = [], {}, 0.0
+    runs, by_stage, attempts_by_stage, total = [], {}, {}, 0.0
     run_resolved = Path(run).resolve()
     base = cohort_root()
     if not run_resolved.parent == base:
         return {"known": False, "reason": "run_not_in_cohort_root", "runs": runs}
     if not base.is_dir():
-        return {"known": True, "runs": runs, "stage_cost_s": {}, "total_s": 0.0}
+        return {"known": True, "runs": runs, "stage_cost_s": {},
+                "stage_attempts": {}, "total_s": 0.0}
     for sibling in sorted(base.iterdir()):
         if sibling == run_resolved or not sibling.is_dir():
             continue
@@ -546,10 +573,18 @@ def _cohort_history(run: Path, cohort: str) -> dict:
                     return {"known": False,
                             "reason": f"unregistered_attempt:{sibling.name}:{stage}",
                             "runs": runs}
+                count = _stage_attempts(sibling, stage)
+                if count is None:
+                    return {"known": False,
+                            "reason": f"unregistered_attempt_count:{sibling.name}:{stage}",
+                            "runs": runs}
                 stage_costs[stage] = cost
                 by_stage[stage] = by_stage.get(stage, 0.0) + cost
+                attempts_by_stage[stage] = attempts_by_stage.get(stage, 0) + count
                 total += cost
             runs.append({"run": record_path(sibling), "stage_cost_s": stage_costs,
+                         "stage_attempts": {
+                             s: _stage_attempts(sibling, s) for s in STAGE_BUDGETS},
                          "unregistered": True})
             continue
         try:
@@ -563,16 +598,26 @@ def _cohort_history(run: Path, cohort: str) -> dict:
             return {"known": False, "reason": f"foreign_execution:{sibling.name}",
                     "runs": runs}
         stage_costs = {}
+        stage_counts = {}
         for stage in STAGE_BUDGETS:
             cost = _stage_history(sibling, stage)
             if cost is None:
                 return {"known": False, "reason": f"unknown_history:{sibling.name}:{stage}",
                         "runs": runs}
+            count = _stage_attempts(sibling, stage)
+            if count is None:
+                return {"known": False,
+                        "reason": f"unknown_attempt_count:{sibling.name}:{stage}",
+                        "runs": runs}
             stage_costs[stage] = cost
+            stage_counts[stage] = count
             by_stage[stage] = by_stage.get(stage, 0.0) + cost
+            attempts_by_stage[stage] = attempts_by_stage.get(stage, 0) + count
             total += cost
-        runs.append({"run": record_path(sibling), "stage_cost_s": stage_costs})
-    return {"known": True, "runs": runs, "stage_cost_s": by_stage, "total_s": total}
+        runs.append({"run": record_path(sibling), "stage_cost_s": stage_costs,
+                     "stage_attempts": stage_counts})
+    return {"known": True, "runs": runs, "stage_cost_s": by_stage,
+            "stage_attempts": attempts_by_stage, "total_s": total}
 
 
 def budget_for(run: Path, stage: str, cohort: dict) -> dict:
@@ -580,11 +625,19 @@ def budget_for(run: Path, stage: str, cohort: dict) -> dict:
         raise SystemExit(f"cohort history unknown: {cohort.get('reason')}")
     local_stage = _stage_history(run, stage)
     local_total = _total_history(run)
-    if local_stage is None or local_total is None:
+    local_attempts = _stage_attempts(run, stage)
+    if local_stage is None or local_total is None or local_attempts is None:
         raise SystemExit("local cost history unknown")
     stage_budget, reserve = STAGE_BUDGETS[stage]
     prior_stage = float(cohort.get("stage_cost_s", {}).get(stage, 0.0))
     prior_total = float(cohort.get("total_s", 0.0))
+    prior_attempts = int(cohort.get("stage_attempts", {}).get(stage, 0))
+    used_attempts = local_attempts + prior_attempts
+    if used_attempts >= STAGE_ATTEMPT_LIMIT:
+        raise SystemExit(
+            f"{stage} attempt limit reached: local {local_attempts} + prior "
+            f"{prior_attempts} >= {STAGE_ATTEMPT_LIMIT}; no new attempt in this "
+            "cohort without a formally revised plan")
     remaining_stage = stage_budget - local_stage - prior_stage
     remaining_total = TOTAL_BUDGET_S - local_total - prior_total
     remaining = min(remaining_stage, remaining_total)
@@ -595,7 +648,10 @@ def budget_for(run: Path, stage: str, cohort: dict) -> dict:
             f"<= reserve {reserve}s)")
     return {"stage": stage, "total_s": stage_budget, "reserve_s": reserve,
             "local_stage_s": local_stage, "prior_stage_s": prior_stage,
-            "prior_total_s": prior_total, "remaining_s": remaining}
+            "prior_total_s": prior_total, "remaining_s": remaining,
+            "local_attempts": local_attempts, "prior_attempts": prior_attempts,
+            "used_attempts": used_attempts,
+            "attempt_limit": STAGE_ATTEMPT_LIMIT}
 
 
 def _finish_stage(run: Path, stage: str, attempt: str, t0: float,
@@ -614,8 +670,49 @@ def _finish_stage(run: Path, stage: str, attempt: str, t0: float,
 
     def timed(fn, *args):
         start = time.perf_counter()
-        fn(*args)
+        out = fn(*args)
         writes.append(time.perf_counter() - start)
+        return out
+
+    def retract_report(reason: str) -> bool:
+        """A budget revocation must revoke the REPORT's completion claim too.
+
+        Returns False when the report cannot be rewritten; the caller then
+        leaves a non-consumable publishing/incomplete row instead of a
+        terminal completion whose report still claims success.
+        """
+        try:
+            for key in ("report", "summary"):
+                rel = row.get(key)
+                if not rel:
+                    continue
+                path = ROOT / rel
+                if not path.is_file():
+                    continue
+                doc = read_json(path)
+                if not isinstance(doc, dict):
+                    raise ValueError(f"{key} report is not a mapping")
+                doc = dict(doc)
+                doc["status"] = "incomplete"
+                doc["complete"] = False
+                for flag in ("complete_evidence", "diagnosis_complete",
+                             "implementation_contract_passed", "experiment_complete"):
+                    if flag in doc:
+                        doc[flag] = False
+                doc["incomplete_reason"] = reason
+                gaps = doc.get("evidence_gaps")
+                if isinstance(gaps, list):
+                    doc["evidence_gaps"] = sorted(set(
+                        gaps + [f"budget_revoked:{reason}"]))
+                write_json(path, doc)
+                sha = full_sha(path)
+                row[f"{key}_sha256"] = sha
+                artifacts = row.get("artifacts")
+                if isinstance(artifacts, dict) and rel in artifacts:
+                    artifacts[rel] = sha
+            return True
+        except (OSError, ValueError, TypeError):
+            return False
 
     def publish(rw):
         rw = {**rw, "status": "publishing",
@@ -630,6 +727,7 @@ def _finish_stage(run: Path, stage: str, attempt: str, t0: float,
         return rw
 
     remaining = budget["remaining_s"]
+    unknown = False
     overrun = time.perf_counter() - t0 >= remaining
     if not overrun:
         pending = {**row, "status": "running", "complete": False,
@@ -644,12 +742,20 @@ def _finish_stage(run: Path, stage: str, attempt: str, t0: float,
     if overrun:
         row.update(complete=False,
                    incomplete_reason="budget_exceeded_after_registration")
+        if not timed(retract_report, "budget_exceeded_after_registration"):
+            unknown = True
+            row["incomplete_reason"] = (
+                "budget_exceeded_after_registration:report_retraction_failed")
         status = "incomplete"
     row = publish(row)
     if not overrun and time.perf_counter() - t0 >= remaining:
         overrun = True
         row.update(complete=False,
                    incomplete_reason="budget_exceeded_after_publication")
+        if not timed(retract_report, "budget_exceeded_after_publication"):
+            unknown = True
+            row["incomplete_reason"] = (
+                "budget_exceeded_after_publication:report_retraction_failed")
         status = "incomplete"
         row = publish(row)
 
@@ -667,10 +773,16 @@ def _finish_stage(run: Path, stage: str, attempt: str, t0: float,
         return rw
 
     def revoke(reason):
-        nonlocal overrun, row
+        nonlocal overrun, row, unknown
         overrun = True
         tail = reserve()
         row.update(complete=False, incomplete_reason=reason)
+        if not timed(retract_report, reason):
+            unknown = True
+            row.update(status="publishing",
+                       incomplete_reason=f"{reason}:report_retraction_failed")
+            row = publish(row)
+            return row
         row = publish(row)
         return terminal(row, "incomplete", time.perf_counter() - t0 + tail, tail)
 
@@ -678,25 +790,40 @@ def _finish_stage(run: Path, stage: str, attempt: str, t0: float,
     if not overrun and time.perf_counter() - t0 + tail >= remaining:
         overrun = True
         row.update(complete=False, incomplete_reason="budget_exceeded_before_seal")
+        if not timed(retract_report, "budget_exceeded_before_seal"):
+            unknown = True
+            row["incomplete_reason"] = (
+                "budget_exceeded_before_seal:report_retraction_failed")
         status = "incomplete"
         row = publish(row)
     row = terminal(row, status, time.perf_counter() - t0 + tail, tail)
+    if unknown:
+        return False
     for _ in range(driver.SEAL_VERIFY_ROUNDS):
         post = time.perf_counter() - t0
         if not overrun and post >= remaining:
             row = revoke("budget_exceeded_after_seal")
+            if unknown:
+                break
             continue
         if post <= row["measured_wall_s"]:
             break
         tail = reserve()
         if not overrun and post + tail >= remaining:
             row = revoke("seal_tail_reserve_insufficient")
+            if unknown:
+                break
             continue
         row = terminal(row, status, post + tail, tail)
     else:
         row.update(complete=False, status="publishing",
                    incomplete_reason="seal_tail_reserve_unverifiable")
+        if not timed(retract_report, "seal_tail_reserve_unverifiable"):
+            row["incomplete_reason"] = (
+                "seal_tail_reserve_unverifiable:report_retraction_failed")
         row = publish(row)
+        return False
+    if unknown:
         return False
     return not overrun and row.get("complete") is True
 
@@ -1218,16 +1345,21 @@ def _save_arrays(path: Path, arrays: dict) -> None:
 def saved_windows_stage(run: Path) -> bool:
     t0 = time.perf_counter()
     reg = verify_registration(run)
+    r_row, r_problems = stage_state(run, "register")
+    if r_row is None or r_row.get("complete") is not True or r_problems:
+        raise SystemExit(
+            f"cannot start saved-windows: register not complete ({r_row}, {r_problems})")
     cohort = _cohort_history(run, reg["cohort_id"])
     budget = budget_for(run, "saved-windows", cohort)
     attempt = _next_attempt(run, "saved-windows")
     if attempt != "attempt_001":
         raise SystemExit("saved-windows already attempted; a new attempt needs an explicit "
                          "engineering revision and a new registered implementation")
-    _preregister_attempt(run, "saved-windows", attempt, t0, cohort=reg["cohort_id"])
+    deadline = t0 + budget["remaining_s"] - budget["reserve_s"]
+    _preregister_attempt(run, "saved-windows", attempt, t0,
+                         cohort=reg["cohort_id"], deadline=deadline)
     attempt_dir = run / STAGE_DIRS["saved-windows"] / attempt
     attempt_dir.mkdir(parents=True, exist_ok=True)
-    deadline = t0 + budget["remaining_s"] - budget["reserve_s"]
     report_path = attempt_dir / "summary.json"
     report = {"status": "running", "complete": False,
               "registration": file_record(run / "freeze/execution_registration.json"),
@@ -1425,24 +1557,32 @@ def _capture_session(generator, batch: dict, model: str, seed: int,
             return out
 
         generator.model.forward = MethodType(counted, generator.model)
+        restore = [("forward", original)]
     else:
-        original = generator.model.sample
+        # Count the ACTUAL network forward calls inside ``sample``; the old
+        # hardcoded +25 would keep claiming 25 even when a model called the
+        # backbone a different number of times.
+        original_forward = generator.model.forward
+        original_sample = generator.model.sample
 
-        def counted(self, *args, **kwargs):
-            stats["network_forwards"] += 25  # DDIM-25 exposes 25 forwards
-            out = original(*args, **kwargs)
+        def counted_forward(self, *args, **kwargs):
+            stats["network_forwards"] += 1
+            return original_forward(*args, **kwargs)
+
+        def captured_sample(self, *args, **kwargs):
+            out = original_sample(*args, **kwargs)
             capture["normalized"] = out.detach().cpu().numpy().copy()
             return out
 
-        generator.model.sample = MethodType(counted, generator.model)
+        generator.model.forward = MethodType(counted_forward, generator.model)
+        generator.model.sample = MethodType(captured_sample, generator.model)
+        restore = [("forward", original_forward), ("sample", original_sample)]
     try:
         stats["conditioner_calls"] += 1
         decoded, _ = generator._sample_windows(batch, seed)
     finally:
-        if model == "deterministic":
-            generator.model.forward = original
-        else:
-            generator.model.sample = original
+        for name, original in restore:
+            setattr(generator.model, name, original)
     if capture["normalized"] is None:
         raise ValueError("session output was not captured")
     return {"normalized": capture["normalized"], "decoded": decoded}, stats
@@ -1851,16 +1991,21 @@ def probe_unit(reg: dict, demo: str, out: Path, deadline: float,
 def probes_stage(run: Path) -> bool:
     t0 = time.perf_counter()
     reg = verify_registration(run)
+    w_row, w_problems = stage_state(run, "saved-windows")
+    if w_row is None or w_row.get("complete") is not True or w_problems:
+        raise SystemExit(
+            f"cannot start probes: saved-windows not complete ({w_row}, {w_problems})")
     cohort = _cohort_history(run, reg["cohort_id"])
     budget = budget_for(run, "probes", cohort)
     attempt = _next_attempt(run, "probes")
     if attempt != "attempt_001":
         raise SystemExit("probes already attempted; no automatic retry")
-    _preregister_attempt(run, "probes", attempt, t0, cohort=reg["cohort_id"])
+    deadline = t0 + budget["remaining_s"] - budget["reserve_s"]
+    _preregister_attempt(run, "probes", attempt, t0, cohort=reg["cohort_id"],
+                         deadline=deadline)
     attempt_dir = run / STAGE_DIRS["probes"] / attempt
     attempt_dir.mkdir(parents=True, exist_ok=True)
     (attempt_dir / "units").mkdir(parents=True, exist_ok=True)
-    deadline = t0 + budget["remaining_s"] - budget["reserve_s"]
     report_path = attempt_dir / "summary.json"
     report = {"status": "running", "complete": False,
               "registration": file_record(run / "freeze/execution_registration.json"),
@@ -1951,10 +2096,14 @@ def probes_stage(run: Path) -> bool:
             report["evidence_gaps"].append("network_forward_count")
         if not rng_ok:
             report["evidence_gaps"].append("global_rng_changed")
-        replay = _replay_summary(rows)
-        groups = pc.aggregate_probe_rows(rows, _plan_for_aggregation(reg))
-        snr = pc.denoise_snr_table(rows)
+        replay_problems, replay = _replay_gate(rows)
+        report["evidence_gaps"].extend(replay_problems)
+        plan = _plan_for_aggregation(reg)
+        groups = pc.aggregate_probe_rows(rows, plan)
+        snr = pc.denoise_snr_table(rows, plan)
         oracle = _oracle_summary(rows)
+        if oracle.get("n") != 65 or oracle.get("missing"):
+            report["evidence_gaps"].append("oracle_rows_incomplete")
         report.update({
             "row_count": len(rows), "sessions": sessions,
             "first_attempt": first_attempt, "replay": replay,
@@ -1990,53 +2139,98 @@ def probes_stage(run: Path) -> bool:
 
 
 def _replay_summary(rows: list[dict]) -> dict:
-    out = {"deterministic": {"windows": 0, "bitwise": 0, "tolerance": 0,
-                             "max_normalized": 0.0, "max_position": 0.0,
-                             "max_joints": 0.0, "max_rotation": 0.0},
-           "diffusion": {"windows": 0, "bitwise": 0, "tolerance": 0,
-                         "max_normalized": 0.0, "max_position": 0.0,
-                         "max_joints": 0.0, "max_rotation": 0.0}}
+    empty = {"rows": 0, "measured": 0, "windows": 0, "with_replay": 0,
+             "missing_replay": 0, "nonfinite": 0, "bitwise": 0,
+             "tolerance": 0, "max_normalized": 0.0, "max_position": 0.0,
+             "max_joints": 0.0, "max_rotation": 0.0}
+    out = {"deterministic": dict(empty), "diffusion": dict(empty)}
     for row in rows:
         if row.get("probe") not in ("deterministic_generation", "diffusion_ddim25"):
             continue
         key = "deterministic" if row["probe"] == "deterministic_generation" else "diffusion"
-        rep = row.get("replay")
-        if rep is None:
+        rec = out[key]
+        rec["rows"] += 1
+        if row.get("status") != "measured":
             continue
-        out[key]["windows"] += 1
-        out[key]["bitwise"] += int(rep["normalized_bitwise"]
-                                   and all(rep["decoded_bitwise"].values()))
-        out[key]["tolerance"] += int(rep["tolerance_pass"])
-        out[key]["max_normalized"] = max(out[key]["max_normalized"],
-                                         rep["normalized_max_abs"])
-        out[key]["max_position"] = max(out[key]["max_position"],
-                                       rep["decoded_max_abs"]["pos"])
-        out[key]["max_joints"] = max(out[key]["max_joints"],
-                                     rep["decoded_max_abs"]["q"])
-        out[key]["max_rotation"] = max(out[key]["max_rotation"],
-                                       rep["rotation_max_deg"])
+        rec["measured"] += 1
+        rec["windows"] += 1
+        rep = row.get("replay")
+        if not isinstance(rep, dict):
+            rec["missing_replay"] += 1
+            continue
+        rec["with_replay"] += 1
+        values = (rep.get("normalized_max_abs"),
+                  (rep.get("decoded_max_abs") or {}).get("pos"),
+                  (rep.get("decoded_max_abs") or {}).get("q"),
+                  rep.get("rotation_max_deg"))
+        if not all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                   and math.isfinite(float(v)) for v in values):
+            rec["nonfinite"] += 1
+            continue
+        rec["bitwise"] += int(bool(rep.get("normalized_bitwise"))
+                              and all((rep.get("decoded_bitwise") or {}).values()))
+        rec["tolerance"] += int(rep.get("tolerance_pass") is True)
+        rec["max_normalized"] = max(rec["max_normalized"], float(values[0]))
+        rec["max_position"] = max(rec["max_position"], float(values[1]))
+        rec["max_joints"] = max(rec["max_joints"], float(values[2]))
+        rec["max_rotation"] = max(rec["max_rotation"], float(values[3]))
     return out
 
 
+def _oracle_fact(row: dict) -> dict | None:
+    """The oracle claim must come from the recomputed metrics, not a top field."""
+    metrics = row.get("metrics")
+    if not isinstance(metrics, dict):
+        return None
+    fact = metrics.get("oracle_absolute")
+    return fact if isinstance(fact, dict) else None
+
+
 def _oracle_summary(rows: list[dict]) -> dict:
-    oracle = [r for r in rows if r.get("probe") == "teacher_roundtrip"
-              and r.get("oracle_absolute")]
-    if not oracle:
-        return {"n": 0, "all_passed": None}
+    oracle_rows = [r for r in rows if r.get("probe") == "teacher_roundtrip"]
+    measured = [(r, _oracle_fact(r)) for r in oracle_rows
+                if _oracle_fact(r) is not None]
+    if not measured:
+        return {"n": 0, "n_expected": 65, "n_rows": len(oracle_rows),
+                "missing": [r.get("key") for r in oracle_rows],
+                "all_passed": None, "failed": []}
+    failed = []
+    maxima = {"max_position_m": 0.0, "max_joints_rad": 0.0,
+              "max_rotation_deg": 0.0}
+    for row, fact in measured:
+        pos = fact.get("position_max_m")
+        joints = fact.get("joints_max_rad")
+        rot = fact.get("rotation_max_deg")
+        if not all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                   and math.isfinite(float(v)) for v in (pos, joints, rot)):
+            failed.append(row.get("key"))
+            continue
+        maxima["max_position_m"] = max(maxima["max_position_m"], float(pos))
+        maxima["max_joints_rad"] = max(maxima["max_joints_rad"], float(joints))
+        maxima["max_rotation_deg"] = max(maxima["max_rotation_deg"], float(rot))
+        passed = (float(pos) <= pc.ORACLE_TOL["position_m"]
+                  and float(joints) <= pc.ORACLE_TOL["joints_rad"]
+                  and float(rot) <= pc.ORACLE_TOL["rotation_deg"])
+        # Derive the verdict from the magnitudes; never trust recorded booleans.
+        if not passed:
+            failed.append(row.get("key"))
+    fk_values = []
+    for row, _ in measured:
+        value = ((((row.get("metrics") or {}).get("physical") or {})
+                  .get("fk") or {}).get("mpjpe_m"))
+        if isinstance(value, (int, float)) and not isinstance(value, bool) \
+                and math.isfinite(float(value)):
+            fk_values.append(float(value))
     return {
-        "n": len(oracle),
-        "all_passed": all(r["oracle_absolute"]["position_pass"]
-                          and r["oracle_absolute"]["joints_pass"]
-                          and r["oracle_absolute"]["rotation_pass"] for r in oracle),
-        "failed": [r["key"] for r in oracle
-                   if not (r["oracle_absolute"]["position_pass"]
-                           and r["oracle_absolute"]["joints_pass"]
-                           and r["oracle_absolute"]["rotation_pass"])],
-        "max_position_m": max(r["oracle_absolute"]["position_max_m"] for r in oracle),
-        "max_joints_rad": max(r["oracle_absolute"]["joints_max_rad"] for r in oracle),
-        "max_rotation_deg": max(r["oracle_absolute"]["rotation_max_deg"] for r in oracle),
-        "fk_mean_m": float(np.mean([
-            r["metrics"]["physical"]["fk"]["mpjpe_m"] for r in oracle])),
+        "n": len(measured),
+        "n_expected": 65,
+        "n_rows": len(oracle_rows),
+        "missing": [r.get("key") for r in oracle_rows
+                    if _oracle_fact(r) is None],
+        "all_passed": bool(len(measured) == 65 and not failed),
+        "failed": failed,
+        **maxima,
+        "fk_mean_m": (float(np.mean(fk_values)) if fk_values else None),
     }
 
 
@@ -2059,22 +2253,28 @@ def _rng_equal(a: dict, b: dict) -> bool:
 # finalize stage (F)
 # ---------------------------------------------------------------------------
 
+def _stage_gap(stage: str, row: dict | None, problems: list[str]) -> str:
+    if row is None:
+        return f"f_prerequisite:{stage}:missing"
+    return (f"f_prerequisite:{stage}:{row.get('status')}:"
+            f"complete={row.get('complete')}:{'|'.join(problems) or 'clean'}")
+
+
 def finalize_stage(run: Path) -> bool:
     t0 = time.perf_counter()
     reg = verify_registration(run)
-    for stage in ("register", "saved-windows", "probes"):
-        row, problems = stage_state(run, stage)
-        if row is None or row.get("complete") is not True or problems:
-            raise SystemExit(f"cannot finalize: {stage} not complete ({row}, {problems})")
+    states = {stage: stage_state(run, stage)
+              for stage in ("register", "saved-windows", "probes")}
     cohort = _cohort_history(run, reg["cohort_id"])
     budget = budget_for(run, "finalize", cohort)
     attempt = _next_attempt(run, "finalize")
     if attempt != "attempt_001":
         raise SystemExit("finalize already attempted; no automatic retry")
-    _preregister_attempt(run, "finalize", attempt, t0, cohort=reg["cohort_id"])
+    deadline = t0 + budget["remaining_s"] - budget["reserve_s"]
+    _preregister_attempt(run, "finalize", attempt, t0, cohort=reg["cohort_id"],
+                         deadline=deadline)
     attempt_dir = run / STAGE_DIRS["finalize"] / attempt
     attempt_dir.mkdir(parents=True, exist_ok=True)
-    deadline = t0 + budget["remaining_s"] - budget["reserve_s"]
     final_path = attempt_dir / "prediction_consistency_final.json"
     report = {"schema": "w1_prediction_consistency_final_v1",
               "status": "running", "complete": False,
@@ -2082,118 +2282,194 @@ def finalize_stage(run: Path) -> bool:
               "failures": [], "evidence_gaps": []}
     write_json(final_path, report, exclusive=True)
     try:
+        failures: list[str] = []
+        gaps: list[str] = []
+        register_row, register_problems = states["register"]
+        w_row, w_problems = states["saved-windows"]
+        p_row, p_problems = states["probes"]
+        register_ready = (register_row is not None
+                          and register_row.get("complete") is True
+                          and not register_problems)
+        w_ready = (w_row is not None and w_row.get("complete") is True
+                   and not w_problems)
+        p_ready = (p_row is not None and p_row.get("complete") is True
+                   and not p_problems)
+        if not register_ready:
+            gaps.append(_stage_gap("register", register_row, register_problems))
+        if not w_ready:
+            gaps.append(_stage_gap("saved-windows", w_row, w_problems))
+        if not p_ready:
+            gaps.append(_stage_gap("probes", p_row, p_problems))
+        w_ready = w_ready and register_ready
+        p_ready = p_ready and register_ready
         w_dir = run / "saved_windows/attempt_001"
         p_dir = run / "probes/attempt_001"
-        w_rows = read_json(w_dir / "rows.json")
-        p_rows = read_json(p_dir / "rows.json")
-        w_summary = read_json(w_dir / "summary.json")
-        p_summary = read_json(p_dir / "summary.json")
-        failures = []
-        gaps = []
         expected = reg["window_plan"]
-        w_keys = [r.get("key") for r in w_rows["rows"]]
-        t_keys = [r.get("key") for r in w_rows["teacher_rows"]]
-        p_keys = [r.get("key") for r in p_rows["rows"]]
-        if sorted(w_keys) != sorted(expected["window_keys"]):
-            failures.append("w_window_key_set_mismatch")
-        if sorted(t_keys) != sorted(expected["teacher_keys"]):
-            failures.append("w_teacher_key_set_mismatch")
-        if sorted(p_keys) != sorted(expected["probe_keys"]):
-            failures.append("p_probe_key_set_mismatch")
-        # Recompute W from the source windows; no model calls.
+        plan = _plan_for_aggregation(reg)
+        w_rows: dict = {"rows": [], "teacher_rows": []}
+        p_rows: dict = {"rows": []}
+        w_summary: dict = {}
+        p_summary: dict = {}
         recomputed_w = []
-        for demo in reg["demos"]:
-            _deadline(deadline, "f-windows")
-            got = recompute_saved_windows(
-                reg, demo, deadline=deadline,
-                curve_root=w_dir / "units" / demo / "curves")
-            recomputed_w.append(got)
-            if got.get("status") != "ok":
-                failures.append(f"w_recompute_incomplete:{demo}")
-            failures += got.get("curve_problems", [])
-            recorded = [r for r in w_rows["rows"] if r.get("demo") == demo]
-            recorded_t = [r for r in w_rows["teacher_rows"] if r.get("demo") == demo]
-            failures += _compare_rows(f"w:{demo}", recorded, got["rows"])
-            failures += _compare_rows(f"teacher:{demo}", recorded_t, got["teacher_rows"])
-            pairs_recorded = [p for p in read_json(w_dir / "pairs.json")["pairs"]
-                              if p.get("demo") == demo]
-            if [p.get("key") for p in pairs_recorded] != [p.get("key") for p in got["pairs"]]:
-                failures.append(f"w_pair_keys:{demo}")
-            for a, b in zip(pairs_recorded, got["pairs"]):
-                failures += _compare_pair(a, b, f"pair:{demo}:{a.get('global_frame')}")
-        # Recompute P metrics from stored inputs/outputs; verify noise replay.
-        for demo in reg["demos"]:
-            _deadline(deadline, "f-probes")
-            failures += _recompute_probe_artifacts(reg, demo, p_dir / "units" / demo,
-                                                   p_rows["rows"], deadline)
-        # Fixed independent model replay: three demos, full P matrix.
-        replay_dir = attempt_dir / "replay"
-        replay_dir.mkdir(parents=True, exist_ok=True)
+        recomputed_window_rows = []
+        groups = pair_summary = teacher_inheritance = known_case = None
+        p_groups = p_snr = p_replay = oracle = None
+        w_summary_complete = False
+        p_summary_complete = False
+        if w_ready:
+            try:
+                w_rows = read_json(w_dir / "rows.json")
+                w_summary = read_json(w_dir / "summary.json")
+                pairs_doc = read_json(w_dir / "pairs.json")
+                if (not isinstance(w_rows, dict)
+                        or not isinstance(w_rows.get("rows"), list)
+                        or not isinstance(w_rows.get("teacher_rows"), list)
+                        or not isinstance(pairs_doc, dict)
+                        or not isinstance(pairs_doc.get("pairs"), list)):
+                    raise ValueError("w artifacts are not structured")
+            except (OSError, ValueError, TypeError) as exc:
+                gaps.append(f"f_artifact:saved-windows:{type(exc).__name__}")
+                w_ready = False
+        if p_ready:
+            try:
+                p_rows = read_json(p_dir / "rows.json")
+                p_summary = read_json(p_dir / "summary.json")
+                if (not isinstance(p_rows, dict)
+                        or not isinstance(p_rows.get("rows"), list)):
+                    raise ValueError("p rows are not structured")
+            except (OSError, ValueError, TypeError) as exc:
+                gaps.append(f"f_artifact:probes:{type(exc).__name__}")
+                p_ready = False
+        if w_ready:
+            w_keys = [r.get("key") for r in w_rows["rows"]]
+            t_keys = [r.get("key") for r in w_rows["teacher_rows"]]
+            if sorted(w_keys) != sorted(expected["window_keys"]):
+                failures.append("w_window_key_set_mismatch")
+            if sorted(t_keys) != sorted(expected["teacher_keys"]):
+                failures.append("w_teacher_key_set_mismatch")
+            # Recompute W from the source windows; no model calls.
+            for demo in reg["demos"]:
+                _deadline(deadline, "f-windows")
+                got = recompute_saved_windows(
+                    reg, demo, deadline=deadline,
+                    curve_root=w_dir / "units" / demo / "curves")
+                recomputed_w.append(got)
+                if got.get("status") != "ok":
+                    failures.append(f"w_recompute_incomplete:{demo}")
+                failures += got.get("curve_problems", [])
+                recorded = [r for r in w_rows["rows"] if r.get("demo") == demo]
+                recorded_t = [r for r in w_rows["teacher_rows"]
+                              if r.get("demo") == demo]
+                failures += _compare_rows(f"w:{demo}", recorded, got["rows"])
+                failures += _compare_rows(f"teacher:{demo}", recorded_t,
+                                          got["teacher_rows"])
+                pairs_recorded = [p for p in pairs_doc["pairs"]
+                                  if p.get("demo") == demo]
+                if [p.get("key") for p in pairs_recorded] != [
+                        p.get("key") for p in got["pairs"]]:
+                    failures.append(f"w_pair_keys:{demo}")
+                for a, b in zip(pairs_recorded, got["pairs"]):
+                    failures += _compare_pair(
+                        a, b, f"pair:{demo}:{a.get('global_frame')}")
+            recomputed_window_rows = [row for unit in recomputed_w
+                                      for row in unit["rows"]]
+            groups = pc.aggregate_window_rows(recomputed_window_rows, plan)
+            pair_summary = pc.summarize_pairs(pairs_doc["pairs"])
+            if pair_summary["n"] != expected["counts"]["cross_window_pairs"]:
+                failures.append("pair_denominator")
+            teacher_inheritance = _teacher_inheritance(recomputed_window_rows)
+            known_case = next((unit.get("known_case") for unit in recomputed_w
+                               if unit.get("demo") == KNOWN_CASE), None)
+            for label, recorded, recomputed in (
+                    ("w_groups", w_summary.get("groups"), groups),
+                    ("w_pair_summary", w_summary.get("pair_summary"), pair_summary),
+                    ("w_teacher_inheritance",
+                     w_summary.get("teacher_inheritance"), teacher_inheritance),
+                    ("w_known_case", w_summary.get("known_case"), known_case)):
+                failures += _compare_metric_docs(recorded, recomputed, label)
+            if w_summary.get("row_count") != len(w_rows["rows"]):
+                failures.append("w_row_count_not_reproducible")
+            if w_summary.get("teacher_row_count") != len(w_rows["teacher_rows"]):
+                failures.append("w_teacher_row_count_not_reproducible")
+            if w_summary.get("pair_row_count") != pair_summary["n"]:
+                failures.append("w_pair_row_count_not_reproducible")
+            w_summary_complete = w_summary.get("complete") is True
+        if p_ready:
+            p_keys = [r.get("key") for r in p_rows["rows"]]
+            if sorted(p_keys) != sorted(expected["probe_keys"]):
+                failures.append("p_probe_key_set_mismatch")
+            # Recompute P metrics and rebuild every noise input from registration.
+            for demo in reg["demos"]:
+                _deadline(deadline, "f-probes")
+                failures += _recompute_probe_artifacts(
+                    reg, demo, p_dir / "units" / demo, p_rows["rows"], deadline)
+            p_groups = pc.aggregate_probe_rows(p_rows["rows"], plan)
+            p_snr = pc.denoise_snr_table(p_rows["rows"], plan)
+            replay_problems, p_replay = _replay_gate(p_rows["rows"])
+            failures += replay_problems
+            oracle = _oracle_summary(p_rows["rows"])
+            for label, recorded, recomputed in (
+                    ("p_groups", p_summary.get("groups"), p_groups),
+                    ("p_denoise_snr", p_summary.get("denoise_snr"), p_snr),
+                    ("p_replay", p_summary.get("replay"), p_replay),
+                    ("p_oracle", p_summary.get("oracle"), oracle)):
+                failures += _compare_metric_docs(recorded, recomputed, label)
+            if p_summary.get("row_count") != len(p_rows["rows"]):
+                failures.append("p_row_count_not_reproducible")
+            if p_summary.get("sessions") != _session_counts(p_dir / "units"):
+                failures.append("p_session_counts_not_reproducible")
+            if oracle.get("n") != 65 or oracle.get("missing"):
+                failures.append("p_oracle_rows_incomplete")
+            p_summary_complete = p_summary.get("complete") is True
         replay_rows = []
-        for demo in REPLAY_DEMOS:
-            _deadline(deadline, "f-model-replay")
-            result = probe_unit(reg, demo, replay_dir / demo, deadline, write=True)
-            replay_rows.extend(result["rows"])
-            recorded = [r for r in p_rows["rows"] if r.get("demo") == demo]
-            failures += _compare_probe_rows(f"replay:{demo}", recorded,
-                                            result["rows"], strict_replay=True)
-        replay_counts = _replay_call_counts(replay_rows)
-        if replay_counts["units"] != 88 or replay_counts["learned"] != 77 \
-                or replay_counts["oracle"] != 11:
-            failures.append("f_replay_matrix_size")
+        replay_counts = {"units": 0, "learned": 0, "oracle": 0,
+                         "high_level_calls": 0, "network_forwards": 0}
+        replay_dir = attempt_dir / "replay"
+        if w_ready and p_ready:
+            # Fixed independent model replay: three demos, full P matrix.
+            replay_dir.mkdir(parents=True, exist_ok=True)
+            for demo in REPLAY_DEMOS:
+                _deadline(deadline, "f-model-replay")
+                try:
+                    result = probe_unit(reg, demo, replay_dir / demo, deadline,
+                                        write=True)
+                except Exception as exc:
+                    failures.append(
+                        f"f_replay_failed:{demo}:{type(exc).__name__}:{exc}")
+                    continue
+                replay_rows.extend(result["rows"])
+                recorded = [r for r in p_rows["rows"] if r.get("demo") == demo]
+                failures += _compare_probe_rows(
+                    f"replay:{demo}", recorded, result["rows"],
+                    strict_replay=True)
+            replay_counts = _replay_call_counts(replay_rows)
+            sessions = _session_counts(replay_dir)
+            replay_counts["high_level_calls"] = sessions["high_level_calls"]
+            replay_counts["network_forwards"] = sessions["network_forwards"]
+            if replay_counts["units"] != 88 or replay_counts["learned"] != 77 \
+                    or replay_counts["oracle"] != 11:
+                failures.append("f_replay_matrix_size")
+        else:
+            gaps.append("f_model_replay_skipped:prerequisites_incomplete")
         # Synthetic/interface tests are part of the implementation contract.
         tests = _run_synthetic_tests(deadline)
         if tests.get("returncode") != 0:
             failures.append("implementation_synthetic_tests_failed")
-        # Three-way summary recomputation.
-        recomputed_window_rows = [row for unit in recomputed_w
-                                  for row in unit["rows"]]
-        groups = pc.aggregate_window_rows(recomputed_window_rows,
-                                          _plan_for_aggregation(reg))
-        pair_summary = pc.summarize_pairs(read_json(w_dir / "pairs.json")["pairs"])
-        if pair_summary["n"] != expected["counts"]["cross_window_pairs"]:
-            failures.append("pair_denominator")
-        teacher_inheritance = _teacher_inheritance(recomputed_window_rows)
-        known_case = next((unit.get("known_case") for unit in recomputed_w
-                           if unit.get("demo") == KNOWN_CASE), None)
-        # Summary files are claims, not evidence: compare every aggregate with
-        # the independently recomputed rows, including the known-case facts.
-        for label, recorded, recomputed in (
-                ("w_groups", w_summary.get("groups"), groups),
-                ("w_pair_summary", w_summary.get("pair_summary"), pair_summary),
-                ("w_teacher_inheritance", w_summary.get("teacher_inheritance"),
-                 teacher_inheritance),
-                ("w_known_case", w_summary.get("known_case"), known_case),
-                ("p_groups", p_summary.get("groups"),
-                 pc.aggregate_probe_rows(p_rows["rows"], _plan_for_aggregation(reg))),
-                ("p_denoise_snr", p_summary.get("denoise_snr"),
-                 pc.denoise_snr_table(p_rows["rows"])),
-                ("p_replay", p_summary.get("replay"), _replay_summary(p_rows["rows"])),
-                ("p_oracle", p_summary.get("oracle"), _oracle_summary(p_rows["rows"]))):
-            failures += _compare_metric_docs(recorded, recomputed, label)
-        if w_summary.get("row_count") != len(w_rows["rows"]):
-            failures.append("w_row_count_not_reproducible")
-        if w_summary.get("teacher_row_count") != len(w_rows["teacher_rows"]):
-            failures.append("w_teacher_row_count_not_reproducible")
-        if w_summary.get("pair_row_count") != pair_summary["n"]:
-            failures.append("w_pair_row_count_not_reproducible")
-        if p_summary.get("row_count") != len(p_rows["rows"]):
-            failures.append("p_row_count_not_reproducible")
-        if p_summary.get("sessions") != _session_counts(p_dir / "units"):
-            failures.append("p_session_counts_not_reproducible")
-        oracle = _oracle_summary(p_rows["rows"])
         judgement = pc.attribution_judgement(
-            w_summary={"groups": w_summary.get("groups"),
-                       "pair_summary": pair_summary,
-                       "teacher_inheritance": w_summary.get("teacher_inheritance")},
-            p_summary={"denoise_snr": p_summary.get("denoise_snr")},
-            oracle=oracle, evidence_gaps=failures + gaps)
+            w_summary=({"groups": groups, "pair_summary": pair_summary,
+                        "teacher_inheritance": teacher_inheritance}
+                       if w_ready else None),
+            p_summary=({"denoise_snr": p_snr} if p_ready else None),
+            oracle=oracle if p_ready else None,
+            evidence_gaps=failures + gaps)
         source_ok = not _hash_map(reg["anchors"])
         if not source_ok:
             failures.append("source_anchors_drifted")
-        implementation_ok = tests.get("returncode") == 0 and not failures
-        complete = not failures and not gaps and w_summary.get("complete") is True \
-            and p_summary.get("complete") is True and source_ok
+        implementation_ok = bool(tests.get("returncode") == 0 and not failures
+                                 and w_ready and p_ready)
+        complete = bool(not failures and not gaps and w_ready and p_ready
+                        and register_ready and w_summary_complete
+                        and p_summary_complete and source_ok)
         report.update({
             "implementation_contract_passed": implementation_ok,
             "complete_evidence": complete,
@@ -2201,20 +2477,23 @@ def finalize_stage(run: Path) -> bool:
                                        and not failures and not gaps),
             "attribution_status": judgement["status"],
             "attribution": judgement,
+            "prerequisites": {
+                "register": register_ready, "saved_windows": w_ready,
+                "probes": p_ready},
             "failures": sorted(set(failures)),
             "evidence_gaps": sorted(set(gaps)),
             "window_rows": len(w_rows["rows"]),
             "teacher_rows": len(w_rows["teacher_rows"]),
             "probe_rows": len(p_rows["rows"]),
-            "pair_rows": pair_summary["n"],
+            "pair_rows": pair_summary["n"] if pair_summary else None,
             "groups": groups,
             "pair_summary": pair_summary,
             "oracle": oracle,
-            "denoise_snr": p_summary.get("denoise_snr"),
-            "replay": p_summary.get("replay"),
+            "denoise_snr": p_snr,
+            "replay": p_replay,
             "replay_counts": replay_counts,
             "synthetic_tests": tests,
-            "known_case": w_summary.get("known_case"),
+            "known_case": known_case,
             "final_interaction_method": "not_ready",
             "training_steps": 0,
             "production_integration": False,
@@ -2230,8 +2509,8 @@ def finalize_stage(run: Path) -> bool:
         _write_tables(attempt_dir, w_rows, p_rows, report)
     except Exception as exc:
         report.update(status="incomplete", complete=False,
-                      failures=sorted(set(report.get("failures", [])
-                                          + [f"stage_exception:{type(exc).__name__}:{exc}"])))
+                      evidence_gaps=sorted(set(report.get("evidence_gaps", [])
+                                               + [f"stage_exception:{type(exc).__name__}:{exc}"])))
         write_json(final_path, report)
     row = {"complete": report.get("complete") is True,
            "status": report.get("status", "incomplete"),
@@ -2259,6 +2538,39 @@ def _compare_rows(label: str, recorded: list[dict], recomputed: list[dict]) -> l
     return problems
 
 
+def _is_int_number(value) -> bool:
+    return (isinstance(value, (int, np.integer))
+            and not isinstance(value, (bool, np.bool_)))
+
+
+def _is_float_number(value) -> bool:
+    return (isinstance(value, (float, np.floating))
+            and not isinstance(value, (bool, np.bool_)))
+
+
+def _is_number(value) -> bool:
+    return _is_int_number(value) or _is_float_number(value)
+
+
+def _compare_number(x, y, label: str, key: str) -> list[str]:
+    """Finite numbers only; integer counts are exact and never float-rounded."""
+    problems = []
+    if not math.isfinite(float(x)) or not math.isfinite(float(y)):
+        return [f"{label}:{key}:nonfinite"]
+    x_int = _is_int_number(x)
+    y_int = _is_int_number(y)
+    if x_int != y_int:
+        return [f"{label}:{key}:int_type"]
+    if x_int:
+        if int(x) != int(y):
+            problems.append(f"{label}:{key}:int")
+        return problems
+    tol = 1e-6 if ("m" in key or "rad" in key or "deg" in key) else 1e-9
+    if abs(float(x) - float(y)) > tol:
+        problems.append(f"{label}:{key}:float")
+    return problems
+
+
 def _compare_metric_docs(a, b, label: str) -> list[str]:
     problems = []
     if not isinstance(a, dict) or not isinstance(b, dict):
@@ -2281,21 +2593,11 @@ def _compare_metric_docs(a, b, label: str) -> list[str]:
             for i, (u, v) in enumerate(zip(x, y)):
                 problems += _compare_metric_docs({str(i): u}, {str(i): v},
                                                  f"{label}:{key}")
-        elif isinstance(x, bool) or isinstance(y, bool):
-            if x is not y:
+        elif isinstance(x, (bool, np.bool_)) or isinstance(y, (bool, np.bool_)):
+            if bool(x) is not bool(y):
                 problems.append(f"{label}:{key}:bool")
-        elif isinstance(x, (int, float)) and isinstance(y, (int, float)):
-            if isinstance(x, int) and isinstance(y, int) and not isinstance(x, bool):
-                if int(x) != int(y):
-                    problems.append(f"{label}:{key}:int")
-            elif not math.isfinite(float(x)) or not math.isfinite(float(y)):
-                if not (isinstance(x, float) and isinstance(y, float)
-                        and math.isnan(x) and math.isnan(y)):
-                    problems.append(f"{label}:{key}:nonfinite")
-            else:
-                tol = 1e-6 if ("m" in key or "rad" in key or "deg" in key) else 1e-9
-                if abs(float(x) - float(y)) > tol:
-                    problems.append(f"{label}:{key}:float")
+        elif _is_number(x) and _is_number(y):
+            problems += _compare_number(x, y, label, key)
         else:
             if x != y:
                 problems.append(f"{label}:{key}:value")
@@ -2338,10 +2640,8 @@ def _compare_pair(a: dict, b: dict, label: str) -> list[str]:
         return [f"{label}:keys"]
     for key in a:
         x, y = a[key], b[key]
-        if isinstance(x, (int, float)) and isinstance(y, (int, float)) \
-                and not isinstance(x, bool) and not isinstance(y, bool):
-            if abs(float(x) - float(y)) > 1e-6:
-                problems.append(f"{label}:{key}:float")
+        if _is_number(x) and _is_number(y):
+            problems += _compare_number(x, y, label, key)
         elif x != y:
             problems.append(f"{label}:{key}:value")
     return problems
@@ -2353,33 +2653,164 @@ def _compare_probe_rows(label: str, recorded: list[dict], replay: list[dict],
     if [r.get("key") for r in recorded] != [r.get("key") for r in replay]:
         return [f"{label}:key_order"]
     for a, b in zip(recorded, replay):
+        key = a.get("key")
         if a.get("status") != b.get("status"):
-            problems.append(f"{label}:status:{a.get('key')}")
-        if a.get("metrics") is not None and b.get("metrics") is not None:
-            problems += _compare_metric_docs(a["metrics"], b["metrics"],
-                                             f"{label}:{a.get('key')}")
+            problems.append(f"{label}:status:{key}")
+        am, bm = a.get("metrics"), b.get("metrics")
+        if am is None and bm is None:
+            if a.get("status") == "measured":
+                problems.append(f"{label}:metrics_missing:{key}")
+        elif not isinstance(am, dict) or not isinstance(bm, dict):
+            problems.append(f"{label}:metrics_presence:{key}")
+        else:
+            problems += _compare_metric_docs(am, bm, f"{label}:{key}")
         if strict_replay and a.get("probe") in ("deterministic_generation",
                                                 "diffusion_ddim25"):
-            ra, rb = a.get("replay") or {}, b.get("replay") or {}
-            if not rb.get("tolerance_pass"):
-                problems.append(f"{label}:replay_tolerance:{a.get('key')}")
+            rb = b.get("replay")
+            if not isinstance(rb, dict) or rb.get("tolerance_pass") is not True:
+                problems.append(f"{label}:replay_tolerance:{key}")
+            ra = a.get("replay")
+            if not isinstance(ra, dict):
+                problems.append(f"{label}:replay_missing:{key}")
+            else:
+                problems += _compare_metric_docs(ra, rb or {},
+                                                 f"{label}:{key}:replay")
     return problems
+
+
+DENOISE_INPUT_NAMES = frozenset({"epsilon", "x_t", "seed", "t",
+                                 "alpha_cumprod", "snr",
+                                 "epsilon_sha256", "x_t_sha256"})
+
+
+def _verify_denoise_inputs(demo: str, starts: list[int],
+                           teacher_windows: np.ndarray,
+                           inputs: dict, scheduler) -> tuple[list[str], dict]:
+    """Rebuild each denoise input from registration; saved t/epsilon are not inputs.
+
+    Returns ``(problems, seed_alpha_snr_by_start)``. The caller uses the
+    returned registered t/alpha/snr to bind row-level fields, so a
+    self-consistent tamper of the saved block cannot survive.
+    """
+    problems = []
+    registered_t = np.asarray(pc.DENOISE_TIMESTEPS, dtype=np.int64)
+    alpha_all = scheduler.alphas_cumprod.detach().cpu().numpy()
+    alpha_reg = alpha_all[registered_t]
+    snr_reg = alpha_reg / np.maximum(1.0 - alpha_reg, 1e-12)
+    bound = {}
+    for i, start in enumerate(starts):
+        block = {k.split(f"denoise_{start}_", 1)[1]: v
+                 for k, v in inputs.items() if k.startswith(f"denoise_{start}_")}
+        if set(block) != DENOISE_INPUT_NAMES:
+            problems.append(f"f_inputs:{demo}:{start}:denoise_key_set")
+            continue
+        seed = int(block["seed"])
+        expected_seed = pc.noise_seed_for_window(demo, start)
+        if seed != expected_seed:
+            problems.append(f"f_inputs:{demo}:{start}:seed")
+        eps, regenerated_seed = pc.epsilon_for_window(demo, start, device="cpu")
+        if regenerated_seed != expected_seed or seed != regenerated_seed:
+            problems.append(f"f_inputs:{demo}:{start}:seed_regeneration")
+        eps_np = eps.numpy()
+        if (block["epsilon"].shape != eps_np.shape
+                or block["epsilon"].dtype != eps_np.dtype
+                or not np.array_equal(block["epsilon"], eps_np)):
+            problems.append(f"f_inputs:{demo}:{start}:epsilon_value")
+        if pc.array_sha256(block["epsilon"]) != block["epsilon_sha256"]:
+            problems.append(f"f_inputs:{demo}:{start}:epsilon_hash_self")
+        if not np.array_equal(block["t"], registered_t):
+            problems.append(f"f_inputs:{demo}:{start}:t_registered")
+        if block["t"].shape != registered_t.shape \
+                or not np.issubdtype(block["t"].dtype, np.integer):
+            problems.append(f"f_inputs:{demo}:{start}:t_dtype")
+        if not np.array_equal(block["alpha_cumprod"], alpha_reg):
+            problems.append(f"f_inputs:{demo}:{start}:alpha")
+        if not np.array_equal(block["snr"], snr_reg):
+            problems.append(f"f_inputs:{demo}:{start}:snr")
+        x0 = torch.as_tensor(teacher_windows[i], dtype=torch.float32)
+        eps_rep = torch.as_tensor(eps_np)[None].repeat(
+            len(pc.DENOISE_TIMESTEPS), 1, 1)
+        x0_rep = x0[None].repeat(len(pc.DENOISE_TIMESTEPS), 1, 1)
+        x_t = scheduler.add_noise(
+            x0_rep, eps_rep, torch.tensor(registered_t, dtype=torch.long)).numpy()
+        if not np.array_equal(x_t, block["x_t"]):
+            problems.append(f"f_inputs:{demo}:{start}:x_t")
+        if pc.array_sha256(block["x_t"]) != block["x_t_sha256"]:
+            problems.append(f"f_inputs:{demo}:{start}:x_t_hash_self")
+        if pc.array_sha256(x_t) != block["x_t_sha256"]:
+            problems.append(f"f_inputs:{demo}:{start}:x_t_hash")
+        bound[start] = (seed, alpha_reg, snr_reg)
+    return problems, bound
+
+
+def _probe_row_problems(row: dict | None, demo: str, key: str) -> list[str]:
+    if row is None:
+        return [f"f_rows:{demo}:{key}:missing"]
+    if row.get("status") != "measured":
+        return [f"f_rows:{demo}:{key}:not_measured:{row.get('status')}"]
+    if not isinstance(row.get("metrics"), dict):
+        return [f"f_rows:{demo}:{key}:metrics_missing"]
+    return []
+
+
+def _compare_bound_fact(row: dict, recomputed_metrics: dict, field: str,
+                        label: str) -> list[str]:
+    """Top-level oracle/replay facts must equal the recomputed metric block."""
+    if not isinstance(row.get(field), dict):
+        return [f"{label}:{field}_missing"]
+    if not isinstance(recomputed_metrics.get(field), dict):
+        return [f"{label}:{field}_not_recomputed"]
+    return _compare_metric_docs(row[field], recomputed_metrics[field],
+                                f"{label}:{field}")
+
+
+def _replay_gate(rows: list[dict], *, expected_rows: int = 65
+                 ) -> tuple[list[str], dict]:
+    """Replay tolerance is a closure gate, not a descriptive footnote."""
+    problems = []
+    replay = _replay_summary(rows)
+    for model in ("deterministic", "diffusion"):
+        rec = replay[model]
+        if rec["rows"] != expected_rows or rec["measured"] != expected_rows:
+            problems.append(f"replay_rows:{model}")
+        if rec["missing_replay"] or rec["nonfinite"]:
+            problems.append(f"baseline_window_replay_unreadable:{model}")
+        if rec["tolerance"] != rec["rows"]:
+            problems.append(f"baseline_window_replay_mismatch:{model}")
+    return problems, replay
 
 
 def _recompute_probe_artifacts(reg: dict, demo: str, unit: Path,
                                all_rows: list[dict], deadline: float) -> list[str]:
-    """Recompute P metrics and noise inputs from the stored artifacts."""
+    """Recompute P metrics and noise inputs from the stored artifacts.
+
+    Every denoise input is REBUILT from the registered t list, regenerated
+    epsilon and the frozen teacher x0; saved arrays/t are never trusted as
+    inputs. Rows must exist with metrics and curves for every registered key.
+    """
     problems = []
     ctx = _load_context(reg, demo)
     clip = ctx["clip"]
     starts = pc.inference_starts(clip.T)
-    with np.load(unit / "inputs.npz", allow_pickle=False) as z:
-        inputs = {k: np.array(z[k], copy=True) for k in z.files}
-    with np.load(unit / "outputs.npz", allow_pickle=False) as z:
-        outputs = {k: np.array(z[k], copy=True) for k in z.files}
-    teacher_x0 = inputs["teacher_x0"]
+    inputs_path, outputs_path = unit / "inputs.npz", unit / "outputs.npz"
+    if not inputs_path.is_file() or not outputs_path.is_file():
+        return [f"f_inputs:{demo}:artifact_missing"]
+    try:
+        with np.load(inputs_path, allow_pickle=False) as z:
+            inputs = {k: np.array(z[k], copy=True) for k in z.files}
+        with np.load(outputs_path, allow_pickle=False) as z:
+            outputs = {k: np.array(z[k], copy=True) for k in z.files}
+    except (OSError, ValueError) as exc:
+        return [f"f_inputs:{demo}:unreadable:{type(exc).__name__}"]
+    if not np.array_equal(inputs.get("starts", np.empty(0)),
+                          np.asarray(starts, dtype=np.int64)):
+        problems.append(f"f_inputs:{demo}:starts")
+    if not np.array_equal(outputs.get("starts", np.empty(0)),
+                          np.asarray(starts, dtype=np.int64)):
+        problems.append(f"f_outputs:{demo}:starts")
     teacher_windows = pc.teacher_windows(pc.encode_teacher(clip, ctx["tokenizer"]),
                                          starts)
+    teacher_x0 = inputs.get("teacher_x0", np.empty(0))
     if not np.array_equal(teacher_x0, teacher_windows):
         problems.append(f"f_inputs:{demo}:teacher_x0")
     from diffusers import DDPMScheduler
@@ -2390,37 +2821,24 @@ def _recompute_probe_artifacts(reg: dict, demo: str, unit: Path,
         beta_start=ctx["w1_reg"]["configs"]["diffusion"]["beta_start"],
         beta_end=ctx["w1_reg"]["configs"]["diffusion"]["beta_end"],
         prediction_type="sample", clip_sample=False)
-    for i, start in enumerate(starts):
-        block = {k.split(f"denoise_{start}_", 1)[1]: v
-                 for k, v in inputs.items() if k.startswith(f"denoise_{start}_")}
-        if not block:
-            problems.append(f"f_inputs:{demo}:{start}:denoise_missing")
-            continue
-        seed = int(block["seed"])
-        if seed != pc.noise_seed_for_window(demo, start):
-            problems.append(f"f_inputs:{demo}:{start}:seed")
-        eps, expected_seed = pc.epsilon_for_window(demo, start, device="cpu")
-        if seed != expected_seed:
-            problems.append(f"f_inputs:{demo}:{start}:seed_regeneration")
-        if pc.array_sha256(eps.numpy()) != block["epsilon_sha256"]:
-            problems.append(f"f_inputs:{demo}:{start}:epsilon_hash")
-        x0 = torch.as_tensor(teacher_windows[i], dtype=torch.float32)
-        eps_rep = torch.as_tensor(block["epsilon"])[None].repeat(5, 1, 1)
-        x0_rep = x0[None].repeat(5, 1, 1)
-        t = torch.tensor(block["t"], dtype=torch.long)
-        x_t = scheduler.add_noise(x0_rep, eps_rep, t).numpy()
-        if pc.array_sha256(x_t) != block["x_t_sha256"]:
-            problems.append(f"f_inputs:{demo}:{start}:x_t_hash")
-        if not np.array_equal(x_t, block["x_t"]):
-            problems.append(f"f_inputs:{demo}:{start}:x_t")
-        alpha = scheduler.alphas_cumprod.numpy()[block["t"]]
-        if not np.allclose(alpha, block["alpha_cumprod"], rtol=0, atol=0):
-            problems.append(f"f_inputs:{demo}:{start}:alpha")
-    cond = _condition_arrays(clip)
+    expected_input_keys = ({"starts", "teacher_x0"}
+                           | {f"condition_{k}" for k in pc.CONDITION_KEYS}
+                           | {f"denoise_{s}_{name}" for s in starts
+                              for name in DENOISE_INPUT_NAMES})
+    if set(inputs) != expected_input_keys:
+        problems.append(f"f_inputs:{demo}:key_set")
+    expected_output_keys = ({"starts", "det_normalized", "ddim_normalized"}
+                            | {f"denoise_{s}" for s in starts})
+    if set(outputs) != expected_output_keys:
+        problems.append(f"f_outputs:{demo}:key_set")
     for key in pc.CONDITION_KEYS:
-        expected = np.stack([np.asarray(cond[key])[s:s + WINDOW] for s in starts])
+        expected = np.stack([np.asarray(_condition_arrays(clip)[key])[s:s + WINDOW]
+                             for s in starts])
         if not np.array_equal(inputs.get(f"condition_{key}", np.empty(0)), expected):
             problems.append(f"f_inputs:{demo}:condition_{key}")
+    noise_problems, denoise_seed = _verify_denoise_inputs(
+        demo, starts, teacher_windows, inputs, scheduler)
+    problems += noise_problems
     # Metrics recompute from outputs with the W/P measurement functions.
     teacher_geom = {int(s): _teacher_window_geometry(ctx, s, deadline) for s in starts}
     assembler = pc.make_loss_assembler(
@@ -2472,7 +2890,7 @@ def _recompute_probe_artifacts(reg: dict, demo: str, unit: Path,
                  "decoded_q": saved["decoded_q"][index]}, [start])
         if out.get("metrics") is not None and probe == "teacher_roundtrip":
             p = out["metrics"]["physical"]
-            oracle_absolute = {
+            out["metrics"]["oracle_absolute"] = {
                 "position_max_m": p["root_position"]["max_m"],
                 "joints_max_rad": p["joints"]["max_abs_rad"],
                 "rotation_max_deg": p["root_rotation"]["max_deg"],
@@ -2480,46 +2898,76 @@ def _recompute_probe_artifacts(reg: dict, demo: str, unit: Path,
                 "joints_pass": p["joints"]["max_abs_rad"] <= pc.ORACLE_TOL["joints_rad"],
                 "rotation_pass": p["root_rotation"]["max_deg"] <= pc.ORACLE_TOL["rotation_deg"],
             }
-            out["metrics"]["oracle_absolute"] = oracle_absolute
         return out
+
+    def check_row(row: dict | None, key: str) -> list[str]:
+        return _probe_row_problems(row, demo, key)
 
     for i, start in enumerate(starts):
         for probe, pred, saved_model in (
                 ("teacher_roundtrip", teacher_windows[i], None),
-                ("deterministic_generation", outputs["det_normalized"][i],
+                ("deterministic_generation", outputs.get("det_normalized", [])[i]
+                 if i < len(outputs.get("det_normalized", [])) else None,
                  "deterministic"),
-                ("diffusion_ddim25", outputs["ddim_normalized"][i], "diffusion")):
+                ("diffusion_ddim25", outputs.get("ddim_normalized", [])[i]
+                 if i < len(outputs.get("ddim_normalized", [])) else None,
+                 "diffusion")):
             key = pc.probe_key(demo, start, probe)
             row = recorded.get(key)
-            if row is None:
-                problems.append(f"f_rows:{demo}:{key}:missing")
+            problems += check_row(row, key)
+            if pred is None:
+                problems.append(f"f_rows:{demo}:{key}:output_missing")
                 continue
             out = measure(pred, probe, start, i, reg["groups"][demo], saved_model)
             if out.get("metrics") is None:
                 problems.append(f"f_rows:{demo}:{key}:recompute_incomplete")
-            elif row.get("metrics") is not None:
+                continue
+            if isinstance(row.get("metrics"), dict):
                 problems += _compare_metric_docs(row["metrics"], out["metrics"],
                                                  f"f_rows:{demo}:{key}")
-                problems += _compare_curve_file(
-                    unit / "curves" / f"{key.replace('|', '__')}.npz",
-                    out["curves"], f"f_curve:{demo}:{key}")
+            problems += _compare_curve_file(
+                unit / "curves" / f"{key.replace('|', '__')}.npz",
+                out["curves"], f"f_curve:{demo}:{key}")
+            field = ("oracle_absolute" if probe == "teacher_roundtrip"
+                     else "replay")
+            problems += _compare_bound_fact(
+                row, out["metrics"], field, f"f_rows:{demo}:{key}")
         for ti, tt in enumerate(pc.DENOISE_TIMESTEPS):
             key = pc.probe_key(demo, start, "diffusion_denoise", int(tt))
             row = recorded.get(key)
-            if row is None:
-                problems.append(f"f_rows:{demo}:{key}:missing")
+            problems += check_row(row, key)
+            den = outputs.get(f"denoise_{start}")
+            if not isinstance(den, np.ndarray) or den.shape != (
+                    len(pc.DENOISE_TIMESTEPS), WINDOW, 38):
+                problems.append(f"f_rows:{demo}:{key}:output_missing")
                 continue
-            pred = outputs[f"denoise_{start}"][ti]
+            pred = den[ti]
             out = measure(pred, "diffusion_denoise", start, i,
                           reg["groups"][demo], None)
             if out.get("metrics") is None:
                 problems.append(f"f_rows:{demo}:{key}:recompute_incomplete")
-            elif row.get("metrics") is not None:
+                continue
+            if isinstance(row.get("metrics"), dict):
                 problems += _compare_metric_docs(row["metrics"], out["metrics"],
                                                  f"f_rows:{demo}:{key}")
-                problems += _compare_curve_file(
-                    unit / "curves" / f"{key.replace('|', '__')}.npz",
-                    out["curves"], f"f_curve:{demo}:{key}")
+            problems += _compare_curve_file(
+                unit / "curves" / f"{key.replace('|', '__')}.npz",
+                out["curves"], f"f_curve:{demo}:{key}")
+            if row is not None and start in denoise_seed:
+                seed, alpha_reg_i, snr_reg_i = denoise_seed[start]
+                expected = {"t": int(tt), "seed": int(seed),
+                            "alpha_cumprod": float(alpha_reg_i[ti]),
+                            "snr": float(snr_reg_i[ti])}
+                for field, want in expected.items():
+                    got = row.get(field)
+                    if field in ("t", "seed"):
+                        good = isinstance(got, int) and not isinstance(got, bool) \
+                            and got == want
+                    else:
+                        good = isinstance(got, (int, float)) \
+                            and not isinstance(got, bool) and float(got) == want
+                    if not good:
+                        problems.append(f"f_rows:{demo}:{key}:{field}_binding")
     return problems
 
 
@@ -2696,8 +3144,10 @@ def register(run: Path) -> None:
     if not history.get("known"):
         raise SystemExit(f"same-cohort history unknown: {history.get('reason')}")
     budget = budget_for(run, "register", history)
+    deadline = t0 + budget["remaining_s"] - budget["reserve_s"]
     (run / "freeze/attempt_001").mkdir(parents=True, exist_ok=True)
-    _preregister_attempt(run, "register", "attempt_001", t0, cohort=cohort)
+    _preregister_attempt(run, "register", "attempt_001", t0, cohort=cohort,
+                         deadline=deadline)
     failure_path = run / "freeze/registration_failure.json"
     try:
         ok = _register_impl(run, t0, cohort, history, budget)
@@ -2889,16 +3339,72 @@ def _register_impl(run: Path, t0: float, cohort: str, history: dict,
 # CLI
 # ---------------------------------------------------------------------------
 
-def saved_window_unit(run: Path, demo: str, out: Path, deadline: float) -> dict:
+def _unit_admission(run: Path, stage: str, demo: str, out: Path,
+                    deadline: float) -> dict:
+    """Internal units are only legal inside an active, registered parent attempt.
+
+    This closes the bypass where a direct ``probe-unit``/``saved-window-unit``
+    call could perform real computation with no pre-registered running row,
+    no accounting entry and no parent deadline.
+    """
     reg = verify_registration(run)
-    result = recompute_saved_windows(reg, demo, deadline=deadline, write=out)
+    if demo not in (reg.get("demos") or []):
+        raise SystemExit(f"unit demo is not in the registered 13-scene matrix:{demo}")
+    rows = [r for r in _index(run) if r.get("stage") == stage]
+    if len(rows) != 1:
+        raise SystemExit(f"{stage} unit requires exactly one active parent attempt")
+    row = rows[0]
+    attempt = row.get("attempt")
+    ledger = [e for e in _stage_ledger_rows(run, stage)
+              if e.get("attempt") == attempt]
+    if len(ledger) != 1:
+        raise SystemExit(f"{stage} unit parent index/ledger mismatch")
+    entry = ledger[0]
+    if row.get("status") != "running" or entry.get("status") != "running":
+        raise SystemExit(f"{stage} unit parent attempt is not running")
+    if row.get("complete") is not False or entry.get("complete") is not False:
+        raise SystemExit(f"{stage} unit parent attempt claims completion")
+    for source in (row, entry):
+        if (source.get("accounting_schema") != ACCOUNTING_SCHEMA
+                or source.get("cohort_id") != reg["cohort_id"]
+                or source.get("execution_registration_sha256")
+                != _registration_sha(run)):
+            raise SystemExit(f"{stage} unit parent accounting binding is invalid")
+    parent_deadline = row.get("deadline_s")
+    if not _num_cost(parent_deadline):
+        raise SystemExit(f"{stage} unit parent has no registered deadline")
+    if (not isinstance(deadline, (int, float)) or isinstance(deadline, bool)
+            or not math.isfinite(float(deadline))):
+        raise SystemExit("unit deadline must be finite")
+    now = time.perf_counter()
+    if not (now < float(deadline) <= float(parent_deadline)):
+        raise SystemExit("unit deadline is outside the active parent attempt")
+    parent_dir = run / STAGE_DIRS[stage] / str(attempt)
+    if not parent_dir.is_dir():
+        raise SystemExit(f"{stage} unit parent attempt directory is missing")
+    expected = (parent_dir / "units" / demo).resolve()
+    if Path(out).expanduser().resolve() != expected:
+        raise SystemExit("unit output must be the registered parent unit directory")
+    if stage == "probes":
+        if expected.exists():
+            raise SystemExit("probe unit output already exists")
+    elif expected.exists() and any(expected.iterdir()):
+        raise SystemExit("saved-window unit output is not empty")
+    return {"registration": reg, "attempt": attempt,
+            "parent_deadline_s": float(parent_deadline)}
+
+
+def saved_window_unit(run: Path, demo: str, out: Path, deadline: float) -> dict:
+    admission = _unit_admission(run, "saved-windows", demo, out, deadline)
+    result = recompute_saved_windows(admission["registration"], demo,
+                                     deadline=deadline, write=out)
     write_json(out / "result.json", result)
     return result
 
 
 def probe_unit_cli(run: Path, demo: str, out: Path, deadline: float) -> dict:
-    reg = verify_registration(run)
-    return probe_unit(reg, demo, out, deadline, write=True)
+    admission = _unit_admission(run, "probes", demo, out, deadline)
+    return probe_unit(admission["registration"], demo, out, deadline, write=True)
 
 
 def main() -> int:
