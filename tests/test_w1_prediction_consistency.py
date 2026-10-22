@@ -1111,6 +1111,89 @@ def test_compare_rejects_nan_and_fractional_counts():
     assert any("metrics_missing" in p for p in problems)
 
 
+def test_compare_rejects_boolean_numeric_mixing():
+    d = _import_script()
+    measured = {"physical": {"fk": {"mpjpe_m": 0.052830741}}}
+    assert d._compare_metric_docs(measured, measured, "r") == []
+    # ``bool(0.05)`` is True: a lone bool must never equal a nonzero number.
+    for other in (0.052830741, 1, float("nan"), float("inf")):
+        recorded = {"physical": {"fk": {"mpjpe_m": True}}}
+        replay = {"physical": {"fk": {"mpjpe_m": other}}}
+        problems = d._compare_metric_docs(recorded, replay, "r")
+        assert any("bool_type" in p for p in problems)
+    mixed = {"physical": {"fk": {"mpjpe_m": 1}}}
+    assert any("bool_type" in p for p in d._compare_metric_docs(
+        {"physical": {"fk": {"mpjpe_m": True}}}, mixed, "r"))
+    true_pair = {"physical": {"fk": {"mpjpe_m": True}}}
+    assert d._compare_metric_docs(true_pair, true_pair, "r") == []
+    assert d._compare_metric_docs(
+        {"physical": {"fk": {"mpjpe_m": np.bool_(True)}}},
+        true_pair, "r") == []
+    assert any("bool" in p for p in d._compare_metric_docs(
+        true_pair, {"physical": {"fk": {"mpjpe_m": False}}}, "r"))
+    assert any("bool_type" in p for p in d._compare_pair(
+        {"position_diff_m": True}, {"position_diff_m": 1}, "p"))
+    # The same bypass through a real probe row: a saved FK error replaced by
+    # True used to compare equal to the recomputed value.
+    recorded = [{"key": "probe|d|0", "status": "measured",
+                 "probe": "deterministic_generation",
+                 "metrics": {"physical": {"fk": {"mpjpe_m": True}}}}]
+    replay = [{"key": "probe|d|0", "status": "measured",
+               "probe": "deterministic_generation",
+               "metrics": {"physical": {"fk": {"mpjpe_m": 0.052830741}}}}]
+    assert d._compare_probe_rows("r", recorded, replay)
+
+
+def test_full_denoise_matrix_publishes_group_macros_and_rejects_tampering():
+    plan, rows, values = _probe_rows_for_macro()
+    out = pc.aggregate_probe_rows(rows, plan)
+    for group, demos in (("train6", plan["train6"]), ("val6", plan["val6"]),
+                         ("known_case", [plan["known_case"]])):
+        rec = out["groups"][f"{group}|diffusion_denoise"]
+        expected_windows = sum(len(plan["per_demo"][d]["inference"])
+                               for d in demos)
+        expected = float(np.mean([values[d] for d in demos]))
+        assert rec["n"] == expected_windows * len(pc.DENOISE_TIMESTEPS)
+        assert rec["macro"]["n_demo_measured"] == len(demos)
+        assert rec["fk_mpjpe_macro_equal_demo"] == pytest.approx(expected)
+        if len({len(plan["per_demo"][d]["inference"]) for d in demos}) > 1:
+            assert rec["fk_mpjpe_mean_m"] != pytest.approx(expected)
+    demo = plan["train6"][0]
+    start = plan["per_demo"][demo]["inference"][0]
+    t0 = int(pc.DENOISE_TIMESTEPS[0])
+    t1 = int(pc.DENOISE_TIMESTEPS[1])
+    missing = [r for r in rows if not (
+        r["probe"] == "diffusion_denoise" and r["demo"] == demo
+        and r["start"] == start and r["t"] == t0)]
+    out = pc.aggregate_probe_rows(missing, plan)
+    assert out["groups"]["train6|diffusion_denoise"]["macro"][
+        "n_demo_measured"] == 5
+    assert out["groups"]["train6|diffusion_denoise"][
+        "fk_mpjpe_macro_equal_demo"] is None
+    assert out["groups"]["val6|diffusion_denoise"][
+        "fk_mpjpe_macro_equal_demo"] is not None
+    duplicate = []
+    for r in rows:
+        if (r["probe"] == "diffusion_denoise" and r["demo"] == demo
+                and r["start"] == start and r["t"] == t0):
+            duplicate.append({**r, "t": t1})
+        else:
+            duplicate.append(r)
+    out = pc.aggregate_probe_rows(duplicate, plan)
+    rec = out["groups"]["train6|diffusion_denoise"]
+    assert rec["n"] == sum(len(plan["per_demo"][d]["inference"])
+                           for d in plan["train6"]) * len(pc.DENOISE_TIMESTEPS)
+    assert rec["macro"]["n_demo_measured"] == 5
+    assert rec["fk_mpjpe_macro_equal_demo"] is None
+    table = pc.denoise_snr_table(duplicate, plan)
+    assert table[str(t0)]["per_group"]["train6"][
+        "fk_mpjpe_macro_equal_demo"] is None
+    assert table[str(t1)]["per_group"]["train6"][
+        "fk_mpjpe_macro_equal_demo"] is None
+    assert table[str(t1)]["per_group"]["val6"][
+        "fk_mpjpe_macro_equal_demo"] is not None
+
+
 def test_probe_row_requirements_and_top_level_fact_binding():
     d = _import_script()
     assert d._probe_row_problems(None, "d", "k")
@@ -1308,7 +1391,9 @@ def test_unknown_seal_path_retracts_and_stays_nonconsumable(tmp_path, monkeypatc
     assert "attempt_final_check_pending" in problems
 
 
-def test_unretractable_report_leaves_nonconsumable_incomplete(tmp_path):
+@pytest.mark.parametrize("remaining", [0.0, 0.5])
+def test_unretractable_report_never_leaves_a_consumable_terminal_row(
+        tmp_path, monkeypatch, remaining):
     d = _import_script()
     run = tmp_path / "run"; run.mkdir()
     (run / "freeze/attempt_001").mkdir(parents=True)
@@ -1318,11 +1403,31 @@ def test_unretractable_report_leaves_nonconsumable_incomplete(tmp_path):
     d._preregister_attempt(run, "register", "attempt_001",
                            time.perf_counter(), cohort="cohort",
                            deadline=time.perf_counter() + 100)
+    terminal_writes = []
+    real_upsert = d._upsert_cost
+
+    def delayed_upsert(path, stage, attempt, wall, extra, status):
+        if status == "incomplete":
+            terminal_writes.append(status)
+            time.sleep(0.2)
+        return real_upsert(path, stage, attempt, wall, extra, status)
+
+    monkeypatch.setattr(d, "_upsert_cost", delayed_upsert)
     assert d._finish_stage(
         run, "register", "attempt_001", time.perf_counter(),
-        {"remaining_s": 0.0},
+        {"remaining_s": remaining},
         {"complete": True, "status": "done", "report": str(report)}, {}) is False
-    row, _ = d.stage_state(run, "register")
+    # A terminal row would be consumed as a known cost even though the report
+    # still claims success; none may be written on a failed retraction.
+    assert terminal_writes == []
+    row, problems = d.stage_state(run, "register")
+    assert row["status"] == "publishing"
     assert row["complete"] is False
-    assert row["status"] == "incomplete"
-    assert "report_retraction_failed" in row.get("incomplete_reason", "")
+    assert "attempt_final_check_pending" in problems
+    assert any("report_retraction_failed" in (e.get("incomplete_reason") or "")
+               for e in d._stage_ledger_rows(run, "register"))
+    assert d._stage_history(run, "register") is None
+    with pytest.raises(SystemExit):
+        d.budget_for(run, "register",
+                     {"known": True, "stage_cost_s": {}, "total_s": 0.0,
+                      "stage_attempts": {}})

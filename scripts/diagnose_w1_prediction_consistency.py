@@ -678,8 +678,8 @@ def _finish_stage(run: Path, stage: str, attempt: str, t0: float,
         """A budget revocation must revoke the REPORT's completion claim too.
 
         Returns False when the report cannot be rewritten; the caller then
-        leaves a non-consumable publishing/incomplete row instead of a
-        terminal completion whose report still claims success.
+        keeps a non-consumable publishing row instead of a terminal row whose
+        report still claims success.
         """
         try:
             for key in ("report", "summary"):
@@ -796,9 +796,15 @@ def _finish_stage(run: Path, stage: str, attempt: str, t0: float,
                 "budget_exceeded_before_seal:report_retraction_failed")
         status = "incomplete"
         row = publish(row)
-    row = terminal(row, status, time.perf_counter() - t0 + tail, tail)
     if unknown:
+        # The report still claims completion. A terminal row here would be
+        # consumed as a known (and possibly under-measured) cost while the
+        # evidence contradicts it, so seal nothing: publishing/complete=false
+        # is non-consumable and makes the cohort history unknown.
+        row.update(complete=False, status="publishing")
+        row = publish(row)
         return False
+    row = terminal(row, status, time.perf_counter() - t0 + tail, tail)
     for _ in range(driver.SEAL_VERIFY_ROUNDS):
         post = time.perf_counter() - t0
         if not overrun and post >= remaining:
@@ -2594,7 +2600,13 @@ def _compare_metric_docs(a, b, label: str) -> list[str]:
                 problems += _compare_metric_docs({str(i): u}, {str(i): v},
                                                  f"{label}:{key}")
         elif isinstance(x, (bool, np.bool_)) or isinstance(y, (bool, np.bool_)):
-            if bool(x) is not bool(y):
+            # ``bool(0.05)`` is True, so coercing a lone bool would let a
+            # boolean masquerade as any nonzero measurement. Both sides must
+            # be booleans; bool-vs-number is a type error, never equality.
+            if not (isinstance(x, (bool, np.bool_))
+                    and isinstance(y, (bool, np.bool_))):
+                problems.append(f"{label}:{key}:bool_type")
+            elif bool(x) != bool(y):
                 problems.append(f"{label}:{key}:bool")
         elif _is_number(x) and _is_number(y):
             problems += _compare_number(x, y, label, key)
@@ -2640,7 +2652,13 @@ def _compare_pair(a: dict, b: dict, label: str) -> list[str]:
         return [f"{label}:keys"]
     for key in a:
         x, y = a[key], b[key]
-        if _is_number(x) and _is_number(y):
+        if isinstance(x, (bool, np.bool_)) or isinstance(y, (bool, np.bool_)):
+            if not (isinstance(x, (bool, np.bool_))
+                    and isinstance(y, (bool, np.bool_))):
+                problems.append(f"{label}:{key}:bool_type")
+            elif bool(x) != bool(y):
+                problems.append(f"{label}:{key}:bool")
+        elif _is_number(x) and _is_number(y):
             problems += _compare_number(x, y, label, key)
         elif x != y:
             problems.append(f"{label}:{key}:value")

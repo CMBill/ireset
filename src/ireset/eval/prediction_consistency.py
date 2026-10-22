@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+from collections import Counter
 from dataclasses import dataclass
 from typing import Iterable, Mapping, Sequence
 
@@ -1378,27 +1379,55 @@ def _group_demos(plan: Mapping, group: str) -> list[str]:
     return list(plan[group]) if group != "known_case" else [plan["known_case"]]
 
 
+def _probe_row_key(row: Mapping, probe: str):
+    start = row.get("start")
+    if isinstance(start, (bool, np.bool_)) or not isinstance(
+            start, (int, np.integer)):
+        return None
+    if probe != "diffusion_denoise":
+        return (int(start), None)
+    t = row.get("t")
+    if isinstance(t, (bool, np.bool_)) or not isinstance(t, (int, np.integer)):
+        return None
+    return (int(start), int(t))
+
+
+def _expected_probe_keys(plan: Mapping, demo: str, probe: str,
+                         t: int | None = None) -> Counter:
+    starts = plan["per_demo"][demo]["inference"]
+    if probe != "diffusion_denoise":
+        return Counter((int(s), None) for s in starts)
+    times = DENOISE_TIMESTEPS if t is None else (int(t),)
+    return Counter((int(s), int(tv)) for s in starts for tv in times)
+
+
+def _probe_matrix_complete(rows: Sequence[Mapping], plan: Mapping, demo: str,
+                           probe: str, t: int | None = None) -> bool:
+    """Every registered (start, t) key exactly once; a duplicate is a missing key.
+
+    A global sorted-starts comparison cannot express "each start five times":
+    the expected sequence is a multiset of pairs, not an ordered repetition.
+    """
+    seen = Counter(_probe_row_key(r, probe) for r in rows)
+    return seen == _expected_probe_keys(plan, demo, probe, t)
+
+
 def _probe_metric_macro(rows: Sequence[Mapping], plan: Mapping, group: str,
                         probe: str, getter) -> dict:
     """Equal-demo mean over the complete fixed probe matrix for one group.
 
     ``diffusion_denoise`` has five registered t rows per window, so a demo
-    is complete only when every registered start appears exactly five times
-    with finite metric values. Micro (window-level) values are never a
+    is complete only when every registered (start, t) key appears exactly
+    once with finite metric values. Micro (window-level) values are never a
     substitute for this macro.
     """
     demos = _group_demos(plan, group)
     per_demo = {}
     for demo in demos:
-        expected = list(plan["per_demo"][demo]["inference"])
         selected = [r for r in rows if r.get("group") == group
                     and r.get("probe") == probe and r.get("demo") == demo
                     and r.get("metrics") is not None]
-        starts = [int(r.get("start")) for r in selected]
-        repetitions = len(DENOISE_TIMESTEPS) if probe == "diffusion_denoise" else 1
-        complete = (len(starts) == repetitions * len(expected)
-                    and sorted(starts) == sorted(expected) * repetitions)
-        if not complete:
+        if not _probe_matrix_complete(selected, plan, demo, probe):
             continue
         vals = [getter(r) for r in selected]
         if not all(isinstance(v, (int, float)) and not isinstance(v, bool)
@@ -1510,21 +1539,12 @@ def _group_probe_macro(rows: Sequence[Mapping], plan: Mapping, group: str,
                        probe: str, t: int | None, getter):
     demos = _group_demos(plan, group)
     per_demo = {}
-    repetitions = len(DENOISE_TIMESTEPS) if probe == "diffusion_denoise" else 1
     for demo in demos:
-        expected = list(plan["per_demo"][demo]["inference"])
         selected = [r for r in rows if r.get("group") == group
                     and r.get("probe") == probe and r.get("demo") == demo
                     and r.get("metrics") is not None
                     and (t is None or r.get("t") == t)]
-        starts = [int(r.get("start")) for r in selected]
-        if t is not None:
-            complete = (len(starts) == len(expected)
-                        and sorted(starts) == sorted(expected))
-        else:
-            complete = (len(starts) == repetitions * len(expected)
-                        and sorted(starts) == sorted(expected) * repetitions)
-        if not complete:
+        if not _probe_matrix_complete(selected, plan, demo, probe, t):
             continue
         vals = [getter(r) for r in selected]
         if not all(isinstance(v, (int, float)) and not isinstance(v, bool)
@@ -1540,20 +1560,11 @@ def _all_group_macro(rows: Sequence[Mapping], plan: Mapping, probe: str,
     """Macro over all 13 registered demos (train6/val6/known), never mixed groups."""
     demos = list(plan["train6"]) + list(plan["val6"]) + [plan["known_case"]]
     per_demo = {}
-    repetitions = len(DENOISE_TIMESTEPS) if probe == "diffusion_denoise" else 1
     for demo in demos:
-        expected = list(plan["per_demo"][demo]["inference"])
         selected = [r for r in rows if r.get("probe") == probe
                     and r.get("demo") == demo and r.get("metrics") is not None
                     and (t is None or r.get("t") == t)]
-        starts = [int(r.get("start")) for r in selected]
-        if t is not None:
-            complete = (len(starts) == len(expected)
-                        and sorted(starts) == sorted(expected))
-        else:
-            complete = (len(starts) == repetitions * len(expected)
-                        and sorted(starts) == sorted(expected) * repetitions)
-        if not complete:
+        if not _probe_matrix_complete(selected, plan, demo, probe, t):
             continue
         vals = [getter(r) for r in selected]
         if not all(isinstance(v, (int, float)) and not isinstance(v, bool)
