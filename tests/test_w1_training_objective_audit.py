@@ -746,6 +746,65 @@ def test_verifier_detects_a5_evidence_attacks(audit_dir: Path, tmp_path: Path):
                 r["actual"]["timesteps_visited"] = [0, 0, 0, 0, 0]
         (d / "objective_rows.json").write_text(json.dumps(o))
 
+    def clip_arrays(d):
+        z = dict(np.load(d / "update_arrays.npz"))
+        for k in list(z):
+            for with_run, no_run in (("deterministic_with_clip__", "deterministic_no_clip__"),
+                                     ("diffusion_with_clip__", "diffusion_no_clip__")):
+                if k.startswith(with_run):
+                    z[k] = z[no_run + k[len(with_run):]].copy()
+        np.savez(d / "update_arrays.npz", **z)
+
+    def scalar_3d(d):
+        z = dict(np.load(d / "update_arrays.npz"))
+        for k in list(z):
+            if k.endswith("initial_bias") or k.endswith("initial_scale"):
+                z[k] = np.full((3, 1, 1), float(z[k]), dtype=np.float32)
+        np.savez(d / "update_arrays.npz", **z)
+
+    def fd_raw(d):
+        o = _load("objective_rows.json", d)
+        for r in o["rows"]:
+            if r["id"] == "grad.finite_difference_float64":
+                r["actual"]["vel"]["fd"] = 1.0
+        (d / "objective_rows.json").write_text(json.dumps(o))
+
+    def fd_delete(d):
+        o = _load("objective_rows.json", d)
+        for r in o["rows"]:
+            if r["id"] == "grad.finite_difference_float64":
+                for term in r["actual"]:
+                    r["actual"][term].pop("fd", None)
+                    r["actual"][term].pop("analytic", None)
+        (d / "objective_rows.json").write_text(json.dumps(o))
+
+    def batch_bad(d):
+        o = _load("objective_rows.json", d)
+        for r in o["rows"]:
+            if r["id"] in ("loss.batch_permutation_invariance",
+                           "loss.repeated_batch_invariance"):
+                for key in ("unpermuted", "permuted", "repeated", "independent_mean"):
+                    if isinstance(r["actual"].get(key), list):
+                        r["actual"][key][0] += 0.1
+        (d / "objective_rows.json").write_text(json.dumps(o))
+
+    def grad_detail_bad(d):
+        g = _load("gradient_rows.json", d)
+        for r in g["rows"]:
+            if r["id"] == "grad.vel":
+                r["actual"]["grad_norm"] = 123.0
+                r["actual"]["weighted_grad_norm"] = 456.0
+        (d / "gradient_rows.json").write_text(json.dumps(g))
+
+    def summary_empty(d):
+        (d / "audit_summary.json").write_text("{}")
+
+    def config_bad(d):
+        s = _load("static_contract.json", d)
+        s["effective_config"]["seed"] = 999
+        s["effective_config"]["grad_clip"] = 999.0
+        (d / "static_contract.json").write_text(json.dumps(s))
+
     expected = {
         "empty_parity": ("audit_incomplete", "structure_empty:update_parity.runs"),
         "best_999": ("implementation_mismatch", "selection_row_mismatch"),
@@ -769,6 +828,14 @@ def test_verifier_detects_a5_evidence_attacks(audit_dir: Path, tmp_path: Path):
         "gap_add": ("audit_incomplete", "summary_gap_list_mismatch"),
         "permute_bad": ("implementation_mismatch", "batch_invariance_mismatch"),
         "ddim_zero": ("implementation_mismatch", "sampling_full_loop_forward_or_step_count"),
+        "clip_arrays": ("implementation_mismatch", "grad_clip_identity"),
+        "scalar_3d": ("audit_incomplete", "structure_shape"),
+        "fd_raw": ("implementation_mismatch", "finite_difference_recompute_mismatch"),
+        "fd_delete": ("implementation_mismatch", "finite_difference_recompute_mismatch"),
+        "batch_bad": ("implementation_mismatch", "batch_invariance_mismatch"),
+        "grad_detail_bad": ("implementation_mismatch", "gradient_detail_mismatch"),
+        "summary_empty": ("audit_incomplete", "structure_empty:audit_summary"),
+        "config_bad": ("implementation_mismatch", "static_effective_config_mismatch"),
     }
     cases = [("empty_parity", empty_parity), ("best_999", best_999),
              ("nan_total", nan_total), ("nan_grad", nan_grad),
@@ -780,7 +847,10 @@ def test_verifier_detects_a5_evidence_attacks(audit_dir: Path, tmp_path: Path):
              ("fd_bad", fd_bad), ("one_run", one_run), ("noise_zero", noise_zero),
              ("noise_inf", noise_inf), ("static_short", static_short),
              ("gap_add", gap_add), ("permute_bad", permute_bad),
-             ("ddim_zero", ddim_zero)]
+             ("ddim_zero", ddim_zero), ("clip_arrays", clip_arrays),
+             ("scalar_3d", scalar_3d), ("fd_raw", fd_raw), ("fd_delete", fd_delete),
+             ("batch_bad", batch_bad), ("grad_detail_bad", grad_detail_bad),
+             ("summary_empty", summary_empty), ("config_bad", config_bad)]
     for name, mutate in cases:
         v = _tampered(audit_dir, tmp_path, f"attack_{name}", mutate)
         want_conclusion, want_problem = expected[name]
@@ -838,3 +908,45 @@ def test_ddim_full_loop_is_executed(monkeypatch, tmp_path: Path):
     row = next(r for r in rows if r["id"] == "sampling.ddim_full_loop")
     assert row["status"] == "contract_mismatch"
     assert row["actual"]["sample_error"] is not None
+
+
+def test_ddim_schedule_and_terminal_update_are_bound(monkeypatch, tmp_path: Path):
+    from diffusers import DDIMScheduler
+    from ireset.diffusion.generator import DiffusionG1
+
+    # (a) a sampled schedule [4,3,2,1,0] must not match the frozen table
+    def wrong_schedule(self, memory, F, steps=25, eta=0.0, generator=None):
+        self.ddim.timesteps = torch.tensor([4, 3, 2, 1, 0])
+        x = torch.randn(memory.shape[0], F, 38, generator=generator)
+        for tv in self.ddim.timesteps:
+            x0 = self.forward(x, tv.expand(memory.shape[0]), memory)
+            x = self.ddim.step(x0, tv, x, eta=eta).prev_sample
+        return x
+
+    monkeypatch.setattr(DiffusionG1, "sample", wrong_schedule)
+    rows, _, _ = audit.run_a3(build_synthetic_world(), tmp_path / "schedule")
+    row = next(r for r in rows if r["id"] == "sampling.ddim_full_loop")
+    assert row["status"] == "contract_mismatch"
+    assert row["actual"]["timesteps_visited"] != row["actual"]["scheduler_timesteps"]
+
+
+def test_ddim_terminal_step_is_bound(monkeypatch, tmp_path: Path):
+    from diffusers import DDIMScheduler
+    from ireset.diffusion.generator import DiffusionG1
+
+    class Out:
+        def __init__(self, prev_sample):
+            self.prev_sample = prev_sample
+
+    real_step = DDIMScheduler.step
+
+    def broken_step(self, model_output, timestep, sample, eta=0.0, **kwargs):
+        if int(timestep.reshape(-1)[0]) == 0:
+            return Out(sample)          # deliberately return the old state
+        return real_step(self, model_output, timestep, sample, eta=eta, **kwargs)
+
+    monkeypatch.setattr(DDIMScheduler, "step", broken_step)
+    rows, _, _ = audit.run_a3(build_synthetic_world(), tmp_path / "terminal")
+    row = next(r for r in rows if r["id"] == "sampling.ddim_full_loop")
+    assert row["status"] == "contract_mismatch"
+    assert row["actual"]["reference_final_max_abs_error"] > 1e-5

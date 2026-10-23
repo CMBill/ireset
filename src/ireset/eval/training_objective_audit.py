@@ -1203,6 +1203,9 @@ def run_a1(world: SyntheticWorld) -> tuple[list[dict], dict]:
         "lo": tk.lo, "hi": tk.hi,
         "box_t_clip": world.center[None, :], "center": world.center,
         "box_quat": world.box_quat, "contact": world.contact,
+        "batch_target_b": target_b, "batch_pred_b": pred_b,
+        "batch_perm": perm, "batch_target_r": np.concatenate([target_b, target_b], axis=0),
+        "batch_pred_r": np.concatenate([pred_b, pred_b], axis=0),
     }
     return rows, inputs
 
@@ -2061,18 +2064,22 @@ def run_a3(world: SyntheticWorld, tmp_root: Path) -> tuple[list[dict], dict, dic
                      expected={"noise_fraction_at_t0": ">0", "not_noiseless": True},
                      actual={"noise_fraction_at_t0": t0_frac,
                              "alpha_cumprod_t0": float(diff.ddpm.alphas_cumprod[0])}))
-    # FULL DDIM loop: execute the real scheduler for every timestep, record
-    # the actual t sequence and scheduler.step calls, and compare the whole
-    # trajectory against an independently constructed DDIM loop.  A constant
-    # "perfect x0" predictor would hide a wrong/no-op loop, so the predictor
-    # here depends on x_t and t.
+    # FULL DDIM loop: freeze the expected timestep table BEFORE calling the
+    # sampling entry, count scheduler.step calls, and compare the trajectory
+    # against an independently implemented eta=0 DDIM update.  The reference
+    # does not reuse the tested scheduler.step or its mutable timestep table.
     target = torch.tensor(world.x0, dtype=torch.float32)[None]
+    diff.ddim.set_timesteps(5)
+    expected_timesteps = [int(v) for v in diff.ddim.timesteps]
     fwd_ts: list[int] = []
     step_ts: list[int] = []
 
+    def predict_value(x_t, t):
+        return target * 0.5 + x_t * 0.5 + 0.01 * (t.float() / 1000.0)[:, None, None]
+
     def predictor(x_t, t, memory):
         fwd_ts.append(int(t.reshape(-1)[0]))
-        return target * 0.5 + x_t * 0.5 + 0.01 * (t.float() / 1000.0)[:, None, None]
+        return predict_value(x_t, t)
 
     diff.forward = predictor
     real_step = diff.ddim.step
@@ -2090,17 +2097,20 @@ def run_a3(world: SyntheticWorld, tmp_root: Path) -> tuple[list[dict], dict, dic
         sample_error = f"{type(exc).__name__}: {exc}"
     finally:
         diff.ddim.step = real_step
-    expected_timesteps = [int(v) for v in diff.ddim.timesteps]
     sampled_fwd_ts = list(fwd_ts)
-    # independent reference loop with the same initial noise and predictor
+    # independent eta=0 DDIM update, frozen schedule, same predictor/noise
     reference = None
     ref_error = None
     try:
         x_ref = torch.randn(1, world.T, 38,
                             generator=torch.Generator().manual_seed(5))
-        for tv in diff.ddim.timesteps:
-            x_ref = real_step(predictor(x_ref, tv.expand(1), torch.zeros(1, 4, 8)),
-                              tv, x_ref, eta=0.0).prev_sample
+        for idx, tv in enumerate(expected_timesteps):
+            ab_t = float(diff.ddim.alphas_cumprod[tv])
+            prev_tv = expected_timesteps[idx + 1] if idx + 1 < len(expected_timesteps) else None
+            ab_prev = float(diff.ddim.alphas_cumprod[prev_tv]) if prev_tv is not None else 1.0
+            x0_pred = predict_value(x_ref, torch.tensor([tv]))
+            eps = (x_ref - math.sqrt(ab_t) * x0_pred) / math.sqrt(1.0 - ab_t)
+            x_ref = math.sqrt(ab_prev) * x0_pred + math.sqrt(1.0 - ab_prev) * eps
         reference = x_ref
         ref_error = (float((sampled - reference).abs().max())
                      if sampled is not None else None)
@@ -2112,7 +2122,7 @@ def run_a3(world: SyntheticWorld, tmp_root: Path) -> tuple[list[dict], dict, dic
                and diff.ddim.config.clip_sample is False
                and diff.ddim.config.thresholding is False
                and float(diff.ddim.final_alpha_cumprod) == 1.0
-               and len(expected_timesteps) == 5
+               and expected_timesteps == [800, 600, 400, 200, 0]
                and sampled_fwd_ts == expected_timesteps
                and step_ts == expected_timesteps
                and sampled is not None and tuple(sampled.shape) == tuple(target.shape)
@@ -2123,7 +2133,7 @@ def run_a3(world: SyntheticWorld, tmp_root: Path) -> tuple[list[dict], dict, dic
                                "thresholding": False, "final_alpha_cumprod": 1.0,
                                "sample_calls": 1, "forward_calls": 5,
                                "scheduler_step_calls": 5,
-                               "timesteps_visited": expected_timesteps,
+                               "timesteps_visited": [800, 600, 400, 200, 0],
                                "reference_final_max_abs_error": "<=1e-5"},
                      actual={"prediction_type": diff.ddim.config.prediction_type,
                              "clip_sample": diff.ddim.config.clip_sample,
@@ -2921,20 +2931,48 @@ def _validate_static(static: Any, problems: list[str]) -> tuple[dict, dict, dict
             if not isinstance(rec, dict) or not path.is_file() \
                     or sha256_file(path) != rec.get("sha256"):
                 problems.append(f"static_source_drift:{rel}")
-    # re-parse the config and bind the effective weights
+    # re-parse the FULL config and bind every effective parameter, not only loss
     try:
         import yaml
         raw = yaml.safe_load(cfg_path.read_text())
-        parsed_loss = (raw or {}).get("loss", {})
+        if not isinstance(raw, dict):
+            problems.append("static_config_parse_failed:not_mapping")
+            return st, loss, {}, cfg_path
+        parsed = {k: v for k, v in raw.items() if k != "formal_validation_contract"}
+        parsed_loss = parsed.get("loss", {})
         parsed_loss = {k: float(v) for k, v in parsed_loss.items()} if isinstance(parsed_loss, dict) else {}
+        parsed["loss"] = parsed_loss
+        static_eff = {k: v for k, v in eff.items()}
         static_loss = {k: float(v) for k, v in loss.items()}
-        if parsed_loss != static_loss:
-            problems.append("static_effective_loss_mismatch:config_file")
-        expected_loss = dict(W1_SYNTHETIC_WEIGHTS.__dict__)
-        if static_loss != {k: float(v) for k, v in expected_loss.items()}:
+        static_eff["loss"] = static_loss
+        for key in sorted(set(parsed) | set(static_eff)):
+            if key not in parsed or key not in static_eff or parsed[key] != static_eff[key]:
+                problems.append(f"static_effective_config_mismatch:{key}")
+        expected_loss = {k: float(v) for k, v in W1_SYNTHETIC_WEIGHTS.__dict__.items()}
+        if static_loss != expected_loss:
             problems.append("static_effective_loss_mismatch:expected_w1")
-        if parsed_loss != {k: float(v) for k, v in expected_loss.items()}:
+        if parsed_loss != expected_loss:
             problems.append("static_effective_loss_mismatch:config_expected")
+        check_map = {c.get("id"): c for c in checks if isinstance(c, dict)}
+        field_checks = {
+            "steps": "static.steps", "micro_batch": "static.micro_batch",
+            "grad_accum": "static.grad_accum", "lr": "static.lr",
+            "weight_decay": "static.weight_decay", "grad_clip": "static.grad_clip",
+            "seed": "static.seed", "val_seed": "static.val_seed",
+            "val_every": "static.val_every", "time_window": "static.time_window",
+            "num_train_timesteps": "static.num_train_timesteps",
+        }
+        for field, check_id in field_checks.items():
+            c = check_map.get(check_id)
+            if c is None:
+                problems.append(f"static_check_missing_for_config:{field}")
+            elif c.get("actual") != static_eff.get(field):
+                problems.append(f"static_effective_config_mismatch:check_{field}")
+        lc = check_map.get("static.loss_weights")
+        if lc is None:
+            problems.append("static_check_missing_for_config:loss_weights")
+        elif lc.get("actual") != static_loss:
+            problems.append("static_effective_config_mismatch:check_loss_weights")
     except Exception as exc:  # noqa: BLE001
         problems.append(f"static_config_parse_failed:{type(exc).__name__}")
     return st, loss, {}, cfg_path
@@ -2978,7 +3016,7 @@ def _saved_world(inputs: dict, problems: list[str]) -> tuple[SyntheticWorld | No
 
 
 def _validate_gradient_arrays(garr: dict, world: SyntheticWorld, weights: LossWeights,
-                              row_map: dict, problems: list[str]) -> dict:
+                              row_map: dict, detail_map: dict, problems: list[str]) -> dict:
     if not garr:
         problems.append("structure_empty:gradient_arrays")
         return {}
@@ -3016,6 +3054,18 @@ def _validate_gradient_arrays(garr: dict, world: SyntheticWorld, weights: LossWe
                 problems.append(f"gradient_row_mismatch:{term}:{key}")
         if act.get("finite") is not True or act.get("nonzero") is not True:
             problems.append(f"gradient_row_not_verified:{term}")
+        detail = detail_map.get(f"grad.{term}")
+        if detail is None or not isinstance(detail.get("actual"), dict):
+            problems.append(f"structure_missing_keys:gradient_rows.grad.{term}.actual")
+        else:
+            dact = detail["actual"]
+            for key in ("grad_norm", "weighted_grad_norm"):
+                a, b = act.get(key), dact.get(key)
+                if not _finite_number(a) or not _finite_number(b) or abs(float(a) - float(b)) > 1e-9:
+                    problems.append(f"gradient_detail_mismatch:{term}:{key}")
+            for key in ("finite", "nonzero"):
+                if act.get(key) is not dact.get(key):
+                    problems.append(f"gradient_detail_mismatch:{term}:{key}")
     gsum = (weights.w_pos * recomputed["grad_pos"] + weights.w_rot6d * recomputed["grad_rot6d"]
             + weights.w_joint * recomputed["grad_joint"]
             + weights.w_geodesic * recomputed["grad_geodesic_rad2"]
@@ -3043,27 +3093,45 @@ def _recompute_update_run(run: dict, uarr: dict, tokenizer, weights: LossWeights
     if run.get("problems"):
         problems.append(f"producer_parity_problems:{run_id}:{run['problems']}")
     prefix = f"{run_id}__"
+    expected_clip = EXPECTED_UPDATE_RUNS.get(run_id, (None, None))[1]
     micro = _as_float_array(uarr.get(f"{prefix}micro_x0"), f"{run_id}.micro_x0", problems)
     if micro is None:
         return
-    if micro.ndim != 4 or micro.shape[0] != 4:
+    if micro.ndim != 4 or micro.shape[0] != 4 or micro.shape[-1] != 38:
         problems.append(f"structure_shape:{run_id}.micro_x0")
         return
-    initial_bias = _as_float_array(uarr.get(f"{prefix}initial_bias"), f"{run_id}.initial_bias", problems)
-    initial_scale = _as_float_array(uarr.get(f"{prefix}initial_scale"), f"{run_id}.initial_scale", problems)
-    grad_clip_arr = _as_float_array(uarr.get(f"{prefix}grad_clip"), f"{run_id}.grad_clip", problems)
+    initial_bias = _as_float_array(uarr.get(f"{prefix}initial_bias"),
+                                   f"{run_id}.initial_bias", problems, ())
+    initial_scale = _as_float_array(uarr.get(f"{prefix}initial_scale"),
+                                    f"{run_id}.initial_scale", problems, ())
+    grad_clip_arr = _as_float_array(uarr.get(f"{prefix}grad_clip"),
+                                    f"{run_id}.grad_clip", problems, ())
     if initial_bias is None or initial_scale is None or grad_clip_arr is None:
         return
-    grad_clip = float(grad_clip_arr.reshape(-1)[0])
+    grad_clip = float(grad_clip_arr)
+    if expected_clip is None or abs(grad_clip - float(expected_clip)) > 1e-12 \
+            or abs(float(run.get("grad_clip", -1)) - float(expected_clip)) > 1e-12:
+        problems.append(f"update_replay_mismatch:{run_id}:grad_clip_identity")
+        return
     model_type = str(run.get("model_type"))
+    clip_should_trigger = float(expected_clip) < 1.0
     for side in ("s0", "formal"):
-        pred_saved = _as_float_array(uarr.get(f"{prefix}{side}_preds"), f"{run_id}.{side}.preds", problems)
-        parts_saved = _as_float_array(uarr.get(f"{prefix}{side}_parts"), f"{run_id}.{side}.parts", problems)
-        pre0 = _as_float_array(uarr.get(f"{prefix}{side}_preclip_0"), f"{run_id}.{side}.preclip_0", problems)
-        pre1 = _as_float_array(uarr.get(f"{prefix}{side}_preclip_1"), f"{run_id}.{side}.preclip_1", problems)
-        post0 = _as_float_array(uarr.get(f"{prefix}{side}_postclip_0"), f"{run_id}.{side}.postclip_0", problems)
-        post1 = _as_float_array(uarr.get(f"{prefix}{side}_postclip_1"), f"{run_id}.{side}.postclip_1", problems)
-        gnorm_saved = _as_float_array(uarr.get(f"{prefix}{side}_gnorm"), f"{run_id}.{side}.gnorm", problems)
+        pred_saved = _as_float_array(
+            uarr.get(f"{prefix}{side}_preds"), f"{run_id}.{side}.preds", problems,
+            (4, 4) + tuple(micro.shape[2:]))
+        parts_saved = _as_float_array(
+            uarr.get(f"{prefix}{side}_parts"), f"{run_id}.{side}.parts", problems,
+            (4, len(LOSS_PART_KEYS)))
+        pre0 = _as_float_array(uarr.get(f"{prefix}{side}_preclip_0"),
+                               f"{run_id}.{side}.preclip_0", problems, (X0_DIM,))
+        pre1 = _as_float_array(uarr.get(f"{prefix}{side}_preclip_1"),
+                               f"{run_id}.{side}.preclip_1", problems, ())
+        post0 = _as_float_array(uarr.get(f"{prefix}{side}_postclip_0"),
+                                f"{run_id}.{side}.postclip_0", problems, (X0_DIM,))
+        post1 = _as_float_array(uarr.get(f"{prefix}{side}_postclip_1"),
+                                f"{run_id}.{side}.postclip_1", problems, ())
+        gnorm_saved = _as_float_array(
+            uarr.get(f"{prefix}{side}_gnorm"), f"{run_id}.{side}.gnorm", problems, ())
         if any(v is None for v in (pred_saved, parts_saved, pre0, pre1, post0, post1, gnorm_saved)):
             return
         bias = torch.nn.Parameter(torch.full(
@@ -3096,26 +3164,38 @@ def _recompute_update_run(run: dict, uarr: dict, tokenizer, weights: LossWeights
         if float((pre[0].numpy() - pre0).__abs__().max()) > 1e-6 or \
                 float((pre[1].numpy() - pre1).__abs__().max()) > 1e-6:
             problems.append(f"update_replay_mismatch:{run_id}:{side}:preclip")
+        pre_norm = math.sqrt(sum(float(t.cpu().norm()) ** 2 for t in pre))
         gnorm = float(torch.nn.utils.clip_grad_norm_([bias, scale], grad_clip))
-        if abs(gnorm - float(gnorm_saved.reshape(-1)[0])) > 1e-6:
+        if abs(gnorm - float(gnorm_saved)) > 1e-6:
             problems.append(f"update_replay_mismatch:{run_id}:{side}:gnorm")
         post = [bias.grad.detach().clone(), scale.grad.detach().clone()]
+        post_norm = math.sqrt(sum(float(t.cpu().norm()) ** 2 for t in post))
+        if clip_should_trigger:
+            if not (gnorm > grad_clip and abs(post_norm - grad_clip) <= 1e-6):
+                problems.append(f"update_replay_clip_not_triggered:{run_id}:{side}")
+        else:
+            if gnorm > grad_clip or abs(post_norm - pre_norm) > 1e-6:
+                problems.append(f"update_replay_no_clip_changed:{run_id}:{side}")
         if float((post[0].numpy() - post0).__abs__().max()) > 1e-6 or \
                 float((post[1].numpy() - post1).__abs__().max()) > 1e-6:
             problems.append(f"update_replay_mismatch:{run_id}:{side}:postclip")
         opt.step()
         names = ("model.bias", "conditioner.scale")
         for j, (n, param) in enumerate(zip(names, (bias, scale))):
+            pshape = (X0_DIM,) if n == "model.bias" else ()
             saved_param = _as_float_array(uarr.get(f"{prefix}{side}_param_{n}"),
-                                          f"{run_id}.{side}.param.{n}", problems)
+                                          f"{run_id}.{side}.param.{n}", problems, pshape)
             saved_grad = _as_float_array(uarr.get(f"{prefix}{side}_grad_{n}"),
-                                         f"{run_id}.{side}.grad.{n}", problems)
+                                         f"{run_id}.{side}.grad.{n}", problems, pshape)
             saved_step = uarr.get(f"{prefix}{side}_step_{n}")
             exp_avg = _as_float_array(uarr.get(f"{prefix}{side}_exp_avg_{n}"),
-                                      f"{run_id}.{side}.exp_avg.{n}", problems)
+                                      f"{run_id}.{side}.exp_avg.{n}", problems, pshape)
             exp_avg_sq = _as_float_array(uarr.get(f"{prefix}{side}_exp_avg_sq_{n}"),
-                                         f"{run_id}.{side}.exp_avg_sq.{n}", problems)
+                                         f"{run_id}.{side}.exp_avg_sq.{n}", problems, pshape)
             if any(v is None for v in (saved_param, saved_grad, exp_avg, exp_avg_sq)):
+                return
+            if np.asarray(saved_step).shape != ():
+                problems.append(f"structure_shape:{run_id}.{side}.step.{n}")
                 return
             if float(np.abs(param.detach().numpy() - saved_param).max()) > 1e-6:
                 problems.append(f"update_replay_mismatch:{run_id}:{side}:param:{n}")
@@ -3228,50 +3308,92 @@ def _recompute_selection(evidence: dict, rows: dict, problems: list[str],
         checks.append({"id": f"independent.selection:{run_name}", "expected_best": expected_best})
 
 
-def _verify_row_semantics(row_map: dict, problems: list[str]) -> None:
-    # batch invariance: BOTH the unpermuted and permuted (or repeated) facts
-    # must agree with the independent mean
-    for rid, keys in (("loss.batch_permutation_invariance", ("unpermuted", "permuted")),
-                      ("loss.repeated_batch_invariance", ("repeated",))):
-        row = row_map.get(rid)
-        act = row.get("actual") if isinstance(row, dict) else None
-        if not isinstance(act, dict):
-            problems.append(f"structure_missing_keys:{rid}.actual")
-            continue
-        mean = act.get("independent_mean")
-        if not isinstance(mean, list) or len(mean) != 3 or not all(_finite_number(v) for v in mean):
-            problems.append(f"structure_invalid:{rid}.independent_mean")
-            continue
-        for key in keys:
-            vals = act.get(key)
-            if not isinstance(vals, list) or len(vals) != 3 or not all(_finite_number(v) for v in vals):
-                problems.append(f"structure_invalid:{rid}.{key}")
-                continue
-            tol = TOLERANCES["loss_float64"]
-            if any(abs(float(a) - float(b)) > tol["atol"] + tol["rtol"] * abs(float(b))
-                   for a, b in zip(vals, mean)):
-                problems.append(f"batch_invariance_mismatch:{rid}:{key}")
-    # finite-difference row: rel_error/ok/cosine must agree with the frozen gate
+def _verify_row_semantics(row_map: dict, inputs: dict, world: SyntheticWorld,
+                          weights: LossWeights, recomputed: dict,
+                          pred_np: np.ndarray | None, problems: list[str]) -> None:
+    # Batch invariance: recompute both means from the saved target/perturbation
+    # tensors.  Never use the row's own "independent_mean" as the expectation.
+    required = ("batch_target_b", "batch_pred_b", "batch_perm",
+                "batch_target_r", "batch_pred_r")
+    if not all(k in inputs for k in required):
+        problems.append("structure_missing_keys:synthetic_inputs:batch_invariance")
+    else:
+        tb = _as_float_array(inputs["batch_target_b"], "inputs.batch_target_b", problems)
+        pb = _as_float_array(inputs["batch_pred_b"], "inputs.batch_pred_b", problems)
+        perm = _as_float_array(inputs["batch_perm"], "inputs.batch_perm", problems)
+        tr = _as_float_array(inputs["batch_target_r"], "inputs.batch_target_r", problems)
+        pr = _as_float_array(inputs["batch_pred_r"], "inputs.batch_pred_r", problems)
+        if all(v is not None for v in (tb, pb, perm, tr, pr)):
+            if tb.ndim != 3 or pb.shape != tb.shape or perm.shape != (3,) \
+                    or tr.ndim != 3 or pr.shape != tr.shape:
+                problems.append("structure_shape:inputs:batch_invariance")
+            else:
+                def means(preds, targets):
+                    vals = [_independent_terms(preds[i], targets[i], world, weights)
+                            for i in range(preds.shape[0])]
+                    return [float(np.mean([v[k] for v in vals])) for k in ("total", "pos", "vel")]
+                exp_unperm = means(pb, tb)
+                exp_perm = means(pb[perm.astype(int)], tb[perm.astype(int)])
+                exp_rep = means(pr, tr)
+                for rid, key, expected in (
+                        ("loss.batch_permutation_invariance", "unpermuted", exp_unperm),
+                        ("loss.batch_permutation_invariance", "permuted", exp_perm),
+                        ("loss.batch_permutation_invariance", "independent_mean", exp_unperm),
+                        ("loss.repeated_batch_invariance", "repeated", exp_rep),
+                        ("loss.repeated_batch_invariance", "independent_mean", exp_rep)):
+                    row = row_map.get(rid)
+                    act = row.get("actual") if isinstance(row, dict) else None
+                    vals = act.get(key) if isinstance(act, dict) else None
+                    if not isinstance(vals, list) or len(vals) != 3 \
+                            or not all(_finite_number(v) for v in vals):
+                        problems.append(f"structure_invalid:{rid}.{key}")
+                        continue
+                    tol = TOLERANCES["loss_float64"]
+                    if any(abs(float(a) - float(b)) > tol["atol"] + tol["rtol"] * abs(float(b))
+                           for a, b in zip(vals, expected)):
+                        problems.append(f"batch_invariance_mismatch:{rid}:{key}")
+    # Finite difference: recompute fd, analytic directional derivative and
+    # rel_error from the bound target/pred/direction/step, then compare records.
     fd = row_map.get("grad.finite_difference_float64")
     act = fd.get("actual") if isinstance(fd, dict) else None
-    if not isinstance(act, dict):
+    if pred_np is None or not isinstance(act, dict):
         problems.append("structure_missing_keys:grad.finite_difference_float64.actual")
-    else:
-        tol = TOLERANCES["finite_difference_float64"]
-        for term in ("pos", "rot6d", "joint", "geodesic_rad2", "vel", "fk_m2"):
-            rec = act.get(term)
-            if not isinstance(rec, dict):
-                problems.append(f"structure_missing_keys:grad.fd.{term}")
-                continue
-            rel = rec.get("rel_error")
-            ok = rec.get("ok")
-            if not _finite_number(rel) or rel < 0 or rel > tol["rtol"] or ok is not True:
-                problems.append(f"finite_difference_row_not_verified:{term}:{rel}:{ok}")
-            cos = rec.get("cosine")
-            if cos is not None and (not _finite_number(cos) or abs(float(cos)) > 1.0 + 1e-12):
-                problems.append(f"finite_difference_cosine_invalid:{term}")
-            if cos is None and not rec.get("cosine_reason"):
-                problems.append(f"finite_difference_cosine_missing_reason:{term}")
+        return
+    pred2 = np.asarray(pred_np, dtype=np.float64)
+    if pred2.ndim == 3:
+        pred2 = pred2[0]
+    tol = TOLERANCES["finite_difference_float64"]
+    rng = np.random.default_rng(7)
+    for term in ("pos", "rot6d", "joint", "geodesic_rad2", "vel", "fk_m2"):
+        rec = act.get(term)
+        if not isinstance(rec, dict):
+            problems.append(f"structure_missing_keys:grad.fd.{term}")
+            continue
+        direction = rng.normal(size=pred2.shape)
+        direction /= np.linalg.norm(direction)
+        fd_re, _ = _fd_directional(world, pred2, direction, term, 1e-6)
+        g = recomputed.get(f"grad_{term}")
+        if g is None:
+            problems.append(f"gradient_recompute_unavailable:{term}")
+            continue
+        analytic_re = float(np.sum(g[0] * direction))
+        rel_re = abs(fd_re - analytic_re) / max(abs(analytic_re), 1e-12)
+        for key, want in (("fd", fd_re), ("analytic", analytic_re)):
+            if not _finite_number(rec.get(key)) or abs(float(rec[key]) - want) > 1e-7:
+                problems.append(f"finite_difference_recompute_mismatch:{term}:{key}")
+        if not _finite_number(rec.get("rel_error")) or abs(float(rec["rel_error"]) - rel_re) > 1e-7:
+            problems.append(f"finite_difference_recompute_mismatch:{term}:rel_error")
+        expected_ok = rel_re <= tol["rtol"]
+        if rec.get("ok") is not expected_ok or not expected_ok:
+            problems.append(f"finite_difference_row_not_verified:{term}:{rel_re}:{rec.get('ok')}")
+        gnorm = float(np.linalg.norm(g))
+        expected_cos = analytic_re / gnorm if gnorm > 0 else None
+        if expected_cos is None:
+            if rec.get("cosine") is not None:
+                problems.append(f"finite_difference_cosine_mismatch:{term}")
+        elif not _finite_number(rec.get("cosine")) \
+                or abs(float(rec["cosine"]) - expected_cos) > 1e-9:
+            problems.append(f"finite_difference_cosine_mismatch:{term}")
 
 
 def _verify_audit_artifacts_impl(out_dir: Path) -> dict:
@@ -3327,8 +3449,8 @@ def _verify_audit_artifacts_impl(out_dir: Path) -> dict:
         row_map.update(_validate_row_list(all_rows, group, f"objective_rows.{group}", problems))
 
     gradient = _mapping(gradient_raw, "gradient_rows", problems)
-    _validate_row_list(gradient.get("rows"), "A2", "gradient_rows", problems)
-    _verify_row_semantics(row_map, problems)
+    gradient_rows_map = _validate_row_list(gradient.get("rows"), "A2",
+                                          "gradient_rows", problems)
     world, saved = _saved_world(inputs, problems) if inputs else (None, {})
     if world is not None and weights is not None:
         exp = _independent_terms(saved["pred"], saved["x0"], world, weights)
@@ -3351,8 +3473,12 @@ def _verify_audit_artifacts_impl(out_dir: Path) -> dict:
                 problems.append("objective_recompute_mismatch:total")
         checks.append({"id": "independent.recompute_terms", "recomputed": exp})
 
+    recomputed_grads = {}
     if world is not None:
-        _validate_gradient_arrays(garr, world, weights, row_map, problems)
+        recomputed_grads = _validate_gradient_arrays(
+            garr, world, weights, row_map, gradient_rows_map, problems)
+        _verify_row_semantics(row_map, inputs, world, weights, recomputed_grads,
+                              saved.get("pred"), problems)
 
     # A3: reload every saved run and replay its update from the bound inputs.
     parity = _mapping(parity_raw, "update_parity", problems)
@@ -3424,7 +3550,9 @@ def _verify_audit_artifacts_impl(out_dir: Path) -> dict:
             elif act.get("forward_calls") != 5 or act.get("scheduler_step_calls") != 5:
                 problems.append("sampling_full_loop_forward_or_step_count")
             elif (not isinstance(times, list) or not isinstance(expected_times, list)
-                  or len(times) != 5 or times != expected_times or len(set(times)) != 5):
+                  or len(times) != 5 or times != expected_times
+                  or expected_times != [800, 600, 400, 200, 0]
+                  or len(set(times)) != 5):
                 problems.append("sampling_full_loop_timesteps_mismatch")
             elif not _finite_number(act.get("reference_final_max_abs_error")) \
                     or float(act["reference_final_max_abs_error"]) > 1e-5:
@@ -3473,7 +3601,12 @@ def _verify_audit_artifacts_impl(out_dir: Path) -> dict:
 
     # summary/detail consistency
     summary = _mapping(summary_raw, "audit_summary", problems)
-    if summary:
+    if summary is not None:
+        required_summary = ("schema", "source", "counts", "failures", "gaps",
+                            "scope", "boundaries", "producer_conclusion")
+        _require_keys(summary, required_summary, "audit_summary", problems)
+        if not summary:
+            problems.append("structure_empty:audit_summary")
         computed_failures = {r.get("id") for r in all_rows
                              if isinstance(r, dict) and r.get("status") == "contract_mismatch"}
         if static:
@@ -3520,6 +3653,8 @@ def _verify_audit_artifacts_impl(out_dir: Path) -> dict:
                       for r in all_rows)
     numeric_prefixes = ("objective_recompute_mismatch", "gradient_recompute_mismatch",
                         "gradient_saved_sum_mismatch", "gradient_row_mismatch",
+                        "gradient_detail_mismatch", "finite_difference_recompute_mismatch",
+                        "static_effective_config_mismatch",
                         "update_replay_mismatch", "selection_recompute_mismatch",
                         "selection_row_mismatch", "static_effective_loss_mismatch",
                         "input_x0_not_bound", "nonfinite:",
