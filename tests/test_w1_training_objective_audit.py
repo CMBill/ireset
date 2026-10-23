@@ -121,6 +121,12 @@ def test_loss_reductions_weights_and_vel_grouping():
     vel = rows["loss.vel_reduction_38_channels"]
     assert vel["status"] == "synthetic_verified"
     assert vel["evidence"]["grouped_differs"] is True
+    batch = rows["loss.batch_permutation_invariance"]
+    assert batch["status"] == "synthetic_verified"
+    assert batch["actual"][0] > 1e-6 and all(v > 0 for v in batch["actual"][:3])
+    repeat = rows["loss.repeated_batch_invariance"]
+    assert repeat["status"] == "synthetic_verified"
+    assert repeat["actual"][0] > 1e-6
     total = rows["loss.total_weighted_sum"]
     assert total["status"] == "synthetic_verified"
     w = W1_SYNTHETIC_WEIGHTS
@@ -205,45 +211,62 @@ def test_detached_prediction_is_detected():
 
 def test_parity_predicate_catches_tampering(audit_dir: Path):
     runs = _load("update_parity.json", audit_dir)["runs"]
+    assert len(runs) == 4
     assert all(not r["problems"] for r in runs)
     assert all(r["n_micro_s0"] == 4 and r["n_micro_formal"] == 4 for r in runs)
     z = np.load(audit_dir / "update_arrays.npz")
-    names = sorted({k[len("s0_param_"):] for k in z.files if k.startswith("s0_param_")})
-    assert names == ["conditioner.scale", "model.bias"]
+    prefix = "deterministic_no_clip__"
+    names = ["model.bias", "conditioner.scale"]
+    for n in names:
+        assert f"{prefix}s0_param_{n}" in z.files
+        assert f"{prefix}formal_param_{n}" in z.files
 
-    def make_res() -> dict:
-        params = {n: torch.tensor(z[f"s0_param_{n}"]) for n in names}
-        tr_params = {n: torch.tensor(z[f"formal_param_{n}"]) for n in names}
-        grads = {n: torch.tensor(z[f"s0_grad_{n}"]) for n in names}
-        tr_grads = {n: torch.tensor(z[f"formal_grad_{n}"]) for n in names}
-        state = {n: {"step": 1,
-                     "exp_avg": torch.zeros_like(grads[n]),
-                     "exp_avg_sq": torch.zeros_like(grads[n])} for n in names}
-        clip = {"pre": [grads["model.bias"], grads["conditioner.scale"]],
-                "post": [grads["model.bias"], grads["conditioner.scale"]],
-                "gnorm": 1.0}
-        z_pred = torch.zeros(4, 8, 38)
-        parts = {k: 0.0 for k in ("pos", "rot6d", "joint", "geodesic_rad2",
-                                  "vel", "fk_m2", "total")}
+    def make_res(prefix_: str = prefix, model_type: str = "deterministic") -> dict:
+        params = {n: torch.tensor(z[f"{prefix_}s0_param_{n}"]) for n in names}
+        tr_params = {n: torch.tensor(z[f"{prefix_}formal_param_{n}"]) for n in names}
+        grads = {n: torch.tensor(z[f"{prefix_}s0_grad_{n}"]) for n in names}
+        tr_grads = {n: torch.tensor(z[f"{prefix_}formal_grad_{n}"]) for n in names}
+        state = {n: {"step": int(z[f"{prefix_}s0_step_{n}"]),
+                     "exp_avg": torch.tensor(z[f"{prefix_}s0_exp_avg_{n}"]),
+                     "exp_avg_sq": torch.tensor(z[f"{prefix_}s0_exp_avg_sq_{n}"])}
+                 for n in names}
+        tr_state = {n: {"step": int(z[f"{prefix_}formal_step_{n}"]),
+                        "exp_avg": torch.tensor(z[f"{prefix_}formal_exp_avg_{n}"]),
+                        "exp_avg_sq": torch.tensor(z[f"{prefix_}formal_exp_avg_sq_{n}"])}
+                    for n in names}
+        clip = {"pre": [torch.tensor(z[f"{prefix_}s0_preclip_0"]),
+                        torch.tensor(z[f"{prefix_}s0_preclip_1"])],
+                "post": [torch.tensor(z[f"{prefix_}s0_postclip_0"]),
+                         torch.tensor(z[f"{prefix_}s0_postclip_1"])],
+                "gnorm": float(z[f"{prefix_}s0_gnorm"])}
+        tr_clip = {"pre": [torch.tensor(z[f"{prefix_}formal_preclip_0"]),
+                           torch.tensor(z[f"{prefix_}formal_preclip_1"])],
+                   "post": [torch.tensor(z[f"{prefix_}formal_postclip_0"]),
+                            torch.tensor(z[f"{prefix_}formal_postclip_1"])],
+                   "gnorm": float(z[f"{prefix_}formal_gnorm"])}
         res = {
             "s0_params": params, "tr_params": tr_params,
             "s0_grads": grads, "tr_grads": tr_grads,
-            "s0_preds": [z_pred.clone() for _ in range(4)],
-            "tr_preds": [z_pred.clone() for _ in range(4)],
-            "s0_parts": [dict(parts) for _ in range(4)],
-            "tr_parts": [dict(parts) for _ in range(4)],
-            "s0_clip": {"pre": [g.clone() for g in clip["pre"]],
-                        "post": [g.clone() for g in clip["post"]],
-                        "gnorm": 1.0},
-            "tr_clip": {"pre": [g.clone() for g in clip["pre"]],
-                        "post": [g.clone() for g in clip["post"]],
-                        "gnorm": 1.0},
-            "s0_state": {n: dict(v) for n, v in state.items()},
-            "tr_state": {n: dict(v) for n, v in state.items()},
+            "s0_preds": [torch.tensor(v) for v in z[f"{prefix_}s0_preds"]],
+            "tr_preds": [torch.tensor(v) for v in z[f"{prefix_}formal_preds"]],
+            "s0_parts": [dict(zip(audit.LOSS_PART_KEYS, v)) for v in z[f"{prefix_}s0_parts"]],
+            "tr_parts": [dict(zip(audit.LOSS_PART_KEYS, v)) for v in z[f"{prefix_}formal_parts"]],
+            "s0_clip": clip, "tr_clip": tr_clip,
+            "s0_state": state, "tr_state": tr_state,
             "s0_micro_calls": 4, "tr_micro_calls": 4,
-            "s0_records": [{"t": torch.tensor([1]), "noise": torch.tensor([0.1])}],
-            "tr_records": [{"t": torch.tensor([1]), "noise": torch.tensor([0.1])}],
+            "s0_records": [], "tr_records": [],
         }
+        if model_type == "diffusion":
+            res["s0_records"] = [
+                {"t": torch.tensor(z[f"{prefix_}s0_t"][i]),
+                 "noise": torch.tensor(z[f"{prefix_}s0_noise"][i]),
+                 "x_t": torch.tensor(z[f"{prefix_}s0_x_t"][i])}
+                for i in range(4)]
+            res["tr_records"] = [
+                {"t": torch.tensor(z[f"{prefix_}formal_t"][i]),
+                 "noise": torch.tensor(z[f"{prefix_}formal_noise"][i]),
+                 "x_t": torch.tensor(z[f"{prefix_}formal_x_t"][i])}
+                for i in range(4)]
         return res
 
     res = make_res()
@@ -262,10 +285,6 @@ def test_parity_predicate_catches_tampering(audit_dir: Path):
     res["s0_params"]["model.bias"] = torch.full_like(res["s0_params"]["model.bias"], 0.01)
     res["tr_params"]["model.bias"] = torch.full_like(res["tr_params"]["model.bias"], 0.01)
     assert "parameter_unchanged:model.bias" in parity_problems(res)
-    # diffusion t/epsilon mismatch
-    res = make_res()
-    res["tr_records"][0]["noise"] = torch.tensor([0.2])
-    assert "t_or_epsilon_mismatch" in parity_problems(res)
     # pre-clip gradients are a separate contract from post-clip gradients
     res = make_res()
     res["tr_clip"]["pre"][0] = res["tr_clip"]["pre"][0] + 0.01
@@ -280,6 +299,11 @@ def test_parity_predicate_catches_tampering(audit_dir: Path):
     res = make_res()
     res["tr_parts"][0]["pos"] = 1.0
     assert "loss_part_mismatch:pos" in parity_problems(res)
+    # diffusion actual x_t must be the same on both sides
+    res = make_res("diffusion_no_clip__", "diffusion")
+    assert parity_problems(res) == []
+    res["tr_records"][0]["x_t"] = res["tr_records"][0]["x_t"] + 1.0
+    assert "t_epsilon_or_x_t_mismatch" in parity_problems(res)
 
 
 def test_sampling_facts(audit_dir: Path):
@@ -291,7 +315,11 @@ def test_sampling_facts(audit_dir: Path):
     assert s["ddim"]["thresholding"] is False
     rows = _rows(audit_dir)
     assert rows["sampling.ddim_single_step"]["status"] == "synthetic_verified"
-    assert rows["sampling.ddim_full_loop"]["status"] == "synthetic_verified"
+    full = rows["sampling.ddim_full_loop"]
+    assert full["status"] == "synthetic_verified"
+    assert full["actual"]["sample_calls"] == 1
+    assert full["actual"]["forward_calls"] == full["actual"]["timesteps"] == 5
+    assert full["actual"]["final_max_abs_error"] <= 1e-5
 
 
 def test_data_consumption_traces(audit_dir: Path):
@@ -407,10 +435,11 @@ def test_verifier_detects_missing_row_and_corrupt_artifact(audit_dir: Path, tmp_
 def test_verifier_detects_tampered_update_arrays(audit_dir: Path, tmp_path: Path):
     d = _copy_audit(audit_dir, tmp_path / "tamper_update")
     z = dict(np.load(d / "update_arrays.npz"))
-    z["formal_param_model.bias"] = z["formal_param_model.bias"] + np.float32(0.01)
+    key = "deterministic_no_clip__formal_param_model.bias"
+    z[key] = z[key] + np.float32(0.01)
     np.savez(d / "update_arrays.npz", **z)
     v = verify_audit_artifacts(d)
-    assert any("update_parameter_mismatch:model.bias" in p for p in v["problems"])
+    assert any("update_replay_mismatch" in p and "model.bias" in p for p in v["problems"])
     assert v["conclusion"] == "implementation_mismatch"
 
 
@@ -420,7 +449,7 @@ def test_verifier_detects_tampered_gradient_array(audit_dir: Path, tmp_path: Pat
     z["grad_vel"] = z["grad_vel"] + 0.1
     np.savez(d / "gradient_arrays.npz", **z)
     v = verify_audit_artifacts(d)
-    assert any("gradient_sum_mismatch" in p for p in v["problems"])
+    assert any("gradient_recompute_mismatch" in p or "gradient_saved_sum_mismatch" in p for p in v["problems"])
 
 
 def test_verifier_does_not_crash_on_missing_artifact(audit_dir: Path, tmp_path: Path):
@@ -565,3 +594,152 @@ def test_contact_branch_does_not_execute_at_zero_weight(monkeypatch):
     assert "contact_m2" not in parts
     assert sdf_calls == []
     assert all(tuple(c) != tuple(audit.HAND_SITE_NAMES) for c in fk.calls)
+
+
+def _tampered(audit_dir: Path, tmp_path: Path, name: str, mutate) -> dict:
+    d = _copy_audit(audit_dir, tmp_path / name)
+    mutate(d)
+    return verify_audit_artifacts(d)
+
+
+def test_verifier_detects_a5_evidence_attacks(audit_dir: Path, tmp_path: Path):
+    def empty_parity(d):
+        (d / "update_parity.json").write_text("{}")
+
+    def best_999(d):
+        o = _load("objective_rows.json", d)
+        for r in o["rows"]:
+            if r["id"] == "selection.best_uses_macro_complete_only":
+                r["actual"]["complete_run"]["best_formal_step"] = 999
+        (d / "objective_rows.json").write_text(json.dumps(o))
+
+    def nan_total(d):
+        o = _load("objective_rows.json", d)
+        for r in o["rows"]:
+            if r["id"] == "loss.total_weighted_sum":
+                r["actual"] = float("nan")
+        (d / "objective_rows.json").write_text(json.dumps(o))
+
+    def nan_grad(d):
+        z = dict(np.load(d / "gradient_arrays.npz"))
+        z["grad_vel"] = z["grad_vel"].copy()
+        z["grad_vel"].flat[0] = np.nan
+        np.savez(d / "gradient_arrays.npz", **z)
+
+    def double_grads(d):
+        z = dict(np.load(d / "gradient_arrays.npz"))
+        for k in list(z):
+            if k.startswith("grad_"):
+                z[k] = z[k] * 2
+        np.savez(d / "gradient_arrays.npz", **z)
+
+    def root_shift(d):
+        z = dict(np.load(d / "synthetic_inputs.npz"))
+        z["root"] = z["root"].copy()
+        z["root"][:, 0] += 100.0
+        np.savez(d / "synthetic_inputs.npz", **z)
+
+    def wfk_2000(d):
+        s = _load("static_contract.json", d)
+        s["effective_config"]["loss"]["w_fk"] = 2000.0
+        (d / "static_contract.json").write_text(json.dumps(s))
+
+    def xt_miswire(d):
+        z = dict(np.load(d / "update_arrays.npz"))
+        for k in list(z):
+            if k.endswith("__formal_x_t"):
+                run = k[: -len("formal_x_t")]
+                z[k] = z[run + "micro_x0"].copy()
+        np.savez(d / "update_arrays.npz", **z)
+
+    def objective_list(d):
+        (d / "objective_rows.json").write_text("[]")
+
+    def empty_errors(d):
+        s = _load("sampling_trace.json", d)
+        s["x_t_closed_form"]["max_abs_errors"] = []
+        (d / "sampling_trace.json").write_text(json.dumps(s))
+
+    def ddim_not_run(d):
+        o = _load("objective_rows.json", d)
+        for r in o["rows"]:
+            if r["id"] == "sampling.ddim_full_loop":
+                r["actual"]["sample_calls"] = 0
+        (d / "objective_rows.json").write_text(json.dumps(o))
+
+    expected = {
+        "empty_parity": ("audit_incomplete", "structure_empty:update_parity.runs"),
+        "best_999": ("implementation_mismatch", "selection_row_mismatch"),
+        "nan_total": ("implementation_mismatch", "nonfinite:objective"),
+        "nan_grad": ("implementation_mismatch", "nonfinite:gradient_arrays"),
+        "double_grads": ("implementation_mismatch", "gradient_recompute_mismatch"),
+        "root_shift": ("implementation_mismatch", "input_x0_not_bound"),
+        "wfk_2000": ("implementation_mismatch", "static_effective_loss_mismatch"),
+        "xt_miswire": ("implementation_mismatch", "update_replay_mismatch"),
+        "objective_list": ("audit_incomplete", "structure_not_mapping:objective_rows"),
+        "empty_errors": ("audit_incomplete", "sampling_x_t_errors_empty"),
+        "ddim_not_run": ("implementation_mismatch", "sampling_full_loop_not_executed"),
+    }
+    cases = [("empty_parity", empty_parity), ("best_999", best_999),
+             ("nan_total", nan_total), ("nan_grad", nan_grad),
+             ("double_grads", double_grads), ("root_shift", root_shift),
+             ("wfk_2000", wfk_2000), ("xt_miswire", xt_miswire),
+             ("objective_list", objective_list), ("empty_errors", empty_errors),
+             ("ddim_not_run", ddim_not_run)]
+    for name, mutate in cases:
+        v = _tampered(audit_dir, tmp_path, f"attack_{name}", mutate)
+        want_conclusion, want_problem = expected[name]
+        assert v["conclusion"] == want_conclusion, (name, v["problems"])
+        assert any(want_problem in p for p in v["problems"]), (name, v["problems"])
+
+
+def test_batch_invariance_is_not_zero_loss_and_detects_batch_sum():
+    world = build_synthetic_world()
+    weights = audit.W1_SYNTHETIC_WEIGHTS
+    target = world.x0
+    pred = target.copy()
+    pred[2:5, 0:3] += 0.02
+    a = build_synthetic_assembler(world.tokenizer, weights, torch.float64)
+    batch = make_synthetic_batch(world, B=3, dtype=torch.float64,
+                                 x0=np.stack([target, target, target]))
+    _, parts = a(torch.tensor(np.stack([pred, pred, pred]), dtype=torch.float64), batch)
+    expected = float(np.mean([
+        audit._independent_terms(pred, target, world, weights)["total"]
+        for _ in range(3)]))
+    assert parts["total"] > 1e-6
+    assert abs(parts["total"] - expected) < 1e-12
+    # a batch-size-summing loss would report 3x the mean; the audit's independent
+    # expected mean catches it instead of comparing the buggy value to itself
+    assert abs(parts["total"] * 3 - expected) > 1e-6
+
+
+def test_update_arrays_contain_all_four_runs_for_independent_replay(audit_dir: Path):
+    z = np.load(audit_dir / "update_arrays.npz")
+    for run_id in ("deterministic_no_clip", "deterministic_with_clip",
+                   "diffusion_no_clip", "diffusion_with_clip"):
+        for suffix in ("micro_x0", "s0_preds", "formal_preds", "s0_parts",
+                       "formal_parts", "s0_preclip_0", "formal_preclip_0",
+                       "s0_postclip_0", "formal_postclip_0", "s0_gnorm",
+                       "formal_gnorm", "s0_param_model.bias",
+                       "formal_param_model.bias", "s0_grad_model.bias",
+                       "formal_grad_model.bias", "s0_exp_avg_model.bias",
+                       "formal_exp_avg_model.bias"):
+            assert f"{run_id}__{suffix}" in z.files, (run_id, suffix)
+    # diffusion runs must carry the real t/epsilon/x_t inputs
+    for run_id in ("diffusion_no_clip", "diffusion_with_clip"):
+        for suffix in ("s0_t", "formal_t", "s0_noise", "formal_noise",
+                       "s0_x_t", "formal_x_t"):
+            assert f"{run_id}__{suffix}" in z.files, (run_id, suffix)
+
+
+def test_ddim_full_loop_is_executed(monkeypatch, tmp_path: Path):
+    from ireset.diffusion.generator import DiffusionG1
+
+    def boom(*_a, **_k):
+        raise RuntimeError("sampling loop disabled")
+
+    monkeypatch.setattr(DiffusionG1, "sample", boom)
+    rows, _, _ = audit.run_a3(build_synthetic_world(), tmp_path)
+    row = next(r for r in rows if r["id"] == "sampling.ddim_full_loop")
+    assert row["status"] == "contract_mismatch"
+    assert row["actual"]["sample_error"] is not None

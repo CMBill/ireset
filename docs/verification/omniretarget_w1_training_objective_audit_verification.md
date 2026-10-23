@@ -1,6 +1,6 @@
 # W1 训练拟合与目标一致性合成审计验证记录
 
-日期：2026-10-22。对应方案：[W1训练拟合与目标一致性单因素诊断执行方案](../plans/omniretarget_w1_training_fit_objective_audit_plan.md) A0–A5。**本次交付是纯合成审计实现与运行，不是真实数据审计或单因素训练预注册。**
+日期：2026-10-22（2026-10-22 复核轮修复 4 P1 + 4 P2 后重跑）。对应方案：[W1训练拟合与目标一致性单因素诊断执行方案](../plans/omniretarget_w1_training_fit_objective_audit_plan.md) A0–A5。**本次交付是纯合成审计实现与运行，不是真实数据审计或单因素训练预注册。**
 
 ## 0. 结论与边界
 
@@ -10,7 +10,7 @@
 | 退出码 | 0 |
 | 生产侧结论 | `synthetic_contract_passed` |
 | 独立复核结论 | `synthetic_contract_passed`；`problems=[]` |
-| 审计行 | **66**：A0 静态 22、A1 23、A2 14、A3 19、A4 10 |
+| 审计行 | **A1–A4 66 + A0 静态 22 = 88**（A1 23、A2 14、A3 19、A4 10；A0 22） |
 | 失败/缺口 | **0 / 0** |
 | 已登记限制 | **5**（见 §8） |
 | 真实数据/真实 checkpoint/真实 G1 FK | 0 / 0 / 0（均 `not_run`） |
@@ -26,16 +26,16 @@
 | --- | --- |
 | [src/ireset/eval/training_objective_audit.py](../../src/ireset/eval/training_objective_audit.py) | 独立合成审计模块：A0 静态契约、A1/A2/A4 对拍、A3 循环/采样/RNG、A5 独立复核；不修改默认 loss、模型或数据入口 |
 | [scripts/audit_w1_training_objective.py](../../scripts/audit_w1_training_objective.py) | 默认纯合成入口；显式拒绝 manifest/cache/checkpoint/预注册/预算/demo/step/seed 等真实或研究输入；不调用旧诊断脚本 |
-| [tests/test_w1_training_objective_audit.py](../../tests/test_w1_training_objective_audit.py) | 26 项正向链与篡改反例；临时目录，不扫描生产历史 |
+| [tests/test_w1_training_objective_audit.py](../../tests/test_w1_training_objective_audit.py) | 30 项正向链与篡改反例（含 A5 证据攻击矩阵与 DDIM 全循环）；临时目录，不扫描生产历史 |
 | [derived/audit/w1_training_objective_audit/](../../derived/audit/w1_training_objective_audit/) | 权威合成产物：`static_contract.json`、`s0_formal_comparison.json`、`objective_rows.json`、`synthetic_inputs.npz`、`gradient_rows.json`、`gradient_arrays.npz`、`update_parity.json`、`update_arrays.npz`、`sampling_trace.json`、`rng_state_facts.json`、`audit_summary.json`、`independent_verification.json` |
 
-权威运行的基础提交为 `7b934ddf438625deee4c1d13142595b17b9fa2df`；运行时新审计文件尚未跟踪，`static_contract.json` 记录 `git.dirty=true`、tracked diff 为空哈希，并单独登记三个新文件 SHA-256：
+权威运行基于已提交的 `9fcbdf6a59baf1adca79f80506c3564d80a4a3d9`；复核修复文件在运行时尚未提交，`static_contract.json` 记录 `git.dirty=true`、tracked diff SHA-256 `860a4282a41cc287ae5958aa82b153cdf8eb8778e468eaac4de489ef9d72d982`，并单独登记三个实现文件 SHA-256：
 
 | 文件 | SHA-256 |
 | --- | --- |
-| `src/ireset/eval/training_objective_audit.py` | `2749ba9318acf10c0da0c88a381126e608ece1d626d01ae2528474a433fe21ba` |
+| `src/ireset/eval/training_objective_audit.py` | `601d5f288c917816b3f10491ad1dcadd45842d96dc3cec5b09883572a3958182` |
 | `scripts/audit_w1_training_objective.py` | `2816a31d1a211b9f46caf51e391cdb61934b33b55540519aace1d47e3306c832` |
-| `tests/test_w1_training_objective_audit.py` | `831b1202ea313b4f8a2bd57d65a8a6b6851d62d3b05f6fc31ae7fa204c2a9973` |
+| `tests/test_w1_training_objective_audit.py` | `fe3b5f1f2f583993ce7397df0034c0077c32294c714f7a14ff5e9fc746d16b93` |
 
 配置文件 `configs/train/omniretarget_motion.yaml` 原字节 SHA-256：`0e2cfa96849ee2de14ac84b7343289090c606f78116bb79114ff81b046b521e0`。
 
@@ -57,7 +57,7 @@
   - 全目标 `total` = **5.599772600542075e-4**；分项 `pos=4.9549856908e-5`、`rot6d=4.9329040122e-5`、`joint=5.0213358583e-5`、`geodesic_rad2=1.3462212551e-4`、`vel=4.4898224644e-6`、`fk_m2=1.7066451523e-4`（合成 FK）。
   - 分组均值 vs 38 通道整体 MSE：分组和 **1.4909225561e-4**，整体 MSE **5.0021347641e-5**，差 **9.9070907972e-5**；实现 `total` 与分组和差 **2.7105e-20**，证明没有暗中退化成整体 MSE。
   - `vel` 对全部 38 通道共同归约：**4.4898224644e-6**；若按三组分别求 vel 再相加会得到 **1.3597526734e-5**，二者不同，归约口径被钉住。
-  - batch 重排/重复不改变均值；`pos/rot/joint/adjacent` 四类扰动分别对拍通过。
+  - batch 重排/重复使用**独立目标与非零、不同大小的逐样本残差**；排列/重复后的 total/pos/vel 均以独立期望均值为准（副本 total=**6.3221850458e-4**），不再退化为零损失。`pos/rot/joint/adjacent` 四类扰动分别对拍通过。
 - 数值域：近零 6D 的 `ok=False`；零 6D 时 `LossAssembler.decode_clip` 会用单位四元数占位但 tokenizer 的 `ok` 明确为 False，正式 Trainer 拒绝（已登记为“仅正式调用方有门”的限制）；饱和 logits 输出严格在 `[-1,1]`；关节边界 `u=±1/±1.5` 按 clamp 后的限位值解码。
 - 近 π 负门原样保留：相对角 `π-1e-4` 时独立期望 `1.2336220116`，实现 `geodesic_rad2=0.0616674696`（相对误差 **0.9500**）。这是已知的 `so3_log_torch` 近 π 精度限制，**没有被零旋转/零误差回退成通过**，也不是本轮新增缺陷；行状态为 `synthetic_verified` 并带 `limitation=near_pi_precision_negative_gate_retained`。
 - 平行 6D 列：tokenizer 自身的 `ok` 标志没有识别（`decode` 随后在 scipy 因非正行列式抛 `ValueError`）；正式 Trainer 的 `_rotation6d_valid` 与生成器 `_valid_windows` 均拒绝该输入。记录为工具/未使用解码路径的限制，而不是静默零旋转通过。
@@ -77,10 +77,11 @@
 ## 5. A3 更新循环、噪声与 RNG
 
 - 共 4 个 S0-vs-正式 Trainer parity run（确定性/扩散 × 无裁剪/裁剪），每个 run 两侧各 **4** 个 micro-batch 实际消费；同一初始替身参数、同一有序 micro-batch、同一 t/epsilon。
-- 四个 run 的 `parity_problems=[]`：前向输出 **逐位相等**、分项 loss（pos/rot6d/joint/geodesic/vel/fk/total）**逐项一致**、更新后参数 **逐位相等**、裁剪前梯度 **逐位相等**、裁剪后梯度 **逐位相等**、AdamW `step/exp_avg/exp_avg_sq` **逐位相等**、扩散 t/epsilon **逐位相等**、参数确实发生变化、模型与 conditioner 两个模块梯度均非零。
-- micro loss 确实除以 `grad_accum`：累加梯度与“逐 micro loss 求和后除 grad_accum”的最大差 **0.0**，梯度范数 **0.7765777111**；若漏除一次，两种路径可区分。等大小 micro（2+2）累加与一次 4 窗大 batch 的最大差 **1.8626451492e-9**（≤1e-6），确认等大小累计正确。样本加权与 micro 等权的最大差 **0.1683333814**，说明实现语义是 micro 均值等权，S0 因六窗等大小而不产生该差异。
+- 四个 run 的 `parity_problems=[]`：前向输出 **逐位相等**、分项 loss（pos/rot6d/joint/geodesic/vel/fk/total）**逐项一致**、更新后参数 **逐位相等**、裁剪前梯度 **逐位相等**、裁剪后梯度 **逐位相等**、AdamW `step/exp_avg/exp_avg_sq` **逐位相等**、扩散 t/epsilon/x_t **逐位相等**、参数确实发生变化、模型与 conditioner 两个模块梯度均非零。
+- 四个 run 的**完整原始证据**写入 `update_arrays.npz`（micro 目标、两侧前向、分项 loss、裁剪前后梯度、参数、AdamW 状态、扩散 t/noise/x_t）；A5 从这些数组和绑定输入**逐一重放**四组更新，并重算两组选模，不再只检查文件存在或自报字段。
+- micro loss 确实除以 `grad_accum`：累加梯度与“逐 micro loss 求和后除 grad_accum”的最大差 **0.0**，梯度范数 **1.3948284388**；若漏除一次，两种路径可区分。等大小 micro（2+2）累加与一次 4 窗大 batch 的最大差 **1.8626451492e-9**（≤1e-6），确认等大小累计正确。样本加权与 micro 等权的最大差 **0.3381143212**，说明实现语义是 micro 均值等权，S0 因六窗等大小而不产生该差异。
 - optimizer 成员：2 个参数、2 个 optimizer 参数、重复 **0**；AdamW 单步参考（lr=1e-4、wd=1e-5、betas=0.9/0.999）最大误差 **0.0**；Trainer 无 `lr_scheduler` 调用，固定 lr。
-- 扩散：`add_noise` 与独立 alpha 公式在 t=0/1/500/999 的 `x_t` 最大误差 **0.0**；t=0 噪声比例 **0.0100008296**（非无噪）；`prediction_type=sample`、`clip_sample=False`、`thresholding=False`、`final_alpha_cumprod=1.0`；DDIM 单步（t=600、eta=0）与独立公式最大误差 **0.0**，完整 DDIM 采样与单步去噪分列。
+- 扩散：`add_noise` 与独立 alpha 公式在 t=0/1/500/999 的 `x_t` 最大误差 **0.0**；t=0 噪声比例 **0.0100008296**（非无噪）；`prediction_type=sample`、`clip_sample=False`、`thresholding=False`、`final_alpha_cumprod=1.0`；DDIM 单步（t=600、eta=0）与独立公式最大误差 **0.0**；**完整 DDIM 循环实际执行**：`sample_calls=1`、`forward_calls=5`、`timesteps=5`、最终输出与 perfect-x0 目标最大误差 **0.0**，采样循环被禁用时会登记 `contract_mismatch` 而不是停留在配置检查。
 - 数据消费：S0 六窗整批 **24** 次消费、6 个唯一窗口、每个恰好 4 次；正式 4×4、10 窗数据集 **32** 次消费、8 个 micro-batch、每 epoch 丢 **2** 窗，4 个 epoch 的丢弃集合分别为 `[2,8]/[1,6]/[6,8]/[0,7]`，累计覆盖 0–9 全部窗口。
 - RNG：`_evaluation_state` 在故意异常后恢复 Python/NumPy/Torch CPU 状态与模块训练标志；DataLoader 使用独立 generator 时不污染全局流，`generator=None` 时会消耗全局流（两向都记录）。
 
@@ -99,11 +100,29 @@
 
 | 检查 | 结果 |
 | --- | --- |
-| 独立重算 pos/rot6d/joint/geodesic/vel/fk/total | 与生产者行一致；total 重算 **5.5997726005e-4** |
-| 梯度加权和 vs 总梯度 | 最大绝对误差 **4.3368086899e-19** |
-| 独立 AdamW 第一步 vs 存盘参数 | 最大绝对误差 **0.0** |
+| 独立重算 pos/rot6d/joint/geodesic/vel/fk/total（输入/配置逐字段绑定） | 与生产者行一致；total 重算 **5.5997726005e-4**；root/q/wfc 重编码必须逐位回到 x0；有效损失权重须与配置文件及 W1 契约一致 |
+| 从原始输入重算六项梯度 vs 保存梯度 | 每项均要求一致（容差 1e-8），不是只验证保存数组的加权和 |
+| update replay：4 个 run 的前向、分项 loss、裁剪前后梯度、参数、AdamW 状态 | 全部与保存证据一致；A5 `checks` 含 `independent.update_replay:{det,diff}_{no,with}_clip` |
+| selection replay：两组 raw callback 行 | 从 `per_demo` 重算 demo 等权宏/complete，重推 best step：完整 run=2、缺行 run=1；A5 `checks` 含 `independent.selection:{complete,incomplete}_run` |
+| 结构/有限性 | 顶层与嵌套 mapping/list、必需键、形状、非空集合先校验；NaN/Inf 在容差判定前登记为失败 |
 
-篡改测试（26 项测试内）：目标 total +0.1 → `objective_recompute_mismatch`/`implementation_mismatch`；删除 `grad.vel` → `missing_row:A2:grad.vel`/`audit_incomplete`；`gradient_rows.json` 写坏 → `unreadable_artifact`/`audit_incomplete`；`formal_param_model.bias` +0.01 → `update_parameter_mismatch`/`implementation_mismatch`；`grad_vel` +0.1 → `gradient_sum_mismatch`；删除 `static_contract.json` → `missing_artifact`/`audit_incomplete`，验证器均未崩溃且仍写出报告。
+复核攻击矩阵（30 项测试与独立脚本；均在临时副本/合成故障注入，权威产物未改写）：
+
+| 攻击 | A5 反应 |
+| --- | --- |
+| `update_parity.json={}` | `structure_empty:update_parity.runs` / `audit_incomplete` |
+| `best_formal_step` 2→999 | `selection_row_mismatch:complete_run:2!=999` / `implementation_mismatch` |
+| loss total 置 NaN | `nonfinite:objective.loss.total_weighted_sum.total` / `implementation_mismatch` |
+| `grad_vel` 一个元素 NaN | `nonfinite:gradient_arrays.grad_vel` / `implementation_mismatch` |
+| 全部 `grad_*` ×2 | `gradient_recompute_mismatch` / `implementation_mismatch` |
+| `synthetic_inputs.root` +100m | `input_x0_not_bound` / `implementation_mismatch` |
+| `effective_config.loss.w_fk=2000` | `static_effective_loss_mismatch` / `implementation_mismatch` |
+| 正式 Trainer 的 x_t 换成干净 x0 | `update_replay_mismatch`（前向/分项 loss）与 s0/formal x_t 不等 / `implementation_mismatch` |
+| DDIM 循环禁用/未执行 | `sampling_full_loop_not_executed` / `implementation_mismatch` |
+| `objective_rows.json=[]` | `structure_not_mapping` + 缺行，正常落盘 / `audit_incomplete` |
+| `max_abs_errors=[]` | `sampling_x_t_errors_empty_or_mismatched`，不再 `max([])` 崩溃 / `audit_incomplete` |
+
+其余旧攻击（目标 total +0.1、删除 `grad.vel`、写坏 JSON、改 update 参数、改 `grad_vel`、删除 `static_contract.json`）继续被拦截；验证器顶层异常也会由 wrapper 写入 `verifier_exception` 报告，而不是中断。
 
 ## 8. 已登记限制（不冒充通过）
 
@@ -117,12 +136,12 @@
 
 ```
 uv run --locked pytest tests/test_w1_training_objective_audit.py -q
-# 26 passed in 10.95s
+# 30 passed in 17.08s
 ```
 
-测试覆盖：完整 A1–A4 正向链；解析编码/解码、分组均值与 38 通道 vel、四类扰动、batch 重排/重复、近零/平行/近 π/关节边界/饱和 logits、接触分支静默、FK 合成标记；逐项梯度、权重消费、detach 反例、FK target no_grad、有限差分、float32、参数链式法则；S0/正式四项 parity、裁剪/无裁剪、micro 除法、样本加权区别、optimizer 成员、AdamW 参考、无 scheduler、x_t/t=0/DDIM、两种数据消费、RNG 恢复与独立 generator；宏微排名、物理 FK MPJPE、roster/坏行、选模、确定性与舍入限制；独立复核的目标/梯度/更新数组篡改、缺行、坏 JSON、缺工件；CLI 真实输入拒绝与端到端合成运行。
+测试覆盖：完整 A1–A4 正向链与 A5 证据攻击矩阵；解析编码/解码、分组均值与 38 通道 vel、四类扰动、batch 重排/重复、近零/平行/近 π/关节边界/饱和 logits、接触分支静默、FK 合成标记；逐项梯度、权重消费、detach 反例、FK target no_grad、有限差分、float32、参数链式法则；S0/正式四项 parity、裁剪/无裁剪、micro 除法、样本加权区别、optimizer 成员、AdamW 参考、无 scheduler、x_t/t=0/DDIM、两种数据消费、RNG 恢复与独立 generator；宏微排名、物理 FK MPJPE、roster/坏行、选模、确定性与舍入限制；独立复核的目标/梯度/更新数组篡改、缺行、坏 JSON、缺工件；CLI 真实输入拒绝与端到端合成运行。
 
-**未重跑全项目套件。** 上一次全量记录仍为 2026-10-22 首轮修复后的 **947 passed + 1 skipped**（旧范围），本记录不冒充新的全量结果。审计模块的 26 项测试与权威运行是本次新增的独立证据。
+**未重跑全项目套件。** 上一次全量记录仍为 2026-10-22 首轮修复后的 **947 passed + 1 skipped**（旧范围），本记录不冒充新的全量结果。审计模块的 30 项测试与权威运行是本次新增的独立证据。
 
 ## 10. 边界与下一交付
 

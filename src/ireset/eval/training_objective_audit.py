@@ -66,6 +66,7 @@ AUDIT_SOURCE = "synthetic_only"
 #: literal initial values of the loop stand-ins; "same initial parameters"
 #: is a property of the constructor, not a post-hoc copy.
 INITIAL_PARAMS = {"model.bias": 0.01, "conditioner.scale": 1.0}
+LOSS_PART_KEYS = ("pos", "rot6d", "joint", "geodesic_rad2", "vel", "fk_m2", "total")
 
 W1_SYNTHETIC_WEIGHTS = LossWeights(
     w_pos=1.0, w_rot6d=1.0, w_joint=1.0, w_geodesic=0.5,
@@ -179,6 +180,7 @@ REQUIRED_ARTIFACTS = (
     "update_arrays.npz",
     "sampling_trace.json",
     "rng_state_facts.json",
+    "selection_evidence.json",
     "audit_summary.json",
 )
 
@@ -942,24 +944,46 @@ def run_a1(world: SyntheticWorld) -> tuple[list[dict], dict]:
                                              ("pos", "rot6d", "joint", "geodesic_rad2",
                                               "vel", "fk_m2")}}))
 
-    # batch permutation / repeat invariance
-    pred_b = np.stack([pred, _make_pred(world, "adjacent_frames"), pred * 0.5 + x0 * 0.5])
-    batch = make_synthetic_batch(world, B=3, dtype=torch.float64, x0=pred_b)
+    # batch permutation / repeat invariance with an INDEPENDENT target and
+    # nonzero, different per-sample residuals.  Using pred_b as its own target
+    # would make total/pos/vel exactly zero and hide a batch-size-summing bug.
+    target_b = np.stack([x0, x0, x0])
+    pred_b = target_b.copy()
+    pred_b[0, 2:5, 0:3] += np.array([0.02, -0.01, 0.03])
+    pred_b[1, 1:6, 3:9] += 0.01
+    pred_b[2, 0:4, 9:20] += 0.03
+    batch = make_synthetic_batch(world, B=3, dtype=torch.float64, x0=target_b)
     _, p1 = a(torch.tensor(pred_b, dtype=torch.float64), batch)
+    expected_b = [float(np.mean([
+        _independent_terms(pred_b[i], target_b[i], world, weights)["total"]
+        for i in range(3)]))]
+    expected_pos = [float(np.mean([
+        _independent_terms(pred_b[i], target_b[i], world, weights)["pos"]
+        for i in range(3)]))]
+    expected_vel = [float(np.mean([
+        _independent_terms(pred_b[i], target_b[i], world, weights)["vel"]
+        for i in range(3)]))]
     perm = np.array([2, 0, 1])
-    batch_p = make_synthetic_batch(world, B=3, dtype=torch.float64, x0=pred_b[perm])
+    batch_p = make_synthetic_batch(world, B=3, dtype=torch.float64, x0=target_b[perm])
     _, p2 = a(torch.tensor(pred_b[perm], dtype=torch.float64), batch_p)
     rows.append(_compare("loss.batch_permutation_invariance", "A1",
+                         expected_b + expected_pos + expected_vel,
                          [p1["total"], p1["pos"], p1["vel"]],
-                         [p2["total"], p2["pos"], p2["vel"]],
-                         TOLERANCES["loss_float64"]))
+                         TOLERANCES["loss_float64"],
+                         evidence={"nonzero_per_sample_residual": True,
+                                   "per_sample_totals": [
+                                       _independent_terms(pred_b[i], target_b[i], world, weights)["total"]
+                                       for i in range(3)],
+                                   "permuted": [p2["total"], p2["pos"], p2["vel"]]}))
     batch_r = make_synthetic_batch(world, B=6, dtype=torch.float64,
-                                   x0=np.concatenate([pred_b, pred_b], axis=0))
+                                   x0=np.concatenate([target_b, target_b], axis=0))
     _, p3 = a(torch.tensor(np.concatenate([pred_b, pred_b], axis=0), dtype=torch.float64), batch_r)
     rows.append(_compare("loss.repeated_batch_invariance", "A1",
-                         [p1["total"], p1["pos"], p1["vel"]],
+                         expected_b + expected_pos + expected_vel,
                          [p3["total"], p3["pos"], p3["vel"]],
-                         TOLERANCES["loss_float64"]))
+                         TOLERANCES["loss_float64"],
+                         evidence={"repeated_total": p3["total"],
+                                   "nonzero_per_sample_residual": True}))
 
     # 5. numerical domains
     z = x0.copy(); z[1, 3:9] = [1e-9, 0, 0, 1e-9, 0, 0]
@@ -1145,8 +1169,8 @@ def run_a1(world: SyntheticWorld) -> tuple[list[dict], dict]:
         "root": world.root, "q": world.q, "wfc": world.wfc,
         "mean": tk.root_stats.mean, "std": tk.root_stats.std,
         "lo": tk.lo, "hi": tk.hi,
-        "box_t_clip": world.center[None, :], "box_quat": world.box_quat,
-        "contact": world.contact,
+        "box_t_clip": world.center[None, :], "center": world.center,
+        "box_quat": world.box_quat, "contact": world.contact,
     }
     return rows, inputs
 
@@ -1398,9 +1422,12 @@ class _StubModel(nn.Module):
             self.records.append({"kind": "train_or_probe", "t": t.detach().clone(),
                                  "x_t": x_t.detach().clone(),
                                  "noise": None if self._last_noise is None else self._last_noise.clone()})
+            # deliberately depend on the ACTUAL x_t and timestep so a wrong
+            # noise wiring changes forward output, losses and updates
+            out = mem + self.bias + 0.02 * x_t                 + 0.02 * (t.float() / 1000.0)[:, None, None]
         else:
             mem = a
-        out = mem + self.bias
+            out = mem + self.bias
         self.preds.append(out.detach().clone())
         return out
 
@@ -1463,8 +1490,7 @@ def _stub_cfg(model_type: str, *, steps: int, micro_batch: int, grad_accum: int,
         seed=1234, num_workers=0, val_every=10, log_every=1000, device="cpu",
         val_seed=99, d_model=8, n_layers=1, n_heads=2, ffn_mult=2,
         time_window=3, num_train_timesteps=1000,
-        loss=LossWeights(w_pos=1, w_rot6d=1, w_joint=1, w_geodesic=0.5,
-                         w_fk=0.0, w_contact=0.0, w_vel=0.5))
+        loss=W1_SYNTHETIC_WEIGHTS)
 
 
 def _load_w1_s0():
@@ -1592,8 +1618,10 @@ def parity_problems(res: dict, grad_accum: int = 4,
         problems.append("t_epsilon_record_count_mismatch")
     else:
         for a, b in zip(s0r, trr):
-            if not torch.equal(a["t"], b["t"]) or not torch.equal(a["noise"], b["noise"]):
-                problems.append("t_or_epsilon_mismatch")
+            if (not torch.equal(a["t"], b["t"])
+                    or not torch.equal(a["noise"], b["noise"])
+                    or not torch.equal(a["x_t"], b["x_t"])):
+                problems.append("t_epsilon_or_x_t_mismatch")
                 break
     return problems
 
@@ -1621,7 +1649,7 @@ def _run_parity_once(world: SyntheticWorld, model_type: str, grad_clip: float,
     class _Factory:
         def __call__(self, tokenizer, weights, device):
             rec = _RecordingLoss(
-                build_synthetic_assembler(tokenizer, weights, torch.float32, use_fk=False))
+                build_synthetic_assembler(tokenizer, weights, torch.float32, use_fk=True))
             _Factory.instances.append(rec)
             return rec
 
@@ -1672,6 +1700,8 @@ def _run_parity_once(world: SyntheticWorld, model_type: str, grad_clip: float,
         s0_adam = _RecordingAdamW.instances[-1]
         s0_records = [r for r in s0_model.records if r["t"].shape[0] == 4]
         s0_micro_calls = sum(1 for n in s0_model.call_sizes if n == 4)
+        micro_x0 = [torch.stack([items[j]["x0"] for j in idx])
+                    for idx in ([0, 1, 2, 3], [4, 5, 6, 7], [0, 1, 2, 3], [4, 5, 6, 7])]
         s0_params = {f"model.{n}": p.detach().clone()
                      for n, p in s0_model.named_parameters()}
         s0_params.update({f"conditioner.{n}": p.detach().clone()
@@ -1740,6 +1770,8 @@ def _run_parity_once(world: SyntheticWorld, model_type: str, grad_clip: float,
             "s0_parts": s0_parts, "tr_parts": tr_parts,
             "s0_forward_n": len(s0_preds), "tr_forward_n": len(tr_preds),
             "s0_loss_n": len(s0_parts), "tr_loss_n": len(tr_parts),
+            "model_type": model_type, "grad_clip": grad_clip,
+            "micro_x0": micro_x0,
             "s0_summary": s0_summary, "tr_summary": summary,
         }
     finally:
@@ -1767,6 +1799,7 @@ def run_a3(world: SyntheticWorld, tmp_root: Path) -> tuple[list[dict], dict, dic
         for clip, label in ((1e9, "no_clip"), (1e-6, "with_clip")):
             res = _run_parity_once(world, model_type, clip, tmp_root)
             problems = parity_problems(res)
+            prefix = f"{model_type}_{label}"
             rid = f"update.{model_type}_{label}_parity"
             rows.append(_row(rid, "A3",
                              "synthetic_verified" if not problems else "contract_mismatch",
@@ -1784,21 +1817,60 @@ def run_a3(world: SyntheticWorld, tmp_root: Path) -> tuple[list[dict], dict, dic
                                      "loss_part_records_formal": res["tr_loss_n"]},
                              evidence={"model_type": model_type, "grad_clip": clip,
                                        "stub": "minimal deterministic modules; same initial parameters"}))
-            parity_json["runs"].append({"model_type": model_type, "grad_clip": clip,
+            parity_json["runs"].append({"run_id": prefix,
+                                        "model_type": model_type, "grad_clip": clip,
                                         "problems": problems,
                                         "n_micro_s0": res["s0_micro_calls"],
                                         "n_micro_formal": res["tr_micro_calls"],
                                         "forward_records_s0": res["s0_forward_n"],
                                         "forward_records_formal": res["tr_forward_n"],
                                         "loss_part_records_s0": res["s0_loss_n"],
-                                        "loss_part_records_formal": res["tr_loss_n"]})
-            if model_type == "deterministic" and label == "no_clip":
-                for n in sorted(res["s0_params"]):
-                    parity_arrays[f"s0_param_{n}"] = res["s0_params"][n].numpy()
-                    parity_arrays[f"formal_param_{n}"] = res["tr_params"][n].numpy()
-                    if res["s0_grads"][n] is not None:
-                        parity_arrays[f"s0_grad_{n}"] = res["s0_grads"][n].numpy()
-                        parity_arrays[f"formal_grad_{n}"] = res["tr_grads"][n].numpy()
+                                        "loss_part_records_formal": res["tr_loss_n"],
+                                        "micro_x0_shape": list(np.stack(
+                                            [m.numpy() for m in res["micro_x0"]]).shape),
+                                        "part_keys": list(LOSS_PART_KEYS),
+                                        "grad_clip": float(clip)})
+            prefix = f"{model_type}_{label}"
+            parity_arrays[f"{prefix}__micro_x0"] = np.stack(
+                [m.numpy() for m in res["micro_x0"]])
+            parity_arrays[f"{prefix}__s0_preds"] = np.stack(
+                [p.numpy() for p in res["s0_preds"]])
+            parity_arrays[f"{prefix}__formal_preds"] = np.stack(
+                [p.numpy() for p in res["tr_preds"]])
+            parity_arrays[f"{prefix}__s0_parts"] = np.asarray(
+                [[p[k] for k in LOSS_PART_KEYS] for p in res["s0_parts"]], dtype=np.float32)
+            parity_arrays[f"{prefix}__formal_parts"] = np.asarray(
+                [[p[k] for k in LOSS_PART_KEYS] for p in res["tr_parts"]], dtype=np.float32)
+            parity_arrays[f"{prefix}__initial_bias"] = np.asarray(
+                INITIAL_PARAMS["model.bias"], dtype=np.float32)
+            parity_arrays[f"{prefix}__initial_scale"] = np.asarray(
+                INITIAL_PARAMS["conditioner.scale"], dtype=np.float32)
+            parity_arrays[f"{prefix}__grad_clip"] = np.asarray(float(clip), dtype=np.float64)
+            for side, clip_rec in (("s0", res["s0_clip"]), ("formal", res["tr_clip"])):
+                parity_arrays[f"{prefix}__{side}_preclip_0"] = clip_rec["pre"][0].numpy()
+                parity_arrays[f"{prefix}__{side}_preclip_1"] = clip_rec["pre"][1].numpy()
+                parity_arrays[f"{prefix}__{side}_postclip_0"] = clip_rec["post"][0].numpy()
+                parity_arrays[f"{prefix}__{side}_postclip_1"] = clip_rec["post"][1].numpy()
+                parity_arrays[f"{prefix}__{side}_gnorm"] = np.asarray(
+                    clip_rec["gnorm"], dtype=np.float64)
+            for side, params, grads, state in (
+                    ("s0", res["s0_params"], res["s0_grads"], res["s0_state"]),
+                    ("formal", res["tr_params"], res["tr_grads"], res["tr_state"])):
+                for n in sorted(params):
+                    parity_arrays[f"{prefix}__{side}_param_{n}"] = params[n].numpy()
+                    parity_arrays[f"{prefix}__{side}_grad_{n}"] = grads[n].numpy()
+                    parity_arrays[f"{prefix}__{side}_step_{n}"] = np.asarray(
+                        state[n]["step"], dtype=np.int64)
+                    parity_arrays[f"{prefix}__{side}_exp_avg_{n}"] = state[n]["exp_avg"].numpy()
+                    parity_arrays[f"{prefix}__{side}_exp_avg_sq_{n}"] = state[n]["exp_avg_sq"].numpy()
+            if model_type == "diffusion":
+                for side, records in (("s0", res["s0_records"]), ("formal", res["tr_records"])):
+                    parity_arrays[f"{prefix}__{side}_t"] = torch.stack(
+                        [r["t"] for r in records]).numpy()
+                    parity_arrays[f"{prefix}__{side}_noise"] = torch.stack(
+                        [r["noise"] for r in records]).numpy()
+                    parity_arrays[f"{prefix}__{side}_x_t"] = torch.stack(
+                        [r["x_t"] for r in records]).numpy()
 
     # gradient accumulation division and sample-weighting distinction
     cfg = _stub_cfg("deterministic", steps=1, micro_batch=4, grad_accum=2, grad_clip=1e9)
@@ -1806,7 +1878,7 @@ def run_a3(world: SyntheticWorld, tmp_root: Path) -> tuple[list[dict], dict, dic
     cond = _StubConditioner()
     with torch.no_grad():
         cond.scale.fill_(1.5)   # prediction must depend on the target per sample
-    asm = build_synthetic_assembler(world.tokenizer, cfg.loss, torch.float32, use_fk=False)
+    asm = build_synthetic_assembler(world.tokenizer, cfg.loss, torch.float32, use_fk=True)
     items = _make_items(world, 6)
     # make the two micro-batch means differ in scale so equal-micro weighting
     # is numerically distinguishable from sample weighting
@@ -1957,18 +2029,50 @@ def run_a3(world: SyntheticWorld, tmp_root: Path) -> tuple[list[dict], dict, dic
                      expected={"noise_fraction_at_t0": ">0", "not_noiseless": True},
                      actual={"noise_fraction_at_t0": t0_frac,
                              "alpha_cumprod_t0": float(diff.ddpm.alphas_cumprod[0])}))
+    # FULL DDIM loop: actually execute DiffusionG1.sample with a perfect-x0
+    # forward, count its calls and verify the final step returns the target.
+    # A config-only check cannot notice a broken/no-op sampling loop.
+    target = torch.tensor(world.x0, dtype=torch.float32)[None]
+    fwd_calls = {"n": 0}
+
+    def perfect_forward(x_t, t, memory):
+        fwd_calls["n"] += 1
+        return target
+
+    diff.forward = perfect_forward
+    sample_error, sampled = None, None
+    try:
+        sampled = diff.sample(torch.zeros(1, 4, 8), world.T, steps=5,
+                              generator=torch.Generator().manual_seed(5))
+    except Exception as exc:  # noqa: BLE001 -- the loop failure is the finding
+        sample_error = f"{type(exc).__name__}: {exc}"
+    n_timesteps = len(diff.ddim.timesteps)
+    final_err = (float((sampled - target).abs().max())
+                 if sampled is not None else None)
+    full_ok = (sample_error is None
+               and diff.ddim.config.prediction_type == "sample"
+               and diff.ddim.config.clip_sample is False
+               and diff.ddim.config.thresholding is False
+               and float(diff.ddim.final_alpha_cumprod) == 1.0
+               and n_timesteps == 5
+               and fwd_calls["n"] == n_timesteps
+               and sampled is not None and tuple(sampled.shape) == tuple(target.shape)
+               and final_err is not None and final_err <= 1e-5)
     rows.append(_row("sampling.ddim_full_loop", "A3",
-                     "synthetic_verified" if (
-                         diff.ddim.config.prediction_type == "sample"
-                         and diff.ddim.config.clip_sample is False
-                         and diff.ddim.config.thresholding is False)
-                     else "contract_mismatch",
+                     "synthetic_verified" if full_ok else "contract_mismatch",
                      expected={"prediction_type": "sample", "clip_sample": False,
-                               "thresholding": False, "final_alpha_cumprod": 1.0},
+                               "thresholding": False, "final_alpha_cumprod": 1.0,
+                               "sample_calls": 1, "forward_calls": 5,
+                               "final_max_abs_error": "<=1e-5"},
                      actual={"prediction_type": diff.ddim.config.prediction_type,
                              "clip_sample": diff.ddim.config.clip_sample,
                              "thresholding": diff.ddim.config.thresholding,
-                             "final_alpha_cumprod": float(diff.ddim.final_alpha_cumprod)}))
+                             "final_alpha_cumprod": float(diff.ddim.final_alpha_cumprod),
+                             "sample_calls": 1,
+                             "forward_calls": fwd_calls["n"],
+                             "timesteps": n_timesteps,
+                             "final_max_abs_error": final_err,
+                             "sample_error": sample_error}))
 
     # single DDIM step vs independent eta=0 formula
     diff.ddim.set_timesteps(5)
@@ -2003,7 +2107,7 @@ def run_a3(world: SyntheticWorld, tmp_root: Path) -> tuple[list[dict], dict, dic
     real_loss = losses_mod.LossAssembler
     class _F:
         def __call__(self, tokenizer, weights, device):
-            return build_synthetic_assembler(tokenizer, weights, torch.float32, use_fk=False)
+            return build_synthetic_assembler(tokenizer, weights, torch.float32, use_fk=True)
     try:
         s0.build_s0_modules = lambda mt, cf, dv: (_StubModel(mt), _StubConditioner())
         losses_mod.LossAssembler = _F()
@@ -2218,7 +2322,7 @@ def run_a4(world: SyntheticWorld, tmp_root: Path) -> tuple[list[dict], dict]:
         trainer_mod.ConditionEncoder = lambda d: cond
         class _F:
             def __call__(self, tokenizer, weights, device):
-                return build_synthetic_assembler(tokenizer, weights, torch.float32, use_fk=False)
+                return build_synthetic_assembler(tokenizer, weights, torch.float32, use_fk=True)
         trainer_mod.LossAssembler = _F()
         tr = trainer_mod.Trainer(cfg, world.tokenizer, _ListDataset(items[:3]), val_ds,
                                  tmp_root / "a4_validate")
@@ -2226,7 +2330,7 @@ def run_a4(world: SyntheticWorld, tmp_root: Path) -> tuple[list[dict], dict]:
         val = tr.validate()
     finally:
         trainer_mod.DeterministicG1, trainer_mod.ConditionEncoder, trainer_mod.LossAssembler = real_det, real_cond, real_loss
-    asm = build_synthetic_assembler(world.tokenizer, cfg.loss, torch.float32, use_fk=False)
+    asm = build_synthetic_assembler(world.tokenizer, cfg.loss, torch.float32, use_fk=True)
     with torch.no_grad():
         per_window = []
         for it in items:
@@ -2359,6 +2463,7 @@ def run_a4(world: SyntheticWorld, tmp_root: Path) -> tuple[list[dict], dict]:
     # best only from a complete macro; synthetic callback at two cadence points
     def run_best(second_bad: bool) -> dict:
         steps = {"n": 0}
+        raw_steps: list[dict] = []
 
         def callback(model, conditioner, budget_deadline=None):
             steps["n"] += 1
@@ -2376,9 +2481,11 @@ def run_a4(world: SyntheticWorld, tmp_root: Path) -> tuple[list[dict], dict]:
                 rs = [{"demo": d, "T": lengths[d], "status": "ok", "numerical_valid": True,
                        "mpjpe_m": 0.2} for d in expected]
             vals = [r["mpjpe_m"] for r in rs if r["status"] == "ok" and r["mpjpe_m"] is not None]
-            return {"n_expected": len(expected), "n_ok": len(vals),
-                    "macro_mpjpe_m": sum(vals) / len(expected) if len(vals) == len(expected) else None,
-                    "per_demo": rs, "seed": 7}
+            raw = {"n_expected": len(expected), "n_ok": len(vals),
+                   "macro_mpjpe_m": sum(vals) / len(expected) if len(vals) == len(expected) else None,
+                   "per_demo": rs, "seed": 7}
+            raw_steps.append(raw)
+            return raw
         callback.expected_demos = expected
         callback.demo_lengths = lengths
         m, c = _StubModel("deterministic"), _StubConditioner()
@@ -2397,7 +2504,7 @@ def run_a4(world: SyntheticWorld, tmp_root: Path) -> tuple[list[dict], dict]:
         finally:
             trainer_mod.DeterministicG1, trainer_mod.ConditionEncoder, trainer_mod.LossAssembler = real_det, real_cond, real_loss
         best = summ.get("best_formal_step")
-        return {"best_formal_step": best, "summary": {
+        return {"best_formal_step": best, "raw_steps": raw_steps, "summary": {
             "selection_status": summ.get("selection_status"),
             "best_formal_macro_mpjpe_m": summ.get("best_formal_macro_mpjpe_m")}}
     good_res = run_best(False)
@@ -2452,7 +2559,15 @@ def run_a4(world: SyntheticWorld, tmp_root: Path) -> tuple[list[dict], dict]:
     return rows, {"macro": {"method1": m1, "method2": m2},
                   "micro": {"method1": u1, "method2": u2},
                   "best_complete_step": good_res["best_formal_step"],
-                  "best_incomplete_step": bad_res["best_formal_step"]}
+                  "best_incomplete_step": bad_res["best_formal_step"],
+                  "selection_evidence": {
+                      "expected_demos": expected,
+                      "demo_lengths": lengths,
+                      "complete_run": {"raw_steps": good_res["raw_steps"],
+                                       "best_formal_step": good_res["best_formal_step"]},
+                      "incomplete_run": {"raw_steps": bad_res["raw_steps"],
+                                         "best_formal_step": bad_res["best_formal_step"]},
+                  }}
 
 
 # ---------------------------------------------------------------------------
@@ -2534,6 +2649,10 @@ def run_synthetic_audit(out_dir: Path, project_root: Path | None = None,
         "facts": parity_json["sampling_trace"]["rng"],
         "note": "streams compared by SHA-256 digest of the full state, not by intent",
     })
+    _write_json(out_dir / "selection_evidence.json", {
+        "schema": AUDIT_SCHEMA, "source": AUDIT_SOURCE,
+        **a4_summary["selection_evidence"],
+    })
 
     summary = {
         "schema": AUDIT_SCHEMA, "source": AUDIT_SOURCE,
@@ -2541,7 +2660,10 @@ def run_synthetic_audit(out_dir: Path, project_root: Path | None = None,
         "config_sha256": static["config_sha256"],
         "git": static["git"],
         "counts": {
-            "rows": len(rows), "failures": len(failures), "gaps": len(gaps),
+            "rows": len(rows) + len(static["checks"]),
+            "a1_a4_rows": len(rows),
+            "a0_checks": len(static["checks"]),
+            "failures": len(failures), "gaps": len(gaps),
             "limitations": len(limitations),
             "by_group": {"A0": len(static["checks"]),
                          **{g: sum(1 for r in rows if r["group"] == g)
@@ -2601,8 +2723,373 @@ def run_synthetic_audit(out_dir: Path, project_root: Path | None = None,
 # ---------------------------------------------------------------------------
 
 
-def verify_audit_artifacts(out_dir: Path) -> dict:
-    """Recompute key facts from raw artifacts; never trust top-level pass strings."""
+
+def _is_mapping(value: Any) -> bool:
+    return isinstance(value, dict)
+
+
+def _finite_number(value: Any) -> bool:
+    return (isinstance(value, (int, float, np.integer, np.floating))
+            and not isinstance(value, (bool, np.bool_))
+            and math.isfinite(float(value)))
+
+
+def _as_float_array(value: Any, name: str, problems: list[str],
+                    shape: tuple | None = None) -> np.ndarray | None:
+    try:
+        arr = np.asarray(value)
+    except Exception:  # noqa: BLE001
+        problems.append(f"structure_nonarray:{name}")
+        return None
+    if arr.dtype.kind == "b" or arr.dtype.kind not in "iuf":
+        problems.append(f"structure_non_numeric:{name}:{arr.dtype}")
+        return None
+    if shape is not None and tuple(arr.shape) != tuple(shape):
+        problems.append(f"structure_shape:{name}:{arr.shape}!={shape}")
+        return None
+    arr = arr.astype(np.float64, copy=False)
+    if not np.isfinite(arr).all():
+        problems.append(f"nonfinite:{name}")
+        return None
+    return arr
+
+
+def _mapping(value: Any, name: str, problems: list[str]) -> dict:
+    if not isinstance(value, dict):
+        problems.append(f"structure_not_mapping:{name}")
+        return {}
+    return value
+
+
+def _list(value: Any, name: str, problems: list[str]) -> list:
+    if not isinstance(value, list):
+        problems.append(f"structure_not_list:{name}")
+        return []
+    return value
+
+
+def _require_keys(mapping: dict, keys: tuple[str, ...], name: str,
+                  problems: list[str]) -> bool:
+    missing = [k for k in keys if k not in mapping]
+    if missing:
+        problems.append(f"structure_missing_keys:{name}:{missing}")
+        return False
+    return True
+
+
+def _validate_row_list(rows: Any, group: str, name: str,
+                       problems: list[str]) -> dict[str, dict]:
+    rows = _list(rows, name, problems)
+    required = set(REQUIRED_AUDIT_ROWS[group])
+    out: dict[str, dict] = {}
+    for i, row in enumerate(rows):
+        if not isinstance(row, dict):
+            problems.append(f"structure_row_not_mapping:{name}:{i}")
+            continue
+        if row.get("group") != group:
+            continue
+        if not _require_keys(row, ("id", "group", "status", "expected", "actual"),
+                             f"{name}.row[{i}]", problems):
+            continue
+        if row.get("status") not in ("static_confirmed", "synthetic_verified",
+                                     "runtime_not_checked", "contract_mismatch"):
+            problems.append(f"structure_bad_status:{name}:{row.get('id')}")
+        out[str(row.get("id"))] = row
+    missing = sorted(required - set(out))
+    for rid in missing:
+        problems.append(f"missing_row:{group}:{rid}")
+    return out
+
+
+def _validate_static(static: Any, problems: list[str]) -> tuple[dict, dict, dict, Path | None]:
+    """Validate static contract and return (static, effective loss, config, path)."""
+    st = _mapping(static, "static_contract", problems)
+    if not st:
+        return {}, {}, {}, None
+    checks = _list(st.get("checks"), "static_contract.checks", problems)
+    for i, c in enumerate(checks):
+        if not isinstance(c, dict):
+            problems.append(f"structure_row_not_mapping:static_contract.checks:{i}")
+            continue
+        if c.get("status") == "contract_mismatch":
+            problems.append(f"static_check_failed:{c.get('id')}")
+    eff = _mapping(st.get("effective_config"), "static_contract.effective_config", problems)
+    loss = _mapping(eff.get("loss"), "static_contract.effective_config.loss", problems)
+    src = _mapping(st.get("source_files"), "static_contract.source_files", problems)
+    tol = _mapping(st.get("tolerances"), "static_contract.tolerances", problems)
+    if not checks or not src or not tol:
+        problems.append("static_contract_incomplete")
+    cfg_path = Path(str(st.get("config_path", "")))
+    if not cfg_path.is_file():
+        problems.append("static_config_path_unreadable")
+        return st, loss, {}, None
+    if sha256_file(cfg_path) != st.get("config_sha256"):
+        problems.append("static_config_sha256_drift")
+    project_root = cfg_path.resolve().parents[2]
+    for group in ("source_files", "audit_implementation_files"):
+        for rel, rec in (st.get(group) or {}).items():
+            path = project_root / rel
+            if not isinstance(rec, dict) or not path.is_file() \
+                    or sha256_file(path) != rec.get("sha256"):
+                problems.append(f"static_source_drift:{rel}")
+    # re-parse the config and bind the effective weights
+    try:
+        import yaml
+        raw = yaml.safe_load(cfg_path.read_text())
+        parsed_loss = (raw or {}).get("loss", {})
+        parsed_loss = {k: float(v) for k, v in parsed_loss.items()} if isinstance(parsed_loss, dict) else {}
+        static_loss = {k: float(v) for k, v in loss.items()}
+        if parsed_loss != static_loss:
+            problems.append("static_effective_loss_mismatch:config_file")
+        expected_loss = dict(W1_SYNTHETIC_WEIGHTS.__dict__)
+        if static_loss != {k: float(v) for k, v in expected_loss.items()}:
+            problems.append("static_effective_loss_mismatch:expected_w1")
+        if parsed_loss != {k: float(v) for k, v in expected_loss.items()}:
+            problems.append("static_effective_loss_mismatch:config_expected")
+    except Exception as exc:  # noqa: BLE001
+        problems.append(f"static_config_parse_failed:{type(exc).__name__}")
+    return st, loss, {}, cfg_path
+
+
+def _saved_world(inputs: dict, problems: list[str]) -> tuple[SyntheticWorld | None, dict]:
+    required = ("x0", "root", "q", "wfc", "mean", "std", "lo", "hi",
+                "center", "box_quat", "contact", "x0_pred_generic",
+                "x0_pred_pos", "x0_pred_rot", "x0_pred_joint", "x0_pred_adjacent")
+    missing = [k for k in required if k not in inputs]
+    if missing:
+        problems.append(f"structure_missing_keys:synthetic_inputs:{missing}")
+        return None, {}
+    x0 = _as_float_array(inputs["x0"], "inputs.x0", problems)
+    root = _as_float_array(inputs["root"], "inputs.root", problems)
+    q = _as_float_array(inputs["q"], "inputs.q", problems)
+    wfc = _as_float_array(inputs["wfc"], "inputs.wfc", problems, (4, 4))
+    mean = _as_float_array(inputs["mean"], "inputs.mean", problems, (3,))
+    std = _as_float_array(inputs["std"], "inputs.std", problems, (3,))
+    lo = _as_float_array(inputs["lo"], "inputs.lo", problems, (29,))
+    hi = _as_float_array(inputs["hi"], "inputs.hi", problems, (29,))
+    center = _as_float_array(inputs["center"], "inputs.center", problems, (3,))
+    box_quat = _as_float_array(inputs["box_quat"], "inputs.box_quat", problems)
+    contact = _as_float_array(inputs["contact"], "inputs.contact", problems)
+    pred = _as_float_array(inputs["x0_pred_generic"], "inputs.x0_pred_generic", problems)
+    if any(v is None for v in (x0, root, q, wfc, mean, std, lo, hi, center, box_quat, contact, pred)):
+        return None, {}
+    if x0.shape[1] != 38 or root.shape[1] != 7 or q.shape[1] != 29 \
+            or root.shape[0] != x0.shape[0] or q.shape[0] != x0.shape[0]:
+        problems.append("structure_shape:inputs:x0_root_q")
+        return None, {}
+    if not (std > 0).all() or not (hi > lo).all():
+        problems.append("structure_invalid:inputs:std_or_joint_range")
+    tokenizer = StateTokenizer(np.stack([lo, hi], axis=1), RootStats(mean=mean, std=std))
+    recomputed_x0 = _encode_np(root, q, wfc, tokenizer)
+    if recomputed_x0.shape != x0.shape or np.abs(recomputed_x0 - x0).max() > TOLERANCES["encode_float64"]["atol"]:
+        problems.append("input_x0_not_bound")
+    world = SyntheticWorld(tokenizer=tokenizer, wfc=wfc, root=root, q=q, x0=x0,
+                           center=center, box_quat=box_quat, contact=contact)
+    return world, {"x0": x0, "pred": pred, "tokenizer": tokenizer}
+
+
+def _validate_gradient_arrays(garr: dict, world: SyntheticWorld, weights: LossWeights,
+                              problems: list[str]) -> dict:
+    required = {"grad_pos", "grad_rot6d", "grad_joint", "grad_geodesic_rad2",
+                "grad_vel", "grad_fk_m2", "grad_total", "grad_sum", "pred_input"}
+    if not required <= set(garr):
+        problems.append(f"structure_missing_keys:gradient_arrays:{sorted(required - set(garr))}")
+        return {}
+    arrays = {}
+    for key in required:
+        arrays[key] = _as_float_array(garr[key], f"gradient_arrays.{key}", problems)
+    if any(v is None for v in arrays.values()):
+        return {}
+    pred = torch.tensor(arrays["pred_input"], dtype=torch.float64)
+    if pred.ndim == 2:
+        pred = pred[None]
+    recomputed = {}
+    for term in ("pos", "rot6d", "joint", "geodesic_rad2", "vel", "fk_m2"):
+        g, _ = _term_grad(world, pred.detach().clone().requires_grad_(True), term, torch.float64)
+        recomputed[f"grad_{term}"] = g.numpy()
+        err = float(np.abs(g.numpy() - arrays[f"grad_{term}"]).max())
+        if err > 1e-8:
+            problems.append(f"gradient_recompute_mismatch:{term}:{err}")
+    gsum = (weights.w_pos * recomputed["grad_pos"] + weights.w_rot6d * recomputed["grad_rot6d"]
+            + weights.w_joint * recomputed["grad_joint"]
+            + weights.w_geodesic * recomputed["grad_geodesic_rad2"]
+            + weights.w_vel * recomputed["grad_vel"] + weights.w_fk * recomputed["grad_fk_m2"])
+    if float(np.abs(gsum - arrays["grad_total"]).max()) > TOLERANCES["gradient_sum_float64"]["atol"]:
+        problems.append("gradient_recompute_mismatch:total")
+    if float(np.abs(gsum - arrays["grad_sum"]).max()) > TOLERANCES["gradient_sum_float64"]["atol"]:
+        problems.append("gradient_saved_sum_mismatch")
+    if float(np.abs(arrays["grad_pos"]).max()) == 0:
+        problems.append("gradient_pos_zero")
+    return recomputed
+
+
+def _recompute_update_run(run: dict, uarr: dict, tokenizer, weights: LossWeights,
+                          problems: list[str], checks: list[dict]) -> None:
+    run_id = str(run.get("run_id", f"{run.get('model_type')}_{run.get('grad_clip')}"))
+    required = ("model_type", "grad_clip", "problems", "micro_x0_shape",
+                "part_keys", "forward_records_s0", "forward_records_formal",
+                "loss_part_records_s0", "loss_part_records_formal")
+    if tokenizer is None:
+        problems.append(f"update_replay_missing_tokenizer:{run_id}")
+        return
+    if not _require_keys(run, required, f"update_parity.run:{run_id}", problems):
+        return
+    if run.get("problems"):
+        problems.append(f"producer_parity_problems:{run_id}:{run['problems']}")
+    prefix = f"{run_id}__"
+    micro = _as_float_array(uarr.get(f"{prefix}micro_x0"), f"{run_id}.micro_x0", problems)
+    if micro is None:
+        return
+    if micro.ndim != 4 or micro.shape[0] != 4:
+        problems.append(f"structure_shape:{run_id}.micro_x0")
+        return
+    initial_bias = _as_float_array(uarr.get(f"{prefix}initial_bias"), f"{run_id}.initial_bias", problems)
+    initial_scale = _as_float_array(uarr.get(f"{prefix}initial_scale"), f"{run_id}.initial_scale", problems)
+    grad_clip_arr = _as_float_array(uarr.get(f"{prefix}grad_clip"), f"{run_id}.grad_clip", problems)
+    if initial_bias is None or initial_scale is None or grad_clip_arr is None:
+        return
+    grad_clip = float(grad_clip_arr.reshape(-1)[0])
+    model_type = str(run.get("model_type"))
+    for side in ("s0", "formal"):
+        pred_saved = _as_float_array(uarr.get(f"{prefix}{side}_preds"), f"{run_id}.{side}.preds", problems)
+        parts_saved = _as_float_array(uarr.get(f"{prefix}{side}_parts"), f"{run_id}.{side}.parts", problems)
+        pre0 = _as_float_array(uarr.get(f"{prefix}{side}_preclip_0"), f"{run_id}.{side}.preclip_0", problems)
+        pre1 = _as_float_array(uarr.get(f"{prefix}{side}_preclip_1"), f"{run_id}.{side}.preclip_1", problems)
+        post0 = _as_float_array(uarr.get(f"{prefix}{side}_postclip_0"), f"{run_id}.{side}.postclip_0", problems)
+        post1 = _as_float_array(uarr.get(f"{prefix}{side}_postclip_1"), f"{run_id}.{side}.postclip_1", problems)
+        gnorm_saved = _as_float_array(uarr.get(f"{prefix}{side}_gnorm"), f"{run_id}.{side}.gnorm", problems)
+        if any(v is None for v in (pred_saved, parts_saved, pre0, pre1, post0, post1, gnorm_saved)):
+            return
+        bias = torch.nn.Parameter(torch.full(
+            (X0_DIM,), float(initial_bias.reshape(-1)[0]), dtype=torch.float32))
+        scale = torch.nn.Parameter(torch.tensor(
+            float(initial_scale.reshape(-1)[0]), dtype=torch.float32))
+        asm = build_synthetic_assembler(tokenizer, weights, torch.float32, use_fk=True)
+        opt = torch.optim.AdamW([bias, scale], lr=1e-4, weight_decay=1e-5)
+        for i in range(4):
+            x0 = torch.tensor(micro[i], dtype=torch.float32)
+            if model_type == "diffusion":
+                xt = _as_float_array(uarr.get(f"{prefix}{side}_x_t"), f"{run_id}.{side}.x_t", problems)
+                tt = _as_float_array(uarr.get(f"{prefix}{side}_t"), f"{run_id}.{side}.t", problems)
+                if xt is None or tt is None:
+                    return
+                pred = x0 * scale + bias + 0.02 * torch.tensor(xt[i], dtype=torch.float32) \
+                    + 0.02 * (torch.tensor(tt[i], dtype=torch.float32) / 1000.0)[:, None, None]
+            else:
+                pred = x0 * scale + bias
+            if float((pred.detach() - torch.tensor(pred_saved[i], dtype=torch.float32)).abs().max()) > 1e-6:
+                problems.append(f"update_replay_mismatch:{run_id}:{side}:forward:{i}")
+            loss, parts = asm(pred, {"x0": x0})
+            for j, key in enumerate(LOSS_PART_KEYS):
+                if key not in parts:
+                    problems.append(f"update_replay_missing_part:{run_id}:{side}:{key}")
+                elif abs(float(parts[key]) - float(parts_saved[i, j])) > 1e-6:
+                    problems.append(f"update_replay_mismatch:{run_id}:{side}:part:{key}:{i}")
+            (loss / 4.0).backward()
+        pre = [bias.grad.detach().clone(), scale.grad.detach().clone()]
+        if float((pre[0].numpy() - pre0).__abs__().max()) > 1e-6 or \
+                float((pre[1].numpy() - pre1).__abs__().max()) > 1e-6:
+            problems.append(f"update_replay_mismatch:{run_id}:{side}:preclip")
+        gnorm = float(torch.nn.utils.clip_grad_norm_([bias, scale], grad_clip))
+        if abs(gnorm - float(gnorm_saved.reshape(-1)[0])) > 1e-6:
+            problems.append(f"update_replay_mismatch:{run_id}:{side}:gnorm")
+        post = [bias.grad.detach().clone(), scale.grad.detach().clone()]
+        if float((post[0].numpy() - post0).__abs__().max()) > 1e-6 or \
+                float((post[1].numpy() - post1).__abs__().max()) > 1e-6:
+            problems.append(f"update_replay_mismatch:{run_id}:{side}:postclip")
+        opt.step()
+        names = ("model.bias", "conditioner.scale")
+        for j, (n, param) in enumerate(zip(names, (bias, scale))):
+            saved_param = _as_float_array(uarr.get(f"{prefix}{side}_param_{n}"),
+                                          f"{run_id}.{side}.param.{n}", problems)
+            saved_grad = _as_float_array(uarr.get(f"{prefix}{side}_grad_{n}"),
+                                         f"{run_id}.{side}.grad.{n}", problems)
+            saved_step = uarr.get(f"{prefix}{side}_step_{n}")
+            exp_avg = _as_float_array(uarr.get(f"{prefix}{side}_exp_avg_{n}"),
+                                      f"{run_id}.{side}.exp_avg.{n}", problems)
+            exp_avg_sq = _as_float_array(uarr.get(f"{prefix}{side}_exp_avg_sq_{n}"),
+                                         f"{run_id}.{side}.exp_avg_sq.{n}", problems)
+            if any(v is None for v in (saved_param, saved_grad, exp_avg, exp_avg_sq)):
+                return
+            if float(np.abs(param.detach().numpy() - saved_param).max()) > 1e-6:
+                problems.append(f"update_replay_mismatch:{run_id}:{side}:param:{n}")
+            if float(np.abs(post[j].numpy() - saved_grad).max()) > 1e-6:
+                problems.append(f"update_replay_mismatch:{run_id}:{side}:grad:{n}")
+            st = opt.state[param]
+            if int(saved_step) != 1 or int(st.get("step", -1)) != 1:
+                problems.append(f"update_replay_mismatch:{run_id}:{side}:adamw_step:{n}")
+            if float(np.abs(st["exp_avg"].detach().numpy() - exp_avg).max()) > 1e-6 \
+                    or float(np.abs(st["exp_avg_sq"].detach().numpy() - exp_avg_sq).max()) > 1e-6:
+                problems.append(f"update_replay_mismatch:{run_id}:{side}:adamw_state:{n}")
+    # S0 and formal must have the same real inputs, forward outputs and updates
+    for key in ("micro_x0",):
+        pass
+    for side_pair in (("s0", "formal"),):
+        for suffix in ("preds", "parts", "preclip_0", "preclip_1", "postclip_0",
+                       "postclip_1", "gnorm", "param_model.bias", "param_conditioner.scale",
+                       "grad_model.bias", "grad_conditioner.scale", "exp_avg_model.bias",
+                       "exp_avg_conditioner.scale", "exp_avg_sq_model.bias",
+                       "exp_avg_sq_conditioner.scale", "step_model.bias",
+                       "step_conditioner.scale"):
+            a = uarr.get(f"{prefix}s0_{suffix}")
+            b = uarr.get(f"{prefix}formal_{suffix}")
+            if a is None or b is None:
+                problems.append(f"structure_missing_keys:{run_id}:s0_or_formal_{suffix}")
+            elif not np.array_equal(np.asarray(a), np.asarray(b)):
+                problems.append(f"update_replay_mismatch:{run_id}:s0_vs_formal:{suffix}")
+        if model_type == "diffusion":
+            for suffix in ("t", "noise", "x_t"):
+                a = uarr.get(f"{prefix}s0_{suffix}")
+                b = uarr.get(f"{prefix}formal_{suffix}")
+                if a is None or b is None:
+                    problems.append(f"structure_missing_keys:{run_id}:s0_or_formal_{suffix}")
+                elif not np.array_equal(np.asarray(a), np.asarray(b)):
+                    problems.append(f"update_replay_mismatch:{run_id}:s0_vs_formal:{suffix}")
+    checks.append({"id": f"independent.update_replay:{run_id}", "ok": True})
+
+
+def _recompute_selection(evidence: dict, rows: dict, problems: list[str],
+                         checks: list[dict]) -> None:
+    expected = _list(evidence.get("expected_demos"), "selection.expected_demos", problems)
+    if not expected or len(set(expected)) != len(expected) or not all(isinstance(d, str) for d in expected):
+        problems.append("selection_expected_roster_invalid")
+        return
+    lengths = _mapping(evidence.get("demo_lengths"), "selection.demo_lengths", problems)
+    for run_name in ("complete_run", "incomplete_run"):
+        run = _mapping(evidence.get(run_name), f"selection.{run_name}", problems)
+        raw_steps = _list(run.get("raw_steps"), f"selection.{run_name}.raw_steps", problems)
+        if len(raw_steps) != 2:
+            problems.append(f"selection_evidence_raw_steps:{run_name}:{len(raw_steps)}")
+            continue
+        complete = []
+        for idx, raw in enumerate(raw_steps, start=1):
+            raw = _mapping(raw, f"selection.{run_name}.raw[{idx}]", problems)
+            per_demo = _list(raw.get("per_demo"), f"selection.{run_name}.raw[{idx}].per_demo", problems)
+            res = independent_macro(per_demo, list(expected),
+                                    {k: int(v) for k, v in lengths.items()} if lengths else None)
+            if raw.get("n_expected") != res["n_expected"] or raw.get("n_ok") != res["n_ok"]:
+                problems.append(f"selection_evidence_counts:{run_name}:{idx}")
+            if res["complete"]:
+                complete.append((idx, res["macro"]))
+                if not _finite_number(raw.get("macro_mpjpe_m")) \
+                        or abs(float(raw["macro_mpjpe_m"]) - res["macro"]) > TOLERANCES["macro_float64"]["atol"]:
+                    problems.append(f"selection_evidence_macro:{run_name}:{idx}")
+        expected_best = min(complete, key=lambda p: p[1])[0] if complete else None
+        recorded = run.get("best_formal_step")
+        if expected_best != recorded:
+            problems.append(f"selection_recompute_mismatch:{run_name}:{expected_best}!={recorded}")
+        row = rows.get("selection.best_uses_macro_complete_only")
+        if row is None or not isinstance(row.get("actual"), dict):
+            problems.append("selection_row_missing")
+        else:
+            key = "complete_run" if run_name == "complete_run" else "incomplete_run"
+            actual = row["actual"].get(key, {}).get("best_formal_step")
+            if actual != expected_best:
+                problems.append(f"selection_row_mismatch:{run_name}:{expected_best}!={actual}")
+        checks.append({"id": f"independent.selection:{run_name}", "expected_best": expected_best})
+
+
+def _verify_audit_artifacts_impl(out_dir: Path) -> dict:
     out_dir = Path(out_dir)
     problems: list[str] = []
     checks: list[dict] = []
@@ -2614,254 +3101,213 @@ def verify_audit_artifacts(out_dir: Path) -> dict:
             return None
         try:
             return json.loads(path.read_text())
-        except Exception as exc:  # noqa: BLE001 -- a corrupt artifact is a failure, not a crash
+        except Exception as exc:  # noqa: BLE001
             problems.append(f"unreadable_artifact:{name}:{type(exc).__name__}")
             return None
 
-    def load_npz(name: str) -> dict | None:
+    def load_npz(name: str) -> dict:
         path = out_dir / name
         if not path.is_file():
             problems.append(f"missing_artifact:{name}")
-            return None
+            return {}
         try:
             with np.load(path) as z:
                 return {k: z[k] for k in z.files}
         except Exception as exc:  # noqa: BLE001
             problems.append(f"unreadable_artifact:{name}:{type(exc).__name__}")
-            return None
+            return {}
 
-    static = load_json("static_contract.json")
-    comparison = load_json("s0_formal_comparison.json")
-    objective = load_json("objective_rows.json")
-    gradient = load_json("gradient_rows.json")
-    parity = load_json("update_parity.json")
-    sampling = load_json("sampling_trace.json")
-    rng = load_json("rng_state_facts.json")
-    summary = load_json("audit_summary.json")
+    static_raw = load_json("static_contract.json")
+    comparison_raw = load_json("s0_formal_comparison.json")
+    objective_raw = load_json("objective_rows.json")
+    gradient_raw = load_json("gradient_rows.json")
+    parity_raw = load_json("update_parity.json")
+    sampling_raw = load_json("sampling_trace.json")
+    rng_raw = load_json("rng_state_facts.json")
+    selection_raw = load_json("selection_evidence.json")
+    summary_raw = load_json("audit_summary.json")
     inputs = load_npz("synthetic_inputs.npz")
     garr = load_npz("gradient_arrays.npz")
     uarr = load_npz("update_arrays.npz")
-
-    # required artifacts
     for name in REQUIRED_ARTIFACTS:
         if not (out_dir / name).is_file():
             problems.append(f"required_artifact_absent:{name}")
 
-    # key-set completeness
-    missing_required_rows: list[str] = []
-    if objective is not None:
-        rows = objective.get("rows")
-        if not isinstance(rows, list):
-            problems.append("objective_rows_not_a_list")
-            rows = []
-        present = {(r.get("group"), r.get("id")) for r in rows if isinstance(r, dict)}
-        for group, required in REQUIRED_AUDIT_ROWS.items():
-            for rid in required:
-                if (group, rid) not in present:
-                    missing_required_rows.append(f"{group}:{rid}")
-                    problems.append(f"missing_row:{group}:{rid}")
-        self_reported_failures = set(objective.get("failures", []))
-        computed_failures = {r.get("id") for r in rows
-                             if isinstance(r, dict) and r.get("status") == "contract_mismatch"}
-        if self_reported_failures != computed_failures:
-            problems.append("failure_list_does_not_match_rows")
+    static, static_loss, _, cfg_path = _validate_static(static_raw, problems)
+    weights = LossWeights(**static_loss) if static_loss else W1_SYNTHETIC_WEIGHTS
+    objective = _mapping(objective_raw, "objective_rows", problems)
+    all_rows = _list(objective.get("rows"), "objective_rows.rows", problems) if objective else []
+    row_map: dict[str, dict] = {}
+    for group in ("A1", "A2", "A3", "A4"):
+        row_map.update(_validate_row_list(all_rows, group, f"objective_rows.{group}", problems))
 
-    # recompute scalar losses from raw synthetic inputs
-    if inputs is not None and objective is not None:
-        try:
-            world = build_synthetic_world()
-            target = inputs["x0"]
-            pred = inputs["x0_pred_generic"]
-            weights = W1_SYNTHETIC_WEIGHTS
-            exp = _independent_terms(pred, target, world, weights)
-            rows_by_id = {r["id"]: r for r in objective["rows"]}
-            tol = TOLERANCES["loss_float64"]
-            for key in ("pos", "rot6d", "joint", "geodesic_rad2", "vel", "fk_m2", "total"):
-                actual = rows_by_id["loss.total_weighted_sum"]["evidence"]["terms"].get(key)
-                if key == "total":
-                    actual = rows_by_id["loss.total_weighted_sum"]["actual"]
-                if actual is None:
-                    problems.append(f"objective_row_missing_value:{key}")
-                elif abs(float(actual) - exp[key]) > tol["atol"] + tol["rtol"] * abs(exp[key]):
-                    problems.append(f"objective_recompute_mismatch:{key}")
-            checks.append({"id": "independent.recompute_terms", "recomputed": exp})
-        except Exception as exc:  # noqa: BLE001
-            problems.append(f"objective_recompute_failed:{type(exc).__name__}")
-
-    # gradient arrays: finite, weighted sum equals total
-    if garr is not None and gradient is not None:
-        required = {"grad_pos", "grad_rot6d", "grad_joint", "grad_geodesic_rad2",
-                    "grad_vel", "grad_fk_m2", "grad_total"}
-        missing = sorted(required - set(garr))
-        if missing:
-            problems.append(f"gradient_arrays_missing:{missing}")
+    world, saved = _saved_world(inputs, problems) if inputs else (None, {})
+    if world is not None and weights is not None:
+        exp = _independent_terms(saved["pred"], saved["x0"], world, weights)
+        row = row_map.get("loss.total_weighted_sum")
+        if row is None or not isinstance(row.get("evidence"), dict) \
+                or not isinstance(row["evidence"].get("terms"), dict):
+            problems.append("structure_missing_keys:loss.total_weighted_sum.evidence.terms")
         else:
-            try:
-                w = W1_SYNTHETIC_WEIGHTS
-                gsum = (w.w_pos * garr["grad_pos"] + w.w_rot6d * garr["grad_rot6d"]
-                        + w.w_joint * garr["grad_joint"]
-                        + w.w_geodesic * garr["grad_geodesic_rad2"]
-                        + w.w_vel * garr["grad_vel"] + w.w_fk * garr["grad_fk_m2"])
-                err = float(np.abs(gsum - garr["grad_total"]).max())
-                if not np.isfinite(garr["grad_total"]).all():
-                    problems.append("gradient_total_nonfinite")
-                if err > TOLERANCES["gradient_sum_float64"]["atol"]:
-                    problems.append(f"gradient_sum_mismatch:{err}")
-                if float(np.abs(garr["grad_pos"]).max()) == 0:
-                    problems.append("gradient_pos_zero")
-                checks.append({"id": "independent.gradient_sum", "max_abs_error": err})
-            except Exception as exc:  # noqa: BLE001
-                problems.append(f"gradient_recompute_failed:{type(exc).__name__}")
+            terms = row["evidence"]["terms"]
+            for key in ("pos", "rot6d", "joint", "geodesic_rad2", "vel", "fk_m2"):
+                val = terms.get(key)
+                if val is None or not _finite_number(val):
+                    problems.append(f"nonfinite:objective.loss.total_weighted_sum.{key}")
+                elif abs(float(val) - exp[key]) > TOLERANCES["loss_float64"]["atol"]:
+                    problems.append(f"objective_recompute_mismatch:{key}")
+            total = row.get("actual")
+            if not _finite_number(total):
+                problems.append("nonfinite:objective.loss.total_weighted_sum.total")
+            elif abs(float(total) - exp["total"]) > TOLERANCES["loss_float64"]["atol"]:
+                problems.append("objective_recompute_mismatch:total")
+        checks.append({"id": "independent.recompute_terms", "recomputed": exp})
 
-    # update parity: stored parameters bitwise equal; AdamW reference recomputed
-    if uarr is not None and parity is not None:
-        try:
-            names = sorted({k[len("s0_param_"):] for k in uarr if k.startswith("s0_param_")})
-            if not names:
-                problems.append("update_arrays_have_no_parameters")
-            for n in names:
-                a, b = uarr[f"s0_param_{n}"], uarr[f"formal_param_{n}"]
-                if a.dtype != b.dtype or not np.array_equal(a, b):
-                    problems.append(f"update_parameter_mismatch:{n}")
-                if f"s0_grad_{n}" in uarr:
-                    if not np.array_equal(uarr[f"s0_grad_{n}"], uarr[f"formal_grad_{n}"]):
-                        problems.append(f"update_gradient_mismatch:{n}")
-            # independent AdamW first-step reference from the stored gradient
-            if "s0_param_model.bias" in uarr:
-                p0 = uarr["s0_param_model.bias"]
-                p1 = uarr["formal_param_model.bias"]
-                p_before = np.full_like(p0, 0.01, dtype=np.float32)
-                g = uarr["s0_grad_model.bias"]
-                b1, b2, eps, lr, wd = 0.9, 0.999, 1e-8, 1e-4, 1e-5
-                exp = p_before - lr * (((1 - b1) * g / (1 - b1))
-                                        / (np.sqrt((1 - b2) * g * g / (1 - b2)) + eps)
-                                        + wd * p_before)
-                # with grad_clip=1e9 the stored gradient is the clipped one;
-                # its norm may exceed 1, so only compare when the clip did not fire
-                if float(np.linalg.norm(g)) <= 1.0:
-                    err = float(np.abs(exp - p1).max())
-                    if err > TOLERANCES["adamw_float32"]["atol"]:
-                        problems.append(f"adamw_reference_mismatch:{err}")
-                    checks.append({"id": "independent.adamw", "max_abs_error": err})
-        except Exception as exc:  # noqa: BLE001
-            problems.append(f"update_recompute_failed:{type(exc).__name__}")
+    if world is not None and garr:
+        _validate_gradient_arrays(garr, world, weights, problems)
 
-    # sampling facts
-    if sampling is not None:
-        x = sampling.get("x_t_closed_form", {})
-        if not x or max(x.get("max_abs_errors", [1e9])) > 1e-6:
-            problems.append("sampling_x_t_closed_form_not_verified")
-        if not (sampling.get("t0", {}).get("noise_fraction") or 0) > 0:
+    # A3: reload every saved run and replay its update from the bound inputs.
+    parity = _mapping(parity_raw, "update_parity", problems)
+    runs = _list(parity.get("runs"), "update_parity.runs", problems) if parity else []
+    if not runs:
+        problems.append("structure_empty:update_parity.runs")
+    for run in runs:
+        if not isinstance(run, dict):
+            problems.append("structure_row_not_mapping:update_parity.runs")
+            continue
+        _recompute_update_run(run, uarr, saved.get("tokenizer"), weights, problems, checks)
+
+    # A4: recompute the formal macro and selected step from raw callback rows.
+    _recompute_selection(_mapping(selection_raw, "selection_evidence", problems),
+                         row_map, problems, checks)
+
+    # A3 sampling: validate structure and the executed full loop.
+    sampling = _mapping(sampling_raw, "sampling_trace", problems)
+    if sampling:
+        x = _mapping(sampling.get("x_t_closed_form"), "sampling.x_t_closed_form", problems)
+        ts = _list(x.get("t"), "sampling.x_t_closed_form.t", problems)
+        errs = _list(x.get("max_abs_errors"), "sampling.x_t_closed_form.max_abs_errors", problems)
+        if not ts or not errs or len(ts) != len(errs):
+            problems.append("sampling_x_t_errors_empty_or_mismatched")
+        else:
+            nums = [_as_float_array([e], "sampling.max_abs_errors", problems) for e in errs]
+            if any(n is None for n in nums):
+                problems.append("sampling_x_t_nonfinite")
+            elif max(float(n.reshape(-1)[0]) for n in nums) > 1e-6:
+                problems.append("sampling_x_t_closed_form_not_verified")
+        t0 = _mapping(sampling.get("t0"), "sampling.t0", problems)
+        if not _finite_number(t0.get("noise_fraction")) or float(t0["noise_fraction"]) <= 0:
             problems.append("sampling_t0_not_noised")
-        d = sampling.get("ddim", {})
+        d = _mapping(sampling.get("ddim"), "sampling.ddim", problems)
         if d.get("prediction_type") != "sample" or d.get("clip_sample") is not False:
             problems.append("ddim_config_not_frozen")
-
-    # static contract fields
-    if static is not None:
-        if not static.get("source_files") or not static.get("tolerances"):
-            problems.append("static_contract_incomplete")
-        for r in static.get("checks", []):
-            if r.get("status") == "contract_mismatch":
-                problems.append(f"static_check_failed:{r.get('id')}")
-        cfg_path = Path(static.get("config_path", ""))
-        if cfg_path.is_file():
-            if sha256_file(cfg_path) != static.get("config_sha256"):
-                problems.append("static_config_sha256_drift")
-            project_root = cfg_path.resolve().parents[2]
-            for group in ("source_files", "audit_implementation_files"):
-                for rel, rec in static.get(group, {}).items():
-                    path = project_root / rel
-                    if not path.is_file() or sha256_file(path) != rec.get("sha256"):
-                        problems.append(f"static_source_drift:{rel}")
+        full = row_map.get("sampling.ddim_full_loop")
+        if full is None or not isinstance(full.get("actual"), dict):
+            problems.append("sampling_full_loop_row_missing")
         else:
-            problems.append("static_config_path_unreadable")
-    if comparison is not None:
-        rows = comparison.get("rows")
-        if not isinstance(rows, list) or len(rows) < 10:
-            problems.append("s0_formal_comparison_incomplete")
-        elif static is not None:
-            cfg = static.get("effective_config", {})
-            cr = {r.get("item"): r for r in rows if isinstance(r, dict)}
-            expected = {
-                "micro_batch": (cfg.get("micro_batch"), cr.get("micro_batch", {}).get("formal")),
-                "grad_accum": (cfg.get("grad_accum"), cr.get("grad_accum", {}).get("s0")),
-                "samples_per_update_s0": (6 * cfg.get("grad_accum", 0),
-                                          cr.get("samples_per_update", {}).get("s0")),
-                "samples_per_update_formal": (cfg.get("micro_batch", 0) * cfg.get("grad_accum", 0),
-                                               cr.get("samples_per_update", {}).get("formal")),
-            }
-            for key, (want, got) in expected.items():
-                if want != got:
-                    problems.append(f"s0_formal_comparison_mismatch:{key}")
-    if rng is not None:
-        facts = rng.get("facts", {})
-        if facts.get("validation_restored") is not True or facts.get("dataloader_dedicated_unchanged") is not True:
+            act = full["actual"]
+            if act.get("sample_calls") != 1 or act.get("sample_error") is not None:
+                problems.append("sampling_full_loop_not_executed")
+            elif act.get("forward_calls") != act.get("timesteps") or act.get("timesteps") != 5:
+                problems.append("sampling_full_loop_forward_count")
+            elif not _finite_number(act.get("final_max_abs_error")) \
+                    or float(act["final_max_abs_error"]) > 1e-5:
+                problems.append("sampling_full_loop_final_mismatch")
+        consumption = _mapping(sampling.get("consumption"), "sampling.consumption", problems)
+        s0c = _mapping(consumption.get("s0"), "sampling.consumption.s0", problems)
+        fc = _mapping(consumption.get("formal"), "sampling.consumption.formal", problems)
+        if s0c.get("samples") != 24 or s0c.get("unique") != 6 \
+                or not isinstance(s0c.get("counts"), dict) \
+                or set(map(str, s0c["counts"].values())) != {"4"}:
+            problems.append("consumption_s0_mismatch")
+        dropped = fc.get("dropped_per_epoch")
+        if fc.get("samples") != 32 or not isinstance(dropped, list) \
+                or len(dropped) != 4 or any(not isinstance(x, list) or len(x) != 2 for x in dropped) \
+                or sorted(fc.get("coverage", [])) != list(range(10)):
+            problems.append("consumption_formal_mismatch")
+        rng = _mapping(sampling.get("rng"), "sampling.rng", problems)
+        if rng.get("validation_restored") is not True \
+                or rng.get("dataloader_dedicated_unchanged") is not True:
             problems.append("rng_facts_not_verified")
 
-    # summary/detail consistency: a running pass flag cannot excuse a
-    # summary whose counts, failure list, gaps or scope contradict the rows
-    if summary is not None:
-        computed_failures = set()
-        if objective is not None and isinstance(objective.get("rows"), list):
-            computed_failures |= {r.get("id") for r in objective["rows"]
-                                  if isinstance(r, dict)
-                                  and r.get("status") == "contract_mismatch"}
-        static_fail_ids = set()
-        if static is not None:
-            static_fail_ids = {r.get("id") for r in static.get("checks", [])
-                               if r.get("status") == "contract_mismatch"}
-            computed_failures |= static_fail_ids
+    # comparison and rng artifacts
+    comparison = _mapping(comparison_raw, "s0_formal_comparison", problems)
+    comp_rows = _list(comparison.get("rows"), "s0_formal_comparison.rows", problems)
+    if len(comp_rows) < 10:
+        problems.append("s0_formal_comparison_incomplete")
+    else:
+        cr = {r.get("item"): r for r in comp_rows if isinstance(r, dict)}
+        cfg = static.get("effective_config", {}) if static else {}
+        expected_cmp = {
+            "micro_batch": (cfg.get("micro_batch"), cr.get("micro_batch", {}).get("formal")),
+            "grad_accum": (cfg.get("grad_accum"), cr.get("grad_accum", {}).get("s0")),
+            "samples_per_update_s0": (6 * cfg.get("grad_accum", 0),
+                                      cr.get("samples_per_update", {}).get("s0")),
+            "samples_per_update_formal": (cfg.get("micro_batch", 0) * cfg.get("grad_accum", 0),
+                                           cr.get("samples_per_update", {}).get("formal")),
+        }
+        for key, (want, got) in expected_cmp.items():
+            if want != got:
+                problems.append(f"s0_formal_comparison_mismatch:{key}")
+    rng_doc = _mapping(rng_raw, "rng_state_facts", problems)
+    facts = _mapping(rng_doc.get("facts"), "rng_state_facts.facts", problems)
+    if facts.get("validation_restored") is not True \
+            or facts.get("dataloader_dedicated_unchanged") is not True:
+        problems.append("rng_facts_not_verified")
+
+    # summary/detail consistency
+    summary = _mapping(summary_raw, "audit_summary", problems)
+    if summary:
+        computed_failures = {r.get("id") for r in all_rows
+                             if isinstance(r, dict) and r.get("status") == "contract_mismatch"}
+        if static:
+            computed_failures |= {c.get("id") for c in static.get("checks", [])
+                                  if isinstance(c, dict) and c.get("status") == "contract_mismatch"}
         summary_failures = set(summary.get("failures", []))
         if summary_failures != computed_failures:
             problems.append("summary_failure_list_mismatch")
-        if summary.get("counts", {}).get("failures") != len(computed_failures):
+        counts = _mapping(summary.get("counts"), "audit_summary.counts", problems)
+        n_static = len(static.get("checks", [])) if static else 0
+        if counts.get("rows") != len(all_rows) + n_static:
+            problems.append("summary_row_count_mismatch")
+        if counts.get("a1_a4_rows") != len(all_rows):
+            problems.append("summary_a1_a4_count_mismatch")
+        if counts.get("a0_checks") != n_static:
+            problems.append("summary_a0_count_mismatch")
+        if counts.get("failures") != len(computed_failures):
             problems.append("summary_failure_count_mismatch")
-        if summary.get("counts", {}).get("gaps") != len(missing_required_rows):
-            problems.append("summary_gap_count_mismatch")
-        if set(summary.get("gaps", [])) != set(f"missing_row:{m}" for m in missing_required_rows):
-            problems.append("summary_gap_list_mismatch")
-        if objective is not None and isinstance(objective.get("rows"), list):
-            if summary.get("counts", {}).get("rows") != len(objective["rows"]):
-                problems.append("summary_row_count_mismatch")
-        scope = summary.get("scope", {})
-        if (scope.get("real_dataset_loaded") is not False
-                or scope.get("real_checkpoint_loaded") is not False
-                or scope.get("real_model_forward") is not False
-                or scope.get("real_g1_fk") is not False
-                or scope.get("training_updates_on_real_data") != 0
-                or scope.get("real_model_calls") != 0):
+        scope = _mapping(summary.get("scope"), "audit_summary.scope", problems)
+        if any(scope.get(k) is not False for k in
+               ("real_dataset_loaded", "real_checkpoint_loaded", "real_model_forward",
+                "real_g1_fk", "production_model_forward")) \
+                or scope.get("training_updates_on_real_data") != 0 \
+                or scope.get("real_model_calls") != 0 \
+                or scope.get("production_model_calls") != 0:
             problems.append("summary_scope_violation")
-        boundaries = summary.get("boundaries", {})
-        if (boundaries.get("auto_execute") is not False
-                or boundaries.get("final_interaction_method") != "not_ready"
-                or boundaries.get("production_integration") is not False
-                or boundaries.get("factor_selected") is not False):
+        boundaries = _mapping(summary.get("boundaries"), "audit_summary.boundaries", problems)
+        if boundaries.get("auto_execute") is not False \
+                or boundaries.get("final_interaction_method") != "not_ready" \
+                or boundaries.get("production_integration") is not False \
+                or boundaries.get("factor_selected") is not False:
             problems.append("summary_boundary_violation")
-        if summary.get("producer_conclusion") == "synthetic_contract_passed" and (
-                computed_failures or missing_required_rows):
-            problems.append("summary_pass_with_failures_or_gaps")
 
-    # conclusion: any row failure is a mismatch; unreadable/missing evidence is incomplete
-    row_failure = False
-    if objective is not None and isinstance(objective.get("rows"), list):
-        row_failure = any(r.get("status") == "contract_mismatch" for r in objective["rows"]
-                          if isinstance(r, dict))
-    if static is not None:
-        row_failure = row_failure or any(r.get("status") == "contract_mismatch"
-                                         for r in static.get("checks", []))
-    numeric_mismatch = any(p.startswith(("objective_recompute_mismatch", "gradient_sum_mismatch",
-                                        "update_parameter_mismatch", "update_gradient_mismatch",
-                                        "adamw_reference_mismatch", "failure_list"))
-                           for p in problems)
-    if row_failure or numeric_mismatch:
+    # conclusion
+    row_failure = any(isinstance(r, dict) and r.get("status") == "contract_mismatch"
+                      for r in all_rows)
+    numeric_prefixes = ("objective_recompute_mismatch", "gradient_recompute_mismatch",
+                        "gradient_saved_sum_mismatch", "update_replay_mismatch",
+                        "selection_recompute_mismatch", "selection_row_mismatch",
+                        "static_effective_loss_mismatch", "input_x0_not_bound",
+                        "nonfinite:", "sampling_full_loop_not_executed",
+                        "sampling_full_loop_forward_count", "sampling_full_loop_final_mismatch",
+                        "summary_failure_list_mismatch")
+    if row_failure or any(any(p.startswith(pre) for pre in numeric_prefixes) for p in problems):
         conclusion = "implementation_mismatch"
     elif problems:
         conclusion = "audit_incomplete"
     else:
         conclusion = "synthetic_contract_passed"
-
-    result = {
+    return {
         "schema": AUDIT_SCHEMA,
         "source": "independent_verifier",
         "conclusion": conclusion,
@@ -2870,5 +3316,22 @@ def verify_audit_artifacts(out_dir: Path) -> dict:
         "trusted_top_level_pass_string": False,
         "artifacts_read": list(REQUIRED_ARTIFACTS),
     }
+
+
+def verify_audit_artifacts(out_dir: Path) -> dict:
+    """Independent verifier with a guaranteed report even for bad structures."""
+    out_dir = Path(out_dir)
+    try:
+        result = _verify_audit_artifacts_impl(out_dir)
+    except Exception as exc:  # noqa: BLE001 -- never leave the audit unsealed
+        result = {
+            "schema": AUDIT_SCHEMA,
+            "source": "independent_verifier",
+            "conclusion": "audit_incomplete",
+            "problems": [f"verifier_exception:{type(exc).__name__}:{exc}"],
+            "checks": [],
+            "trusted_top_level_pass_string": False,
+            "artifacts_read": list(REQUIRED_ARTIFACTS),
+        }
     _write_json(out_dir / "independent_verification.json", result)
     return result
