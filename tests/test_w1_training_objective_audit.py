@@ -123,10 +123,12 @@ def test_loss_reductions_weights_and_vel_grouping():
     assert vel["evidence"]["grouped_differs"] is True
     batch = rows["loss.batch_permutation_invariance"]
     assert batch["status"] == "synthetic_verified"
-    assert batch["actual"][0] > 1e-6 and all(v > 0 for v in batch["actual"][:3])
+    assert batch["actual"]["unpermuted"][0] > 1e-6
+    assert batch["actual"]["permuted"][0] > 1e-6
+    assert all(v > 0 for v in batch["actual"]["independent_mean"][:3])
     repeat = rows["loss.repeated_batch_invariance"]
     assert repeat["status"] == "synthetic_verified"
-    assert repeat["actual"][0] > 1e-6
+    assert repeat["actual"]["repeated"][0] > 1e-6
     total = rows["loss.total_weighted_sum"]
     assert total["status"] == "synthetic_verified"
     w = W1_SYNTHETIC_WEIGHTS
@@ -318,8 +320,11 @@ def test_sampling_facts(audit_dir: Path):
     full = rows["sampling.ddim_full_loop"]
     assert full["status"] == "synthetic_verified"
     assert full["actual"]["sample_calls"] == 1
-    assert full["actual"]["forward_calls"] == full["actual"]["timesteps"] == 5
-    assert full["actual"]["final_max_abs_error"] <= 1e-5
+    assert full["actual"]["forward_calls"] == 5
+    assert full["actual"]["scheduler_step_calls"] == 5
+    assert full["actual"]["timesteps_visited"] == full["actual"]["scheduler_timesteps"]
+    assert len(set(full["actual"]["timesteps_visited"])) == 5
+    assert full["actual"]["reference_final_max_abs_error"] <= 1e-5
 
 
 def test_data_consumption_traces(audit_dir: Path):
@@ -667,6 +672,80 @@ def test_verifier_detects_a5_evidence_attacks(audit_dir: Path, tmp_path: Path):
                 r["actual"]["sample_calls"] = 0
         (d / "objective_rows.json").write_text(json.dumps(o))
 
+    def empty_gradient(d):
+        np.savez(d / "gradient_arrays.npz")
+        (d / "gradient_rows.json").write_text("{}")
+
+    def grad_status(d):
+        o = _load("objective_rows.json", d)
+        for r in o["rows"]:
+            if r["id"] == "grad.vel":
+                r["status"] = "runtime_not_checked"
+        (d / "objective_rows.json").write_text(json.dumps(o))
+
+    def grad_nan_row(d):
+        o = _load("objective_rows.json", d)
+        for r in o["rows"]:
+            if r["id"] == "grad.vel":
+                r["actual"]["grad_norm"] = float("nan")
+        (d / "objective_rows.json").write_text(json.dumps(o))
+
+    def fd_bad(d):
+        o = _load("objective_rows.json", d)
+        for r in o["rows"]:
+            if r["id"] == "grad.finite_difference_float64":
+                r["actual"]["vel"]["rel_error"] = 1.0
+                r["actual"]["vel"]["ok"] = False
+        (d / "objective_rows.json").write_text(json.dumps(o))
+
+    def one_run(d):
+        z = dict(np.load(d / "update_arrays.npz"))
+        z = {k: v for k, v in z.items() if k.startswith("deterministic_no_clip__")}
+        np.savez(d / "update_arrays.npz", **z)
+        p = _load("update_parity.json", d)
+        p["runs"] = [r for r in p["runs"] if r["run_id"] == "deterministic_no_clip"]
+        (d / "update_parity.json").write_text(json.dumps(p))
+
+    def noise_zero(d):
+        z = dict(np.load(d / "update_arrays.npz"))
+        for k in list(z):
+            if k.endswith("__s0_noise") or k.endswith("__formal_noise"):
+                z[k] = np.zeros_like(z[k])
+        np.savez(d / "update_arrays.npz", **z)
+
+    def noise_inf(d):
+        z = dict(np.load(d / "update_arrays.npz"))
+        for k in list(z):
+            if k.endswith("__s0_noise") or k.endswith("__formal_noise"):
+                z[k] = np.full_like(z[k], np.inf)
+        np.savez(d / "update_arrays.npz", **z)
+
+    def static_short(d):
+        s = _load("static_contract.json", d)
+        s["checks"] = s["checks"][:1]
+        (d / "static_contract.json").write_text(json.dumps(s))
+
+    def gap_add(d):
+        s = _load("audit_summary.json", d)
+        s["gaps"] = ["missing_row:A1:fake"]
+        s["counts"]["gaps"] = 1
+        (d / "audit_summary.json").write_text(json.dumps(s))
+
+    def permute_bad(d):
+        o = _load("objective_rows.json", d)
+        for r in o["rows"]:
+            if r["id"] == "loss.batch_permutation_invariance":
+                r["actual"]["permuted"][0] += 0.1
+        (d / "objective_rows.json").write_text(json.dumps(o))
+
+    def ddim_zero(d):
+        o = _load("objective_rows.json", d)
+        for r in o["rows"]:
+            if r["id"] == "sampling.ddim_full_loop":
+                r["actual"]["scheduler_step_calls"] = 0
+                r["actual"]["timesteps_visited"] = [0, 0, 0, 0, 0]
+        (d / "objective_rows.json").write_text(json.dumps(o))
+
     expected = {
         "empty_parity": ("audit_incomplete", "structure_empty:update_parity.runs"),
         "best_999": ("implementation_mismatch", "selection_row_mismatch"),
@@ -679,13 +758,29 @@ def test_verifier_detects_a5_evidence_attacks(audit_dir: Path, tmp_path: Path):
         "objective_list": ("audit_incomplete", "structure_not_mapping:objective_rows"),
         "empty_errors": ("audit_incomplete", "sampling_x_t_errors_empty"),
         "ddim_not_run": ("implementation_mismatch", "sampling_full_loop_not_executed"),
+        "empty_gradient": ("audit_incomplete", "gradient_rows"),
+        "grad_status": ("audit_incomplete", "required_row_not_verified:A2:grad.vel"),
+        "grad_nan_row": ("implementation_mismatch", "nonfinite:objective_rows"),
+        "fd_bad": ("implementation_mismatch", "finite_difference_row_not_verified"),
+        "one_run": ("audit_incomplete", "update_run_set_mismatch"),
+        "noise_zero": ("implementation_mismatch", "noise_to_x_t"),
+        "noise_inf": ("implementation_mismatch", "nonfinite:diffusion"),
+        "static_short": ("audit_incomplete", "static_check_set_mismatch"),
+        "gap_add": ("audit_incomplete", "summary_gap_list_mismatch"),
+        "permute_bad": ("implementation_mismatch", "batch_invariance_mismatch"),
+        "ddim_zero": ("implementation_mismatch", "sampling_full_loop_forward_or_step_count"),
     }
     cases = [("empty_parity", empty_parity), ("best_999", best_999),
              ("nan_total", nan_total), ("nan_grad", nan_grad),
              ("double_grads", double_grads), ("root_shift", root_shift),
              ("wfk_2000", wfk_2000), ("xt_miswire", xt_miswire),
              ("objective_list", objective_list), ("empty_errors", empty_errors),
-             ("ddim_not_run", ddim_not_run)]
+             ("ddim_not_run", ddim_not_run), ("empty_gradient", empty_gradient),
+             ("grad_status", grad_status), ("grad_nan_row", grad_nan_row),
+             ("fd_bad", fd_bad), ("one_run", one_run), ("noise_zero", noise_zero),
+             ("noise_inf", noise_inf), ("static_short", static_short),
+             ("gap_add", gap_add), ("permute_bad", permute_bad),
+             ("ddim_zero", ddim_zero)]
     for name, mutate in cases:
         v = _tampered(audit_dir, tmp_path, f"attack_{name}", mutate)
         want_conclusion, want_problem = expected[name]
