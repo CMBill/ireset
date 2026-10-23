@@ -105,6 +105,8 @@ TOLERANCES: dict[str, dict[str, float | str]] = {
                              "derivation": "sum of separately computed gradients"},
     "adamw_float32": {"atol": 2e-7, "rtol": 2e-6,
                       "derivation": "float32 AdamW first step + bias correction"},
+    "update_replay_float32": {"atol": 1e-8, "rtol": 1e-5,
+                              "derivation": "float32 replay; small clipped gradients ~1e-7 must not be swallowed"},
     "macro_float64": {"atol": 1e-12, "rtol": 1e-12,
                       "derivation": "scalar mean of exactly represented floats"},
 }
@@ -3015,6 +3017,19 @@ def _saved_world(inputs: dict, problems: list[str]) -> tuple[SyntheticWorld | No
     return world, {"x0": x0, "pred": pred, "tokenizer": tokenizer}
 
 
+def _doc_fields_close(a: Any, b: Any, atol: float = 1e-9, rtol: float = 0.0) -> bool:
+    if isinstance(a, dict) and isinstance(b, dict):
+        return set(a) == set(b) and all(_doc_fields_close(a[k], b[k], atol, rtol) for k in a)
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(_doc_fields_close(x, y, atol, rtol) for x, y in zip(a, b))
+    if isinstance(a, (int, float, np.integer, np.floating)) and not isinstance(a, (bool, np.bool_)) \
+            and isinstance(b, (int, float, np.integer, np.floating)) and not isinstance(b, (bool, np.bool_)):
+        if not math.isfinite(float(a)) or not math.isfinite(float(b)):
+            return False
+        return abs(float(a) - float(b)) <= atol + rtol * abs(float(b))
+    return a == b
+
+
 def _validate_gradient_arrays(garr: dict, world: SyntheticWorld, weights: LossWeights,
                               row_map: dict, detail_map: dict, problems: list[str]) -> dict:
     if not garr:
@@ -3054,6 +3069,14 @@ def _validate_gradient_arrays(garr: dict, world: SyntheticWorld, weights: LossWe
                 problems.append(f"gradient_row_mismatch:{term}:{key}")
         if act.get("finite") is not True or act.get("nonzero") is not True:
             problems.append(f"gradient_row_not_verified:{term}")
+        ref_dir = np.random.default_rng(1000 + ("pos", "rot6d", "joint",
+                                                "geodesic_rad2", "vel", "fk_m2").index(term)).normal(
+                                                    size=g.shape)
+        ref_dir = ref_dir / max(np.linalg.norm(ref_dir), 1e-15)
+        expected_cos = float(np.sum(g.numpy() * ref_dir) / max(norm, 1e-15))
+        if not _finite_number(act.get("direction_cosine")) \
+                or abs(float(act["direction_cosine"]) - expected_cos) > 1e-9:
+            problems.append(f"gradient_row_mismatch:{term}:direction_cosine")
         detail = detail_map.get(f"grad.{term}")
         if detail is None or not isinstance(detail.get("actual"), dict):
             problems.append(f"structure_missing_keys:gradient_rows.grad.{term}.actual")
@@ -3115,6 +3138,10 @@ def _recompute_update_run(run: dict, uarr: dict, tokenizer, weights: LossWeights
         return
     model_type = str(run.get("model_type"))
     clip_should_trigger = float(expected_clip) < 1.0
+    replay_tol = TOLERANCES["update_replay_float32"]
+
+    def close(a, b) -> bool:
+        return abs(float(a) - float(b)) <= replay_tol["atol"] + replay_tol["rtol"] * abs(float(b))
     for side in ("s0", "formal"):
         pred_saved = _as_float_array(
             uarr.get(f"{prefix}{side}_preds"), f"{run_id}.{side}.preds", problems,
@@ -3161,8 +3188,8 @@ def _recompute_update_run(run: dict, uarr: dict, tokenizer, weights: LossWeights
                     problems.append(f"update_replay_mismatch:{run_id}:{side}:part:{key}:{i}")
             (loss / 4.0).backward()
         pre = [bias.grad.detach().clone(), scale.grad.detach().clone()]
-        if float((pre[0].numpy() - pre0).__abs__().max()) > 1e-6 or \
-                float((pre[1].numpy() - pre1).__abs__().max()) > 1e-6:
+        if any(not close(a, b) for a, b in zip(pre[0].numpy().ravel(), pre0.ravel())) \
+                or not close(pre[1].item(), float(pre1)):
             problems.append(f"update_replay_mismatch:{run_id}:{side}:preclip")
         pre_norm = math.sqrt(sum(float(t.cpu().norm()) ** 2 for t in pre))
         gnorm = float(torch.nn.utils.clip_grad_norm_([bias, scale], grad_clip))
@@ -3176,8 +3203,8 @@ def _recompute_update_run(run: dict, uarr: dict, tokenizer, weights: LossWeights
         else:
             if gnorm > grad_clip or abs(post_norm - pre_norm) > 1e-6:
                 problems.append(f"update_replay_no_clip_changed:{run_id}:{side}")
-        if float((post[0].numpy() - post0).__abs__().max()) > 1e-6 or \
-                float((post[1].numpy() - post1).__abs__().max()) > 1e-6:
+        if any(not close(a, b) for a, b in zip(post[0].numpy().ravel(), post0.ravel())) \
+                or not close(post[1].item(), float(post1)):
             problems.append(f"update_replay_mismatch:{run_id}:{side}:postclip")
         opt.step()
         names = ("model.bias", "conditioner.scale")
@@ -3194,18 +3221,33 @@ def _recompute_update_run(run: dict, uarr: dict, tokenizer, weights: LossWeights
                                          f"{run_id}.{side}.exp_avg_sq.{n}", problems, pshape)
             if any(v is None for v in (saved_param, saved_grad, exp_avg, exp_avg_sq)):
                 return
-            if np.asarray(saved_step).shape != ():
-                problems.append(f"structure_shape:{run_id}.{side}.step.{n}")
+            step_arr = np.asarray(saved_step)
+            if step_arr.shape != () or step_arr.dtype.kind not in "iuf" \
+                    or not math.isfinite(float(step_arr)) or float(step_arr) != 1.0:
+                problems.append(f"adamw_step_not_exact_one:{run_id}:{side}:{n}")
                 return
-            if float(np.abs(param.detach().numpy() - saved_param).max()) > 1e-6:
-                problems.append(f"update_replay_mismatch:{run_id}:{side}:param:{n}")
-            if float(np.abs(post[j].numpy() - saved_grad).max()) > 1e-6:
-                problems.append(f"update_replay_mismatch:{run_id}:{side}:grad:{n}")
             st = opt.state[param]
-            if int(saved_step) != 1 or int(st.get("step", -1)) != 1:
+            if int(st.get("step", -1)) != 1:
                 problems.append(f"update_replay_mismatch:{run_id}:{side}:adamw_step:{n}")
-            if float(np.abs(st["exp_avg"].detach().numpy() - exp_avg).max()) > 1e-6 \
-                    or float(np.abs(st["exp_avg_sq"].detach().numpy() - exp_avg_sq).max()) > 1e-6:
+            if any(not close(a, b) for a, b in zip(param.detach().numpy().ravel(),
+                                                    saved_param.ravel())):
+                problems.append(f"update_replay_mismatch:{run_id}:{side}:param:{n}")
+            if any(not close(a, b) for a, b in zip(post[j].numpy().ravel(), saved_grad.ravel())):
+                problems.append(f"update_replay_mismatch:{run_id}:{side}:grad:{n}")
+            # saved gradients and AdamW moments must be non-zero and mutually consistent
+            if float(np.abs(saved_grad).max()) == 0:
+                problems.append(f"saved_grad_zero:{run_id}:{side}:{n}")
+            if float(np.abs(exp_avg).max()) == 0 or float(np.abs(exp_avg_sq).max()) == 0:
+                problems.append(f"saved_adamw_state_zero:{run_id}:{side}:{n}")
+            if any(not close(a, b) for a, b in zip(exp_avg.ravel(), (0.1 * saved_grad).ravel())):
+                problems.append(f"adamw_state_formula_mismatch:{run_id}:{side}:exp_avg:{n}")
+            if any(not close(a, b) for a, b in zip(exp_avg_sq.ravel(),
+                                                    (0.001 * saved_grad * saved_grad).ravel())):
+                problems.append(f"adamw_state_formula_mismatch:{run_id}:{side}:exp_avg_sq:{n}")
+            if any(not close(a, b) for a, b in zip(st["exp_avg"].detach().numpy().ravel(),
+                                                    exp_avg.ravel())) \
+                    or any(not close(a, b) for a, b in zip(st["exp_avg_sq"].detach().numpy().ravel(),
+                                                           exp_avg_sq.ravel())):
                 problems.append(f"update_replay_mismatch:{run_id}:{side}:adamw_state:{n}")
     # S0 and formal must have the same real inputs, forward outputs and updates
     for key in ("micro_x0",):
@@ -3324,34 +3366,53 @@ def _verify_row_semantics(row_map: dict, inputs: dict, world: SyntheticWorld,
         tr = _as_float_array(inputs["batch_target_r"], "inputs.batch_target_r", problems)
         pr = _as_float_array(inputs["batch_pred_r"], "inputs.batch_pred_r", problems)
         if all(v is not None for v in (tb, pb, perm, tr, pr)):
-            if tb.ndim != 3 or pb.shape != tb.shape or perm.shape != (3,) \
-                    or tr.ndim != 3 or pr.shape != tr.shape:
+            T = int(world.T)
+            if tb.shape != (3, T, 38) or pb.shape != (3, T, 38) \
+                    or tr.shape != (6, T, 38) or pr.shape != (6, T, 38) \
+                    or perm.shape != (3,):
                 problems.append("structure_shape:inputs:batch_invariance")
             else:
+                perm_int = perm.astype(int)
+                if sorted(perm_int.tolist()) != [0, 1, 2] or not np.allclose(perm, perm_int):
+                    problems.append("batch_permutation_invalid")
+                if not np.array_equal(tr, np.concatenate([tb, tb], axis=0)) \
+                        or not np.array_equal(pr, np.concatenate([pb, pb], axis=0)):
+                    problems.append("batch_repeat_not_original")
                 def means(preds, targets):
+                    if preds.shape[0] < 1:
+                        return None
                     vals = [_independent_terms(preds[i], targets[i], world, weights)
                             for i in range(preds.shape[0])]
-                    return [float(np.mean([v[k] for v in vals])) for k in ("total", "pos", "vel")]
+                    out = [float(np.mean([v[k] for v in vals])) for k in ("total", "pos", "vel")]
+                    return out if all(math.isfinite(v) for v in out) else None
                 exp_unperm = means(pb, tb)
-                exp_perm = means(pb[perm.astype(int)], tb[perm.astype(int)])
+                exp_perm = means(pb[perm_int], tb[perm_int])
                 exp_rep = means(pr, tr)
-                for rid, key, expected in (
-                        ("loss.batch_permutation_invariance", "unpermuted", exp_unperm),
-                        ("loss.batch_permutation_invariance", "permuted", exp_perm),
-                        ("loss.batch_permutation_invariance", "independent_mean", exp_unperm),
-                        ("loss.repeated_batch_invariance", "repeated", exp_rep),
-                        ("loss.repeated_batch_invariance", "independent_mean", exp_rep)):
-                    row = row_map.get(rid)
-                    act = row.get("actual") if isinstance(row, dict) else None
-                    vals = act.get(key) if isinstance(act, dict) else None
-                    if not isinstance(vals, list) or len(vals) != 3 \
-                            or not all(_finite_number(v) for v in vals):
-                        problems.append(f"structure_invalid:{rid}.{key}")
-                        continue
+                if any(v is None for v in (exp_unperm, exp_perm, exp_rep)):
+                    problems.append("batch_invariance_nonfinite_expected")
+                else:
                     tol = TOLERANCES["loss_float64"]
-                    if any(abs(float(a) - float(b)) > tol["atol"] + tol["rtol"] * abs(float(b))
-                           for a, b in zip(vals, expected)):
-                        problems.append(f"batch_invariance_mismatch:{rid}:{key}")
+                    # the three aggregations must be invariant to each other
+                    for other in (exp_perm, exp_rep):
+                        if any(abs(float(a) - float(b)) > tol["atol"] + tol["rtol"] * abs(float(b))
+                               for a, b in zip(other, exp_unperm)):
+                            problems.append("batch_mean_invariance_mismatch")
+                    for rid, key, expected in (
+                            ("loss.batch_permutation_invariance", "unpermuted", exp_unperm),
+                            ("loss.batch_permutation_invariance", "permuted", exp_perm),
+                            ("loss.batch_permutation_invariance", "independent_mean", exp_unperm),
+                            ("loss.repeated_batch_invariance", "repeated", exp_rep),
+                            ("loss.repeated_batch_invariance", "independent_mean", exp_unperm)):
+                        row = row_map.get(rid)
+                        act = row.get("actual") if isinstance(row, dict) else None
+                        vals = act.get(key) if isinstance(act, dict) else None
+                        if not isinstance(vals, list) or len(vals) != 3 \
+                                or not all(_finite_number(v) for v in vals):
+                            problems.append(f"structure_invalid:{rid}.{key}")
+                            continue
+                        if any(abs(float(a) - float(b)) > tol["atol"] + tol["rtol"] * abs(float(b))
+                               for a, b in zip(vals, expected)):
+                            problems.append(f"batch_invariance_mismatch:{rid}:{key}")
     # Finite difference: recompute fd, analytic directional derivative and
     # rel_error from the bound target/pred/direction/step, then compare records.
     fd = row_map.get("grad.finite_difference_float64")
@@ -3451,6 +3512,15 @@ def _verify_audit_artifacts_impl(out_dir: Path) -> dict:
     gradient = _mapping(gradient_raw, "gradient_rows", problems)
     gradient_rows_map = _validate_row_list(gradient.get("rows"), "A2",
                                           "gradient_rows", problems)
+    for rid in REQUIRED_AUDIT_ROWS["A2"]:
+        a = row_map.get(rid)
+        b = gradient_rows_map.get(rid)
+        if a is None or b is None:
+            problems.append(f"structure_missing_keys:A2_detail:{rid}")
+        elif a.get("status") != b.get("status"):
+            problems.append(f"gradient_detail_status_mismatch:{rid}")
+        elif not _doc_fields_close(a.get("actual"), b.get("actual")):
+            problems.append(f"gradient_detail_mismatch:{rid}")
     world, saved = _saved_world(inputs, problems) if inputs else (None, {})
     if world is not None and weights is not None:
         exp = _independent_terms(saved["pred"], saved["x0"], world, weights)
@@ -3655,7 +3725,12 @@ def _verify_audit_artifacts_impl(out_dir: Path) -> dict:
                         "gradient_saved_sum_mismatch", "gradient_row_mismatch",
                         "gradient_detail_mismatch", "finite_difference_recompute_mismatch",
                         "static_effective_config_mismatch",
-                        "update_replay_mismatch", "selection_recompute_mismatch",
+                        "update_replay_mismatch", "update_replay_clip_not_triggered",
+                        "update_replay_no_clip_changed", "saved_grad_zero",
+                        "saved_adamw_state_zero", "adamw_state_formula_mismatch",
+                        "adamw_step_not_exact_one", "batch_permutation_invalid",
+                        "batch_repeat_not_original", "batch_mean_invariance_mismatch",
+                        "batch_invariance_nonfinite_expected", "selection_recompute_mismatch",
                         "selection_row_mismatch", "static_effective_loss_mismatch",
                         "input_x0_not_bound", "nonfinite:",
                         "finite_difference_row_not_verified", "batch_invariance_mismatch",

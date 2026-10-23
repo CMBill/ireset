@@ -805,6 +805,64 @@ def test_verifier_detects_a5_evidence_attacks(audit_dir: Path, tmp_path: Path):
         s["effective_config"]["grad_clip"] = 999.0
         (d / "static_contract.json").write_text(json.dumps(s))
 
+    def zero_clipped_state(d):
+        z = dict(np.load(d / "update_arrays.npz"))
+        for k in list(z):
+            if "with_clip__" in k and "grad_clip" not in k and (
+                    "postclip" in k or "_grad_" in k or "exp_avg" in k):
+                z[k] = np.zeros_like(z[k])
+        np.savez(d / "update_arrays.npz", **z)
+
+    def empty_repeat(d):
+        z = dict(np.load(d / "synthetic_inputs.npz"))
+        z["batch_target_r"] = z["batch_target_r"][:0]
+        z["batch_pred_r"] = z["batch_pred_r"][:0]
+        np.savez(d / "synthetic_inputs.npz", **z)
+
+    def repeated_target(d):
+        z = dict(np.load(d / "synthetic_inputs.npz"))
+        z["batch_pred_r"] = z["batch_target_r"].copy()
+        np.savez(d / "synthetic_inputs.npz", **z)
+        o = _load("objective_rows.json", d)
+        for r in o["rows"]:
+            if r["id"] == "loss.repeated_batch_invariance":
+                r["actual"]["repeated"] = [0.0, 0.0, 0.0]
+                r["actual"]["independent_mean"] = [0.0, 0.0, 0.0]
+        (d / "objective_rows.json").write_text(json.dumps(o))
+
+    def bad_perm(d):
+        z = dict(np.load(d / "synthetic_inputs.npz"))
+        z["batch_perm"] = np.array([0, 0, 0])
+        np.savez(d / "synthetic_inputs.npz", **z)
+
+    def fd_detail(d):
+        g = _load("gradient_rows.json", d)
+        for r in g["rows"]:
+            if r["id"] == "grad.finite_difference_float64":
+                r["actual"]["vel"].update(fd=1.0, analytic=123.0, rel_error=1.0, ok=False)
+        (d / "gradient_rows.json").write_text(json.dumps(g))
+
+    def cos_detail(d):
+        g = _load("gradient_rows.json", d)
+        for r in g["rows"]:
+            if r["id"] == "grad.vel":
+                r["actual"]["direction_cosine"] = 9.0
+        (d / "gradient_rows.json").write_text(json.dumps(g))
+
+    def step_float(d):
+        z = dict(np.load(d / "update_arrays.npz"))
+        for k in list(z):
+            if "_step_" in k:
+                z[k] = np.asarray(1.9, dtype=np.float64)
+        np.savez(d / "update_arrays.npz", **z)
+
+    def step_string(d):
+        z = dict(np.load(d / "update_arrays.npz"))
+        for k in list(z):
+            if "_step_" in k:
+                z[k] = np.asarray("1")
+        np.savez(d / "update_arrays.npz", **z)
+
     expected = {
         "empty_parity": ("audit_incomplete", "structure_empty:update_parity.runs"),
         "best_999": ("implementation_mismatch", "selection_row_mismatch"),
@@ -836,6 +894,14 @@ def test_verifier_detects_a5_evidence_attacks(audit_dir: Path, tmp_path: Path):
         "grad_detail_bad": ("implementation_mismatch", "gradient_detail_mismatch"),
         "summary_empty": ("audit_incomplete", "structure_empty:audit_summary"),
         "config_bad": ("implementation_mismatch", "static_effective_config_mismatch"),
+        "zero_clipped_state": ("implementation_mismatch", "saved_grad_zero"),
+        "empty_repeat": ("audit_incomplete", "structure_shape:inputs:batch_invariance"),
+        "repeated_target": ("implementation_mismatch", "batch_repeat_not_original"),
+        "bad_perm": ("implementation_mismatch", "batch_permutation_invalid"),
+        "fd_detail": ("implementation_mismatch", "gradient_detail_mismatch"),
+        "cos_detail": ("implementation_mismatch", "gradient_detail_mismatch"),
+        "step_float": ("implementation_mismatch", "adamw_step_not_exact_one"),
+        "step_string": ("implementation_mismatch", "adamw_step_not_exact_one"),
     }
     cases = [("empty_parity", empty_parity), ("best_999", best_999),
              ("nan_total", nan_total), ("nan_grad", nan_grad),
@@ -850,7 +916,11 @@ def test_verifier_detects_a5_evidence_attacks(audit_dir: Path, tmp_path: Path):
              ("ddim_zero", ddim_zero), ("clip_arrays", clip_arrays),
              ("scalar_3d", scalar_3d), ("fd_raw", fd_raw), ("fd_delete", fd_delete),
              ("batch_bad", batch_bad), ("grad_detail_bad", grad_detail_bad),
-             ("summary_empty", summary_empty), ("config_bad", config_bad)]
+             ("summary_empty", summary_empty), ("config_bad", config_bad),
+             ("zero_clipped_state", zero_clipped_state), ("empty_repeat", empty_repeat),
+             ("repeated_target", repeated_target), ("bad_perm", bad_perm),
+             ("fd_detail", fd_detail), ("cos_detail", cos_detail),
+             ("step_float", step_float), ("step_string", step_string)]
     for name, mutate in cases:
         v = _tampered(audit_dir, tmp_path, f"attack_{name}", mutate)
         want_conclusion, want_problem = expected[name]
