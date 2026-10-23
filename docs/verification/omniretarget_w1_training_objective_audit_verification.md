@@ -1,6 +1,6 @@
 # W1 训练拟合与目标一致性合成审计验证记录
 
-日期：2026-10-22（第四轮复核轮修复 2 P1 + 3 P2 后重跑）。对应方案：[W1训练拟合与目标一致性单因素诊断执行方案](../plans/omniretarget_w1_training_fit_objective_audit_plan.md) A0–A5。**本次交付是纯合成审计实现与运行，不是真实数据审计或单因素训练预注册。**
+日期：2026-10-22（第五轮复核轮修复 1 P1 + 1 P2 后重跑）。对应方案：[W1训练拟合与目标一致性单因素诊断执行方案](../plans/omniretarget_w1_training_fit_objective_audit_plan.md) A0–A5。**本次交付是纯合成审计实现与运行，不是真实数据审计或单因素训练预注册。**
 
 ## 0. 结论与边界
 
@@ -29,13 +29,13 @@
 | [tests/test_w1_training_objective_audit.py](../../tests/test_w1_training_objective_audit.py) | 32 项正向链与篡改反例（含 A5 证据攻击矩阵、DDIM 时间表/末步替换）；临时目录，不扫描生产历史 |
 | [derived/audit/w1_training_objective_audit/](../../derived/audit/w1_training_objective_audit/) | 权威合成产物：`static_contract.json`、`s0_formal_comparison.json`、`objective_rows.json`、`synthetic_inputs.npz`、`gradient_rows.json`、`gradient_arrays.npz`、`update_parity.json`、`update_arrays.npz`、`sampling_trace.json`、`rng_state_facts.json`、`audit_summary.json`、`independent_verification.json` |
 
-权威运行基于已提交的 `3ee50b1f0b3e1ee75cddda54e4cc169136d55276`；第四轮复核修复文件在运行时尚未提交，`static_contract.json` 记录 `git.dirty=true`、tracked diff SHA-256 `b1d46f64ba3f912ca7bd668647e8d07b0fac23540a2423469352c71f53ddf4d9`，并单独登记三个实现文件 SHA-256：
+权威运行基于已提交的 `7c7b3628e442ec24460f0ea04e36c82d2532960e`；第五轮复核修复文件在运行时尚未提交，`static_contract.json` 记录 `git.dirty=true`、tracked diff SHA-256 `3e8eb22552f0d1a165177f61437cc8b191955472ddcd2028e32823abb0224909`，并单独登记三个实现文件 SHA-256：
 
 | 文件 | SHA-256 |
 | --- | --- |
-| `src/ireset/eval/training_objective_audit.py` | `bf84a11fd077618a4aa5a425b261243fb5c951ed779104d0c3027faa94c326ea` |
+| `src/ireset/eval/training_objective_audit.py` | `357fdba916ad5e2f46ac05d47e0242f5597a30431ba6b1a1430fb6bfdeb10a18` |
 | `scripts/audit_w1_training_objective.py` | `2816a31d1a211b9f46caf51e391cdb61934b33b55540519aace1d47e3306c832` |
-| `tests/test_w1_training_objective_audit.py` | `fc009ab3a32dacaaeefafc37fb06c5fcab12bd671b326417059572b556c7cfe0` |
+| `tests/test_w1_training_objective_audit.py` | `21f837e9ebff4bbd7c79be1bed199f4214b511c2701ec6fb584f00ae94b3b491` |
 
 配置文件 `configs/train/omniretarget_motion.yaml` 原字节 SHA-256：`0e2cfa96849ee2de14ac84b7343289090c606f78116bb79114ff81b046b521e0`。
 
@@ -106,6 +106,8 @@
 | diffusion noise→x_t | 用保存的 micro_x0/t/noise 独立重建 x_t；noise 清零、Inf 或 t 越界均拒绝 |
 | 裁剪身份/形状 | NPZ 的 grad_clip 必须等于固定 run 的 1e9/1e-6（同时与 JSON 一致）；标量参数/梯度/gnorm 必须为 0 维，bias/权重为精确 [38]；with_clip 必须实际触发裁剪（pre>clip、post≈clip）。 |
 | 小量梯度/状态 | 裁剪后梯度约 1e-7，使用 `atol=1e-8 + rtol=1e-5` 专用容差；保存梯度/AdamW 状态必须非零，并与 `0.1·grad`、`0.001·grad²` 公式对账；清零 32 个数组被拒绝。 |
+| 二阶状态尺度/符号 | `exp_avg_sq` 必须非负；公式与重放比较使用 `1e-30` 级尺度相对容差，而非 1e-8 绝对容差；改 −1e-9 或整体 ×1e6 均被拒绝。 |
+| 明细严格类型 | A2 明细对账中 bool 只与 bool 比较；FD `ok=true` 改成整数 `1` 不再等值。 |
 | AdamW 步数 | 保存的 step 必须是非布尔、有限数值标量且精确等于 1；1.9 或字符串 "1" 被拒绝。 |
 | 有限差分重算 | 从绑定 pred/target、固定方向种子 7 与 eps=1e-6 重算 fd/analytic/rel_error/ok/cosine 并逐项对账，不能只信保存的派生标记。 |
 | batch 独立期望/生成关系 | 固定形状 [3,T,38]/[6,T,38] 与非空；perm 必须是 [0,1,2] 的合法排列；重复数组必须逐位等于原数组拼接；未排列/排列/重复均值互相一致且与重新计算值对账。 |
@@ -158,6 +160,9 @@
 | gradient_rows 的 FD 明细改成 fd=1/analytic=123/rel=1/ok=false | `gradient_detail_mismatch` / `implementation_mismatch` |
 | grad.vel direction_cosine 改 9 | `gradient_detail_mismatch` + 重算余弦门 / `implementation_mismatch` |
 | AdamW step 改 1.9 或字符串 "1" | `adamw_step_not_exact_one` / `implementation_mismatch` |
+| with_clip 的 `exp_avg_sq` 改 −1e-9 | `saved_adamw_state_negative` / `implementation_mismatch` |
+| with_clip 的 `exp_avg_sq` 整体 ×1e6 | `adamw_state_formula_mismatch` / `implementation_mismatch` |
+| gradient_rows 的 FD `ok` 由 true 改为整数 1 | `gradient_detail_mismatch` / `implementation_mismatch` |
 
 其余旧攻击（目标 total +0.1、删除 `grad.vel`、写坏 JSON、改 update 参数、改 `grad_vel`、删除 `static_contract.json`）继续被拦截；验证器顶层异常也会由 wrapper 写入 `verifier_exception` 报告，而不是中断。
 
@@ -178,7 +183,7 @@ uv run --locked pytest tests/test_w1_training_objective_audit.py -q
 
 测试覆盖：完整 A1–A4 正向链与 A5 证据攻击矩阵；解析编码/解码、分组均值与 38 通道 vel、四类扰动、batch 重排/重复、近零/平行/近 π/关节边界/饱和 logits、接触分支静默、FK 合成标记；逐项梯度、权重消费、detach 反例、FK target no_grad、有限差分、float32、参数链式法则；S0/正式四项 parity、裁剪/无裁剪、micro 除法、样本加权区别、optimizer 成员、AdamW 参考、无 scheduler、x_t/t=0/DDIM、两种数据消费、RNG 恢复与独立 generator；宏微排名、物理 FK MPJPE、roster/坏行、选模、确定性与舍入限制；独立复核的目标/梯度/更新数组篡改、缺行、坏 JSON、缺工件；CLI 真实输入拒绝与端到端合成运行。
 
-**未重跑全项目套件。** 上一次全量记录仍为 2026-10-22 首轮修复后的 **947 passed + 1 skipped**（旧范围），本记录不冒充新的全量结果。审计模块的 32 项测试与权威运行是本次新增的独立证据（第四轮复核攻击矩阵亦在测试内）。
+**未重跑全项目套件。** 上一次全量记录仍为 2026-10-22 首轮修复后的 **947 passed + 1 skipped**（旧范围），本记录不冒充新的全量结果。审计模块的 32 项测试与权威运行是本次新增的独立证据（第五轮复核攻击矩阵亦在测试内）。
 
 ## 10. 边界与下一交付
 

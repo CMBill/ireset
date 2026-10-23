@@ -3022,12 +3022,20 @@ def _doc_fields_close(a: Any, b: Any, atol: float = 1e-9, rtol: float = 0.0) -> 
         return set(a) == set(b) and all(_doc_fields_close(a[k], b[k], atol, rtol) for k in a)
     if isinstance(a, list) and isinstance(b, list):
         return len(a) == len(b) and all(_doc_fields_close(x, y, atol, rtol) for x, y in zip(a, b))
-    if isinstance(a, (int, float, np.integer, np.floating)) and not isinstance(a, (bool, np.bool_)) \
-            and isinstance(b, (int, float, np.integer, np.floating)) and not isinstance(b, (bool, np.bool_)):
+    a_bool = isinstance(a, (bool, np.bool_))
+    b_bool = isinstance(b, (bool, np.bool_))
+    if a_bool or b_bool:
+        # True and 1 are not interchangeable evidence
+        return a_bool and b_bool and bool(a) == bool(b)
+    a_num = isinstance(a, (int, float, np.integer, np.floating))
+    b_num = isinstance(b, (int, float, np.integer, np.floating))
+    if a_num != b_num:
+        return False
+    if a_num and b_num:
         if not math.isfinite(float(a)) or not math.isfinite(float(b)):
             return False
         return abs(float(a) - float(b)) <= atol + rtol * abs(float(b))
-    return a == b
+    return type(a) is type(b) and a == b
 
 
 def _validate_gradient_arrays(garr: dict, world: SyntheticWorld, weights: LossWeights,
@@ -3142,6 +3150,12 @@ def _recompute_update_run(run: dict, uarr: dict, tokenizer, weights: LossWeights
 
     def close(a, b) -> bool:
         return abs(float(a) - float(b)) <= replay_tol["atol"] + replay_tol["rtol"] * abs(float(b))
+
+    def close_moment(a, b, second_order: bool = False) -> bool:
+        # second moments are ~1e-20..1e-16: an absolute 1e-8 floor would hide
+        # sign/order-of-magnitude errors, so use a scale-aware tiny floor
+        floor = 1e-30 if second_order else 1e-14
+        return abs(float(a) - float(b)) <= floor + 1e-4 * abs(float(b))
     for side in ("s0", "formal"):
         pred_saved = _as_float_array(
             uarr.get(f"{prefix}{side}_preds"), f"{run_id}.{side}.preds", problems,
@@ -3239,15 +3253,21 @@ def _recompute_update_run(run: dict, uarr: dict, tokenizer, weights: LossWeights
                 problems.append(f"saved_grad_zero:{run_id}:{side}:{n}")
             if float(np.abs(exp_avg).max()) == 0 or float(np.abs(exp_avg_sq).max()) == 0:
                 problems.append(f"saved_adamw_state_zero:{run_id}:{side}:{n}")
-            if any(not close(a, b) for a, b in zip(exp_avg.ravel(), (0.1 * saved_grad).ravel())):
+            if bool((exp_avg_sq < 0).any()):
+                problems.append(f"saved_adamw_state_negative:{run_id}:{side}:exp_avg_sq:{n}")
+            if any(not close_moment(a, b) for a, b in zip(
+                    exp_avg.ravel(), (0.1 * saved_grad).ravel())):
                 problems.append(f"adamw_state_formula_mismatch:{run_id}:{side}:exp_avg:{n}")
-            if any(not close(a, b) for a, b in zip(exp_avg_sq.ravel(),
-                                                    (0.001 * saved_grad * saved_grad).ravel())):
+            if any(not close_moment(a, b, second_order=True) for a, b in zip(
+                    exp_avg_sq.ravel(), (0.001 * saved_grad * saved_grad).ravel())):
                 problems.append(f"adamw_state_formula_mismatch:{run_id}:{side}:exp_avg_sq:{n}")
-            if any(not close(a, b) for a, b in zip(st["exp_avg"].detach().numpy().ravel(),
-                                                    exp_avg.ravel())) \
-                    or any(not close(a, b) for a, b in zip(st["exp_avg_sq"].detach().numpy().ravel(),
-                                                           exp_avg_sq.ravel())):
+            live_sq = st["exp_avg_sq"].detach().numpy()
+            if bool((live_sq < 0).any()):
+                problems.append(f"update_replay_negative_state:{run_id}:{side}:exp_avg_sq:{n}")
+            if any(not close_moment(a, b) for a, b in zip(
+                    st["exp_avg"].detach().numpy().ravel(), exp_avg.ravel())) \
+                    or any(not close_moment(a, b, second_order=True) for a, b in zip(
+                        live_sq.ravel(), exp_avg_sq.ravel())):
                 problems.append(f"update_replay_mismatch:{run_id}:{side}:adamw_state:{n}")
     # S0 and formal must have the same real inputs, forward outputs and updates
     for key in ("micro_x0",):

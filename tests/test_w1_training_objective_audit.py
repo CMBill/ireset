@@ -863,6 +863,29 @@ def test_verifier_detects_a5_evidence_attacks(audit_dir: Path, tmp_path: Path):
                 z[k] = np.asarray("1")
         np.savez(d / "update_arrays.npz", **z)
 
+    def exp_sq_negative(d):
+        z = dict(np.load(d / "update_arrays.npz"))
+        for k in list(z):
+            if "with_clip__" in k and "exp_avg_sq" in k:
+                z[k] = np.full_like(z[k], -1e-9)
+        np.savez(d / "update_arrays.npz", **z)
+
+    def exp_sq_million(d):
+        z = dict(np.load(d / "update_arrays.npz"))
+        for k in list(z):
+            if "with_clip__" in k and "exp_avg_sq" in k:
+                z[k] = z[k] * 1e6
+        np.savez(d / "update_arrays.npz", **z)
+
+    def fd_bool_as_int(d):
+        g = _load("gradient_rows.json", d)
+        for r in g["rows"]:
+            if r["id"] == "grad.finite_difference_float64":
+                for term in r["actual"]:
+                    if r["actual"][term].get("ok") is True:
+                        r["actual"][term]["ok"] = 1
+        (d / "gradient_rows.json").write_text(json.dumps(g))
+
     expected = {
         "empty_parity": ("audit_incomplete", "structure_empty:update_parity.runs"),
         "best_999": ("implementation_mismatch", "selection_row_mismatch"),
@@ -902,6 +925,9 @@ def test_verifier_detects_a5_evidence_attacks(audit_dir: Path, tmp_path: Path):
         "cos_detail": ("implementation_mismatch", "gradient_detail_mismatch"),
         "step_float": ("implementation_mismatch", "adamw_step_not_exact_one"),
         "step_string": ("implementation_mismatch", "adamw_step_not_exact_one"),
+        "exp_sq_negative": ("implementation_mismatch", "saved_adamw_state_negative"),
+        "exp_sq_million": ("implementation_mismatch", "adamw_state_formula_mismatch"),
+        "fd_bool_as_int": ("implementation_mismatch", "gradient_detail_mismatch"),
     }
     cases = [("empty_parity", empty_parity), ("best_999", best_999),
              ("nan_total", nan_total), ("nan_grad", nan_grad),
@@ -920,7 +946,9 @@ def test_verifier_detects_a5_evidence_attacks(audit_dir: Path, tmp_path: Path):
              ("zero_clipped_state", zero_clipped_state), ("empty_repeat", empty_repeat),
              ("repeated_target", repeated_target), ("bad_perm", bad_perm),
              ("fd_detail", fd_detail), ("cos_detail", cos_detail),
-             ("step_float", step_float), ("step_string", step_string)]
+             ("step_float", step_float), ("step_string", step_string),
+             ("exp_sq_negative", exp_sq_negative), ("exp_sq_million", exp_sq_million),
+             ("fd_bool_as_int", fd_bool_as_int)]
     for name, mutate in cases:
         v = _tampered(audit_dir, tmp_path, f"attack_{name}", mutate)
         want_conclusion, want_problem = expected[name]
