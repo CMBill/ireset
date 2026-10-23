@@ -64,7 +64,7 @@
 
 本轮完成文档核对：原始 r6 的三个去噪分组仅含 n 与窗口微平均；首轮修复代码的只读再聚合宏为 null；第二轮修复后的 demo 等权宏为 §0.4 所列数值。三种历史已在本记录、AGENTS 与文档索引中分别说明，不改写 r6。测试范围同样分开：第二轮模块59项、相关回归404项已经完成，947+1仍仅指首轮修复后的最近全量，不声称第二轮全量已经完成。
 
-后续[训练拟合与目标一致性审计设计](../plans/omniretarget_w1_training_fit_objective_audit_plan.md)已另起草，当前仅含源代码/配置静态核对与合成审计实现设计，不构成新cohort或真实执行预注册。本轮未启动正式stage、真实数据计算或训练，旧cohort不可正式复验与最终交互not_ready边界保留。
+后续[训练拟合与目标一致性审计设计](../plans/omniretarget_w1_training_fit_objective_audit_plan.md)已另起草；该方案的 A0–A5 **合成审计已实现并运行**（`synthetic_contract_passed`，65 行、0 失败/0 缺口、5 项限制），见[合成审计验证记录](omniretarget_w1_training_objective_audit_verification.md)。真实数据审计与单因素实验仍未注册，不构成新cohort或真实执行预注册。本轮未启动正式stage、真实数据计算或训练，旧cohort不可正式复验与最终交互not_ready边界保留。
 
 本次四份文档共117处本地链接检查通过；七份冻结方案与r6注册/final/pairs共10项SHA-256全部与原登记相等，`git diff --check`通过。这些是文档与字节完整性检查，不是一次新的诊断或模型回归。
 
