@@ -7,7 +7,9 @@ provider and tiny production-code stand-ins; tamper tests run on copies.
 
 from __future__ import annotations
 
+import copy
 import json
+import random
 import shutil
 import subprocess
 import sys
@@ -486,6 +488,7 @@ def _replay_contexts(run_dir: Path):
             "gradient_rows": pdir / "gradient_real_rows.json",
             "call_trace": pdir / "call_trace.json",
             "rng_facts": pdir / "rng_state_facts.json",
+            "report": pdir / "p_report.json",
         },
         "rows": _load(pdir / "objective_real_rows.json")["rows"],
         "gradient_rows": _load(pdir / "gradient_real_rows.json")["rows"],
@@ -500,6 +503,23 @@ def _replay_contexts(run_dir: Path):
             "fk_elements": arrays[f"term_elements_{model}_fk"],
         }
     return r0, p, arrays, gradients
+
+
+def _run_f_on(run: Path, provider, *, attempt: str = "attempt_extra_f",
+              calls=None):
+    r0, p, arrays, gradients = _replay_contexts(run)
+    t0 = time.perf_counter()
+    budget = {"stage": "F", "remaining_s": 120.0}
+    scope = audit._unit_scope(r0["inputs"])
+    audit.pre_register_attempt(
+        run, "F", attempt, t0, scope=scope, budget=budget,
+        registration_sha=r0["registration_sha256"])
+    result = audit.run_f_stage(
+        run, "F", attempt, t0, budget, r0, p, provider,
+        calls if calls is not None else audit.AuditCallBudget(),
+        r0["registration"]["tolerance_contract"],
+        mode="synthetic", scope=scope)
+    return result, r0, p, arrays, gradients
 
 
 @pytest.mark.parametrize("tamper", ["prediction", "gradient", "x_t"])
@@ -691,3 +711,250 @@ def test_synthetic_cli_rejects_real_records(tmp_path: Path):
         cwd=ROOT, capture_output=True, text=True)
     assert proc.returncode != 0
     assert "only valid with --real" in (proc.stdout + proc.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Review counterexamples: each one must fail for the stated reason.
+# ---------------------------------------------------------------------------
+
+
+def test_f_counts_every_actual_vjp(audit_dir: Path, tmp_path: Path,
+                                   monkeypatch):
+    run = tmp_path / "vjp_count"
+    shutil.copytree(audit_dir, run)
+    calls = audit.AuditCallBudget()
+    actual = {"production": 0, "independent": 0}
+    original_prod = audit.production_vjp
+    original_ind = audit.independent_vjp
+
+    def counted_prod(*args, **kwargs):
+        actual["production"] += 1
+        return original_prod(*args, **kwargs)
+
+    def counted_ind(*args, **kwargs):
+        actual["independent"] += 1
+        return original_ind(*args, **kwargs)
+
+    monkeypatch.setattr(audit, "production_vjp", counted_prod)
+    monkeypatch.setattr(audit, "independent_vjp", counted_ind)
+    result, *_ = _run_f_on(
+        run, audit.SyntheticObjectiveProvider(seed=20261026), calls=calls)
+    assert result["problems"] == []
+    assert actual == {"production": 2, "independent": 2}
+    assert calls.snapshot()["counts"]["production_vjp"] == 2
+    assert calls.snapshot()["counts"]["independent_vjp"] == 2
+
+
+def test_f_binds_disk_gradients_not_in_memory_units(audit_dir: Path,
+                                                    tmp_path: Path):
+    run = tmp_path / "disk_grad"
+    shutil.copytree(audit_dir, run)
+    r0, p, arrays, gradients = _replay_contexts(run)
+    for key in gradients:
+        gradients[key] = -gradients[key]
+    np.savez(_stage_files(run, "P") / "gradient_real_arrays.npz", **gradients)
+    # p["units"] intentionally still carries the original in-memory values.
+    result, *_ = _run_f_on(
+        run, audit.SyntheticObjectiveProvider(seed=20261026))
+    assert any("replay_production_grad_not_bitwise" in x
+               for x in result["problems"]), result["problems"]
+    assert any("replay_independent_grad_not_bitwise" in x
+               for x in result["problems"]), result["problems"]
+
+
+def test_f_recomputes_fk_from_saved_points(audit_dir: Path, tmp_path: Path):
+    run = tmp_path / "fk_shift"
+    shutil.copytree(audit_dir, run)
+    pdir = _stage_files(run, "P")
+    arrays = dict(np.load(pdir / "objective_real_arrays.npz", allow_pickle=False))
+    for model in audit.MODELS:
+        arrays[f"fk_points_pred_{model}"] = (
+            arrays[f"fk_points_pred_{model}"] + np.float32(1.0))
+    np.savez(pdir / "objective_real_arrays.npz", **arrays)
+    result, *_ = _run_f_on(
+        run, audit.SyntheticObjectiveProvider(seed=20261026))
+    assert any("fk_elements_not_recomputed" in x
+               for x in result["problems"]), result["problems"]
+
+
+def test_retry_cannot_reset_call_quota(audit_dir: Path):
+    with pytest.raises(SystemExit, match="cumulative call budget exhausted"):
+        audit.run_registered_audit(
+            audit_dir, audit.SyntheticObjectiveProvider(seed=20261026),
+            mode="synthetic", tolerance=audit.build_tolerance_contract())
+
+
+def test_f_restores_rng_before_replay(audit_dir: Path, tmp_path: Path):
+    run = tmp_path / "rng_restore"
+    shutil.copytree(audit_dir, run)
+
+    class NoisyFactoryProvider(audit.SyntheticObjectiveProvider):
+        def model_factory(self):
+            torch.rand(3)
+            np.random.rand(3)
+            random.random()
+            return super().model_factory()
+
+    result, *_ = _run_f_on(
+        run, NoisyFactoryProvider(seed=20261026))
+    assert result["problems"] == [], result["problems"]
+    assert result["gaps"] == [], result["gaps"]
+
+
+def test_valid_negative_result_can_enter_f(tmp_path: Path):
+    class MismatchProvider(audit.SyntheticObjectiveProvider):
+        def loss_factory(self):
+            base = super().loss_factory()
+
+            def build(model_type):
+                asm = base(model_type)
+                if model_type == "deterministic":
+                    asm.w = audit.LossWeights(
+                        w_pos=2.0, w_rot6d=1.0, w_joint=1.0,
+                        w_geodesic=0.5, w_fk=2.0, w_contact=0.0, w_vel=0.5)
+                return asm
+
+            return build
+
+    root = tmp_path / "negative"
+    result = audit.run_registered_audit(
+        root, MismatchProvider(seed=20261026), mode="synthetic",
+        tolerance=audit.build_tolerance_contract())
+    assert result["conclusion"] == "synthetic_pipeline_mismatch", result
+    p_report = _load(root / "production/attempt_001/p_report.json")
+    assert p_report["stop_after_mismatch"] == "deterministic"
+    assert set(p_report["units"]) == {"deterministic"}
+    assert (root / "finalize/attempt_001/independent_verification.json").is_file()
+    verification = _load(
+        root / "finalize/attempt_001/independent_verification.json")
+    assert verification["reported_models"] == ["deterministic"]
+    assert verification["problems"]
+
+
+def test_calibration_evidence_is_reverified():
+    contract = audit.synthetic_calibration(seed=123)
+    assert audit.tolerance_contract_problems(contract) == []
+    widened = copy.deepcopy(contract)
+    widened["tolerances"]["loss_float32"]["atol"] *= 10.0
+    assert "calibration_threshold_derivation_mismatch" in \
+        audit.tolerance_contract_problems(widened)
+    stripped = copy.deepcopy(contract)
+    del stripped["calibration"]
+    stripped["evidence_sha256"] = "0" * 64
+    stripped["calibration_sha256"] = "0" * 64
+    assert "calibration_evidence_missing" in \
+        audit.tolerance_contract_problems(stripped)
+    coordinated = copy.deepcopy(contract)
+    coordinated["calibration"]["observed"]["loss_float32"] = {
+        "atol": 1.0, "rtol": 0.0}
+    coordinated["tolerances"]["loss_float32"] = {
+        "atol": 4.0, "rtol": 2e-5, "scale_floor": 0.0}
+    coordinated["evidence_sha256"] = coordinated["calibration_sha256"] = \
+        audit._canonical_sha256(coordinated["calibration"])
+    problems = audit.tolerance_contract_problems(coordinated)
+    assert any("calibration_" in p and "reproducible" in p for p in problems), problems
+
+
+def test_prior_call_counts_are_cohort_wide_and_fail_closed(tmp_path: Path):
+    fixed = tmp_path / "fixed"
+    fixed.mkdir()
+    old = fixed / "old_run"
+    current = fixed / "current_run"
+    audit.write_cohort(old, mode="real")
+    audit.write_cohort(current, mode="real")
+    t0 = time.perf_counter()
+    budget = {"stage": "R0", "remaining_s": 60.0}
+    audit.pre_register_attempt(old, "R0", "attempt_001", t0,
+                               scope={"s": 1}, budget=budget)
+    balance = audit.AuditCallBudget(prior_counts={
+        "conditioner": 1, "model": 1,
+        "production_vjp": 1, "independent_vjp": 1}).snapshot()
+    sealed = audit.finish_attempt(
+        old, "R0", "attempt_001", t0, budget, {"complete": True},
+        status="done", extra={"call_balance": balance})
+    assert sealed.sealed
+    counts = audit.prior_call_counts(current, fixed_root=fixed, mode="real")
+    assert counts == {"conditioner": 1, "model": 1,
+                      "production_vjp": 1, "independent_vjp": 1}
+    ledger = _load(old / "costs.json")
+    del ledger["invocations"][0]["call_balance"]
+    (old / "costs.json").write_text(json.dumps(ledger))
+    assert audit.prior_call_counts(current, fixed_root=fixed, mode="real") is None
+    # A disk attempt without any index/ledger row is also unknown evidence.
+    orphan = fixed / "orphan_run"
+    audit.write_cohort(orphan, mode="real")
+    (orphan / "registration" / "attempt_001").mkdir(parents=True)
+    assert audit.prior_call_counts(current, fixed_root=fixed, mode="real") is None
+
+
+def test_negative_costs_are_refused_by_both_entries(tmp_path: Path):
+    root = tmp_path / "negative_cost"
+    sealed = _seal_stage(root, "R0", "attempt_001")
+    assert sealed.sealed
+    index = _load(root / "attempts_index.json")
+    ledger = _load(root / "costs.json")
+    index["attempts"][0]["measured_wall_s"] = -100.0
+    index["attempts"][0]["wall_s"] = -100.0
+    ledger["invocations"][0]["measured_wall_s"] = -100.0
+    ledger["invocations"][0]["wall_s"] = -100.0
+    (root / "attempts_index.json").write_text(json.dumps(index))
+    (root / "costs.json").write_text(json.dumps(ledger))
+    assert audit.stage_history(root, "R0") is None
+    _, problems = audit.stage_state(root, "R0")
+    assert "attempt_cost_invalid" in problems
+    with pytest.raises(SystemExit, match="history unknown"):
+        audit.budget_for(root, "R0", fixed_root=tmp_path, mode="synthetic")
+    with pytest.raises(ValueError, match="non-negative"):
+        audit.upsert_cost(root, "R0", "attempt_002", -1.0)
+
+
+def test_f_rejects_extra_rows_and_row_field_tampering(audit_dir: Path,
+                                                      tmp_path: Path):
+    run = tmp_path / "row_fields"
+    shutil.copytree(audit_dir, run)
+    pdir = _stage_files(run, "P")
+    doc = _load(pdir / "objective_real_rows.json")
+    rows = doc["rows"]
+    extra = copy.deepcopy(rows[0])
+    extra["id"] = "unexpected|row"
+    rows.append(extra)
+    rows[1]["denominator"] = 999999
+    rows[2]["weight"] = 999999
+    (pdir / "objective_real_rows.json").write_text(json.dumps(doc))
+    result, *_ = _run_f_on(
+        run, audit.SyntheticObjectiveProvider(seed=20261026))
+    assert any("p_objective_multiset:extra_rows" in x
+               for x in result["gaps"]), result["gaps"]
+    assert any("unexpected|row" in x for x in result["problems"])
+    assert any("denominator" in x for x in result["problems"])
+    assert any("weight" in x for x in result["problems"])
+
+
+def test_non_numeric_arrays_do_not_abort_verification(audit_dir: Path,
+                                                      tmp_path: Path):
+    run = tmp_path / "string_array"
+    shutil.copytree(audit_dir, run)
+    pdir = _stage_files(run, "P")
+    gradients = dict(np.load(pdir / "gradient_real_arrays.npz",
+                             allow_pickle=False))
+    key = "production_grad_deterministic"
+    gradients[key] = np.full(gradients[key].shape, "bad", dtype="<U4")
+    np.savez(pdir / "gradient_real_arrays.npz", **gradients)
+    result, *_ = _run_f_on(
+        run, audit.SyntheticObjectiveProvider(seed=20261026))
+    assert result["conclusion"] == "audit_incomplete"
+    assert any("array_not_numeric" in x for x in result["gaps"]), result["gaps"]
+    assert (run / "finalize/attempt_extra_f/audit_summary.json").is_file()
+
+
+def test_check_arrays_string_dtype_is_a_normal_problem(tmp_path: Path):
+    keys = audit.objective_array_keys()
+    schema = audit._array_schema()
+    arrays = {k: np.zeros(schema[k]["shape"], dtype=schema[k]["dtype"])
+              for k in keys}
+    arrays["x0"] = np.full(schema["x0"]["shape"], "bad", dtype="<U4")
+    path = tmp_path / "string.npz"
+    np.savez(path, **arrays)
+    got, problems = audit._check_arrays(path, keys, schema)
+    assert got
+    assert any("array_not_numeric:x0" in p for p in problems)

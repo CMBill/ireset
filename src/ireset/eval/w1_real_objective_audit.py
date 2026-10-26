@@ -248,6 +248,11 @@ def _count(value: Any) -> bool:
             and not isinstance(value, (bool, np.bool_)) and int(value) >= 0)
 
 
+def _nonneg(value: Any) -> bool:
+    """Finite, numeric and non-negative: the only valid cost/effort domain."""
+    return _num(value) and float(value) >= 0.0
+
+
 def _array(value: Any, name: str, *, dtype=None, ndim: int | None = None) -> np.ndarray:
     a = np.asarray(value)
     if ndim is not None and a.ndim != ndim:
@@ -470,6 +475,8 @@ def upsert_ledger(root: Path, stage: str, attempt: str, entry: dict) -> None:
 def upsert_cost(root: Path, stage: str, attempt: str, measured_wall_s: float,
                 extra: dict | None = None, status: str = "running") -> None:
     measured = float(measured_wall_s)
+    if not _nonneg(measured):
+        raise ValueError(f"measured wall time must be finite and non-negative: {measured}")
     entry = {
         "status": status,
         "complete": bool((extra or {}).get("complete", False)),
@@ -594,14 +601,15 @@ def stage_history(root: Path, stage: str, *, allow_current: tuple[str, str] | No
             measured = e.get("measured_wall_s")
             rounded = e.get("wall_s")
             index_measured = row.get("measured_wall_s")
-            if not (_num(measured) and _num(rounded) and _num(index_measured)):
+            if not (_nonneg(measured) and _nonneg(rounded)
+                    and _nonneg(index_measured)):
                 return None
             if float(index_measured) != float(measured):
                 return None
             if float(rounded) != round(float(measured), 1):
                 return None
             if "wall_s" in row:
-                if not _num(row["wall_s"]) or float(row["wall_s"]) != round(float(measured), 1):
+                if not _nonneg(row["wall_s"]) or float(row["wall_s"]) != round(float(measured), 1):
                     return None
             total += float(measured)
         return total
@@ -716,6 +724,114 @@ def cohort_attempts(fixed_root: Path, stage: str, *,
     return count
 
 
+def _call_counts_from_balance(balance: Any) -> dict[str, int] | None:
+    """Strictly decode one sealed attempt's call ledger; None means unknown."""
+    if not isinstance(balance, Mapping):
+        return None
+    if balance.get("schema") != "w1_real_objective_call_budget_v1":
+        return None
+    counts = balance.get("counts")
+    if not isinstance(counts, Mapping) or set(counts) != set(CALL_CAPS):
+        return None
+    out: dict[str, int] = {}
+    for kind in CALL_CAPS:
+        value = counts.get(kind)
+        if not _count(value) or int(value) > int(CALL_CAPS[kind]):
+            return None
+        out[kind] = int(value)
+    if balance.get("within_caps") is not True:
+        return None
+    return out
+
+
+def prior_call_counts(root: Path, *, fixed_root: Path,
+                      mode: str = "real") -> dict[str, int] | None:
+    """Sum cohort-wide call usage from sealed attempts in the fixed history root.
+
+    Every attempted stage must carry a decodable ``call_balance`` in both the
+    index and the ledger.  A single missing/contradictory row makes the whole
+    history unknown, so the caller stops instead of granting a fresh quota.
+    """
+    roots: list[Path] = []
+    if mode == "real":
+        base = Path(fixed_root)
+        if not base.is_dir():
+            return None
+        current = Path(root).resolve()
+        for sibling in _cohort_roots(base):
+            if sibling.resolve() == current:
+                continue
+            marker_path = sibling / "cohort.json"
+            try:
+                marker = read_json(marker_path) if marker_path.is_file() else {}
+                index = load_index(sibling)
+                ledger = load_ledger(sibling)
+            except (OSError, ValueError, TypeError):
+                return None
+            matching = (isinstance(marker, Mapping)
+                        and marker.get("cohort_id") == COHORT_ID)
+            matching = matching or any(
+                r.get("cohort_id") == COHORT_ID for r in (*index, *ledger))
+            if not matching:
+                continue
+            if isinstance(marker, Mapping) and marker.get("cohort_id") not in (None, COHORT_ID):
+                continue
+            roots.append(sibling)
+    roots.append(Path(root))
+    totals = {kind: 0 for kind in CALL_CAPS}
+    for run_root in roots:
+        try:
+            index = load_index(run_root)
+            ledger = load_ledger(run_root)
+        except (OSError, ValueError, TypeError):
+            return None
+        index_rows = [r for r in index
+                      if r.get("cohort_id") == COHORT_ID
+                      and r.get("accounting_schema") == ACCOUNTING_SCHEMA]
+        ledger_rows = [r for r in ledger
+                       if r.get("cohort_id") == COHORT_ID
+                       and r.get("accounting_schema") == ACCOUNTING_SCHEMA]
+        index_by = {(r.get("stage"), r.get("attempt")): r for r in index_rows}
+        ledger_by = {(e.get("stage"), e.get("attempt")): e for e in ledger_rows}
+        if (len(index_by) != len(index_rows) or len(ledger_by) != len(ledger_rows)
+                or None in {k[0] for k in index_by}
+                or None in {k[1] for k in index_by}
+                or None in {k[0] for k in ledger_by}
+                or None in {k[1] for k in ledger_by}):
+            return None
+        if set(index_by) != set(ledger_by):
+            return None
+        for stage in STAGE_BUDGETS:
+            disk = _disk_attempts(run_root, stage)
+            idx = {attempt for (s, attempt) in index_by if s == stage}
+            led = {attempt for (s, attempt) in ledger_by if s == stage}
+            if disk != idx or disk != led:
+                return None
+        # ``call_balance`` is a cumulative cohort snapshot, not a per-stage
+        # delta.  Taking the maximum (and requiring monotonicity in append
+        # order) deducts earlier attempts/runs exactly once.
+        previous = {kind: 0 for kind in CALL_CAPS}
+        for row in index_rows:
+            key = (row.get("stage"), row.get("attempt"))
+            status = row.get("status")
+            if status in ("running", "publishing"):
+                return None
+            if status not in ("done", "crashed", "timeout", "incomplete"):
+                return None
+            counts = _call_counts_from_balance(row.get("call_balance"))
+            ledger_counts = _call_counts_from_balance(
+                ledger_by[key].get("call_balance"))
+            if counts is None or ledger_counts != counts:
+                return None
+            for kind in CALL_CAPS:
+                if counts[kind] < previous[kind]:
+                    return None
+                previous[kind] = counts[kind]
+        for kind in CALL_CAPS:
+            totals[kind] = max(totals[kind], previous[kind])
+    return totals
+
+
 def budget_for(root: Path, stage: str, *, fixed_root: Path,
                mode: str = "real") -> dict:
     """Read history first, then return the available stage budget.
@@ -805,9 +921,14 @@ def pre_register_attempt(root: Path, stage: str, attempt: str, t0: float,
 
 @dataclass
 class SealResult:
+    """``sealed`` means complete+terminal; ``terminal`` means the row is a
+    trustworthy final record even when the attempt is a legitimate partial
+    (incomplete) result.  Publishing/running leftovers are neither."""
+
     sealed: bool
     row: dict
     problems: list[str] = field(default_factory=list)
+    terminal: bool = False
 
 
 def _report_hashes(row: dict) -> dict:
@@ -976,7 +1097,8 @@ def finish_attempt(root: Path, stage: str, attempt: str, t0: float,
         problems.append("seal_tail_reserve_unverifiable")
         return SealResult(False, row, problems)
     ok = not overrun and row.get("complete") is True
-    return SealResult(ok, row, problems)
+    terminal = row.get("status") in ("done", "crashed", "timeout", "incomplete")
+    return SealResult(ok, row, problems, terminal)
 
 
 def stage_state(root: Path, stage: str) -> tuple[dict | None, list[str]]:
@@ -1025,7 +1147,8 @@ def stage_state(root: Path, stage: str) -> tuple[dict | None, list[str]]:
         measured = e.get("measured_wall_s")
         rounded = e.get("wall_s")
         index_measured = latest.get("measured_wall_s")
-        if not (_num(measured) and _num(rounded) and _num(index_measured)):
+        if not (_nonneg(measured) and _nonneg(rounded)
+                and _nonneg(index_measured)):
             problems.append("attempt_cost_invalid")
         else:
             if float(index_measured) != float(measured):
@@ -1108,6 +1231,23 @@ def _deep_copy_tolerances() -> dict:
     return copy.deepcopy(DEFAULT_TOLERANCES)
 
 
+def _apply_observed_tolerances(observed: Mapping[str, Any]) -> dict:
+    """The only admitted derivation from synthetic observations to thresholds."""
+    tolerances = _deep_copy_tolerances()
+    for key, value in observed.items():
+        if key not in tolerances or not isinstance(value, Mapping):
+            raise ValueError(f"calibration observed an unknown tolerance key: {key}")
+        atol = max(float(tolerances[key]["atol"]),
+                   4.0 * float(value.get("atol", 0.0)))
+        rtol = max(float(tolerances[key]["rtol"]),
+                   4.0 * float(value.get("rtol", 0.0)))
+        if not (math.isfinite(atol) and math.isfinite(rtol)):
+            raise ValueError(f"{key}: non-finite calibrated tolerance")
+        tolerances[key]["atol"] = atol
+        tolerances[key]["rtol"] = rtol
+    return tolerances
+
+
 def build_tolerance_contract(*, observed: Mapping[str, Any] | None = None,
                              evidence_sha256: str | None = None) -> dict:
     """Freeze the comparison domain before real values are opened.
@@ -1117,17 +1257,8 @@ def build_tolerance_contract(*, observed: Mapping[str, Any] | None = None,
     synthetic calibration hash keeps the contract non-consumable for the real
     entry.
     """
-    tolerances = _deep_copy_tolerances()
-    if observed:
-        for key, value in observed.items():
-            if key not in tolerances or not isinstance(value, Mapping):
-                continue
-            atol = max(float(tolerances[key]["atol"]), 4.0 * float(value.get("atol", 0.0)))
-            rtol = max(float(tolerances[key]["rtol"]), 4.0 * float(value.get("rtol", 0.0)))
-            if not (math.isfinite(atol) and math.isfinite(rtol)):
-                raise ValueError(f"{key}: non-finite calibrated tolerance")
-            tolerances[key]["atol"] = atol
-            tolerances[key]["rtol"] = rtol
+    tolerances = (_apply_observed_tolerances(observed) if observed
+                  else _deep_copy_tolerances())
     return {
         "schema": "w1_real_objective_tolerance_contract_v1",
         "audit_schema": AUDIT_SCHEMA,
@@ -1150,7 +1281,20 @@ def build_tolerance_contract(*, observed: Mapping[str, Any] | None = None,
     }
 
 
+def _canonical_sha256(value: Any) -> str:
+    return sha256_bytes(json.dumps(
+        _jsonable(value), sort_keys=True, separators=(",", ":")).encode())
+
+
 def tolerance_contract_problems(contract: Mapping[str, Any] | None) -> list[str]:
+    """Validate not just fields but the entire frozen derivation chain.
+
+    A calibrated contract must carry the synthetic evidence that produced it,
+    its self-hash must match, the thresholds must equal the documented 4x
+    derivation from that evidence, and a fresh deterministic calibration with
+    the recorded seed must reproduce both the evidence and the thresholds.
+    Replacing evidence+hash while widening a tolerance is therefore rejected.
+    """
     problems: list[str] = []
     if not isinstance(contract, Mapping):
         return ["tolerance_contract_not_a_mapping"]
@@ -1162,6 +1306,9 @@ def tolerance_contract_problems(contract: Mapping[str, Any] | None) -> list[str]
         problems.append("tolerance_contract_not_calibrated")
     if contract.get("synthetic_only") is not True:
         problems.append("tolerance_contract_not_synthetic")
+    mode = contract.get("mode")
+    if mode not in ("synthetic_default", "synthetic_calibrated"):
+        problems.append("tolerance_contract_mode")
     tol = contract.get("tolerances")
     if not isinstance(tol, Mapping):
         return problems + ["tolerance_contract_tolerances"]
@@ -1196,6 +1343,66 @@ def tolerance_contract_problems(contract: Mapping[str, Any] | None) -> list[str]
                 value = rec.get(field_name)
                 if not _num(value) or float(value) < 0.0:
                     problems.append(f"term_override:{key}:{field_name}")
+        if _jsonable(overrides) != _jsonable(TERM_FLOAT32_OVERRIDES):
+            problems.append("term_overrides_not_frozen")
+    if problems:
+        return problems
+
+    evidence_sha = contract.get("evidence_sha256")
+    calibration = contract.get("calibration")
+    if mode == "synthetic_default":
+        if evidence_sha is not None:
+            problems.append("default_contract_has_evidence")
+        if calibration not in (None, {}):
+            problems.append("default_contract_has_calibration")
+        if _jsonable(tol) != _jsonable(DEFAULT_TOLERANCES):
+            problems.append("default_tolerances_changed")
+        return problems
+
+    # mode == "synthetic_calibrated"
+    if not isinstance(evidence_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", evidence_sha):
+        problems.append("calibration_evidence_hash_missing")
+    if not isinstance(calibration, Mapping):
+        problems.append("calibration_evidence_missing")
+        return problems
+    if contract.get("calibration_sha256") != evidence_sha:
+        problems.append("calibration_sha_mismatch")
+    if _canonical_sha256(calibration) != evidence_sha:
+        problems.append("calibration_evidence_hash_mismatch")
+    if calibration.get("schema") != "w1_real_objective_synthetic_calibration_v1":
+        problems.append("calibration_schema")
+    if calibration.get("real_dataset_loaded") is not False:
+        problems.append("calibration_real_dataset")
+    if calibration.get("real_checkpoint_loaded") is not False:
+        problems.append("calibration_real_checkpoint")
+    if calibration.get("real_model_calls") != 0:
+        problems.append("calibration_real_model_calls")
+    observed = calibration.get("observed")
+    if not isinstance(observed, Mapping) or not observed:
+        problems.append("calibration_observed_missing")
+    else:
+        try:
+            derived = _apply_observed_tolerances(observed)
+        except (TypeError, ValueError):
+            problems.append("calibration_observed_invalid")
+        else:
+            if _jsonable(derived) != _jsonable(tol):
+                problems.append("calibration_threshold_derivation_mismatch")
+    seed = calibration.get("seed")
+    if not _count(seed):
+        problems.append("calibration_seed_invalid")
+    else:
+        try:
+            fresh = synthetic_calibration(seed=int(seed))
+        except Exception as exc:  # noqa: BLE001 -- evidence must be reproducible
+            problems.append(f"calibration_recompute_failed:{type(exc).__name__}")
+        else:
+            if fresh.get("calibration_sha256") != evidence_sha:
+                problems.append("calibration_evidence_not_reproducible")
+            if _jsonable(fresh.get("calibration")) != _jsonable(calibration):
+                problems.append("calibration_values_not_reproducible")
+            if _jsonable(fresh.get("tolerances")) != _jsonable(tol):
+                problems.append("calibration_contract_not_reproducible")
     return problems
 
 
@@ -1681,11 +1888,26 @@ class AuditCallBudgetExceeded(RuntimeError):
 
 
 class AuditCallBudget:
-    """Cumulative call counter shared by R0/P/F; failures still consume."""
+    """Cumulative call counter shared by R0/P/F; failures still consume.
 
-    def __init__(self, caps: Mapping[str, int] | None = None) -> None:
+    ``prior_counts`` seeds calls already consumed by earlier attempts/runs of
+    the same cohort.  Caps are cohort-wide, so a retry never receives a fresh
+    allowance; missing or malformed history is refused before construction.
+    """
+
+    def __init__(self, caps: Mapping[str, int] | None = None,
+                 prior_counts: Mapping[str, Any] | None = None) -> None:
         self.caps = {k: int(v) for k, v in (caps or CALL_CAPS).items()}
-        self.counts = {k: 0 for k in self.caps}
+        seed = {k: 0 for k in self.caps}
+        if prior_counts is not None:
+            if set(prior_counts) != set(self.caps):
+                raise ValueError("prior call counts do not match the frozen cap keys")
+            for kind, value in prior_counts.items():
+                if not _count(value):
+                    raise ValueError(f"prior call count invalid: {kind}={value!r}")
+                seed[kind] = int(value)
+        self.prior_counts = dict(seed)
+        self.counts = dict(seed)
         self.facts: list[dict] = []
 
     def consume(self, kind: str, **facts: Any) -> int:
@@ -1702,23 +1924,143 @@ class AuditCallBudget:
             "schema": "w1_real_objective_call_budget_v1",
             "caps": dict(self.caps),
             "counts": dict(self.counts),
+            "prior_counts": dict(self.prior_counts),
             "remaining": {k: self.caps[k] - self.counts[k] for k in self.caps},
             "facts": list(self.facts),
             "within_caps": all(self.counts[k] <= self.caps[k] for k in self.caps),
         }
 
 
-def _rng_facts() -> dict:
+def _rng_state() -> dict:
+    """Capture restorable process RNG states (not just hashes)."""
+    import base64
     import random
 
+    py_version, py_keys, py_gauss = random.getstate()
     np_state = np.random.get_state()
+    cuda_states = None
+    if torch.cuda.is_available():
+        cuda_states = [
+            base64.b64encode(state.cpu().numpy().tobytes()).decode("ascii")
+            for state in torch.cuda.get_rng_state_all()
+        ]
     return {
-        "python": sha256_bytes(repr(random.getstate()).encode()),
-        "numpy": sha256_bytes(np_state[1].tobytes() + repr(np_state[2:]).encode()),
-        "torch_cpu": sha256_bytes(torch.get_rng_state().numpy().tobytes()),
-        "torch_cuda": (sha256_bytes(torch.cuda.get_rng_state().cpu().numpy().tobytes())
-                       if torch.cuda.is_available() else None),
+        "python": {"version": int(py_version),
+                   "keys": [int(x) for x in py_keys],
+                   "gauss_next": None if py_gauss is None else float(py_gauss)},
+        "numpy": {"name": str(np_state[0]),
+                  "keys": [int(x) for x in np_state[1]],
+                  "pos": int(np_state[2]), "has_gauss": int(np_state[3]),
+                  "cached_gaussian": float(np_state[4])},
+        "torch_cpu": base64.b64encode(
+            torch.get_rng_state().cpu().numpy().tobytes()).decode("ascii"),
+        "torch_cuda": cuda_states,
         "cuda_available": bool(torch.cuda.is_available()),
+    }
+
+
+def _rng_state_problems(state: Any) -> list[str]:
+    """Structural validation before a replay restores any global RNG state."""
+    problems: list[str] = []
+    if not isinstance(state, Mapping):
+        return ["rng_state_not_a_mapping"]
+    py = state.get("python")
+    if (not isinstance(py, Mapping)
+            or not _count(py.get("version"))
+            or not isinstance(py.get("keys"), list)
+            or not py["keys"]
+            or not all(_count(x) for x in py["keys"])
+            or not (py.get("gauss_next") is None or _num(py.get("gauss_next")))):
+        problems.append("rng_python_invalid")
+    np_state = state.get("numpy")
+    if (not isinstance(np_state, Mapping)
+            or not isinstance(np_state.get("name"), str)
+            or not isinstance(np_state.get("keys"), list)
+            or not np_state["keys"]
+            or not all(_count(x) for x in np_state["keys"])
+            or not _count(np_state.get("pos"))
+            or not _count(np_state.get("has_gauss"))
+            or not _num(np_state.get("cached_gaussian"))):
+        problems.append("rng_numpy_invalid")
+    import base64
+
+    def decoded_length(value: Any) -> int | None:
+        if not isinstance(value, str) or not value:
+            return None
+        try:
+            return len(base64.b64decode(value, validate=True))
+        except (ValueError, TypeError):
+            return None
+
+    cpu = state.get("torch_cpu")
+    expected_len = int(torch.get_rng_state().numel())
+    if decoded_length(cpu) != expected_len:
+        problems.append("rng_torch_cpu_invalid")
+    cuda = state.get("torch_cuda")
+    if state.get("cuda_available") is True:
+        if (not isinstance(cuda, list) or not cuda
+                or not all(decoded_length(x) is not None for x in cuda)):
+            problems.append("rng_torch_cuda_invalid")
+        elif torch.cuda.is_available():
+            cuda_len = {int(s.numel()) for s in torch.cuda.get_rng_state_all()}
+            if any(decoded_length(x) not in cuda_len for x in cuda):
+                problems.append("rng_torch_cuda_invalid")
+    elif cuda is not None:
+        problems.append("rng_torch_cuda_unexpected")
+    if state.get("cuda_available") is not bool(torch.cuda.is_available()):
+        problems.append("rng_cuda_availability_changed")
+    return problems
+
+
+def _restore_rng_state(state: Mapping[str, Any]) -> None:
+    """Restore the exact P-before state; invalid states raise ValueError."""
+    import base64
+    import random
+
+    problems = _rng_state_problems(state)
+    if problems:
+        raise ValueError(f"invalid RNG state: {problems}")
+    py = state["python"]
+    random.setstate((int(py["version"]), tuple(int(x) for x in py["keys"]),
+                     py["gauss_next"]))
+    np_state = state["numpy"]
+    np.random.set_state((
+        np_state["name"],
+        np.asarray(np_state["keys"], dtype=np.uint32),
+        int(np_state["pos"]), int(np_state["has_gauss"]),
+        float(np_state["cached_gaussian"]),
+    ))
+    cpu = torch.frombuffer(
+        bytearray(base64.b64decode(state["torch_cpu"], validate=True)),
+        dtype=torch.uint8).clone()
+    torch.set_rng_state(cpu)
+    if torch.cuda.is_available():
+        for index, encoded in enumerate(state["torch_cuda"]):
+            cuda = torch.frombuffer(
+                bytearray(base64.b64decode(encoded, validate=True)),
+                dtype=torch.uint8).clone()
+            torch.cuda.set_rng_state(cuda, device=index)
+
+
+def _rng_facts(state: Mapping[str, Any] | None = None) -> dict:
+    """Hash the restorable state captured by :func:`_rng_state`."""
+    if state is None:
+        state = _rng_state()
+    return {
+        "python": sha256_bytes(repr(state["python"]).encode()),
+        "numpy": sha256_bytes(
+            np.asarray(state["numpy"]["keys"], dtype=np.uint32).tobytes()
+            + repr((state["numpy"]["name"], state["numpy"]["pos"],
+                    state["numpy"]["has_gauss"],
+                    state["numpy"]["cached_gaussian"])).encode()),
+        "torch_cpu": sha256_bytes(
+            __import__("base64").b64decode(state["torch_cpu"])),
+        "torch_cuda": (
+            sha256_bytes(b"".join(
+                __import__("base64").b64decode(x)
+                for x in state["torch_cuda"]))
+            if state.get("torch_cuda") else None),
+        "cuda_available": bool(state.get("cuda_available")),
     }
 
 
@@ -1833,14 +2175,14 @@ def required_gradient_row_keys() -> list[str]:
     return keys
 
 
-def objective_array_keys() -> list[str]:
+def objective_array_keys_for(models: Sequence[str]) -> list[str]:
     base = [
         "raw_root", "raw_q", "raw_wfc", "kps_obj", "kps_clip",
         "box_t_clip", "box_quat", "contact", "x0", "x0_independent",
         "joint_lo", "joint_hi", "root_mean", "root_std", "t", "noise",
         "alpha_cumprod",
     ]
-    for model in MODELS:
+    for model in models:
         base += [f"prediction_{model}", f"term_elements_{model}_pos",
                  f"term_elements_{model}_rot6d", f"term_elements_{model}_joint",
                  f"term_elements_{model}_geodesic_rad2",
@@ -1851,11 +2193,19 @@ def objective_array_keys() -> list[str]:
     return base
 
 
-def gradient_array_keys() -> list[str]:
+def objective_array_keys() -> list[str]:
+    return objective_array_keys_for(MODELS)
+
+
+def gradient_array_keys_for(models: Sequence[str]) -> list[str]:
     keys = []
-    for model in MODELS:
+    for model in models:
         keys += [f"production_grad_{model}", f"independent_grad_{model}"]
     return keys
+
+
+def gradient_array_keys() -> list[str]:
+    return gradient_array_keys_for(MODELS)
 
 
 def _audit_weights() -> LossWeights:
@@ -1870,7 +2220,8 @@ def production_objective_unit(bundle: ModelBundle, inputs: AuditInputs,
                               device: str, dtype: torch.dtype,
                               tolerance: Mapping[str, Any]) -> dict:
     """One model unit: one production forward, one capture, one VJP."""
-    before_rng = _rng_facts()
+    before_state = _rng_state()
+    before_rng = _rng_facts(before_state)
     pred, x_t, batch = _forward_production(bundle, inputs, calls,
                                            device=device, dtype=dtype)
     pred_problems = validate_prediction(pred, dtype=dtype)
@@ -1898,7 +2249,8 @@ def production_objective_unit(bundle: ModelBundle, inputs: AuditInputs,
         fk_elements.detach().double(), weights,
         rotation_domain=tolerance["rotation_domain"],
     )
-    after_rng = _rng_facts()
+    after_state = _rng_state()
+    after_rng = _rng_facts(after_state)
 
     elements = {
         k: capture["term_elements"][k].detach().double().cpu()
@@ -1936,6 +2288,8 @@ def production_objective_unit(bundle: ModelBundle, inputs: AuditInputs,
         "loss_parts": {k: float(v) for k, v in loss_meta["parts"].items()},
         "rng_before": before_rng,
         "rng_after": after_rng,
+        "rng_state_before": before_state,
+        "rng_state_after": after_state,
         "contact_branch_executed": bool(capture.get("contact_branch_executed", False)),
         "fk_backend": getattr(getattr(loss_fn, "fk", None), "backend", "production"),
     }
@@ -3076,9 +3430,21 @@ def _check_arrays(path: Path, required: Sequence[str], schema: Mapping[str, Any]
         a = arrays[key]
         if list(a.shape) != list(rec["shape"]):
             problems.append(f"array_shape:{key}:{list(a.shape)}!={rec['shape']}")
-        if str(a.dtype) != rec["dtype"]:
+        dtype_ok = str(a.dtype) == rec["dtype"]
+        if not dtype_ok:
             problems.append(f"array_dtype:{key}:{a.dtype}!={rec['dtype']}")
-        if not np.isfinite(a).all():
+        # Type dispatch precedes finiteness: np.isfinite on a string/object
+        # array raises TypeError and would abort the report instead of
+        # producing an honest incomplete result.
+        if not np.issubdtype(a.dtype, np.number) or a.dtype.kind == "b":
+            problems.append(f"array_not_numeric:{key}:{a.dtype}")
+            continue
+        try:
+            finite = bool(np.isfinite(a).all())
+        except (TypeError, ValueError):
+            problems.append(f"array_nonfinite_unreadable:{key}")
+            continue
+        if not finite:
             problems.append(f"array_nonfinite:{key}")
     return arrays, problems
 
@@ -3104,6 +3470,7 @@ def run_p_stage(root: Path, stage: str, attempt: str, t0: float, budget: dict,
     skipped: set[str] = set()
     stop_after_mismatch: str | None = None
     unit_facts: dict[str, dict] = {}
+    unit_artifact_hashes: dict[str, dict[str, str]] = {}
     arrays: dict[str, np.ndarray] = dict(inputs.arrays_for_npz())
     arrays["alpha_cumprod"] = alpha
     gradients: dict[str, np.ndarray] = {}
@@ -3122,6 +3489,8 @@ def run_p_stage(root: Path, stage: str, attempt: str, t0: float, budget: dict,
             "deadline_perf_counter": deadline,
             "admission": admission,
         })
+        unit_artifact_hashes[model] = {
+            "request": sha256_file(unit_dir / "request.json")}
         if not admission["passed"]:
             gaps.append(f"unit_admission:{model}:{admission['problems']}")
             skipped.add(model)
@@ -3144,6 +3513,10 @@ def run_p_stage(root: Path, stage: str, attempt: str, t0: float, budget: dict,
                 "schema": "w1_real_objective_unit_error_v1",
                 "model": model, "error": f"{type(exc).__name__}: {exc}",
             })
+            unit_artifact_hashes[model] = {
+                "request": sha256_file(unit_dir / "request.json"),
+                "error": sha256_file(unit_dir / "error.json"),
+            }
             continue
         units[model] = unit
         if not unit["independent_facts"].get("geodesic_domain_ok", False):
@@ -3175,8 +3548,14 @@ def run_p_stage(root: Path, stage: str, attempt: str, t0: float, budget: dict,
             "schema": "w1_real_objective_unit_result_v1",
             "model": model, **unit_facts[model],
             "rng_before": unit["rng_before"], "rng_after": unit["rng_after"],
+            "rng_state_before": unit["rng_state_before"],
+            "rng_state_after": unit["rng_state_after"],
             "loss_parts": unit["loss_parts"],
         })
+        unit_artifact_hashes[model] = {
+            "request": sha256_file(unit_dir / "request.json"),
+            "result": sha256_file(unit_dir / "result.json"),
+        }
         # Stop new production evaluation after a confirmed mismatch, as
         # required by the draft's section 6.  The completed unit remains
         # available to F; the unexecuted model is an explicit gap.
@@ -3270,6 +3649,7 @@ def run_p_stage(root: Path, stage: str, attempt: str, t0: float, budget: dict,
         "covered_contract_passed": bool(complete and not problems),
         "problems": problems, "gaps": gaps,
         "units": unit_facts,
+        "unit_artifacts": unit_artifact_hashes,
         "stop_after_mismatch": stop_after_mismatch,
         "contact_branch_executions": sum(
             1 for f in unit_facts.values() if f.get("contact_branch_executed")),
@@ -3329,11 +3709,12 @@ def _rebuild_unit_from_arrays(model: str, inputs: AuditInputs,
                               arrays: Mapping[str, np.ndarray],
                               gradients: Mapping[str, np.ndarray],
                               weights: LossWeights,
-                              tolerances: Mapping[str, Any]) -> dict:
+                              tolerances: Mapping[str, Any],
+                              fk_elements_override: np.ndarray | None = None) -> dict:
     pred = torch.as_tensor(arrays[f"prediction_{model}"], dtype=torch.float32)
-    target = torch.as_tensor(inputs.x0, dtype=torch.float32)
-    fk_elements = torch.as_tensor(arrays[f"term_elements_{model}_fk"],
-                                  dtype=torch.float64)
+    fk_elements = torch.as_tensor(
+        arrays[f"term_elements_{model}_fk"] if fk_elements_override is None
+        else fk_elements_override, dtype=torch.float64)
     elements = {
         "pos": torch.as_tensor(arrays[f"term_elements_{model}_pos"], dtype=torch.float64),
         "rot6d": torch.as_tensor(arrays[f"term_elements_{model}_rot6d"], dtype=torch.float64),
@@ -3371,13 +3752,194 @@ def _rebuild_unit_from_arrays(model: str, inputs: AuditInputs,
         "independent_batch": {k: float(v.detach().double()) for k, v in ind_scalars.items()},
         "production_grad": np.asarray(gradients[f"production_grad_{model}"]),
         "independent_grad": np.asarray(gradients[f"independent_grad_{model}"]),
-        "independent_facts": {"geodesic_domain_ok": bool(
-            ind_elements["geodesic_domain_ok"].all().item())},
+        "independent_facts": {
+            "geodesic_domain_ok": bool(
+                ind_elements["geodesic_domain_ok"].all().item()),
+            "geodesic_domain_bad_count": int(
+                (~ind_elements["geodesic_domain_ok"]).sum().item()),
+        },
         "prediction_problems": [],
         "loss_parts": {},
         "rng_before": {}, "rng_after": {},
         "fk_backend": "production" if model in MODELS else "unknown",
     }
+
+
+def _recompute_fk_elements(arrays: Mapping[str, np.ndarray],
+                           model: str) -> np.ndarray:
+    """Independent FK term elements from the two saved point sets.
+
+    The production reference is ``((kp_pred - kp_target)**2).sum(-1)`` in
+    float32.  Recomputing from the saved points (instead of trusting the saved
+    element array) makes a shifted point set visible even when its element
+    array was rewritten consistently.
+    """
+    pred = np.asarray(arrays[f"fk_points_pred_{model}"], dtype=np.float32)
+    target = np.asarray(arrays[f"fk_points_target_{model}"], dtype=np.float32)
+    if pred.shape != target.shape or pred.ndim != 4 or pred.shape[-1] != 3:
+        raise ValueError(
+            f"fk points shape mismatch: {pred.shape} != {target.shape}")
+    return ((pred - target) ** 2).sum(axis=-1, dtype=np.float32).astype(np.float64)
+
+
+def _gradient_element_problems(name: str, fresh: Any, saved: Any, *,
+                               atol: float, rtol: float) -> list[str]:
+    """Elementwise raw-gradient reconciliation (never a norm-only summary)."""
+    try:
+        f = np.asarray(fresh)
+        s = np.asarray(saved)
+    except (TypeError, ValueError):
+        return [f"{name}:unreadable"]
+    if f.shape != s.shape:
+        return [f"{name}:shape:{f.shape}!={s.shape}"]
+    if (not np.issubdtype(f.dtype, np.number) or not np.issubdtype(s.dtype, np.number)
+            or f.dtype.kind == "b" or s.dtype.kind == "b"):
+        return [f"{name}:non_numeric"]
+    try:
+        f64 = f.astype(np.float64, copy=False)
+        s64 = s.astype(np.float64, copy=False)
+        finite = bool(np.isfinite(f64).all() and np.isfinite(s64).all())
+    except (TypeError, ValueError):
+        return [f"{name}:unreadable"]
+    if not finite:
+        return [f"{name}:nonfinite"]
+    diff = np.abs(f64 - s64)
+    limit = atol + rtol * np.abs(s64)
+    bad = diff > limit
+    if not bool(bad.any()):
+        return []
+    idx = tuple(int(x) for x in np.argwhere(bad)[0])
+    return [f"{name}:element_mismatch:{list(idx)}:"
+            f"{float(f64[idx])}!={float(s64[idx])}:"
+            f"limit={float(limit[idx])}"]
+
+
+def _fk_element_problems(arrays: Mapping[str, np.ndarray], model: str,
+                         recomputed: np.ndarray) -> list[str]:
+    saved = np.asarray(arrays[f"term_elements_{model}_fk"], dtype=np.float64)
+    if saved.shape != recomputed.shape:
+        return [f"fk_elements_shape:{model}:{saved.shape}!={recomputed.shape}"]
+    diff = np.abs(saved - recomputed)
+    limit = 1e-9 + 1e-6 * np.abs(recomputed)
+    bad = diff > limit
+    if not bool(bad.any()):
+        return []
+    idx = tuple(int(x) for x in np.argwhere(bad)[0])
+    return [f"fk_elements_not_recomputed:{model}:{list(idx)}:"
+            f"{float(saved[idx])}!={float(recomputed[idx])}"]
+
+
+def _fields_close(got: Any, want: Any, *, rtol: float = 1e-9,
+                  atol: float = 1e-12) -> bool:
+    """Recursive strict field equality; bool is never a number."""
+    if isinstance(want, Mapping):
+        if not isinstance(got, Mapping) or set(got) != set(want):
+            return False
+        return all(_fields_close(got[k], want[k], rtol=rtol, atol=atol)
+                   for k in want)
+    if isinstance(want, (list, tuple)):
+        if not isinstance(got, (list, tuple)) or len(got) != len(want):
+            return False
+        return all(_fields_close(g, w, rtol=rtol, atol=atol)
+                   for g, w in zip(got, want))
+    if isinstance(want, (bool, np.bool_)) or isinstance(got, (bool, np.bool_)):
+        return isinstance(got, (bool, np.bool_)) and isinstance(want, (bool, np.bool_)) \
+            and bool(got) is bool(want)
+    if isinstance(want, (int, np.integer)) and not isinstance(want, bool):
+        return (isinstance(got, (int, np.integer)) and not isinstance(got, bool)
+                and int(got) == int(want))
+    if isinstance(want, (float, np.floating)):
+        return (_num(got)
+                and abs(float(got) - float(want))
+                <= atol + rtol * abs(float(want)))
+    return got == want
+
+
+def _objective_row_field_problems(rid: str, got: Any, want: Mapping[str, Any],
+                                  scalar_tol: Mapping[str, Any]) -> list[str]:
+    if not isinstance(got, Mapping):
+        return [f"p_row_not_mapping:{rid}"]
+    problems: list[str] = []
+    missing = sorted(set(want) - {"id"} - set(got))
+    extra = sorted(set(got) - set(want) - {"id"})
+    if missing:
+        problems.append(f"p_row_fields_missing:{rid}:{missing}")
+    if extra:
+        problems.append(f"p_row_fields_extra:{rid}:{extra}")
+    derived = {"abs_error", "relative_error", "limit"}
+    for key in sorted((set(want) & set(got)) - {"id"} - derived):
+        if key in ("production", "independent"):
+            p_value, i_value = got[key], want[key]
+            if _num(p_value) and _num(i_value):
+                cmp = compare_scalar(f"{rid}:{key}", p_value, i_value,
+                                     scalar_tol)
+                if cmp.get("status") != "within_tolerance":
+                    problems.append(f"p_row_not_reproducible:{rid}:{key}")
+            elif not _fields_close(p_value, i_value):
+                problems.append(f"p_row_field:{rid}:{key}")
+        elif not _fields_close(got[key], want[key]):
+            problems.append(f"p_row_field:{rid}:{key}")
+    # The comparison fields must also be arithmetically self-consistent with
+    # this row's own production/independent pair and frozen tolerance.  They
+    # are not required to be bitwise equal to the replay's float32 totals.
+    p_value, i_value = got.get("production"), got.get("independent")
+    if _num(p_value) and _num(i_value):
+        abs_error = abs(float(p_value) - float(i_value))
+        limit = float(scalar_tol["atol"]) + float(scalar_tol["rtol"]) * abs(i_value)
+        within = abs_error <= limit
+        if not _fields_close(got.get("abs_error"), abs_error,
+                             rtol=1e-6, atol=1e-12):
+            problems.append(f"p_row_abs_error_inconsistent:{rid}")
+        if not _fields_close(got.get("limit"), limit,
+                             rtol=1e-6, atol=1e-12):
+            problems.append(f"p_row_limit_inconsistent:{rid}")
+        expected_relative = None if abs(i_value) == 0.0 else abs_error / abs(i_value)
+        if expected_relative is None:
+            if got.get("relative_error") is not None:
+                problems.append(f"p_row_relative_error_inconsistent:{rid}")
+        elif not _fields_close(got.get("relative_error"), expected_relative,
+                               rtol=1e-6, atol=1e-12):
+            problems.append(f"p_row_relative_error_inconsistent:{rid}")
+        if got.get("within_tolerance") is not within:
+            problems.append(f"p_row_within_tolerance_inconsistent:{rid}")
+    return problems
+
+
+def _gradient_row_field_problems(rid: str, got: Any,
+                                 want: Mapping[str, Any]) -> list[str]:
+    if not isinstance(got, Mapping):
+        return [f"p_gradient_row_not_mapping:{rid}"]
+    problems: list[str] = []
+    missing = sorted(set(want) - {"id"} - set(got))
+    extra = sorted(set(got) - set(want) - {"id"})
+    if missing:
+        problems.append(f"p_gradient_row_fields_missing:{rid}:{missing}")
+    if extra:
+        problems.append(f"p_gradient_row_fields_extra:{rid}:{extra}")
+    for key in sorted((set(want) & set(got)) - {"id"}):
+        if not _fields_close(got[key], want[key]):
+            problems.append(f"p_gradient_row_field:{rid}:{key}")
+    return problems
+
+
+def _read_p_report(p: Mapping[str, Any]) -> tuple[dict | None, list[str]]:
+    """F reads the sealed P report from disk rather than the in-memory unit map."""
+    gaps: list[str] = []
+    paths = p.get("paths") or {}
+    report_path = paths.get("report")
+    if report_path is None or not Path(report_path).is_file():
+        gaps.append("p_report_artifact_missing")
+        report = p.get("report")
+        return (dict(report) if isinstance(report, Mapping) else None), gaps
+    try:
+        report = read_json(Path(report_path))
+    except (OSError, ValueError, TypeError):
+        gaps.append("p_report_artifact_unreadable")
+        return None, gaps
+    if not isinstance(report, Mapping):
+        gaps.append("p_report_artifact_not_a_mapping")
+        return None, gaps
+    return dict(report), gaps
 
 
 def run_f_stage(root: Path, stage: str, attempt: str, t0: float, budget: dict,
@@ -3426,29 +3988,53 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float, budget: dict,
     if impl_sha != registration.get("implementation_sha256"):
         problems.append("implementation_not_reproducible")
     p_paths = p.get("paths") or {}
+    p_report, report_gaps = _read_p_report(p)
+    gaps += report_gaps
+    reported_models = tuple(
+        model for model in MODELS
+        if isinstance(p_report, Mapping)
+        and model in (p_report.get("units") or {}))
+    if not reported_models:
+        gaps.append("p_units_empty")
+    for model in MODELS:
+        if model not in reported_models:
+            gaps.append(f"p_unit_not_measured:{model}")
+    if isinstance(p_report, Mapping):
+        if p_report.get("registration_sha256") not in (
+                None, r0.get("registration_sha256")):
+            problems.append("p_report_registration_mismatch")
+        for model in reported_models:
+            unit_info = (p_report.get("units") or {}).get(model)
+            if not isinstance(unit_info, Mapping):
+                problems.append(f"p_unit_metadata_not_mapping:{model}")
     arrays_path = p_paths.get("arrays")
     grad_path = p_paths.get("gradient_arrays")
     arrays: dict[str, np.ndarray] = {}
     gradients: dict[str, np.ndarray] = {}
     arrays_ok = False
     gradients_ok = False
-    if arrays_path is None or not Path(arrays_path).is_file():
-        gaps.append("p_arrays_missing")
-    else:
+    if reported_models and arrays_path is not None and Path(arrays_path).is_file():
         arrays, problems_ = _check_arrays(
-            Path(arrays_path), objective_array_keys(),
+            Path(arrays_path), objective_array_keys_for(reported_models),
             registration["array_schema"])
         gaps += [f"p_arrays:{x}" for x in problems_]
         arrays_ok = not problems_
-    if grad_path is None or not Path(grad_path).is_file():
-        gaps.append("p_gradient_arrays_missing")
-    else:
+    elif arrays_path is None or not Path(arrays_path).is_file():
+        gaps.append("p_arrays_missing")
+    if reported_models and grad_path is not None and Path(grad_path).is_file():
         gradients, problems_ = _check_arrays(
-            Path(grad_path), gradient_array_keys(),
+            Path(grad_path), gradient_array_keys_for(reported_models),
             _gradient_schema())
         gaps += [f"p_gradient_arrays:{x}" for x in problems_]
         gradients_ok = not problems_
-    if not problems and arrays_ok and gradients_ok:
+    elif grad_path is None or not Path(grad_path).is_file():
+        gaps.append("p_gradient_arrays_missing")
+    p_rows: list[dict] = []
+    p_by_id: dict[str, dict] = {}
+    p_grad_rows: list[dict] = []
+    p_grad_by: dict[str, dict] = {}
+    row_error = grad_row_error = "p_rows_not_read"
+    if not problems and reported_models and arrays_ok and gradients_ok:
         rebuilt = _inputs_from_arrays(arrays, registration)
         admission_path = reg_path.parent / "admission.json"
         if not admission_path.is_file():
@@ -3483,7 +4069,7 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float, budget: dict,
                 tolerance["tolerances"]["loss_float32"], units="normalized_noisy")
             if xt_cmp.get("status") != "within_tolerance":
                 problems.append("x_t_not_reproducible")
-        else:
+        elif "diffusion" in reported_models:
             gaps.append("x_t_missing")
         # x0 must be reproducible from raw root/q/wfc and the frozen stats.
         reencoded = independent_encode(
@@ -3506,18 +4092,15 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float, budget: dict,
                 for kind, cap in CALL_CAPS.items():
                     if not _count(counts.get(kind)) or int(counts[kind]) > cap:
                         problems.append(f"p_call_count_invalid:{kind}")
-                    if int(counts.get(kind, 0)) < len(p.get("units", {})):
+                    if int(counts.get(kind, 0)) < len(reported_models):
                         problems.append(f"p_call_count_missing:{kind}")
             except (OSError, ValueError, TypeError):
                 gaps.append("p_call_trace_unreadable")
-        if p.get("report") and p["report"].get("registration_sha256") not in (
-                None, r0.get("registration_sha256")):
-            problems.append("p_report_registration_mismatch")
+        unit_artifact_declared = (p_report or {}).get("unit_artifacts") or {}
+        p_unit_root = Path(p_paths["arrays"]).parent / "units" if p_paths.get("arrays") else None
+        fk_recomputed: dict[str, np.ndarray] = {}
         replay_facts: dict[str, dict] = {}
-        for model in MODELS:
-            if model not in p.get("units", {}):
-                gaps.append(f"p_unit_missing:{model}")
-                continue
+        for model in reported_models:
             unit_dir = attempt_dir / "units" / model
             unit_dir.mkdir(parents=True, exist_ok=True)
             admission = unit_admission(
@@ -3532,8 +4115,57 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float, budget: dict,
                 "deadline_perf_counter": deadline,
                 "admission": admission,
             })
+            # Recompute the FK elements from the saved point sets.  A shifted
+            # point set is visible even if the element array and rows agree.
+            try:
+                recomputed_fk = _recompute_fk_elements(arrays, model)
+            except (ValueError, TypeError, KeyError) as exc:
+                gaps.append(f"fk_recompute_unavailable:{model}:{type(exc).__name__}")
+            else:
+                fk_problems = _fk_element_problems(arrays, model, recomputed_fk)
+                problems += fk_problems
+                if not fk_problems:
+                    fk_recomputed[model] = recomputed_fk
+            if p_unit_root is not None:
+                declared = unit_artifact_declared.get(model)
+                if not isinstance(declared, Mapping):
+                    gaps.append(f"p_unit_artifacts_missing:{model}")
+                    declared = {}
+                for kind in ("request", "result"):
+                    artifact = p_unit_root / model / f"{kind}.json"
+                    if not artifact.is_file():
+                        gaps.append(f"p_unit_artifact_missing:{model}:{kind}")
+                    elif declared.get(kind) != sha256_file(artifact):
+                        problems.append(f"p_unit_artifact_drifted:{model}:{kind}")
             if not admission["passed"]:
                 gaps.append(f"replay_unit_admission:{model}:{admission['problems']}")
+                continue
+            unit_result_path = (p_unit_root / model / "result.json"
+                                if p_unit_root is not None else None)
+            if unit_result_path is None or not unit_result_path.is_file():
+                gaps.append(f"p_unit_result_missing:{model}")
+                continue
+            try:
+                saved_unit = read_json(unit_result_path)
+            except (OSError, ValueError, TypeError):
+                gaps.append(f"p_unit_result_unreadable:{model}")
+                continue
+            if not isinstance(saved_unit, Mapping):
+                gaps.append(f"p_unit_result_not_a_mapping:{model}")
+                continue
+            state_problems = _rng_state_problems(saved_unit.get("rng_state_before"))
+            if state_problems:
+                gaps.append(f"p_rng_state_invalid:{model}:{state_problems}")
+                continue
+            state_problems = _rng_state_problems(saved_unit.get("rng_state_after"))
+            if state_problems:
+                gaps.append(f"p_rng_state_after_invalid:{model}:{state_problems}")
+                continue
+            try:
+                _restore_rng_state(saved_unit["rng_state_before"])
+            except Exception as exc:  # noqa: BLE001 -- bad state is evidence
+                gaps.append(
+                    f"rng_restore_failed:{model}:{type(exc).__name__}:{exc}")
                 continue
             try:
                 unit = production_objective_unit(
@@ -3543,99 +4175,135 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float, budget: dict,
             except Exception as exc:  # noqa: BLE001
                 gaps.append(f"replay_failed:{model}:{type(exc).__name__}:{exc}")
                 continue
-            saved = p["units"][model]
-            unit_result_path = Path(p_paths["arrays"]).parent / "units" / model / "result.json"
-            if unit_result_path.is_file():
-                saved_unit = read_json(unit_result_path)
-                if saved_unit.get("rng_before") != unit.get("rng_before"):
-                    problems.append(f"replay_rng_before_not_bitwise:{model}")
-                if saved_unit.get("rng_after") != unit.get("rng_after"):
-                    problems.append(f"replay_rng_after_not_bitwise:{model}")
-            if not np.array_equal(unit["prediction"], saved["prediction"]):
+            if saved_unit.get("rng_before") != unit.get("rng_before"):
+                problems.append(f"replay_rng_before_not_bitwise:{model}")
+            if saved_unit.get("rng_after") != unit.get("rng_after"):
+                problems.append(f"replay_rng_after_not_bitwise:{model}")
+            if not _fields_close(saved_unit.get("rng_state_after"),
+                                 unit.get("rng_state_after")):
+                problems.append(f"replay_rng_state_after_not_bitwise:{model}")
+            # Bind the fresh replay to the *artifact* arrays, never to the
+            # in-memory P result object.
+            if not np.array_equal(unit["prediction"],
+                                  np.asarray(arrays[f"prediction_{model}"])):
                 problems.append(f"replay_prediction_not_bitwise:{model}")
+            if not np.array_equal(
+                    np.asarray(unit["fk_points_pred"]),
+                    np.asarray(arrays[f"fk_points_pred_{model}"])):
+                problems.append(f"replay_fk_points_pred_not_bitwise:{model}")
+            if not np.array_equal(
+                    np.asarray(unit["fk_points_target"]),
+                    np.asarray(arrays[f"fk_points_target_{model}"])):
+                problems.append(f"replay_fk_points_target_not_bitwise:{model}")
+            for term in ("pos", "rot6d", "joint", "geodesic_rad2", "vel"):
+                if not np.array_equal(
+                        np.asarray(unit["elements"][term]),
+                        np.asarray(arrays[f"term_elements_{model}_{term}"])):
+                    problems.append(
+                        f"replay_term_elements_not_bitwise:{model}:{term}")
             if model == "diffusion":
-                if not np.array_equal(unit["x_t"], saved["x_t"]):
+                if not np.array_equal(unit["x_t"],
+                                      np.asarray(arrays["x_t_diffusion"])):
                     problems.append(f"replay_x_t_not_bitwise:{model}")
-            if not np.array_equal(np.asarray(unit["production_grad"], dtype=np.float64),
-                                  np.asarray(saved["production_grad"], dtype=np.float64)):
-                problems.append(f"replay_production_grad_not_bitwise:{model}")
-            ind_recomputed = independent_vjp(
-                torch.as_tensor(saved["prediction"], dtype=torch.float32),
-                torch.as_tensor(rebuilt.x0_independent, dtype=torch.float64),
-                torch.as_tensor(saved["fk_elements"], dtype=torch.float64),
-                weights, rotation_domain=tolerance["tolerances"]["rotation_domain"],
-            )[0]
-            grad_cmp = compare_gradient(
-                "independent_replay", ind_recomputed,
-                torch.as_tensor(saved["independent_grad"], dtype=torch.float64),
-                tolerance["tolerances"]["gradient_float64"])
-            if grad_cmp.get("status") != "within_tolerance":
-                problems.append(f"independent_grad_replay_mismatch:{model}")
+            problems += _gradient_element_problems(
+                f"replay_production_grad_not_bitwise:{model}",
+                unit["production_grad"],
+                gradients[f"production_grad_{model}"], atol=0.0, rtol=0.0)
+            problems += _gradient_element_problems(
+                f"replay_independent_grad_not_bitwise:{model}",
+                unit["independent_grad"],
+                gradients[f"independent_grad_{model}"],
+                **{k: float(tolerance["tolerances"]["gradient_float64"][k])
+                   for k in ("atol", "rtol")})
             replay_facts[model] = {
                 "prediction_bitwise": True,
                 "x_t_bitwise": model != "diffusion" or bool(
-                    np.array_equal(unit["x_t"], saved["x_t"])),
-                "production_grad_bitwise": True,
-                "independent_grad_comparison": grad_cmp,
+                    np.array_equal(unit["x_t"], arrays["x_t_diffusion"])),
+                "production_grad_bitwise": not _gradient_element_problems(
+                    f"g:{model}", unit["production_grad"],
+                    gradients[f"production_grad_{model}"], atol=0.0, rtol=0.0),
+                "independent_grad_bound_to_artifact": not _gradient_element_problems(
+                    f"g:{model}", unit["independent_grad"],
+                    gradients[f"independent_grad_{model}"],
+                    **{k: float(tolerance["tolerances"]["gradient_float64"][k])
+                       for k in ("atol", "rtol")}),
+                "rng_restored_before_replay": True,
                 "call_budget": calls.snapshot(),
             }
         # Recompute the complete row table from raw arrays and compare to P.
-        expected_units = {
-            model: _rebuild_unit_from_arrays(model, rebuilt, arrays, gradients, weights,
-                                             tolerance["tolerances"])
-            for model in MODELS if model in p.get("units", {})
-        }
+        expected_units: dict[str, dict] = {}
+        for model in reported_models:
+            if model not in fk_recomputed:
+                gaps.append(f"expected_unit_unavailable:{model}")
+                continue
+            try:
+                expected_units[model] = _rebuild_unit_from_arrays(
+                    model, rebuilt, arrays, gradients, weights,
+                    tolerance["tolerances"],
+                    fk_elements_override=fk_recomputed[model])
+            except (ValueError, TypeError, KeyError) as exc:
+                gaps.append(f"expected_unit_unbuildable:{model}:{type(exc).__name__}")
+        p_rows, p_by_id, row_error = load_rows_checked(Path(p_paths["rows"])) \
+            if p_paths.get("rows") else ([], {}, "p_rows_path_missing")
+        p_grad_rows, p_grad_by, grad_row_error = load_rows_checked(
+            Path(p_paths["gradient_rows"])) if p_paths.get("gradient_rows") else (
+            [], {}, "p_gradient_rows_path_missing")
         try:
             expected_rows = build_objective_rows(
                 expected_units, rebuilt, tolerance, torch.float32)
             expected_grad_rows = build_gradient_rows(
                 expected_units, tolerance, torch.float32)
+            domain_bad = {
+                model: int(unit.get("independent_facts", {}).get(
+                    "geodesic_domain_bad_count", 0))
+                for model, unit in expected_units.items()
+                if not unit.get("independent_facts", {}).get(
+                    "geodesic_domain_ok", True)}
+            _apply_domain_gaps(expected_rows, expected_grad_rows, domain_bad)
             expected_by_id = _rows_by_id(expected_rows)
             expected_grad_by = _rows_by_id(expected_grad_rows)
         except (ValueError, TypeError, KeyError) as exc:
             gaps.append(f"expected_rows_unbuildable:{type(exc).__name__}")
             expected_by_id, expected_grad_by = {}, {}
-        p_rows, p_by_id, row_error = load_rows_checked(Path(p_paths["rows"])) \
-            if p_paths.get("rows") else ([], {}, "p_rows_path_missing")
+        # The registered row set is the denominator.  Extra or missing rows
+        # are gaps, never invisible to the final verdict.
+        objective_multiset = (
+            [row_error] if row_error else row_multiset_problems(
+                p_rows, registration["required_objective_rows"]))
+        gradient_multiset = (
+            [grad_row_error] if grad_row_error else row_multiset_problems(
+                p_grad_rows, registration["required_gradient_rows"]))
+        gaps += [f"p_objective_multiset:{x}" for x in objective_multiset]
+        gaps += [f"p_gradient_multiset:{x}" for x in gradient_multiset]
         if row_error:
             gaps.append(f"p_objective_rows:{row_error}")
+        if grad_row_error:
+            gaps.append(f"p_gradient_rows:{grad_row_error}")
         if not row_error:
             for rid, want in expected_by_id.items():
                 got = p_by_id.get(rid)
                 if got is None:
                     problems.append(f"p_row_missing:{rid}")
                     continue
-                ttol = _term_scalar_tolerance(
-                    tolerance["tolerances"]["loss_float32"],
-                    str(want.get("term", "")), torch.float32,
-                    tolerance.get("term_overrides"))
-                for field_name in ("production", "independent"):
-                    cmp = compare_scalar(
-                        f"{rid}:{field_name}", got.get(field_name),
-                        want.get(field_name), ttol)
-                    if cmp.get("status") != "within_tolerance":
-                        problems.append(
-                            f"p_row_not_reproducible:{rid}:{field_name}")
-        p_grad_rows, p_grad_by, grad_row_error = load_rows_checked(
-            Path(p_paths["gradient_rows"])) if p_paths.get("gradient_rows") else (
-            [], {}, "p_gradient_rows_path_missing")
-        if grad_row_error:
-            gaps.append(f"p_gradient_rows:{grad_row_error}")
+                if want.get("scope") in ("arithmetic", "reconciliation"):
+                    ttol = tolerance["tolerances"]["loss_float32"]
+                else:
+                    ttol = _term_scalar_tolerance(
+                        tolerance["tolerances"]["loss_float32"],
+                        str(want.get("term", "")), torch.float32,
+                        tolerance.get("term_overrides"))
+                problems += _objective_row_field_problems(rid, got, want, ttol)
+            for rid in sorted(set(p_by_id) - set(expected_by_id)):
+                problems.append(f"p_row_unexpected:{rid}")
         if not grad_row_error:
             for rid, want in expected_grad_by.items():
                 got = p_grad_by.get(rid)
                 if got is None:
                     problems.append(f"p_gradient_row_missing:{rid}")
                     continue
-                for field_name in ("production_norm", "independent_norm",
-                                   "max_abs_diff", "limit"):
-                    cmp = compare_scalar(
-                        f"{rid}:{field_name}", got.get(field_name),
-                        want.get(field_name),
-                        {"atol": 1e-6, "rtol": 1e-5, "scale_floor": 0.0})
-                    if cmp.get("status") != "within_tolerance":
-                        problems.append(
-                            f"p_gradient_row_not_reproducible:{rid}:{field_name}")
+                problems += _gradient_row_field_problems(rid, got, want)
+            for rid in sorted(set(p_grad_by) - set(expected_grad_by)):
+                problems.append(f"p_gradient_row_unexpected:{rid}")
         # P's own row statuses must be consistent with the recomputation.
         for rid, row in p_by_id.items():
             if row.get("status") == "mismatch":
@@ -3648,6 +4316,10 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float, budget: dict,
             elif row.get("status") == "incomplete":
                 gaps.append(f"p_declared_gradient_incomplete:{rid}")
     else:
+        objective_multiset = ["rows_not_checked"]
+        gradient_multiset = ["rows_not_checked"]
+        row_error = row_error if reported_models else "p_units_empty"
+        grad_row_error = grad_row_error if reported_models else "p_units_empty"
         replay_facts = {}
     consumers = {}
     for prior_stage in ("R0", "P"):
@@ -3668,14 +4340,17 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float, budget: dict,
         "attempt": attempt, "mode": mode, "conclusion": conclusion,
         "problems": problems, "gaps": gaps,
         "row_multiset": {
-            "objective": row_multiset_problems(
-                p.get("rows", []), registration["required_objective_rows"]),
-            "gradient": row_multiset_problems(
-                p.get("gradient_rows", []), registration["required_gradient_rows"]),
+            "objective": objective_multiset,
+            "gradient": gradient_multiset,
         },
+        "row_errors": {
+            "objective": row_error,
+            "gradient": grad_row_error,
+        },
+        "reported_models": list(reported_models),
         "array_sets": {
-            "objective_required": objective_array_keys(),
-            "gradient_required": gradient_array_keys(),
+            "objective_required": objective_array_keys_for(reported_models),
+            "gradient_required": gradient_array_keys_for(reported_models),
         },
         "replay": replay_facts,
         "consumer_states": consumers,
@@ -3698,9 +4373,9 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float, budget: dict,
         "problems": failures, "failures": failures, "gaps": gaps,
         "counts": {
             "windows": len(registration["window_keys"]),
-            "models": len(p.get("units", {})),
-            "objective_rows": len(p.get("rows", [])),
-            "gradient_rows": len(p.get("gradient_rows", [])),
+            "models": len(reported_models),
+            "objective_rows": len(p_rows),
+            "gradient_rows": len(p_grad_rows),
             "required_objective_rows": len(registration["required_objective_rows"]),
             "required_gradient_rows": len(registration["required_gradient_rows"]),
         },
@@ -3792,7 +4467,16 @@ def run_registered_audit(run_root: Path, provider, *, mode: str,
                 or not tolerance.get("evidence_sha256")):
             raise SystemExit("real audit requires a completed synthetic calibration contract")
     write_cohort(run_root, mode=mode, authorization_sha=authorization_sha)
-    calls = AuditCallBudget()
+    prior_calls = prior_call_counts(run_root, fixed_root=fixed_root, mode=mode)
+    if prior_calls is None:
+        raise SystemExit(
+            "call history unknown: refusing to grant a fresh call quota")
+    exhausted = {kind: prior_calls[kind] for kind in CALL_CAPS
+                 if prior_calls[kind] >= CALL_CAPS[kind]}
+    if exhausted:
+        raise SystemExit(
+            f"cumulative call budget exhausted for this cohort: {exhausted}")
+    calls = AuditCallBudget(prior_counts=prior_calls)
     scope = _stage_scope()
     results: dict[str, Any] = {}
     last_seal: dict[str, Any] = {}
@@ -3855,10 +4539,18 @@ def run_registered_audit(run_root: Path, provider, *, mode: str,
     p_complete = bool(p.get("passed"))
     p_artifacts = {}
     for key in ("arrays", "gradient_arrays", "rows", "gradient_rows",
-                "call_trace", "rng_facts"):
+                "call_trace", "rng_facts", "report"):
         path = (p.get("paths") or {}).get(key)
         if path is not None and Path(path).is_file():
             p_artifacts[path_for_record(path)] = sha256_file(path)
+    unit_artifacts = (p.get("report") or {}).get("unit_artifacts") or {}
+    for model, record in unit_artifacts.items():
+        if not isinstance(record, Mapping):
+            continue
+        for kind, want in record.items():
+            path = stage_dir(run_root, "P") / attempt / "units" / model / f"{kind}.json"
+            if path.is_file():
+                p_artifacts[path_for_record(path)] = sha256_file(path)
     seal = finish_attempt(
         run_root, "P", attempt, t0, budget,
         {"complete": p_complete,
@@ -3870,13 +4562,24 @@ def run_registered_audit(run_root: Path, provider, *, mode: str,
         extra={"stage": "P", "scope": p_scope,
                "call_balance": calls.snapshot()},
     )
-    last_seal["P"] = {"sealed": seal.sealed, "problems": seal.problems,
-                      "row": seal.row}
-    if not seal.sealed:
+    last_seal["P"] = {"sealed": seal.sealed, "terminal": seal.terminal,
+                      "problems": seal.problems, "row": seal.row}
+    # A terminal P row is legitimate partial evidence even when its
+    # ``complete`` flag is false (e.g. stop-after-mismatch).  F must still
+    # replay the measured units and preserve the mismatch; only a leftover
+    # publishing/running row (unknown history) blocks F.
+    if not seal.terminal:
         return {"mode": mode, "conclusion": "audit_incomplete",
                 "complete_evidence": False, "covered_contract_passed": False,
                 "problems": p.get("problems", []),
                 "gaps": p.get("gaps", []) + seal.problems,
+                "stages": results, "seals": last_seal,
+                "summary_path": None}
+    if not p.get("units"):
+        return {"mode": mode, "conclusion": "audit_incomplete",
+                "complete_evidence": False, "covered_contract_passed": False,
+                "problems": p.get("problems", []),
+                "gaps": p.get("gaps", []) + ["p_no_measured_units"],
                 "stages": results, "seals": last_seal,
                 "summary_path": None}
 
@@ -3891,9 +4594,10 @@ def run_registered_audit(run_root: Path, provider, *, mode: str,
     f = run_f_stage(run_root, "F", attempt, t0, budget, r0, p, provider,
                     calls, dict(tolerance), mode=mode, scope=p_scope)
     results["F"] = f
-    f_complete = bool(f.get("passed")) or f.get("conclusion") == "audit_incomplete"
     # A completed mismatch is still complete evidence; an incomplete audit is
-    # not.  Both publish a terminal, non-passing summary.
+    # not.  Both publish a terminal, non-passing summary.  ``complete`` here
+    # is the strict evidence flag; ``seal.terminal`` separately records that
+    # the negative result was sealed rather than abandoned.
     complete_evidence = bool(f["summary"].get("complete_evidence"))
     seal = finish_attempt(
         run_root, "F", attempt, t0, budget,
@@ -3908,9 +4612,11 @@ def run_registered_audit(run_root: Path, provider, *, mode: str,
         extra={"stage": "F", "scope": p_scope,
                "call_balance": calls.snapshot()},
     )
-    last_seal["F"] = {"sealed": seal.sealed, "problems": seal.problems,
-                      "row": seal.row}
-    if not seal.sealed:
+    last_seal["F"] = {"sealed": seal.sealed, "terminal": seal.terminal,
+                      "problems": seal.problems, "row": seal.row}
+    if not seal.terminal:
+        # Unknown history (publishing/running leftover): never claim the
+        # negative result as final.
         return {"mode": mode, "conclusion": "audit_incomplete",
                 "complete_evidence": False, "covered_contract_passed": False,
                 "problems": f.get("problems", []),
@@ -3918,15 +4624,17 @@ def run_registered_audit(run_root: Path, provider, *, mode: str,
                 "stages": results, "seals": last_seal,
                 "summary_path": path_for_record(f["report"])}
     _, final_consumer_problems = stage_state(run_root, "F")
-    if complete_evidence and final_consumer_problems:
-        return {"mode": mode, "conclusion": "audit_incomplete",
-                "complete_evidence": False, "covered_contract_passed": False,
-                "problems": f.get("problems", []),
-                "gaps": final_consumer_problems,
-                "stages": results, "seals": last_seal,
-                "summary_path": path_for_record(f["report"])}
     summary = dict(f["summary"])
     summary["final_consumer_problems"] = final_consumer_problems
+    if summary.get("conclusion") == (
+            "real_batch_covered_contract_passed" if mode == "real"
+            else "synthetic_contract_passed") and final_consumer_problems:
+        # A pass claim cannot survive a non-consumable final record.
+        summary["conclusion"] = "audit_incomplete"
+        summary["producer_conclusion"] = "audit_incomplete"
+        summary["complete_evidence"] = False
+        summary["covered_contract_passed"] = False
+        summary["gaps"] = list(summary.get("gaps", [])) + final_consumer_problems
     return {
         "mode": mode, "conclusion": summary["conclusion"],
         "complete_evidence": bool(summary.get("complete_evidence")),
