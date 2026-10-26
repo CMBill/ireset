@@ -2,6 +2,8 @@
 
 日期：2026-10-26，按静态复核意见修订。状态：**draft，not_registered，not_authorized，not_run**。父方案：[W1训练拟合与目标一致性单因素诊断执行方案](omniretarget_w1_training_fit_objective_audit_plan.md) §5。合成审计结果见[验证记录](../verification/omniretarget_w1_training_objective_audit_verification.md)。
 
+> 2026-10-26 实施补充：审计器、CLI 与 28 项合成/反例测试已实现，合成自测 `synthetic_contract_passed`（98 objective + 14 gradient 行、0失败/0缺口、四次完整前向与八次 batched VJP 上限内、contact 0、更新/FD/DDIM/checkpoint 写入 0）；真实 provider、真实 checkpoint/G1 FK、cohort/预算与执行注册仍未运行/未创建。详见[实现与合成自测验证记录](../verification/omniretarget_w1_real_objective_audit_verification.md)。本文件仍是待授权草案，实施完成不勾选 §8。
+
 > 本文件定义待授权的范围、登记与验收契约。本轮修改仅为文档工作，不创建执行注册、cohort、预算或运行目录。完成 §8 前，真实数据审计仍为 `not_run`，`factor_selected=false`、`auto_execute=false`、最终交互 `not_ready`。文中的预算与调用数均为提案，不是已获授权或已验证可完成的运行额度。
 
 ## 1. 研究问题与可区分假设

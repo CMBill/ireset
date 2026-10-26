@@ -80,14 +80,37 @@ class LossAssembler:
         p_body = torch.einsum("btji,btsj->btsi", R_box_clip, p_rel)      # R_box_clip^T: clip->box
         return (p_body - self.x_g) @ self.R_g                            # R_g^T (p_body - x_g)
 
-    def __call__(self, x0_pred: torch.Tensor, batch: dict) -> tuple[torch.Tensor, dict]:
+    def __call__(
+        self,
+        x0_pred: torch.Tensor,
+        batch: dict,
+        observer: dict | None = None,
+    ) -> tuple[torch.Tensor, dict]:
+        """Compute the weighted objective.
+
+        ``observer`` is an optional audit-only capture sink.  When supplied it
+        receives references to the *live* term tensors, the pre-FK subtotal
+        ``L5`` and the production reduction intermediates.  It must not mutate
+        them; with ``observer=None`` the numeric path is bit-identical.  This
+        is the minimal forensic adapter requested by the real-objective audit
+        plan section 4.3: production code keeps returning the same detached
+        floats, while the caller can still run one VJP through the original
+        graph.
+        """
+        if observer is not None and not isinstance(observer, dict):
+            raise TypeError("loss observer must be a mutable mapping")
         x0 = batch["x0"]
         parts: dict[str, torch.Tensor] = {}
+        elements: dict[str, torch.Tensor] = {}
+        contact_branch_executed = False
 
         diff2 = (x0_pred - x0) ** 2
         parts["pos"] = diff2[..., 0:3].mean()
         parts["rot6d"] = diff2[..., 3:9].mean()
         parts["joint"] = diff2[..., 9:38].mean()
+        elements["pos"] = diff2[..., 0:3]
+        elements["rot6d"] = diff2[..., 3:9]
+        elements["joint"] = diff2[..., 9:38]
         loss = self.w.w_pos * parts["pos"] + self.w.w_rot6d * parts["rot6d"] \
             + self.w.w_joint * parts["joint"]
 
@@ -95,12 +118,18 @@ class LossAssembler:
         R_t = rot6d_to_mat_torch(x0[..., 3:9])
         geo = so3_log_torch(R_p @ R_t.transpose(-1, -2)).norm(dim=-1)
         parts["geodesic_rad2"] = (geo ** 2).mean()
+        elements["geodesic_rad2"] = geo ** 2
         loss = loss + self.w.w_geodesic * parts["geodesic_rad2"]
 
         d_pred = x0_pred[:, 1:] - x0_pred[:, :-1]
         d_tgt = x0[:, 1:] - x0[:, :-1]
         parts["vel"] = ((d_pred - d_tgt) ** 2).mean()
+        elements["vel"] = (d_pred - d_tgt) ** 2
         loss = loss + self.w.w_vel * parts["vel"]
+
+        # The pre-FK subtotal is the actual tensor consumed as ``L5`` in the
+        # registered objective; capture it before the FK branch adds anything.
+        l5 = loss
 
         if self.fk is not None and self.w.w_fk > 0:
             pos_p, quat_p, q_p = self.decode_clip(x0_pred)
@@ -125,6 +154,7 @@ class LossAssembler:
             # says are not consumed. The motion-FK branch above is
             # unaffected.
             if self.w.w_contact > 0:
+                contact_branch_executed = True
                 hand_p = self.fk.site_world_positions(
                     flat(pos_p), flat(quat_p), flat(q_p), HAND_SITE_NAMES
                 ).view(B, F, -1, 3)                                                 # [B,F,6,3]
@@ -146,4 +176,20 @@ class LossAssembler:
                 loss = loss + self.w.w_contact * parts["contact_m2"]
 
         parts["total"] = loss
+
+        if observer is not None:
+            observer["term_tensors"] = dict(parts)
+            observer["term_elements"] = elements
+            observer["L5"] = l5
+            observer["total"] = parts["total"]
+            observer["x0_pred"] = x0_pred
+            observer["x0_target"] = x0
+            observer["contact_branch_executed"] = contact_branch_executed
+            if self.fk is not None and self.w.w_fk > 0:
+                observer["fk_points_pred"] = kp_p
+                observer["fk_points_target"] = kp_t
+                observer["decode_pred"] = (pos_p, quat_p, q_p)
+                observer["decode_target"] = (pos_t, quat_t, q_t)
+                observer["fk_elements"] = ((kp_p - kp_t) ** 2).sum(-1)
+
         return loss, {k: float(v.detach()) for k, v in parts.items()}
