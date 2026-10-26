@@ -5,14 +5,14 @@
 | 状态字段 | 当前状态 |
 | --- | --- |
 | `static_code_review` | complete：完成下文列明的源代码与配置核对；不代表运行行为通过 |
-| `audit_implementation` / `synthetic_audit` | **complete / complete**（2026-10-22）：审计模块、CLI、33 项测试与权威合成运行完成；A4 已加入 `(demo, start, t)` 注册多重集及 A5 独立键级重算；结论仅 `synthetic_contract_passed`（合成适用域），不升级真实结论 |
+| `audit_implementation` / `synthetic_audit` | **complete / complete**（2026-10-22）：审计模块、CLI、33 项测试与权威合成运行完成；A4 已加入 `(demo, start, t)` 注册多重集，A5 独立重算键级多重集、逐键明细及冻结反例语义；结论仅 `synthetic_contract_passed`（合成适用域），不升级真实结论 |
 | `execution_registration` / `cohort` | not_created / not_assigned |
 | `real_data_audit` / `single_factor_experiment` | not_run / not_registered |
 | 本次新增真实数据训练更新 / 生产模型调用 | 0 / 0（A3 仅合成替身/微型模块） |
 | `factor_selected` / `auto_execute` | false / false |
 | 最终交互方法 / 生产接入 | not_ready / false |
 
-> 2026-10-22 实施轮补充：A0–A5 的合成实现与运行已完成，实际结果见[合成审计验证记录](../verification/omniretarget_w1_training_objective_audit_verification.md)与 `derived/audit/w1_training_objective_audit/attempt_002/`。真实数据审计、单因素预注册、cohort、预算与训练仍未开始；`synthetic_contract_passed` 不构成真实数据、G1 FK 或训练主因证据。
+> 2026-10-22 实施轮补充：A0–A5 的合成实现与运行已完成，实际结果见[合成审计验证记录](../verification/omniretarget_w1_training_objective_audit_verification.md)与 `derived/audit/w1_training_objective_audit/attempt_003/`。真实数据审计、单因素预注册、cohort、预算与训练仍未开始；`synthetic_contract_passed` 不构成真实数据、G1 FK 或训练主因证据。
 
 ## 1. 依据、问题与证据地位
 
@@ -194,9 +194,9 @@ FK m² 与评估的 FK MPJPE m 在开方、归约上不同；不能把 `fk_m2` �
 本节记录 A0–A5 的实现与权威合成运行；详细证据见[验证记录](../verification/omniretarget_w1_training_objective_audit_verification.md)。§6 的“本次只完成文档与静态核对”是实施前快照，已被本节取代。
 
 - **实现**：`src/ireset/eval/training_objective_audit.py`、`scripts/audit_w1_training_objective.py`、`tests/test_w1_training_objective_audit.py`。CLI 默认纯合成，显式拒绝 training manifest/cache/checkpoint/预注册/预算/demo/step/seed 等真实或研究输入；不调用旧诊断脚本。
-- **权威命令**：`uv run --locked python scripts/audit_w1_training_objective.py --out derived/audit/w1_training_objective_audit`，退出码 0；防覆盖入口实际写入 `attempt_002/`。
+- **权威命令**：`uv run --locked python scripts/audit_w1_training_objective.py --out derived/audit/w1_training_objective_audit`，退出码 0；防覆盖入口实际写入 `attempt_003/`。
 - **结论**：生产侧与独立复核均为 `synthetic_contract_passed`；`problems=[]`。A1–A4 67 行（A1 23、A2 14、A3 19、A4 11）+ A0 静态 22 = **89 行**；失败/缺口 0/0；已登记限制 5 项。
-- **代表性事实**：A1 编码/解码误差为 0/2.801e-8，`total=5.5997726e-4`，分组均值与整体 MSE 差 9.907e-5，`vel` 38 通道归约与分组和不同；A2 加权梯度和与总梯度差 **4.34e-19**，有限差分最大相对误差 **3.77e-9**，float32 对 float64 最大相对差 **1.71e-5**；A3 四个 parity run 的前向输出/分项 loss/参数/裁剪前与裁剪后梯度/AdamW 状态/t·epsilon 全部逐位相等，等大小 2+2 微批与一次 4 窗大 batch 梯度差 1.86e-9，S0 24 次/6 唯一窗、正式 32 次/8 micro/每 epoch 丢 2，RNG 恢复与独立 generator 均通过；A4 宏/微排名故意不同且正式 best 只消费完整宏，10 类坏 roster 变体全部 `macro=null`、`complete=false`，`best_formal_step` 完整时 2、缺行时保持 1；新增 6 个 `(demo,start,t)` 注册键（2 个 t/键）的键级核验，宏 **0.21** vs 微 **0.1783333333**，删窗/重窗/换 demo/缺 t/重 t/missing metric/bool 与数值混用/NaN/Inf/缺字段/bool 状态/额外 t 共 **12 类**变体均 `complete=false`、`macro=null` 并保留具体原因；A5 从保存的 4 组固定 run 更新数组、2 组选模 raw 行和键级 raw 行独立重放；绑定裁剪参数/精确形状并验证 with_clip 实际触发，使用小量专用容差并核验梯度/AdamW 状态非零与公式、二阶状态非负与尺度、bool/数值严格类型，重算 FD、batch 排列/重复生成关系与均值，对账全部14条A2明细、完整有效配置与精确 AdamW step；DDIM 时间表在采样前冻结并用独立 eta=0 更新公式对拍。NaN/×2 梯度/root 平移/权重篡改/x_t 错接/DDIM 跳步/坏结构均被拦截。
+- **代表性事实**：A1 编码/解码误差为 0/2.801e-8，`total=5.5997726e-4`，分组均值与整体 MSE 差 9.907e-5，`vel` 38 通道归约与分组和不同；A2 加权梯度和与总梯度差 **4.34e-19**，有限差分最大相对误差 **3.77e-9**，float32 对 float64 最大相对差 **1.71e-5**；A3 四个 parity run 的前向输出/分项 loss/参数/裁剪前与裁剪后梯度/AdamW 状态/t·epsilon 全部逐位相等，等大小 2+2 微批与一次 4 窗大 batch 梯度差 1.86e-9，S0 24 次/6 唯一窗、正式 32 次/8 micro/每 epoch 丢 2，RNG 恢复与独立 generator 均通过；A4 宏/微排名故意不同且正式 best 只消费完整宏，10 类坏 roster 变体全部 `macro=null`、`complete=false`，`best_formal_step` 完整时 2、缺行时保持 1；新增 6 个 `(demo,start,t)` 注册键（2 个 t/键）的键级核验，宏 **0.21** vs 微 **0.1783333333**，删窗/重窗/换 demo/缺 t/重 t/missing metric/bool 与数值混用/NaN/Inf/缺字段/bool 状态/额外 t 共 **12 类**变体均 `complete=false`、`macro=null` 并保留具体原因；A5 从保存的 4 组固定 run 更新数组、2 组选模 raw 行和键级 raw 行独立重放；逐键核对 `per_demo`/`per_window` 明细及其关系，预期原因取冻结 `WINDOW_VARIANT_REASONS` 并用 raw 行独立分类实际变异类型；绑定裁剪参数/精确形状并验证 with_clip 实际触发，使用小量专用容差并核验梯度/AdamW 状态非零与公式、二阶状态非负与尺度、bool/数值严格类型，重算 FD、batch 排列/重复生成关系与均值，对账全部14条A2明细、完整有效配置与精确 AdamW step；DDIM 时间表在采样前冻结并用独立 eta=0 更新公式对拍。NaN/×2 梯度/root 平移/权重篡改/x_t 错接/DDIM 跳步/坏结构/明细改 123.0/missing_t→duplicate_t 同步改写均被拦截。
 - **限制**：近 π 精度负门（实现 0.061667 vs 独立 1.233622）、平行 6D 的 tokenizer `ok` 标志漏检（正式 Trainer/生成器仍拒绝，未使用的 NumPy decode 会抛错）、零 6D 解码占位仅由正式调用方守卫、float32 审计使用合成构造器、`loss_history` 6 位舍入不能做逐位对账。真实 G1 FK 对拍 `not_run`。
-- **测试**：`uv run --locked pytest tests/test_w1_training_objective_audit.py -q` -> **33 passed**（29.77s）；全项目套件未重跑，旧 947 passed + 1 skipped 仅作历史范围记录。
+- **测试**：`uv run --locked pytest tests/test_w1_training_objective_audit.py -q` -> **33 passed**（32.41s）；全项目套件未重跑，旧 947 passed + 1 skipped 仅作历史范围记录。
 - **边界**：未加载真实 dataset/cache/checkpoint，未对任何 W1 训练 checkpoint/生产模型做前向，真实数据训练更新为 0；A3 的采样/循环事实只使用随机初始化微型 `DiffusionG1` 与替身模块；未创建执行注册、cohort 或预算；`factor_selected=false`、`auto_execute=false`、最终交互 `not_ready`、生产接入 false。通过合成审计只表示实现契约在合成适用域成立；下一交付须按 §5 另立真实审计/单因素预注册并取得用户授权；无可区分假设时交付 `attribution_insufficient`。

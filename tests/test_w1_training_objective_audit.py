@@ -420,7 +420,7 @@ def test_registered_window_multiset_counterexamples():
 
     variants = {
         "missing_window": [r for r in good if r["demo"] != "B"],
-        "duplicate_window": good + [dict(good[-1])],
+        "duplicate_window": good + [dict(r) for r in good if r["demo"] == "B"],
         "changed_demo": [dict(r, demo="C") if r["demo"] == "B" else r for r in good],
         "missing_t": [r for r in good if not (r["demo"] == "A" and r["t"] == 500)],
         "duplicate_t": good + [dict(good[0])],
@@ -454,6 +454,8 @@ def test_registered_window_multiset_counterexamples():
         assert res["macro"] is None, name
         assert all(any(f in g for g in res["gaps"])
                    for f in expected_fragments[name]), (name, res["gaps"])
+        assert audit._window_variant_kind(rs, registered) == name, name
+    assert audit._window_variant_kind(good, registered) == "complete"
 
     # Empty registries/rows must not pass vacuously; duplicate registry keys
     # are not silently collapsed by Counter.
@@ -1006,6 +1008,30 @@ def test_verifier_detects_a5_evidence_attacks(audit_dir: Path, tmp_path: Path):
                 r["actual"]["variants"]["missing_t"]["gaps"] = [{"x": 1}]
         (d / "objective_rows.json").write_text(json.dumps(o))
 
+    def window_detail_bad(d):
+        o = _load("objective_rows.json", d)
+        for r in o["rows"]:
+            if r["id"] == "aggregate.registered_window_multiset":
+                for field in ("per_demo", "per_window"):
+                    for key in r["actual"][field]:
+                        r["actual"][field][key] = 123.0
+        (d / "objective_rows.json").write_text(json.dumps(o))
+
+    def window_semantics_swap(d):
+        s = _load("selection_evidence.json", d)
+        keys = s["window_keys"]
+        keys["variants"]["missing_t"] = [
+            dict(r) for r in keys["variants"]["duplicate_t"]]
+        keys["expected_reasons"]["missing_t"] = [
+            "duplicate_window:", "duplicate_t:"]
+        (d / "selection_evidence.json").write_text(json.dumps(s))
+        o = _load("objective_rows.json", d)
+        for r in o["rows"]:
+            if r["id"] == "aggregate.registered_window_multiset":
+                r["actual"]["variants"]["missing_t"] = dict(
+                    r["actual"]["variants"]["duplicate_t"])
+        (d / "objective_rows.json").write_text(json.dumps(o))
+
     expected = {
         "empty_parity": ("audit_incomplete", "structure_empty:update_parity.runs"),
         "best_999": ("implementation_mismatch", "selection_row_mismatch"),
@@ -1053,9 +1079,11 @@ def test_verifier_detects_a5_evidence_attacks(audit_dir: Path, tmp_path: Path):
         "window_macro_bad": ("implementation_mismatch", "selection_window_aggregate_mismatch:macro"),
         "window_registry_dup": ("implementation_mismatch", "selection_window_base_not_complete"),
         "window_bool_metric": ("implementation_mismatch", "selection_window_base_not_complete"),
-        "window_reason_tamper": ("implementation_mismatch", "selection_window_variant_reason_missing:missing_t"),
+        "window_reason_tamper": ("implementation_mismatch", "selection_window_reason_mapping_mismatch"),
         "window_variants_list": ("audit_incomplete", "selection_window_variants_not_mapping"),
         "window_gaps_bad": ("implementation_mismatch", "selection_window_row_variant_gaps_mismatch"),
+        "window_detail_bad": ("implementation_mismatch", "selection_window_detail_mismatch"),
+        "window_semantics_swap": ("implementation_mismatch", "selection_window_variant_semantics_mismatch:missing_t"),
     }
     cases = [("empty_parity", empty_parity), ("best_999", best_999),
              ("nan_total", nan_total), ("nan_grad", nan_grad),
@@ -1084,7 +1112,9 @@ def test_verifier_detects_a5_evidence_attacks(audit_dir: Path, tmp_path: Path):
              ("window_bool_metric", window_bool_metric),
              ("window_reason_tamper", window_reason_tamper),
              ("window_variants_list", window_variants_list),
-             ("window_gaps_bad", window_gaps_bad)]
+             ("window_gaps_bad", window_gaps_bad),
+             ("window_detail_bad", window_detail_bad),
+             ("window_semantics_swap", window_semantics_swap)]
     for name, mutate in cases:
         v = _tampered(audit_dir, tmp_path, f"attack_{name}", mutate)
         want_conclusion, want_problem = expected[name]
