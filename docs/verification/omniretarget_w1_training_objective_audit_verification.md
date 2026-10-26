@@ -1,6 +1,6 @@
 # W1 训练拟合与目标一致性合成审计验证记录
 
-日期：2026-10-22（第五轮复核轮修复 1 P1 + 1 P2 后重跑）。对应方案：[W1训练拟合与目标一致性单因素诊断执行方案](../plans/omniretarget_w1_training_fit_objective_audit_plan.md) A0–A5。**本次交付是纯合成审计实现与运行，不是真实数据审计或单因素训练预注册。**
+日期：2026-10-22（A4 `(demo,start,t)` 键级多重集与 A5 独立键级复核补齐后重跑；第五轮 1 P1 + 1 P2 修复保留）。对应方案：[W1训练拟合与目标一致性单因素诊断执行方案](../plans/omniretarget_w1_training_fit_objective_audit_plan.md) A0–A5。**本次交付是纯合成审计实现与运行，不是真实数据审计或单因素训练预注册。**
 
 ## 0. 结论与边界
 
@@ -10,7 +10,8 @@
 | 退出码 | 0 |
 | 生产侧结论 | `synthetic_contract_passed` |
 | 独立复核结论 | `synthetic_contract_passed`；`problems=[]` |
-| 审计行 | **A1–A4 66 + A0 静态 22 = 88**（A1 23、A2 14、A3 19、A4 10；A0 22） |
+| 权威产物 | `derived/audit/w1_training_objective_audit/attempt_002/`（防覆盖入口；根目录与 `attempt_001/` 旧产物已被取代） |
+| 审计行 | **A1–A4 67 + A0 静态 22 = 89**（A1 23、A2 14、A3 19、A4 11；A0 22） |
 | 失败/缺口 | **0 / 0** |
 | 已登记限制 | **5**（见 §8） |
 | 真实数据/真实 checkpoint/真实 G1 FK | 0 / 0 / 0（均 `not_run`） |
@@ -26,16 +27,16 @@
 | --- | --- |
 | [src/ireset/eval/training_objective_audit.py](../../src/ireset/eval/training_objective_audit.py) | 独立合成审计模块：A0 静态契约、A1/A2/A4 对拍、A3 循环/采样/RNG、A5 独立复核；不修改默认 loss、模型或数据入口 |
 | [scripts/audit_w1_training_objective.py](../../scripts/audit_w1_training_objective.py) | 默认纯合成入口；显式拒绝 manifest/cache/checkpoint/预注册/预算/demo/step/seed 等真实或研究输入；不调用旧诊断脚本 |
-| [tests/test_w1_training_objective_audit.py](../../tests/test_w1_training_objective_audit.py) | 32 项正向链与篡改反例（含 A5 证据攻击矩阵、DDIM 时间表/末步替换）；临时目录，不扫描生产历史 |
-| [derived/audit/w1_training_objective_audit/](../../derived/audit/w1_training_objective_audit/) | 权威合成产物：`static_contract.json`、`s0_formal_comparison.json`、`objective_rows.json`、`synthetic_inputs.npz`、`gradient_rows.json`、`gradient_arrays.npz`、`update_parity.json`、`update_arrays.npz`、`sampling_trace.json`、`rng_state_facts.json`、`audit_summary.json`、`independent_verification.json` |
+| [tests/test_w1_training_objective_audit.py](../../tests/test_w1_training_objective_audit.py) | 33 项正向链与篡改反例（含 A4 键级 12 类变体、A5 证据攻击矩阵、DDIM 时间表/末步替换）；临时目录，不扫描生产历史 |
+| [derived/audit/w1_training_objective_audit/attempt_002/](../../derived/audit/w1_training_objective_audit/attempt_002/) | 权威合成产物：`static_contract.json`、`s0_formal_comparison.json`、`objective_rows.json`、`synthetic_inputs.npz`、`gradient_rows.json`、`gradient_arrays.npz`、`update_parity.json`、`update_arrays.npz`、`sampling_trace.json`、`rng_state_facts.json`、`selection_evidence.json`、`audit_summary.json`、`independent_verification.json` |
 
-权威运行基于已提交的 `7c7b3628e442ec24460f0ea04e36c82d2532960e`；第五轮复核修复文件在运行时尚未提交，`static_contract.json` 记录 `git.dirty=true`、tracked diff SHA-256 `3e8eb22552f0d1a165177f61437cc8b191955472ddcd2028e32823abb0224909`，并单独登记三个实现文件 SHA-256：
+权威运行基于已提交的 `8e1402dc403e430b48c5e9665b70e824733107f8`；运行时本轮 A4 键级代码/测试修复尚未提交，随后只同步了文档，未再改动代码或工件。`static_contract.json` 记录运行时的 `git.dirty=true`、tracked diff SHA-256 `c75ba518f7a350246ad2f188b722d7c4e38c2a5c9e45de65b09fed59547e82f2`，并单独登记三个实现文件 SHA-256：
 
 | 文件 | SHA-256 |
 | --- | --- |
-| `src/ireset/eval/training_objective_audit.py` | `357fdba916ad5e2f46ac05d47e0242f5597a30431ba6b1a1430fb6bfdeb10a18` |
+| `src/ireset/eval/training_objective_audit.py` | `5f2a58534bf6f7f8e4d17c482e947f449d6b878097c04f83e8ba4d67f745a35b` |
 | `scripts/audit_w1_training_objective.py` | `2816a31d1a211b9f46caf51e391cdb61934b33b55540519aace1d47e3306c832` |
-| `tests/test_w1_training_objective_audit.py` | `21f837e9ebff4bbd7c79be1bed199f4214b511c2701ec6fb584f00ae94b3b491` |
+| `tests/test_w1_training_objective_audit.py` | `63661617d551356626dddf9d72d501b201837321db6c03137536fc02ec7f7bd5` |
 
 配置文件 `configs/train/omniretarget_motion.yaml` 原字节 SHA-256：`0e2cfa96849ee2de14ac84b7343289090c606f78116bb79114ff81b046b521e0`。
 
@@ -89,6 +90,7 @@
 
 - 宏/微排名故意不同：method1 宏 **0.25**、微 **0.4166666667**；method2 宏 **0.5**、微 **0.1666666667**——宏偏好 method1，微偏好 method2。正式选模只消费注册 val 全集的 **demo 等权宏**，不会把窗口微平均当宏。
 - 窗口微平均：6 个合成 val 窗口的独立逐窗 loss 均值与 `Trainer.validate` 最大差 **4.8506383914e-12**。
+- 注册键级多重集：`(demo,start,t)` 注册 **6** 键（demoA 两窗、demoB 一窗，每窗 t=0/500），观测多重集必须逐键相等；完整时宏 **0.21**、微 **0.1783333333**，两者不同。删整窗、重复整窗、换 demo、缺 t、重复 t、缺 metric、bool/数值混用、NaN、Inf、缺 `start`、`numerical_valid` 用整数、额外 t 共 **12 类**变体全部 `complete=false`、`macro=null`，并保留 `missing_window/duplicate_window/demo_not_registered/missing_t/duplicate_t/missing_field/bool_metric/nan_metric/inf_metric/unexpected_window` 等具体原因；空注册/空观测与重复注册键也不能空真通过。A5 用**独立实现**从原始键级行重建多重集、宏/微与 12 类变体原因，而不是复用生产侧检查器或信任 row 自报字段。
 - 合成物理 FK MPJPE（仅聚合代数，`fk_backend=synthetic`）：demoA 4 窗、demoB 2 窗，宏 **1.1023083019e-3**、微 **7.9140083287e-4**；两者不同且排名可区分。
 - 注册 roster：3/3 完整时宏 **0.11**、`complete=true`；缺行、重复 demo、T 不符、status 缺失、`numerical_valid=False`、bool/NaN/Inf 指标、额外 demo、缺指标键共 **10** 类变体全部 `complete=false`、`macro=null`，坏行保留在固定分母内。
 - 选模：完整第二次评估宏 0.2 时 `best_formal_step=2`；第二次缺一行时保持 `best_formal_step=1`，不会因分母缩水选出“更优”。
@@ -120,7 +122,7 @@
 | selection replay：两组 raw callback 行 | 从 `per_demo` 重算 demo 等权宏/complete，重推 best step：完整 run=2、缺行 run=1；A5 `checks` 含 `independent.selection:{complete,incomplete}_run` |
 | 结构/有限性 | 顶层与嵌套 mapping/list、必需键、形状、非空集合先校验；NaN/Inf 在容差判定前登记为失败 |
 
-复核攻击矩阵（30 项测试与独立脚本；均在临时副本/合成故障注入，权威产物未改写）：
+复核攻击矩阵（33 项测试与独立脚本；均在临时副本/合成故障注入，权威产物未改写）：
 
 | 攻击 | A5 反应 |
 | --- | --- |
@@ -163,6 +165,14 @@
 | with_clip 的 `exp_avg_sq` 改 −1e-9 | `saved_adamw_state_negative` / `implementation_mismatch` |
 | with_clip 的 `exp_avg_sq` 整体 ×1e6 | `adamw_state_formula_mismatch` / `implementation_mismatch` |
 | gradient_rows 的 FD `ok` 由 true 改为整数 1 | `gradient_detail_mismatch` / `implementation_mismatch` |
+| A4 键级 base 删除一个 `(demo,start,t)` 行 | `selection_window_base_not_complete` + 计数/聚合不一致 / `implementation_mismatch` |
+| A4 `missing_window` 变体行替换为完整 base | `selection_window_variant_not_rejected:missing_window` / `implementation_mismatch` |
+| A4 键级 row 的宏 +0.1 | `selection_window_aggregate_mismatch:macro` / `implementation_mismatch` |
+| 注册键重复一项 | `selection_window_base_not_complete`（重复注册键） / `implementation_mismatch` |
+| base 行 loss 改为 bool | `selection_window_base_not_complete`（`bool_metric`） / `implementation_mismatch` |
+| 期望原因改成不存在的字符串 | `selection_window_variant_reason_missing:missing_t` / `implementation_mismatch` |
+| 键级 `variants` 容器改成列表 | `selection_window_variants_not_mapping` / `audit_incomplete`，复核器不崩溃 |
+| 变体 gaps 改为非字符串对象 | `selection_window_row_variant_gaps_mismatch` / `implementation_mismatch`，`set()` 前先做类型校验 |
 
 其余旧攻击（目标 total +0.1、删除 `grad.vel`、写坏 JSON、改 update 参数、改 `grad_vel`、删除 `static_contract.json`）继续被拦截；验证器顶层异常也会由 wrapper 写入 `verifier_exception` 报告，而不是中断。
 
@@ -178,16 +188,16 @@
 
 ```
 uv run --locked pytest tests/test_w1_training_objective_audit.py -q
-# 32 passed in 24.06s
+# 33 passed in 29.77s
 ```
 
-测试覆盖：完整 A1–A4 正向链与 A5 证据攻击矩阵；解析编码/解码、分组均值与 38 通道 vel、四类扰动、batch 重排/重复、近零/平行/近 π/关节边界/饱和 logits、接触分支静默、FK 合成标记；逐项梯度、权重消费、detach 反例、FK target no_grad、有限差分、float32、参数链式法则；S0/正式四项 parity、裁剪/无裁剪、micro 除法、样本加权区别、optimizer 成员、AdamW 参考、无 scheduler、x_t/t=0/DDIM、两种数据消费、RNG 恢复与独立 generator；宏微排名、物理 FK MPJPE、roster/坏行、选模、确定性与舍入限制；独立复核的目标/梯度/更新数组篡改、缺行、坏 JSON、缺工件；CLI 真实输入拒绝与端到端合成运行。
+测试覆盖：完整 A1–A4 正向链与 A5 证据攻击矩阵；解析编码/解码、分组均值与 38 通道 vel、四类扰动、batch 重排/重复、近零/平行/近 π/关节边界/饱和 logits、接触分支静默、FK 合成标记；逐项梯度、权重消费、detach 反例、FK target no_grad、有限差分、float32、参数链式法则；S0/正式四项 parity、裁剪/无裁剪、micro 除法、样本加权区别、optimizer 成员、AdamW 参考、无 scheduler、x_t/t=0/DDIM、两种数据消费、RNG 恢复与独立 generator；宏微排名、物理 FK MPJPE、roster/坏行、选模、`(demo,start,t)` 键级多重集与 12 类变体、确定性与舍入限制；独立复核的目标/梯度/更新数组/键级 raw 行篡改、缺行、坏 JSON、缺工件；CLI 真实输入拒绝与端到端合成运行。
 
-**未重跑全项目套件。** 上一次全量记录仍为 2026-10-22 首轮修复后的 **947 passed + 1 skipped**（旧范围），本记录不冒充新的全量结果。审计模块的 32 项测试与权威运行是本次新增的独立证据（第五轮复核攻击矩阵亦在测试内）。
+**未重跑全项目套件。** 上一次全量记录仍为 2026-10-22 首轮修复后的 **947 passed + 1 skipped**（旧范围），本记录不冒充新的全量结果。审计模块的 33 项测试与权威运行是本次新增的独立证据（A4 键级与第五轮复核攻击矩阵均在测试内）。
 
 ## 10. 边界与下一交付
 
 - 未加载任何真实数据集、缓存、checkpoint、教师或 G1 资产；未对任何 W1 训练 checkpoint/生产模型进行前向或反向，未产生真实数据 optimizer 更新；A3 仅对随机初始化微型 `DiffusionG1` 与最小替身模块做合成前向/更新。
 - 未创建执行注册、cohort、预算或正式 run；`derived/audit/` 只是合成审计产物目录，不是研究 attempt。
 - 未选择训练拟合因素，未修改默认 loss/模型/数据入口、缓存、教师、checkpoint 或旧 final；旧 U0 `incomplete`、UR `no_quality_gain`、原 W1 F `not_ready`、r6 不可验收与融合候选不接入均保持不变。
-- 通过合成审计只表示实现契约在合成适用域成立；真实数据的拟合/泛化/物理质量仍需方案 §5 的正式预注册与用户授权。若没有可区分假设，下一交付应为 `attribution_insufficient`，而不是重跑旧探针或把 `not_ready` 升级。
+- 通过合成审计只表示实现契约在合成适用域成立；真实数据的拟合/泛化/物理质量仍需方案 §5 的正式预注册与用户授权。已起草[真实训练目标审计预注册草案](../plans/omniretarget_w1_real_objective_audit_prereg_draft.md)，状态为 `draft / not_registered / not_run`，不构成授权或执行记录。若没有可区分假设，下一交付应为 `attribution_insufficient`，而不是重跑旧探针或把 `not_ready` 升级。

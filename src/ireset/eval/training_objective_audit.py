@@ -26,6 +26,7 @@ import random
 import subprocess
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any, Callable
 
@@ -177,6 +178,7 @@ REQUIRED_AUDIT_ROWS: dict[str, tuple[str, ...]] = {
     "A4": (
         "aggregate.macro_vs_micro_ranking",
         "aggregate.window_micro_average",
+        "aggregate.registered_window_multiset",
         "aggregate.physical_fk_mpjpe",
         "selection.registered_roster_complete",
         "selection.bad_rows_retained_denominator",
@@ -2363,6 +2365,228 @@ def independent_macro(rows: list[dict], expected: list[str],
             "gaps": gaps}
 
 
+WINDOW_KEY_FIELDS = ("demo", "start", "t", "loss", "numerical_valid")
+NONFINITE_MARKERS = {"nan", "inf", "-inf"}
+
+
+def _window_key_text(key: tuple[str, int, int]) -> str:
+    return f"{key[0]}:{key[1]}:{key[2]}"
+
+
+def _window_evidence_rows(rows: list[dict]) -> list[dict]:
+    """Keep NaN/Inf as explicit markers; json cannot represent them as floats."""
+    out: list[dict] = []
+    for row in rows:
+        copied = dict(row)
+        loss = copied.get("loss")
+        if isinstance(loss, float) and not math.isfinite(loss):
+            copied["loss"] = {"nonfinite": "nan" if math.isnan(loss) else "inf"}
+        out.append(copied)
+    return out
+
+
+def _window_metric_gap(loss: Any, index: int) -> str | None:
+    """Classify one metric as a named gap; None means a finite measurement."""
+    if isinstance(loss, dict):
+        marker = loss.get("nonfinite")
+        if set(loss) == {"nonfinite"} and marker in NONFINITE_MARKERS:
+            return f"nan_metric:{index}" if marker == "nan" else f"inf_metric:{index}"
+        return f"invalid_metric:{index}"
+    if isinstance(loss, (bool, np.bool_)):
+        return f"bool_metric:{index}:loss"
+    if isinstance(loss, (int, float, np.integer, np.floating)):
+        value = float(loss)
+        if math.isnan(value):
+            return f"nan_metric:{index}"
+        if math.isinf(value):
+            return f"inf_metric:{index}"
+        if value < 0:
+            return f"negative_metric:{index}"
+        return None
+    return f"missing_metrics:{index}"
+
+
+def verify_window_key_multiset(rows: list[dict], registered: list[dict]) -> dict:
+    """Registered ``(demo, start, t)`` multiset check for A4 window evidence.
+
+    A count or ``all([])`` is not evidence.  The observed rows must match the
+    registered multiset exactly; missing/extra/duplicated windows and missing/
+    duplicated ``t`` values are reported separately.  Aggregates are returned
+    only when the key set is complete, so a deleted row cannot shrink a
+    denominator and make a method look better.
+    """
+    gaps: list[str] = []
+    if not isinstance(registered, list) or not registered:
+        gaps.append("registered_empty" if isinstance(registered, list)
+                    else "registered_not_list")
+        registered = []
+    reg_counter: Counter[tuple[str, int, int]] = Counter()
+    reg_demos: set[str] = set()
+    reg_windows: dict[tuple[str, int], set[int]] = {}
+    for i, r in enumerate(registered):
+        if not isinstance(r, dict):
+            gaps.append(f"registered_row_not_mapping:{i}")
+            continue
+        missing = sorted({"demo", "start", "t"} - set(r))
+        if missing:
+            gaps.append(f"registered_missing_field:{i}:{','.join(missing)}")
+            continue
+        demo, start, t = r.get("demo"), r.get("start"), r.get("t")
+        if not isinstance(demo, str) or not demo:
+            gaps.append(f"registered_invalid_key:{i}:demo")
+            continue
+        if (not isinstance(start, int) or isinstance(start, bool) or start < 0
+                or not isinstance(t, int) or isinstance(t, bool) or t < 0):
+            gaps.append(f"registered_invalid_key:{i}:start_or_t")
+            continue
+        key = (demo, start, t)
+        reg_counter[key] += 1
+        reg_demos.add(demo)
+        reg_windows.setdefault((demo, start), set()).add(t)
+    for key, count in reg_counter.items():
+        if count > 1:
+            gaps.append(f"registered_duplicate_window:{_window_key_text(key)}")
+            gaps.append(f"registered_duplicate_t:{_window_key_text(key)}")
+
+    if not isinstance(rows, list):
+        gaps.append("rows_not_a_list")
+        rows = []
+    obs_counter: Counter[tuple[str, int, int]] = Counter()
+    obs_windows: set[tuple[str, int]] = set()
+    values: list[tuple[tuple[str, int, int], float]] = []
+    for i, r in enumerate(rows):
+        if not isinstance(r, dict):
+            gaps.append(f"row_not_mapping:{i}")
+            continue
+        missing = sorted(set(WINDOW_KEY_FIELDS) - set(r))
+        if missing:
+            gaps.append(f"missing_field:{i}:{','.join(missing)}")
+            continue
+        demo, start, t = r.get("demo"), r.get("start"), r.get("t")
+        if not isinstance(demo, str) or not demo:
+            gaps.append(f"invalid_key:{i}:demo")
+            continue
+        if (not isinstance(start, int) or isinstance(start, bool) or start < 0
+                or not isinstance(t, int) or isinstance(t, bool) or t < 0):
+            gaps.append(f"invalid_key:{i}:start_or_t")
+            continue
+        key = (demo, start, t)
+        obs_counter[key] += 1
+        obs_windows.add((demo, start))
+        if demo not in reg_demos:
+            gaps.append(f"demo_not_registered:{demo}")
+        status = r.get("numerical_valid")
+        if not isinstance(status, bool):
+            gaps.append(f"bool_metric:{i}:numerical_valid")
+        elif status is not True:
+            gaps.append(f"numerical_invalid:{i}")
+        loss = r.get("loss")
+        metric_gap = _window_metric_gap(loss, i)
+        if metric_gap is not None:
+            gaps.append(metric_gap)
+        else:
+            values.append((key, float(loss)))
+
+    for key, count in obs_counter.items():
+        if count > 1:
+            gaps.append(f"duplicate_window:{_window_key_text(key)}")
+            gaps.append(f"duplicate_t:{_window_key_text(key)}")
+    for key in reg_counter:
+        if key not in obs_counter:
+            if (key[0], key[1]) in obs_windows:
+                gaps.append(f"missing_t:{_window_key_text(key)}")
+            else:
+                gaps.append(f"missing_window:{_window_key_text(key)}")
+    for key in obs_counter:
+        if key not in reg_counter:
+            gaps.append(f"unexpected_window:{_window_key_text(key)}")
+
+    complete = (not gaps and reg_counter == obs_counter
+                and len(values) == sum(reg_counter.values()))
+    macro = micro = None
+    per_demo: dict[str, float] = {}
+    per_window: dict[str, float] = {}
+    if complete:
+        by_window: dict[tuple[str, int], list[float]] = {}
+        for key, value in values:
+            by_window.setdefault((key[0], key[1]), []).append(value)
+        per_window = {f"{d}:{s}": float(np.mean(v))
+                      for (d, s), v in by_window.items()}
+        by_demo: dict[str, list[float]] = {}
+        for (d, _s), vals in by_window.items():
+            by_demo.setdefault(d, []).append(float(np.mean(vals)))
+        per_demo = {d: float(np.mean(v)) for d, v in by_demo.items()}
+        micro = float(np.mean([v for _k, v in values]))
+        macro = float(np.mean(list(per_demo.values())))
+    return {"complete": complete, "gaps": gaps, "macro": macro, "micro": micro,
+            "per_demo": per_demo, "per_window": per_window,
+            "n_registered": sum(reg_counter.values()),
+            "n_observed": sum(obs_counter.values())}
+
+
+WINDOW_VARIANTS = (
+    "missing_window", "duplicate_window", "changed_demo", "missing_t",
+    "duplicate_t", "missing_metric", "bool_metric", "nan_metric",
+    "inf_metric", "missing_field", "bool_status", "extra_t",
+)
+WINDOW_VARIANT_REASONS = {
+    "missing_window": ("missing_window:demoA:30:",),
+    "duplicate_window": ("duplicate_window:demoB:0:",),
+    "changed_demo": ("demo_not_registered:demoC",),
+    "missing_t": ("missing_t:demoA:0:500",),
+    "duplicate_t": ("duplicate_t:demoA:0:500",),
+    "missing_metric": ("missing_field:", ":loss"),
+    "bool_metric": ("bool_metric:", ":loss"),
+    "nan_metric": ("nan_metric:",),
+    "inf_metric": ("inf_metric:",),
+    "missing_field": ("missing_field:", ":start"),
+    "bool_status": ("bool_metric:", ":numerical_valid"),
+    "extra_t": ("unexpected_window:demoB:0:999",),
+}
+
+
+def _window_variant_rows(base: list[dict]) -> dict[str, list[dict]]:
+    def copies() -> list[dict]:
+        return [dict(r) for r in base]
+
+    variants: dict[str, list[dict]] = {}
+    v = [dict(r) for r in base if not (r["demo"] == "demoA" and r["start"] == 30)]
+    variants["missing_window"] = v
+    v = copies()
+    v.extend(dict(r) for r in base if r["demo"] == "demoB" and r["start"] == 0)
+    variants["duplicate_window"] = v
+    v = copies()
+    for r in v:
+        if r["demo"] == "demoB":
+            r["demo"] = "demoC"
+    variants["changed_demo"] = v
+    v = [dict(r) for r in base
+         if not (r["demo"] == "demoA" and r["start"] == 0 and r["t"] == 500)]
+    variants["missing_t"] = v
+    v = copies()
+    v.extend(dict(r) for r in base
+             if r["demo"] == "demoA" and r["start"] == 0 and r["t"] == 500)
+    variants["duplicate_t"] = v
+    v = copies(); v[0].pop("loss", None)
+    variants["missing_metric"] = v
+    v = copies(); v[0]["loss"] = True
+    variants["bool_metric"] = v
+    v = copies(); v[0]["loss"] = float("nan")
+    variants["nan_metric"] = v
+    v = copies(); v[0]["loss"] = float("inf")
+    variants["inf_metric"] = v
+    v = copies(); v[0].pop("start", None)
+    variants["missing_field"] = v
+    v = copies(); v[0]["numerical_valid"] = 1
+    variants["bool_status"] = v
+    v = copies()
+    for r in v:
+        if r["demo"] == "demoB" and r["start"] == 0 and r["t"] == 0:
+            r["t"] = 999
+    variants["extra_t"] = v
+    return variants
+
+
 def run_a4(world: SyntheticWorld, tmp_root: Path) -> tuple[list[dict], dict]:
     rows: list[dict] = []
     # macro vs micro ranking on demos with different window counts
@@ -2419,6 +2643,59 @@ def run_a4(world: SyntheticWorld, tmp_root: Path) -> tuple[list[dict], dict]:
                                    "sample_weighted": True,
                                    "per_window": per_window,
                                    "val_n_windows": val.get("n_windows_evaluated")}))
+
+    # Registered (demo, start, t) multiset.  A row count alone cannot show
+    # that a window was not deleted or duplicated, so every key is registered
+    # and the observed multiset must match it exactly.  Aggregates are only
+    # published when the key set is complete.
+    window_registry = [
+        {"demo": "demoA", "start": 0, "t": 0},
+        {"demo": "demoA", "start": 0, "t": 500},
+        {"demo": "demoA", "start": 30, "t": 0},
+        {"demo": "demoA", "start": 30, "t": 500},
+        {"demo": "demoB", "start": 0, "t": 0},
+        {"demo": "demoB", "start": 0, "t": 500},
+    ]
+    window_losses = (0.10, 0.11, 0.12, 0.13, 0.30, 0.31)
+    window_rows = [
+        {**key, "loss": loss, "numerical_valid": True}
+        for key, loss in zip(window_registry, window_losses)
+    ]
+    window_base = verify_window_key_multiset(window_rows, window_registry)
+    window_variants = _window_variant_rows(window_rows)
+    window_variant_facts: dict[str, dict] = {}
+    window_ok = (window_base["complete"] is True
+                 and window_base["macro"] is not None
+                 and window_base["micro"] is not None
+                 and abs(window_base["macro"] - window_base["micro"]) > 1e-12)
+    for name in WINDOW_VARIANTS:
+        res = verify_window_key_multiset(window_variants[name], window_registry)
+        fragments = WINDOW_VARIANT_REASONS[name]
+        reason_ok = all(any(frag in gap for gap in res["gaps"]) for frag in fragments)
+        window_variant_facts[name] = {
+            "complete": res["complete"], "macro": res["macro"],
+            "gaps": res["gaps"], "reason_ok": reason_ok,
+        }
+        window_ok &= (res["complete"] is False and res["macro"] is None
+                      and bool(res["gaps"]) and reason_ok)
+    rows.append(_row("aggregate.registered_window_multiset", "A4",
+                     "synthetic_verified" if window_ok else "contract_mismatch",
+                     expected={"registered_multiset": window_registry,
+                               "macro": 0.21,
+                               "micro": float(np.mean(window_losses)),
+                               "all_variants_rejected_with_reason": True},
+                     actual={"macro": window_base["macro"],
+                             "micro": window_base["micro"],
+                             "per_demo": window_base["per_demo"],
+                             "per_window": window_base["per_window"],
+                             "n_registered": window_base["n_registered"],
+                             "n_observed": window_base["n_observed"],
+                             "variants": window_variant_facts},
+                     evidence={"source": "synthetic_key_aggregation",
+                               "real_model_windows": 0,
+                               "registered_keys": window_registry,
+                               "rows": window_rows,
+                               "variants": sorted(window_variants)}))
 
     # synthetic physical FK MPJPE aggregation: per-window mean site distance,
     # demo-equal-weight macro vs window micro.  fk_backend is the audit stub,
@@ -2642,6 +2919,16 @@ def run_a4(world: SyntheticWorld, tmp_root: Path) -> tuple[list[dict], dict]:
                                        "best_formal_step": good_res["best_formal_step"]},
                       "incomplete_run": {"raw_steps": bad_res["raw_steps"],
                                          "best_formal_step": bad_res["best_formal_step"]},
+                      "window_keys": {
+                          "registered": window_registry,
+                          "rows": _window_evidence_rows(window_rows),
+                          "variants": {name: _window_evidence_rows(v)
+                                       for name, v in window_variants.items()},
+                          "expected_reasons": {
+                              name: list(fragments)
+                              for name, fragments in WINDOW_VARIANT_REASONS.items()
+                          },
+                      },
                   }}
 
 
@@ -3329,8 +3616,208 @@ def _verify_diffusion_noise(run: dict, uarr: dict, problems: list[str],
     checks.append({"id": f"independent.diffusion_noise:{run_id}", "ok": True})
 
 
+def _independent_window_multiset(rows: Any, registered: Any) -> dict:
+    """Verifier-side multiset reconstruction from raw window rows.
+
+    Deliberately separate from :func:`verify_window_key_multiset`: the audit
+    must not pass merely because producer and verifier share one key checker.
+    """
+    gaps: list[str] = []
+    reg_counter: Counter[tuple[str, int, int]] = Counter()
+    reg_demos: set[str] = set()
+    if not isinstance(registered, list):
+        gaps.append("registered_not_list")
+        registered = []
+    elif not registered:
+        gaps.append("registered_empty")
+    for i, r in enumerate(registered):
+        if not isinstance(r, dict):
+            gaps.append(f"registered_row_not_mapping:{i}")
+            continue
+        if not {"demo", "start", "t"} <= set(r):
+            gaps.append(f"registered_missing_field:{i}")
+            continue
+        demo, start, t = r["demo"], r["start"], r["t"]
+        if (not isinstance(demo, str) or not demo
+                or not isinstance(start, int) or isinstance(start, bool) or start < 0
+                or not isinstance(t, int) or isinstance(t, bool) or t < 0):
+            gaps.append(f"registered_invalid_key:{i}")
+            continue
+        key = (demo, start, t)
+        if key in reg_counter:
+            gaps.append(f"registered_duplicate_window:{_window_key_text(key)}")
+            gaps.append(f"registered_duplicate_t:{_window_key_text(key)}")
+        reg_counter[key] += 1
+        reg_demos.add(demo)
+
+    if not isinstance(rows, list):
+        gaps.append("rows_not_a_list")
+        rows = []
+    obs_counter: Counter[tuple[str, int, int]] = Counter()
+    obs_windows: set[tuple[str, int]] = set()
+    by_key: dict[tuple[str, int, int], float] = {}
+    for i, r in enumerate(rows):
+        if not isinstance(r, dict):
+            gaps.append(f"row_not_mapping:{i}")
+            continue
+        if not set(WINDOW_KEY_FIELDS) <= set(r):
+            missing = sorted(set(WINDOW_KEY_FIELDS) - set(r))
+            gaps.append(f"missing_field:{i}:{','.join(missing)}")
+            continue
+        demo, start, t = r["demo"], r["start"], r["t"]
+        if (not isinstance(demo, str) or not demo
+                or not isinstance(start, int) or isinstance(start, bool) or start < 0
+                or not isinstance(t, int) or isinstance(t, bool) or t < 0):
+            gaps.append(f"invalid_key:{i}")
+            continue
+        key = (demo, start, t)
+        obs_counter[key] += 1
+        obs_windows.add((demo, start))
+        if demo not in reg_demos:
+            gaps.append(f"demo_not_registered:{demo}")
+        status, loss = r["numerical_valid"], r["loss"]
+        if not isinstance(status, bool):
+            gaps.append(f"bool_metric:{i}:numerical_valid")
+        elif status is not True:
+            gaps.append(f"numerical_invalid:{i}")
+        metric_gap = _window_metric_gap(loss, i)
+        if metric_gap is not None:
+            gaps.append(metric_gap)
+        else:
+            by_key[key] = float(loss)
+
+    for key, count in obs_counter.items():
+        if count > 1:
+            gaps.append(f"duplicate_window:{_window_key_text(key)}")
+            gaps.append(f"duplicate_t:{_window_key_text(key)}")
+    for key in reg_counter:
+        if key not in obs_counter:
+            if (key[0], key[1]) in obs_windows:
+                gaps.append(f"missing_t:{_window_key_text(key)}")
+            else:
+                gaps.append(f"missing_window:{_window_key_text(key)}")
+    for key in obs_counter:
+        if key not in reg_counter:
+            gaps.append(f"unexpected_window:{_window_key_text(key)}")
+
+    complete = (not gaps and reg_counter == obs_counter
+                and len(by_key) == sum(reg_counter.values()))
+    macro = micro = None
+    per_demo: dict[str, float] = {}
+    per_window: dict[str, float] = {}
+    if complete:
+        by_window: dict[tuple[str, int], list[float]] = {}
+        for (demo, start, _t), value in by_key.items():
+            by_window.setdefault((demo, start), []).append(value)
+        per_window = {f"{d}:{s}": float(np.mean(v))
+                      for (d, s), v in by_window.items()}
+        grouped: dict[str, list[float]] = {}
+        for (demo, _start), vals in by_window.items():
+            grouped.setdefault(demo, []).append(float(np.mean(vals)))
+        per_demo = {d: float(np.mean(v)) for d, v in grouped.items()}
+        micro = float(np.mean(list(by_key.values())))
+        macro = float(np.mean(list(per_demo.values())))
+    return {"complete": complete, "gaps": gaps, "macro": macro, "micro": micro,
+            "per_demo": per_demo, "per_window": per_window,
+            "n_registered": sum(reg_counter.values()),
+            "n_observed": sum(obs_counter.values())}
+
+
+def _recompute_window_keys(evidence: dict, rows: dict, problems: list[str],
+                           checks: list[dict]) -> None:
+    window_keys = evidence.get("window_keys")
+    if not isinstance(window_keys, dict):
+        problems.append("selection_window_evidence_missing")
+        return
+    registered = window_keys.get("registered")
+    raw_rows = window_keys.get("rows")
+    variants = window_keys.get("variants")
+    reasons = window_keys.get("expected_reasons")
+    if not isinstance(registered, list) or not registered:
+        problems.append("selection_window_registered_invalid")
+    if not isinstance(raw_rows, list) or not raw_rows:
+        problems.append("selection_window_rows_empty")
+    variants_valid = isinstance(variants, dict)
+    reasons_valid = isinstance(reasons, dict)
+    if not variants_valid:
+        problems.append("selection_window_variants_not_mapping")
+        variants = {}
+    if not reasons_valid:
+        problems.append("selection_window_reasons_not_mapping")
+        reasons = {}
+    base = _independent_window_multiset(raw_rows, registered)
+    if base["complete"] is not True:
+        problems.append("selection_window_base_not_complete")
+    if base["macro"] is None or base["micro"] is None:
+        problems.append("selection_window_base_aggregate_missing")
+    elif abs(float(base["macro"]) - float(base["micro"])) <= 1e-12:
+        problems.append("selection_window_macro_micro_not_distinct")
+    if variants_valid and set(variants) != set(WINDOW_VARIANTS):
+        problems.append("selection_window_variant_set_mismatch")
+    if reasons_valid and set(reasons) != set(WINDOW_VARIANTS):
+        problems.append("selection_window_reason_set_mismatch")
+
+    row = rows.get("aggregate.registered_window_multiset")
+    actual = row.get("actual") if isinstance(row, dict) else None
+    row_missing = not isinstance(actual, dict)
+    if row_missing:
+        problems.append("selection_window_row_missing")
+        actual = {}
+    actual_variants: dict = {}
+    if not row_missing:
+        if base["macro"] is not None:
+            for metric in ("macro", "micro"):
+                recorded = actual.get(metric)
+                expected = base[metric]
+                if (not _finite_number(recorded) or expected is None
+                        or abs(float(recorded) - float(expected))
+                        > TOLERANCES["macro_float64"]["atol"]):
+                    problems.append(f"selection_window_aggregate_mismatch:{metric}")
+        if actual.get("n_registered") != base["n_registered"] \
+                or actual.get("n_observed") != base["n_observed"]:
+            problems.append("selection_window_count_mismatch")
+        actual_variants = actual.get("variants")
+        if not isinstance(actual_variants, dict):
+            problems.append("selection_window_row_variants_not_mapping")
+            actual_variants = {}
+        if set(actual_variants) != set(WINDOW_VARIANTS):
+            problems.append("selection_window_row_variant_set_mismatch")
+
+    if variants_valid:
+        for name in WINDOW_VARIANTS:
+            result = _independent_window_multiset(variants.get(name), registered)
+            if result["complete"] is not False or result["macro"] is not None:
+                problems.append(f"selection_window_variant_not_rejected:{name}")
+            fragments = reasons.get(name)
+            if (not isinstance(fragments, list) or not fragments
+                    or not all(isinstance(f, str) and f for f in fragments)):
+                problems.append(f"selection_window_reason_invalid:{name}")
+            elif not all(any(f in gap for gap in result["gaps"]) for f in fragments):
+                problems.append(f"selection_window_variant_reason_missing:{name}")
+            if row_missing:
+                continue
+            recorded = actual_variants.get(name)
+            if not isinstance(recorded, dict):
+                problems.append(f"selection_window_row_variant_missing:{name}")
+                continue
+            if recorded.get("complete") is not False or recorded.get("macro") is not None:
+                problems.append(f"selection_window_row_variant_not_rejected:{name}")
+            recorded_gaps = recorded.get("gaps")
+            if (not isinstance(recorded_gaps, list)
+                    or not all(isinstance(g, str) for g in recorded_gaps)
+                    or set(recorded_gaps) != set(result["gaps"])):
+                problems.append(f"selection_window_row_variant_gaps_mismatch:{name}")
+            if recorded.get("reason_ok") is not True:
+                problems.append(f"selection_window_row_reason_flag:{name}")
+    checks.append({"id": "independent.selection_window_keys",
+                   "n_registered": base["n_registered"],
+                   "n_observed": base["n_observed"],
+                   "variants": len(variants)})
+
+
 def _recompute_selection(evidence: dict, rows: dict, problems: list[str],
                          checks: list[dict]) -> None:
+    _recompute_window_keys(evidence, rows, problems, checks)
     expected = _list(evidence.get("expected_demos"), "selection.expected_demos", problems)
     if not expected or len(set(expected)) != len(expected) or not all(isinstance(d, str) for d in expected):
         problems.append("selection_expected_roster_invalid")
@@ -3751,7 +4238,22 @@ def _verify_audit_artifacts_impl(out_dir: Path) -> dict:
                         "adamw_step_not_exact_one", "batch_permutation_invalid",
                         "batch_repeat_not_original", "batch_mean_invariance_mismatch",
                         "batch_invariance_nonfinite_expected", "selection_recompute_mismatch",
-                        "selection_row_mismatch", "static_effective_loss_mismatch",
+                        "selection_row_mismatch", "selection_window_base_not_complete",
+                        "selection_window_base_aggregate_missing",
+                        "selection_window_macro_micro_not_distinct",
+                        "selection_window_variant_set_mismatch",
+                        "selection_window_reason_set_mismatch",
+                        "selection_window_aggregate_mismatch",
+                        "selection_window_count_mismatch",
+                        "selection_window_row_variant_set_mismatch",
+                        "selection_window_variant_not_rejected",
+                        "selection_window_variant_reason_missing",
+                        "selection_window_reason_invalid",
+                        "selection_window_row_variant_missing",
+                        "selection_window_row_variant_not_rejected",
+                        "selection_window_row_variant_gaps_mismatch",
+                        "selection_window_row_reason_flag",
+                        "static_effective_loss_mismatch",
                         "input_x0_not_bound", "nonfinite:",
                         "finite_difference_row_not_verified", "batch_invariance_mismatch",
                         "sampling_full_loop_not_executed",

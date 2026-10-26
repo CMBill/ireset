@@ -37,6 +37,7 @@ from ireset.eval.training_objective_audit import (
     run_a2,
     run_synthetic_audit,
     verify_audit_artifacts,
+    verify_window_key_multiset,
 )
 
 
@@ -367,6 +368,17 @@ def test_macro_micro_selection_and_best(audit_dir: Path):
     assert best["complete_run"]["best_formal_step"] == 2
     assert best["incomplete_run"]["best_formal_step"] == 1
     assert rows["aggregate.window_micro_average"]["evidence"]["max_abs_error"] < 1e-9
+    keys = rows["aggregate.registered_window_multiset"]
+    assert keys["status"] == "synthetic_verified"
+    assert keys["actual"]["macro"] == pytest.approx(0.21)
+    assert keys["actual"]["micro"] == pytest.approx(np.mean([0.10, 0.11, 0.12, 0.13, 0.30, 0.31]))
+    assert keys["actual"]["n_registered"] == keys["actual"]["n_observed"] == 6
+    assert set(keys["actual"]["variants"]) == set(audit.WINDOW_VARIANTS)
+    for name, rec in keys["actual"]["variants"].items():
+        assert rec["complete"] is False, name
+        assert rec["macro"] is None, name
+        assert rec["gaps"], name
+        assert rec["reason_ok"] is True, name
 
 
 def test_independent_macro_counterexamples():
@@ -388,6 +400,69 @@ def test_independent_macro_counterexamples():
         assert res["complete"] is False
         assert res["macro"] is None
         assert res["gaps"]
+
+
+def test_registered_window_multiset_counterexamples():
+    registered = [
+        {"demo": "A", "start": 0, "t": 0},
+        {"demo": "A", "start": 0, "t": 500},
+        {"demo": "B", "start": 0, "t": 0},
+        {"demo": "B", "start": 0, "t": 500},
+    ]
+    good = [{**k, "loss": 0.1 + 0.01 * i, "numerical_valid": True}
+            for i, k in enumerate(registered)]
+    base = verify_window_key_multiset(good, registered)
+    assert base["complete"] is True
+    assert base["n_registered"] == base["n_observed"] == 4
+    assert base["macro"] == pytest.approx(0.115)
+    assert base["micro"] == pytest.approx(0.115)
+    assert base["gaps"] == []
+
+    variants = {
+        "missing_window": [r for r in good if r["demo"] != "B"],
+        "duplicate_window": good + [dict(good[-1])],
+        "changed_demo": [dict(r, demo="C") if r["demo"] == "B" else r for r in good],
+        "missing_t": [r for r in good if not (r["demo"] == "A" and r["t"] == 500)],
+        "duplicate_t": good + [dict(good[0])],
+        "missing_metric": [{k: v for k, v in r.items() if k != "loss"} if i == 0 else r
+                           for i, r in enumerate(good)],
+        "bool_metric": [dict(r, loss=True) if i == 0 else r for i, r in enumerate(good)],
+        "nan_metric": [dict(r, loss=float("nan")) if i == 0 else r for i, r in enumerate(good)],
+        "inf_metric": [dict(r, loss=float("inf")) if i == 0 else r for i, r in enumerate(good)],
+        "missing_field": [dict(r, start=0) if i == 0 else r for i, r in enumerate(good)],
+        "bool_status": [dict(r, numerical_valid=1) if i == 0 else r for i, r in enumerate(good)],
+        "extra_t": [dict(r, t=999) if i == 0 else r for i, r in enumerate(good)],
+    }
+    del variants["missing_field"][0]["start"]
+    expected_fragments = {
+        "missing_window": ["missing_window:B:0:500"],
+        "duplicate_window": ["duplicate_window:B:0:500"],
+        "changed_demo": ["demo_not_registered:C"],
+        "missing_t": ["missing_t:A:0:500"],
+        "duplicate_t": ["duplicate_window:A:0:0"],
+        "missing_metric": ["missing_field:", ":loss"],
+        "bool_metric": ["bool_metric:", ":loss"],
+        "nan_metric": ["nan_metric:"],
+        "inf_metric": ["inf_metric:"],
+        "missing_field": ["missing_field:", ":start"],
+        "bool_status": ["bool_metric:", ":numerical_valid"],
+        "extra_t": ["unexpected_window:A:0:999"],
+    }
+    for name, rs in variants.items():
+        res = verify_window_key_multiset(rs, registered)
+        assert res["complete"] is False, name
+        assert res["macro"] is None, name
+        assert all(any(f in g for g in res["gaps"])
+                   for f in expected_fragments[name]), (name, res["gaps"])
+
+    # Empty registries/rows must not pass vacuously; duplicate registry keys
+    # are not silently collapsed by Counter.
+    assert verify_window_key_multiset([], [])["complete"] is False
+    assert verify_window_key_multiset([], registered)["complete"] is False
+    duplicate_registry = registered + [dict(registered[0])]
+    dup = verify_window_key_multiset(good, duplicate_registry)
+    assert dup["complete"] is False
+    assert any("registered_duplicate_window" in g for g in dup["gaps"])
 
 
 def test_determinism_and_rounding_limitation(audit_dir: Path):
@@ -886,6 +961,51 @@ def test_verifier_detects_a5_evidence_attacks(audit_dir: Path, tmp_path: Path):
                         r["actual"][term]["ok"] = 1
         (d / "gradient_rows.json").write_text(json.dumps(g))
 
+    def window_base_drop(d):
+        s = _load("selection_evidence.json", d)
+        s["window_keys"]["rows"].pop()
+        (d / "selection_evidence.json").write_text(json.dumps(s))
+
+    def window_variant_pass(d):
+        s = _load("selection_evidence.json", d)
+        s["window_keys"]["variants"]["missing_window"] = [
+            dict(r) for r in s["window_keys"]["rows"]]
+        (d / "selection_evidence.json").write_text(json.dumps(s))
+
+    def window_macro_bad(d):
+        o = _load("objective_rows.json", d)
+        for r in o["rows"]:
+            if r["id"] == "aggregate.registered_window_multiset":
+                r["actual"]["macro"] += 0.1
+        (d / "objective_rows.json").write_text(json.dumps(o))
+
+    def window_registry_dup(d):
+        s = _load("selection_evidence.json", d)
+        s["window_keys"]["registered"].append(dict(s["window_keys"]["registered"][0]))
+        (d / "selection_evidence.json").write_text(json.dumps(s))
+
+    def window_bool_metric(d):
+        s = _load("selection_evidence.json", d)
+        s["window_keys"]["rows"][0]["loss"] = True
+        (d / "selection_evidence.json").write_text(json.dumps(s))
+
+    def window_reason_tamper(d):
+        s = _load("selection_evidence.json", d)
+        s["window_keys"]["expected_reasons"]["missing_t"] = ["not_a_real_reason"]
+        (d / "selection_evidence.json").write_text(json.dumps(s))
+
+    def window_variants_list(d):
+        s = _load("selection_evidence.json", d)
+        s["window_keys"]["variants"] = []
+        (d / "selection_evidence.json").write_text(json.dumps(s))
+
+    def window_gaps_bad(d):
+        o = _load("objective_rows.json", d)
+        for r in o["rows"]:
+            if r["id"] == "aggregate.registered_window_multiset":
+                r["actual"]["variants"]["missing_t"]["gaps"] = [{"x": 1}]
+        (d / "objective_rows.json").write_text(json.dumps(o))
+
     expected = {
         "empty_parity": ("audit_incomplete", "structure_empty:update_parity.runs"),
         "best_999": ("implementation_mismatch", "selection_row_mismatch"),
@@ -928,6 +1048,14 @@ def test_verifier_detects_a5_evidence_attacks(audit_dir: Path, tmp_path: Path):
         "exp_sq_negative": ("implementation_mismatch", "saved_adamw_state_negative"),
         "exp_sq_million": ("implementation_mismatch", "adamw_state_formula_mismatch"),
         "fd_bool_as_int": ("implementation_mismatch", "gradient_detail_mismatch"),
+        "window_base_drop": ("implementation_mismatch", "selection_window_base_not_complete"),
+        "window_variant_pass": ("implementation_mismatch", "selection_window_variant_not_rejected:missing_window"),
+        "window_macro_bad": ("implementation_mismatch", "selection_window_aggregate_mismatch:macro"),
+        "window_registry_dup": ("implementation_mismatch", "selection_window_base_not_complete"),
+        "window_bool_metric": ("implementation_mismatch", "selection_window_base_not_complete"),
+        "window_reason_tamper": ("implementation_mismatch", "selection_window_variant_reason_missing:missing_t"),
+        "window_variants_list": ("audit_incomplete", "selection_window_variants_not_mapping"),
+        "window_gaps_bad": ("implementation_mismatch", "selection_window_row_variant_gaps_mismatch"),
     }
     cases = [("empty_parity", empty_parity), ("best_999", best_999),
              ("nan_total", nan_total), ("nan_grad", nan_grad),
@@ -948,7 +1076,15 @@ def test_verifier_detects_a5_evidence_attacks(audit_dir: Path, tmp_path: Path):
              ("fd_detail", fd_detail), ("cos_detail", cos_detail),
              ("step_float", step_float), ("step_string", step_string),
              ("exp_sq_negative", exp_sq_negative), ("exp_sq_million", exp_sq_million),
-             ("fd_bool_as_int", fd_bool_as_int)]
+             ("fd_bool_as_int", fd_bool_as_int),
+             ("window_base_drop", window_base_drop),
+             ("window_variant_pass", window_variant_pass),
+             ("window_macro_bad", window_macro_bad),
+             ("window_registry_dup", window_registry_dup),
+             ("window_bool_metric", window_bool_metric),
+             ("window_reason_tamper", window_reason_tamper),
+             ("window_variants_list", window_variants_list),
+             ("window_gaps_bad", window_gaps_bad)]
     for name, mutate in cases:
         v = _tampered(audit_dir, tmp_path, f"attack_{name}", mutate)
         want_conclusion, want_problem = expected[name]
