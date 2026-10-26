@@ -1101,3 +1101,185 @@ def test_f_nested_container_types_are_gaps_not_crashes(
     assert any(expected_gap in g for g in result["gaps"]), result["gaps"]
     assert result["conclusion"] == "audit_incomplete", result
     assert (run / "finalize/attempt_extra_f/audit_summary.json").is_file()
+
+
+def test_f_input_gate_blocks_full_chain_model_calls(tmp_path: Path,
+                                                    monkeypatch):
+    """An admission failure must stop F before conditioner/model/VJP calls."""
+    original = audit.run_p_stage
+
+    def tampering_p(*args, **kwargs):
+        out = original(*args, **kwargs)
+        admission_path = _stage_files(
+            Path(kwargs.get("root", args[0])), "R0") / "admission.json"
+        admission = _load(admission_path)
+        admission["passed"] = False
+        admission_path.write_text(json.dumps(admission))
+        return out
+
+    monkeypatch.setattr(audit, "run_p_stage", tampering_p)
+    run = tmp_path / "admission_gate"
+    result = audit.run_registered_audit(
+        run, audit.SyntheticObjectiveProvider(seed=20261026),
+        mode="synthetic", tolerance=audit.build_tolerance_contract())
+    assert result["conclusion"] == "audit_incomplete", result
+    summary = _load(_stage_files(run, "F") / "audit_summary.json")
+    assert any("admission_not_passed" in g for g in summary["gaps"]), summary["gaps"]
+    assert any("f_replay_input_gate_failed" in g
+               for g in summary["gaps"]), summary["gaps"]
+    # P measured two units; a gated F must add no model/conditioner/VJP call.
+    assert summary["calls"]["counts"] == {
+        "conditioner": 2, "model": 2,
+        "production_vjp": 2, "independent_vjp": 2,
+    }, summary["calls"]
+
+
+@pytest.mark.parametrize("tamper", ["x0_binding", "consumer_publishing"])
+def test_f_binding_and_consumer_gate_skip_model_construction(
+        audit_dir: Path, tmp_path: Path, tamper: str):
+    run = tmp_path / f"gate_{tamper}"
+    shutil.copytree(audit_dir, run)
+    pdir = _stage_files(run, "P")
+    r0, p, arrays, gradients = _replay_contexts(run)
+    if tamper == "x0_binding":
+        arrays["x0"] = arrays["x0"] + np.float32(0.01)
+        np.savez(pdir / "objective_real_arrays.npz", **arrays)
+    else:
+        index = _load(run / "attempts_index.json")
+        ledger = _load(run / "costs.json")
+        for row in index["attempts"]:
+            if row["stage"] == "P":
+                row.update(status="publishing", complete=False)
+        for row in ledger["invocations"]:
+            if row["stage"] == "P":
+                row.update(status="publishing", complete=False)
+        (run / "attempts_index.json").write_text(json.dumps(index))
+        (run / "costs.json").write_text(json.dumps(ledger))
+
+    class NoModelProvider(audit.SyntheticObjectiveProvider):
+        def model_factory(self):
+            raise AssertionError("input gate must prevent model construction")
+
+        def loss_factory(self):
+            raise AssertionError("input gate must prevent loss construction")
+
+    result, *_ = _run_f_on(run, NoModelProvider(seed=20261026))
+    assert result["summary"]["complete_evidence"] is False, result
+    assert any("f_replay_input_gate_failed" in g
+               for g in result["gaps"]), result["gaps"]
+
+
+def _withdraw_fixture(tmp_path: Path):
+    root = tmp_path / "withdraw_run"
+    audit.write_cohort(root, mode="synthetic")
+    t0 = time.perf_counter()
+    budget = {"stage": "F", "remaining_s": 60.0}
+    audit.pre_register_attempt(root, "F", "attempt_001", t0,
+                               scope={"s": 1}, budget=budget)
+    report = root / "audit_summary.json"
+    report.write_text(json.dumps({
+        "conclusion": "synthetic_contract_passed",
+        "producer_conclusion": "synthetic_contract_passed",
+        "complete_evidence": True,
+        "covered_contract_passed": True,
+        "gaps": [],
+    }))
+    seal = audit.finish_attempt(
+        root, "F", "attempt_001", t0, budget,
+        {"complete": True, "report": str(report), "summary": str(report)},
+        status="done", extra={"stage": "F"})
+    assert seal.sealed
+    return root, t0, budget, report, seal
+
+
+def test_withdrawal_write_cost_is_charged_to_same_attempt(tmp_path: Path,
+                                                          monkeypatch):
+    root, t0, budget, report, seal = _withdraw_fixture(tmp_path)
+    original = audit._persist_row_entry
+    delayed = {"done": False}
+
+    def slow_persist(*args, **kwargs):
+        if not delayed["done"]:
+            delayed["done"] = True
+            time.sleep(1.3)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(audit, "_persist_row_entry", slow_persist)
+    updated, problems, summary = audit._withdraw_pass_claim(
+        root, "F", "attempt_001", report, seal.row, ["forced_consumer"],
+        reason="forced_consumer", t0=t0, budget=budget,
+        preserve_conclusion=False)
+    actual = time.perf_counter() - t0
+    assert problems == [], problems
+    assert updated["status"] == "incomplete"
+    assert updated["complete"] is False
+    assert updated["measured_wall_s"] >= actual, (updated, actual)
+    assert audit.stage_history(root, "F") >= actual
+    assert summary["complete_evidence"] is False
+
+
+def test_withdrawal_without_affordable_coverage_stays_publishing(
+        tmp_path: Path, monkeypatch):
+    root, t0, budget, report, seal = _withdraw_fixture(tmp_path)
+    original = audit._persist_row_entry
+
+    def slow_persist(*args, **kwargs):
+        time.sleep(1.3)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(audit, "_persist_row_entry", slow_persist)
+    tight = {**budget, "remaining_s": 0.2}
+    updated, problems, summary = audit._withdraw_pass_claim(
+        root, "F", "attempt_001", report, seal.row, ["forced_consumer"],
+        reason="forced_consumer", t0=t0, budget=tight,
+        preserve_conclusion=False)
+    assert "withdraw_cost_unverifiable" in problems, problems
+    assert updated["status"] == "publishing"
+    assert updated["complete"] is False
+    row, state_problems = audit.stage_state(root, "F")
+    assert row is not None and row["status"] == "publishing"
+    assert "attempt_final_check_pending" in state_problems, state_problems
+    assert summary["complete_evidence"] is False
+
+
+def test_f_negative_result_seal_failure_withdraws_completeness_only(
+        tmp_path: Path, monkeypatch):
+    """A measured mismatch stays a mismatch, but cannot claim complete evidence."""
+    original_p = audit.run_p_stage
+    original_seal = audit.finish_attempt
+
+    def tampering_p(*args, **kwargs):
+        out = original_p(*args, **kwargs)
+        path = Path(out["paths"]["arrays"])
+        arrays = dict(np.load(path, allow_pickle=False))
+        arrays["prediction_deterministic"] = (
+            arrays["prediction_deterministic"] + np.float32(0.1))
+        np.savez(path, **arrays)
+        return out
+
+    def forced_f_seal(root, stage, attempt, t0, budget, row, *,
+                      status="done", extra=None):
+        if stage == "F":
+            budget = {**budget, "remaining_s": 0.0}
+        return original_seal(root, stage, attempt, t0, budget, row,
+                             status=status, extra=extra)
+
+    monkeypatch.setattr(audit, "run_p_stage", tampering_p)
+    monkeypatch.setattr(audit, "finish_attempt", forced_f_seal)
+    run = tmp_path / "negative_seal"
+    result = audit.run_registered_audit(
+        run, audit.SyntheticObjectiveProvider(seed=20261026),
+        mode="synthetic", tolerance=audit.build_tolerance_contract())
+    summary = _load(_stage_files(run, "F") / "audit_summary.json")
+    assert summary["conclusion"] == "synthetic_pipeline_mismatch", summary
+    assert summary["producer_conclusion"] == "synthetic_pipeline_mismatch"
+    assert summary["complete_evidence"] is False
+    assert summary["covered_contract_passed"] is False
+    assert any("f_evidence_completeness_withdrawn" in g
+               for g in summary["gaps"]), summary["gaps"]
+    assert result["complete_evidence"] is False
+    assert result["conclusion"] == "synthetic_pipeline_mismatch"
+    row, problems = audit.stage_state(run, "F")
+    assert row is not None
+    assert "report_hash_mismatch" not in problems, problems
+    assert "summary_hash_mismatch" not in problems, problems

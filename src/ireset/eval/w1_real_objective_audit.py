@@ -1012,22 +1012,41 @@ def _persist_row_entry(root: Path, stage: str, attempt: str,
 def _withdraw_pass_claim(root: Path, stage: str, attempt: str,
                          report_path: Path, row: Mapping[str, Any],
                          gaps: Sequence[str], *, reason: str,
-                         extra: Mapping[str, Any] | None = None
+                         extra: Mapping[str, Any] | None = None,
+                         t0: float | None = None,
+                         budget: Mapping[str, Any] | None = None,
+                         preserve_conclusion: bool = False
                          ) -> tuple[dict, list[str], dict]:
-    """Rewrite a pass summary as incomplete and rebind the sealed row hash.
+    """Withdraw a pass/evidence-complete claim and rebind the sealed hashes.
 
-    The on-disk claim is the authoritative one.  If the rewrite or the hash
-    rebind cannot be proven, the row is left non-consumable (publishing or
-    incomplete, complete=false) rather than keeping a readable pass claim.
+    The on-disk claim is the authoritative one.  The withdrawal itself is
+    charged to the same attempt: its report rewrite and row persistence are
+    measured against the stage's remaining budget.  If coverage cannot be
+    proven, the row stays ``publishing`` (unknown history) rather than
+    publishing a terminal record whose cost is known to be understated.
+
+    ``preserve_conclusion`` keeps an already measured negative conclusion
+    (for example a pipeline mismatch) while withdrawing only the
+    ``complete_evidence`` claim.
     """
     problems: list[str] = []
+    writes: list[float] = []
+
+    def timed(fn, *args):
+        start = time.perf_counter()
+        fn(*args)
+        writes.append(time.perf_counter() - start)
+
     try:
         on_disk = read_json(report_path) if Path(report_path).is_file() else {}
     except (OSError, ValueError, TypeError):
         on_disk = {}
     summary = dict(on_disk) if isinstance(on_disk, Mapping) else {}
-    summary["conclusion"] = "audit_incomplete"
-    summary["producer_conclusion"] = "audit_incomplete"
+    if preserve_conclusion:
+        summary.setdefault("conclusion", "audit_incomplete")
+    else:
+        summary["conclusion"] = "audit_incomplete"
+        summary["producer_conclusion"] = "audit_incomplete"
     summary["complete_evidence"] = False
     summary["covered_contract_passed"] = False
     summary["revoked_reason"] = reason
@@ -1039,25 +1058,88 @@ def _withdraw_pass_claim(root: Path, stage: str, attempt: str,
     if extra:
         summary.update(dict(extra))
     try:
-        write_json(report_path, summary)
+        timed(write_json, report_path, summary)
     except (OSError, ValueError, TypeError) as exc:
         problems.append(f"summary_revoke_write_failed:{type(exc).__name__}")
     status = row.get("status")
     if status not in ("running", "publishing", "done", "crashed",
                       "timeout", "incomplete"):
         status = "incomplete"
-    if status == "done":
+    if status in ("done", "crashed", "timeout"):
         status = "incomplete"
     updated = {
         **dict(row), "status": status, "complete": False,
         "incomplete_reason": row.get("incomplete_reason") or reason,
     }
     updated = _report_hashes(updated)
-    problems += _persist_row_entry(root, stage, attempt, updated)
+    previous_cost = row.get("measured_wall_s")
+    base_cost = float(previous_cost) if _nonneg(previous_cost) else 0.0
+    remaining = math.inf
+    if budget is not None and _nonneg(budget.get("remaining_s")):
+        remaining = float(budget["remaining_s"])
+
+    def elapsed() -> float:
+        return max(0.0, time.perf_counter() - t0) if t0 is not None else 0.0
+
+    def reserve() -> float:
+        return max(SEAL_TAIL_RESERVE_S, 2.0 * max(writes, default=0.0))
+
+    def persist(target_status: str, cost: float, tail: float,
+                reason_override: str | None = None) -> dict:
+        nonlocal problems
+        out = {**updated, "status": target_status,
+               "measured_wall_s": float(cost),
+               "sampled_wall_s": elapsed(),
+               "seal_tail_reserve_s": float(tail)}
+        if reason_override is not None:
+            out["incomplete_reason"] = reason_override
+        problems += _persist_row_entry(root, stage, attempt, out)
+        return out
+
+    def unverifiable(target_status: str = "publishing") -> dict:
+        observed = max(elapsed(), base_cost)
+        tail = reserve()
+        note = (f"{updated.get('incomplete_reason') or reason}"
+                ":withdraw_cost_unverifiable")
+        if "withdraw_cost_unverifiable" not in problems:
+            problems.append("withdraw_cost_unverifiable")
+        return persist(target_status, observed, tail, reason_override=note)
+
+    tail = reserve()
+    observed = elapsed()
+    if observed > base_cost:
+        cost = observed + tail
+        if cost >= remaining:
+            updated = unverifiable()
+            if problems:
+                # A failed publishing write must not leave the old pass claim
+                # readable; retry the non-consumable marker once.
+                updated.update(status="publishing", complete=False,
+                               incomplete_reason=(
+                                   f"{reason}:withdraw_cost_unverifiable"))
+                problems += _persist_row_entry(root, stage, attempt, updated)
+            return updated, problems, summary
+    else:
+        cost = base_cost
+    updated = persist(status, cost, tail)
+    for _ in range(SEAL_VERIFY_ROUNDS):
+        observed = elapsed()
+        if observed <= float(updated.get("measured_wall_s", 0.0)):
+            break
+        tail = reserve()
+        if observed + tail >= remaining:
+            updated = unverifiable()
+            break
+        updated = persist(status, observed + tail, tail)
+    else:
+        updated = unverifiable()
     if problems:
         # A claim whose withdrawal cannot be proven must not be consumable.
+        suffix = ("withdraw_cost_unverifiable"
+                  if "withdraw_cost_unverifiable" in problems
+                  else "revoke_verify_failed")
         updated.update(status="publishing", complete=False,
-                       incomplete_reason=f"{reason}:revoke_verify_failed")
+                       incomplete_reason=f"{reason}:{suffix}")
         problems += _persist_row_entry(root, stage, attempt, updated)
     return updated, problems, summary
 
@@ -4092,6 +4174,18 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float, budget: dict,
     if not replay_enabled:
         gaps.append(
             f"f_replay_skipped:{replay_stop_reason or 'disabled'}")
+    # Prior consumer records are a hard gate for new model calls.  A terminal
+    # partial (``attempt_not_complete``) is still consumable evidence, but a
+    # running/publishing row or a hash/cost mismatch is unknown history.
+    consumers: dict[str, list[str]] = {}
+    consumer_gate_reasons: list[str] = []
+    for prior_stage in ("R0", "P"):
+        _, state_problems = stage_state(root, prior_stage)
+        consumers[prior_stage] = state_problems
+        gaps += [f"consumer:{prior_stage}:{x}" for x in state_problems]
+        gate = [p for p in state_problems if p != "attempt_not_complete"]
+        if gate:
+            consumer_gate_reasons.append(f"consumer:{prior_stage}:{gate}")
     registration = r0["registration"]
     inputs = r0["inputs"]
     reg_path = Path(r0.get("registration_path") or
@@ -4185,40 +4279,57 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float, budget: dict,
     p_grad_rows: list[dict] = []
     p_grad_by: dict[str, dict] = {}
     row_error = grad_row_error = "p_rows_not_read"
+    fresh = None
+    loss_factory = None
+    rebuilt = None
     if not problems and reported_models and arrays_ok and gradients_ok:
         rebuilt = _inputs_from_arrays(arrays, registration)
+        replay_gate_reasons: list[str] = list(consumer_gate_reasons)
         admission_path = reg_path.parent / "admission.json"
         if not admission_path.is_file():
             gaps.append("admission_artifact_missing")
+            replay_gate_reasons.append("admission_artifact_missing")
+            admission: Mapping[str, Any] = {}
         else:
             try:
                 admission = read_json(admission_path)
             except (OSError, ValueError, TypeError):
                 admission = {}
                 gaps.append("admission_artifact_unreadable")
+                replay_gate_reasons.append("admission_artifact_unreadable")
             if not isinstance(admission, Mapping):
                 admission = {}
                 gaps.append("admission_artifact_not_a_mapping")
+                replay_gate_reasons.append("admission_artifact_not_a_mapping")
             if admission.get("passed") is not True:
                 gaps.append("admission_not_passed")
+                replay_gate_reasons.append("admission_not_passed")
             declared_arrays = admission.get("arrays_sha256")
             if declared_arrays is not None and not isinstance(
                     declared_arrays, Mapping):
                 gaps.append("admission_arrays_sha256_not_a_mapping")
+                replay_gate_reasons.append("admission_arrays_sha256_not_a_mapping")
                 declared_arrays = {}
             for key, want in (declared_arrays or {}).items():
                 if key in arrays and _hash_array(np.asarray(arrays[key])) != want:
                     problems.append(f"admission_array_drifted:{key}")
+                    replay_gate_reasons.append(f"admission_array_drifted:{key}")
             if admission.get("registration_sha256") != r0.get("registration_sha256"):
                 problems.append("admission_registration_mismatch")
+                replay_gate_reasons.append("admission_registration_mismatch")
         # R0's registration and admission are the frozen identity.  F
-        # independently regenerates the noise, alpha chain and x_t.
+        # independently regenerates the noise, alpha chain and x_t.  Any
+        # binding failure is a hard replay gate: F may organise the existing
+        # evidence, but must not construct models or spend calls on inputs it
+        # cannot bind to the registered identity.
         expected_noise = generate_noise(NOISE_SEED, (WINDOW_COUNT, WINDOW, 38))
         if not np.array_equal(expected_noise, np.asarray(arrays["noise"])):
             problems.append("noise_not_reproducible")
+            replay_gate_reasons.append("noise_not_reproducible")
         expected_alpha = independent_alpha_cumprod(1000, "scaled_linear", 1e-4, 0.02)
         if not np.array_equal(expected_alpha, np.asarray(arrays["alpha_cumprod"])):
             problems.append("alpha_not_reproducible")
+            replay_gate_reasons.append("alpha_not_reproducible")
         expected_xt = independent_x_t(arrays["x0"], arrays["noise"],
                                       np.asarray(arrays["t"], dtype=np.int64),
                                       expected_alpha)
@@ -4228,25 +4339,32 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float, budget: dict,
                 tolerance["tolerances"]["loss_float32"], units="normalized_noisy")
             if xt_cmp.get("status") != "within_tolerance":
                 problems.append("x_t_not_reproducible")
+                replay_gate_reasons.append("x_t_not_reproducible")
         elif "diffusion" in reported_models:
             gaps.append("x_t_missing")
+            replay_gate_reasons.append("x_t_missing")
         # x0 must be reproducible from raw root/q/wfc and the frozen stats.
         reencoded = independent_encode(
             rebuilt.root, rebuilt.q, rebuilt.wfc,
             rebuilt.joint_lo, rebuilt.joint_hi, rebuilt.root_mean, rebuilt.root_std)
         if not np.array_equal(reencoded, np.asarray(arrays["x0_independent"], dtype=np.float64)):
             problems.append("independent_x0_not_reproducible")
+            replay_gate_reasons.append("independent_x0_not_reproducible")
         enc_cmp = compare_array(
             "x0", arrays["x0"], reencoded,
             tolerance["tolerances"]["encode_float32"], units="normalized")
         if enc_cmp.get("status") != "within_tolerance":
             problems.append("x0_encode_mismatch")
+            replay_gate_reasons.append("x0_encode_mismatch")
+        if replay_enabled and replay_gate_reasons:
+            replay_stop_reason = "input_gate_failed"
+            gaps.append(
+                f"f_replay_input_gate_failed:{replay_gate_reasons}")
+            replay_enabled = False
         # Model/checkpoint construction happens once, before any per-unit RNG
         # restore, so constructor noise cannot perturb the restored state.  A
-        # budget-revoked parent or an already-exhausted stage constructs no
-        # models at all.
-        fresh = None
-        loss_factory = None
+        # budget-revoked parent, an already-exhausted stage or a failed input
+        # gate constructs no models at all.
         if replay_enabled:
             if time.perf_counter() + replay_reserve_s >= deadline:
                 replay_stop_reason = "deadline_exhausted_before_first_unit"
@@ -4533,11 +4651,12 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float, budget: dict,
         row_error = row_error if reported_models else "p_units_empty"
         grad_row_error = grad_row_error if reported_models else "p_units_empty"
         replay_facts = {}
-    consumers = {}
-    for prior_stage in ("R0", "P"):
-        _, state_problems = stage_state(root, prior_stage)
-        consumers[prior_stage] = state_problems
-        gaps += [f"consumer:{prior_stage}:{x}" for x in state_problems]
+    if replay_enabled and (fresh is None or loss_factory is None):
+        # The pre-replay block was skipped (identity, registration, array or
+        # row defect).  Never enter a unit with an unconstructed model.
+        replay_stop_reason = "precondition_gate_failed"
+        gaps.append("f_replay_input_gate_failed:precondition_gate")
+        replay_enabled = False
     complete = not gaps
     if problems:
         conclusion = ("real_batch_objective_mismatch" if mode == "real"
@@ -4853,56 +4972,57 @@ def run_registered_audit(run_root: Path, provider, *, mode: str,
     pass_conclusion = (
         "real_batch_covered_contract_passed" if mode == "real"
         else "synthetic_contract_passed")
-    if not seal.terminal:
-        # Unknown history (publishing/running leftover): never claim the
-        # pass/negative result as final.  Withdraw any on-disk pass claim too.
-        summary = dict(f["summary"])
-        revoke_problems: list[str] = []
-        if summary.get("conclusion") == pass_conclusion:
-            updated_row, revoke_problems, summary = _withdraw_pass_claim(
-                run_root, "F", attempt, Path(f["report"]), seal.row,
-                ["f_seal_not_terminal", *seal.problems],
-                reason="f_seal_not_terminal",
-                extra={"final_consumer_problems": list(seal.problems)})
-            last_seal["F"]["row"] = updated_row
-            last_seal["F"]["problems"] = (
-                list(last_seal["F"].get("problems", [])) + revoke_problems)
-        f["summary"] = summary
-        f["conclusion"] = "audit_incomplete"
-        return {"mode": mode, "conclusion": "audit_incomplete",
-                "complete_evidence": False, "covered_contract_passed": False,
-                "problems": list(f.get("problems", [])) + revoke_problems,
-                "gaps": (list(f.get("gaps", [])) + list(seal.problems)
-                         + revoke_problems),
-                "stages": results, "seals": last_seal,
-                "summary": summary,
-                "summary_path": path_for_record(f["report"])}
+    seal_ok = bool(seal.sealed) and seal.row.get("complete") is True
     _, final_consumer_problems = stage_state(run_root, "F")
     summary = dict(f["summary"])
     summary["final_consumer_problems"] = final_consumer_problems
-    revoke_problems = []
-    if summary.get("conclusion") == pass_conclusion and final_consumer_problems:
-        # A pass claim cannot survive a non-consumable final record.  Withdraw
-        # the on-disk summary and rebind the seal hash; never mutate only the
-        # in-memory copy.
+    revoke_problems: list[str] = []
+    withdraw_reasons: list[str] = []
+    if not seal.terminal:
+        withdraw_reasons.append("f_seal_not_terminal")
+    if not seal_ok:
+        withdraw_reasons.extend(seal.problems or ["f_seal_not_consumable"])
+    claimed_pass = summary.get("conclusion") == pass_conclusion
+    if final_consumer_problems:
+        withdraw_reasons.append("final_consumer_not_consumable")
+        withdraw_reasons.extend(final_consumer_problems)
+    if summary.get("complete_evidence") is True and withdraw_reasons:
+        # A pass OR negative conclusion may not keep the evidence-complete
+        # flag on a non-consumable record.  The negative conclusion itself is
+        # preserved: it is the measured mismatch, not a completeness claim.
         updated_row, revoke_problems, summary = _withdraw_pass_claim(
             run_root, "F", attempt, Path(f["report"]), seal.row,
-            final_consumer_problems,
-            reason="final_consumer_not_consumable",
-            extra={"final_consumer_problems": final_consumer_problems})
+            [*withdraw_reasons, "f_evidence_completeness_withdrawn"],
+            reason=withdraw_reasons[0],
+            extra={"final_consumer_problems": final_consumer_problems},
+            t0=t0, budget=budget,
+            preserve_conclusion=not claimed_pass)
         summary["final_consumer_problems"] = final_consumer_problems
         last_seal["F"]["row"] = updated_row
         last_seal["F"]["problems"] = (
             list(last_seal["F"].get("problems", [])) + revoke_problems)
+    if not seal.terminal and summary.get("conclusion") == pass_conclusion:
+        # Unknown history cannot carry a pass conclusion even if the summary
+        # did not claim complete evidence.
+        summary["conclusion"] = "audit_incomplete"
+        summary["producer_conclusion"] = "audit_incomplete"
+        summary["complete_evidence"] = False
+        summary["covered_contract_passed"] = False
     if revoke_problems:
         summary["gaps"] = list(summary.get("gaps", [])) + revoke_problems
     f["summary"] = summary
-    f["conclusion"] = summary["conclusion"]
+    # A publishing/running leftover is unknown history: the producer's
+    # measured mismatch may stay in the summary artifact, but the final
+    # consumer conclusion is incomplete, never a confirmed negative result.
+    result_conclusion = ("audit_incomplete" if not seal.terminal
+                         else summary.get("conclusion", "audit_incomplete"))
+    f["conclusion"] = result_conclusion
     return {
-        "mode": mode, "conclusion": summary["conclusion"],
+        "mode": mode, "conclusion": result_conclusion,
         "complete_evidence": bool(summary.get("complete_evidence")),
         "covered_contract_passed": bool(summary.get("covered_contract_passed")),
-        "problems": list(summary.get("problems", [])) + revoke_problems,
+        "problems": (list(f.get("problems", [])) + list(seal.problems)
+                     + revoke_problems),
         "gaps": summary.get("gaps", []),
         "stages": results, "seals": last_seal,
         "summary": summary, "summary_path": path_for_record(f["report"]),
