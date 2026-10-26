@@ -92,6 +92,11 @@ CALL_CAPS = {
     "independent_vjp": 4,
 }
 
+#: Worst-case calls for one complete R0->P->F chain: two units in P and two
+#: in F.  The entry must prove this balance exists before it starts any work;
+#: a chain that can only finish by raising AuditCallBudgetExceeded is refused.
+FULL_CHAIN_CALLS = {kind: 2 * len(MODELS) for kind in CALL_CAPS}
+
 #: Candidate fixed assets from the draft, section 3.  Full hashes are verified
 #: at registration time; they are not used as a substitute for the file
 #: closure.  The W1-D execution registration and final are parent anchors.
@@ -929,6 +934,132 @@ class SealResult:
     row: dict
     problems: list[str] = field(default_factory=list)
     terminal: bool = False
+
+
+#: Seal reasons that mean the attempt was stopped by accounting, not by a
+#: measured negative result.  Such a parent must not trigger new model calls
+#: in F; F may only reorganise the already-written evidence.
+BUDGET_REVOKE_REASONS = (
+    "budget_exceeded_after_registration",
+    "budget_exceeded_after_publication",
+    "budget_exceeded_before_seal",
+    "budget_exceeded_after_seal",
+    "seal_tail_reserve_insufficient",
+    "seal_tail_reserve_unverifiable",
+)
+
+
+def _budget_revoked(row: Mapping[str, Any] | None) -> bool:
+    if not isinstance(row, Mapping):
+        return False
+    reason = str(row.get("incomplete_reason") or "")
+    return reason.split(":", 1)[0] in BUDGET_REVOKE_REASONS
+
+
+def _p_budget_exhausted(p: Mapping[str, Any], seal: SealResult) -> str | None:
+    """Return the accounting reason that forbids new F model calls, if any."""
+    if _budget_revoked(seal.row):
+        return str(seal.row.get("incomplete_reason"))
+    gap_lists: list[Any] = []
+    if isinstance(p, Mapping):
+        gap_lists.append(p.get("gaps"))
+        report = p.get("report")
+        if isinstance(report, Mapping):
+            gap_lists.append(report.get("gaps"))
+    for gaps in gap_lists:
+        if not isinstance(gaps, (list, tuple)):
+            continue
+        for gap in gaps:
+            text = str(gap)
+            if text.startswith("unit_deadline:"):
+                return text
+            if "AuditCallBudgetExceeded" in text:
+                return text
+    return None
+
+
+def _persist_row_entry(root: Path, stage: str, attempt: str,
+                       row: Mapping[str, Any]) -> list[str]:
+    """Persist an updated row in place to both the index and the ledger."""
+    problems: list[str] = []
+    measured = row.get("measured_wall_s")
+    if not _nonneg(measured):
+        measured = 0.0
+    status = str(row.get("status") or "incomplete")
+    if status not in ("running", "publishing", "done", "crashed",
+                      "timeout", "incomplete"):
+        status = "incomplete"
+    complete = bool(row.get("complete")) if status == "done" else False
+    payload = {
+        key: value for key, value in row.items()
+        if key not in ("stage", "attempt", "status", "complete",
+                       "measured_wall_s", "wall_s")
+    }
+    payload["complete"] = complete
+    try:
+        upsert_index(root, stage, attempt, {
+            **payload, "status": status, "measured_wall_s": float(measured)})
+    except (OSError, ValueError, TypeError) as exc:
+        problems.append(f"row_index_write_failed:{type(exc).__name__}")
+    try:
+        upsert_cost(root, stage, attempt, float(measured),
+                    {**payload, "cohort_id": COHORT_ID}, status)
+    except (OSError, ValueError, TypeError) as exc:
+        problems.append(f"row_ledger_write_failed:{type(exc).__name__}")
+    return problems
+
+
+def _withdraw_pass_claim(root: Path, stage: str, attempt: str,
+                         report_path: Path, row: Mapping[str, Any],
+                         gaps: Sequence[str], *, reason: str,
+                         extra: Mapping[str, Any] | None = None
+                         ) -> tuple[dict, list[str], dict]:
+    """Rewrite a pass summary as incomplete and rebind the sealed row hash.
+
+    The on-disk claim is the authoritative one.  If the rewrite or the hash
+    rebind cannot be proven, the row is left non-consumable (publishing or
+    incomplete, complete=false) rather than keeping a readable pass claim.
+    """
+    problems: list[str] = []
+    try:
+        on_disk = read_json(report_path) if Path(report_path).is_file() else {}
+    except (OSError, ValueError, TypeError):
+        on_disk = {}
+    summary = dict(on_disk) if isinstance(on_disk, Mapping) else {}
+    summary["conclusion"] = "audit_incomplete"
+    summary["producer_conclusion"] = "audit_incomplete"
+    summary["complete_evidence"] = False
+    summary["covered_contract_passed"] = False
+    summary["revoked_reason"] = reason
+    existing_gaps = summary.get("gaps")
+    summary["gaps"] = (
+        (list(existing_gaps) if isinstance(existing_gaps, list) else [])
+        + [str(g) for g in gaps] + [reason]
+    )
+    if extra:
+        summary.update(dict(extra))
+    try:
+        write_json(report_path, summary)
+    except (OSError, ValueError, TypeError) as exc:
+        problems.append(f"summary_revoke_write_failed:{type(exc).__name__}")
+    status = row.get("status")
+    if status not in ("running", "publishing", "done", "crashed",
+                      "timeout", "incomplete"):
+        status = "incomplete"
+    if status == "done":
+        status = "incomplete"
+    updated = {
+        **dict(row), "status": status, "complete": False,
+        "incomplete_reason": row.get("incomplete_reason") or reason,
+    }
+    updated = _report_hashes(updated)
+    problems += _persist_row_entry(root, stage, attempt, updated)
+    if problems:
+        # A claim whose withdrawal cannot be proven must not be consumable.
+        updated.update(status="publishing", complete=False,
+                       incomplete_reason=f"{reason}:revoke_verify_failed")
+        problems += _persist_row_entry(root, stage, attempt, updated)
+    return updated, problems, summary
 
 
 def _report_hashes(row: dict) -> dict:
@@ -3945,13 +4076,22 @@ def _read_p_report(p: Mapping[str, Any]) -> tuple[dict | None, list[str]]:
 def run_f_stage(root: Path, stage: str, attempt: str, t0: float, budget: dict,
                 r0: Mapping[str, Any], p: Mapping[str, Any], provider,
                 calls: AuditCallBudget, tolerance: dict, *, mode: str,
-                scope: dict | None = None) -> dict:
+                scope: dict | None = None, replay: bool = True,
+                replay_skip_reason: str | None = None) -> dict:
     deadline = t0 + float(budget["remaining_s"])
+    replay_reserve_s = budget.get("reserve_s", SEAL_TAIL_RESERVE_S)
+    if not _nonneg(replay_reserve_s):
+        replay_reserve_s = SEAL_TAIL_RESERVE_S
     attempt_dir = stage_dir(root, stage) / attempt
     attempt_dir.mkdir(parents=True, exist_ok=True)
     scope = dict(scope) if scope is not None else _unit_scope(r0["inputs"])
     problems: list[str] = []
     gaps: list[str] = []
+    replay_enabled = bool(replay)
+    replay_stop_reason = replay_skip_reason
+    if not replay_enabled:
+        gaps.append(
+            f"f_replay_skipped:{replay_stop_reason or 'disabled'}")
     registration = r0["registration"]
     inputs = r0["inputs"]
     reg_path = Path(r0.get("registration_path") or
@@ -3990,10 +4130,21 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float, budget: dict,
     p_paths = p.get("paths") or {}
     p_report, report_gaps = _read_p_report(p)
     gaps += report_gaps
+    # ``units`` is a nested structure from a sealed artifact.  Validate its
+    # container type before membership/``.get``: a list merely containing the
+    # model names must be a gap, never an AttributeError that aborts F and
+    # leaves an unsealed running row.
+    p_units: Mapping[str, Any] = {}
+    if isinstance(p_report, Mapping):
+        raw_units = p_report.get("units")
+        if raw_units is None:
+            raw_units = {}
+        if not isinstance(raw_units, Mapping):
+            gaps.append("p_units_not_a_mapping")
+        else:
+            p_units = raw_units
     reported_models = tuple(
-        model for model in MODELS
-        if isinstance(p_report, Mapping)
-        and model in (p_report.get("units") or {}))
+        model for model in MODELS if model in p_units)
     if not reported_models:
         gaps.append("p_units_empty")
     for model in MODELS:
@@ -4004,7 +4155,7 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float, budget: dict,
                 None, r0.get("registration_sha256")):
             problems.append("p_report_registration_mismatch")
         for model in reported_models:
-            unit_info = (p_report.get("units") or {}).get(model)
+            unit_info = p_units.get(model)
             if not isinstance(unit_info, Mapping):
                 problems.append(f"p_unit_metadata_not_mapping:{model}")
     arrays_path = p_paths.get("arrays")
@@ -4045,9 +4196,17 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float, budget: dict,
             except (OSError, ValueError, TypeError):
                 admission = {}
                 gaps.append("admission_artifact_unreadable")
+            if not isinstance(admission, Mapping):
+                admission = {}
+                gaps.append("admission_artifact_not_a_mapping")
             if admission.get("passed") is not True:
                 gaps.append("admission_not_passed")
-            for key, want in (admission.get("arrays_sha256") or {}).items():
+            declared_arrays = admission.get("arrays_sha256")
+            if declared_arrays is not None and not isinstance(
+                    declared_arrays, Mapping):
+                gaps.append("admission_arrays_sha256_not_a_mapping")
+                declared_arrays = {}
+            for key, want in (declared_arrays or {}).items():
                 if key in arrays and _hash_array(np.asarray(arrays[key])) != want:
                     problems.append(f"admission_array_drifted:{key}")
             if admission.get("registration_sha256") != r0.get("registration_sha256"):
@@ -4082,21 +4241,55 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float, budget: dict,
             tolerance["tolerances"]["encode_float32"], units="normalized")
         if enc_cmp.get("status") != "within_tolerance":
             problems.append("x0_encode_mismatch")
-        fresh = provider.model_factory()
-        loss_factory = provider.loss_factory()
+        # Model/checkpoint construction happens once, before any per-unit RNG
+        # restore, so constructor noise cannot perturb the restored state.  A
+        # budget-revoked parent or an already-exhausted stage constructs no
+        # models at all.
+        fresh = None
+        loss_factory = None
+        if replay_enabled:
+            if time.perf_counter() + replay_reserve_s >= deadline:
+                replay_stop_reason = "deadline_exhausted_before_first_unit"
+                gaps.append("f_replay_deadline_exhausted:before_first_unit")
+                replay_enabled = False
+            else:
+                try:
+                    fresh = provider.model_factory()
+                    loss_factory = provider.loss_factory()
+                except Exception as exc:  # noqa: BLE001 -- factory failure is evidence
+                    gaps.append(
+                        f"replay_factory_failed:{type(exc).__name__}:{exc}")
+                    replay_enabled = False
         weights = _audit_weights()
         if p_paths.get("call_trace"):
             try:
                 trace = read_json(p_paths["call_trace"])
-                counts = trace.get("counts") or {}
-                for kind, cap in CALL_CAPS.items():
-                    if not _count(counts.get(kind)) or int(counts[kind]) > cap:
-                        problems.append(f"p_call_count_invalid:{kind}")
-                    if int(counts.get(kind, 0)) < len(reported_models):
-                        problems.append(f"p_call_count_missing:{kind}")
             except (OSError, ValueError, TypeError):
                 gaps.append("p_call_trace_unreadable")
-        unit_artifact_declared = (p_report or {}).get("unit_artifacts") or {}
+            else:
+                if not isinstance(trace, Mapping):
+                    gaps.append("p_call_trace_not_a_mapping")
+                counts = (trace.get("counts")
+                          if isinstance(trace, Mapping) else None)
+                if not isinstance(counts, Mapping):
+                    # Preserve the historical missing-count problems, but do
+                    # not call ``.get`` on a list/string artifact.
+                    counts = {}
+                for kind, cap in CALL_CAPS.items():
+                    value = counts.get(kind)
+                    if not _count(value) or int(value) > cap:
+                        problems.append(f"p_call_count_invalid:{kind}")
+                    if not _count(value) or int(value) < len(reported_models):
+                        problems.append(f"p_call_count_missing:{kind}")
+        raw_artifacts = ((p_report or {}).get("unit_artifacts")
+                         if isinstance(p_report, Mapping) else None)
+        if raw_artifacts is None:
+            unit_artifact_declared: Mapping[str, Any] = {}
+        elif isinstance(raw_artifacts, Mapping):
+            unit_artifact_declared = raw_artifacts
+        else:
+            gaps.append("p_unit_artifacts_not_a_mapping")
+            unit_artifact_declared = {}
         p_unit_root = Path(p_paths["arrays"]).parent / "units" if p_paths.get("arrays") else None
         fk_recomputed: dict[str, np.ndarray] = {}
         replay_facts: dict[str, dict] = {}
@@ -4130,15 +4323,34 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float, budget: dict,
                 declared = unit_artifact_declared.get(model)
                 if not isinstance(declared, Mapping):
                     gaps.append(f"p_unit_artifacts_missing:{model}")
-                    declared = {}
+                    declared = None
                 for kind in ("request", "result"):
                     artifact = p_unit_root / model / f"{kind}.json"
                     if not artifact.is_file():
                         gaps.append(f"p_unit_artifact_missing:{model}:{kind}")
-                    elif declared.get(kind) != sha256_file(artifact):
+                        continue
+                    if declared is None:
+                        # No declaration exists to compare against; this is a
+                        # gap, not evidence that the artifact drifted.
+                        continue
+                    want = declared.get(kind)
+                    if not isinstance(want, str) or not want:
+                        gaps.append(
+                            f"p_unit_artifact_declaration_missing:{model}:{kind}")
+                        continue
+                    if want != sha256_file(artifact):
                         problems.append(f"p_unit_artifact_drifted:{model}:{kind}")
             if not admission["passed"]:
                 gaps.append(f"replay_unit_admission:{model}:{admission['problems']}")
+                continue
+            if not replay_enabled:
+                gaps.append(
+                    f"replay_skipped:{model}:{replay_stop_reason or 'disabled'}")
+                continue
+            if time.perf_counter() + replay_reserve_s >= deadline:
+                replay_stop_reason = f"deadline_exhausted:{model}"
+                gaps.append(f"f_replay_deadline_exhausted:{model}")
+                replay_enabled = False
                 continue
             unit_result_path = (p_unit_root / model / "result.json"
                                 if p_unit_root is not None else None)
@@ -4466,7 +4678,9 @@ def run_registered_audit(run_root: Path, provider, *, mode: str,
         if (tolerance.get("mode") != "synthetic_calibrated"
                 or not tolerance.get("evidence_sha256")):
             raise SystemExit("real audit requires a completed synthetic calibration contract")
-    write_cohort(run_root, mode=mode, authorization_sha=authorization_sha)
+    # Prove the remaining quota can fund the whole registered matrix before
+    # creating even a cohort marker.  A partially funded chain would spend
+    # calls in P/F and only then raise AuditCallBudgetExceeded.
     prior_calls = prior_call_counts(run_root, fixed_root=fixed_root, mode=mode)
     if prior_calls is None:
         raise SystemExit(
@@ -4476,7 +4690,19 @@ def run_registered_audit(run_root: Path, provider, *, mode: str,
     if exhausted:
         raise SystemExit(
             f"cumulative call budget exhausted for this cohort: {exhausted}")
+    insufficient = {
+        kind: {"prior": prior_calls[kind],
+               "required": FULL_CHAIN_CALLS[kind],
+               "cap": CALL_CAPS[kind]}
+        for kind in CALL_CAPS
+        if prior_calls[kind] + FULL_CHAIN_CALLS[kind] > CALL_CAPS[kind]
+    }
+    if insufficient:
+        raise SystemExit(
+            "cumulative call budget insufficient for a full audit chain: "
+            f"{insufficient}")
     calls = AuditCallBudget(prior_counts=prior_calls)
+    write_cohort(run_root, mode=mode, authorization_sha=authorization_sha)
     scope = _stage_scope()
     results: dict[str, Any] = {}
     last_seal: dict[str, Any] = {}
@@ -4564,10 +4790,15 @@ def run_registered_audit(run_root: Path, provider, *, mode: str,
     )
     last_seal["P"] = {"sealed": seal.sealed, "terminal": seal.terminal,
                       "problems": seal.problems, "row": seal.row}
+    p_budget_exhausted = _p_budget_exhausted(p, seal)
+    if p_budget_exhausted:
+        last_seal["P"]["budget_exhausted"] = p_budget_exhausted
     # A terminal P row is legitimate partial evidence even when its
     # ``complete`` flag is false (e.g. stop-after-mismatch).  F must still
     # replay the measured units and preserve the mismatch; only a leftover
-    # publishing/running row (unknown history) blocks F.
+    # publishing/running row (unknown history) blocks F.  A parent stopped by
+    # accounting (budget/seal/deadline/call cap) is different: F may organise
+    # the existing evidence, but must not start new model calls.
     if not seal.terminal:
         return {"mode": mode, "conclusion": "audit_incomplete",
                 "complete_evidence": False, "covered_contract_passed": False,
@@ -4591,8 +4822,13 @@ def run_registered_audit(run_root: Path, provider, *, mode: str,
                          budget=budget,
                          registration_sha=r0["registration_sha256"],
                          call_balance=calls.snapshot())
-    f = run_f_stage(run_root, "F", attempt, t0, budget, r0, p, provider,
-                    calls, dict(tolerance), mode=mode, scope=p_scope)
+    f = run_f_stage(
+        run_root, "F", attempt, t0, budget, r0, p, provider,
+        calls, dict(tolerance), mode=mode, scope=p_scope,
+        replay=p_budget_exhausted is None,
+        replay_skip_reason=(
+            f"parent_budget_exhausted:{p_budget_exhausted}"
+            if p_budget_exhausted else None))
     results["F"] = f
     # A completed mismatch is still complete evidence; an incomplete audit is
     # not.  Both publish a terminal, non-passing summary.  ``complete`` here
@@ -4614,32 +4850,59 @@ def run_registered_audit(run_root: Path, provider, *, mode: str,
     )
     last_seal["F"] = {"sealed": seal.sealed, "terminal": seal.terminal,
                       "problems": seal.problems, "row": seal.row}
+    pass_conclusion = (
+        "real_batch_covered_contract_passed" if mode == "real"
+        else "synthetic_contract_passed")
     if not seal.terminal:
         # Unknown history (publishing/running leftover): never claim the
-        # negative result as final.
+        # pass/negative result as final.  Withdraw any on-disk pass claim too.
+        summary = dict(f["summary"])
+        revoke_problems: list[str] = []
+        if summary.get("conclusion") == pass_conclusion:
+            updated_row, revoke_problems, summary = _withdraw_pass_claim(
+                run_root, "F", attempt, Path(f["report"]), seal.row,
+                ["f_seal_not_terminal", *seal.problems],
+                reason="f_seal_not_terminal",
+                extra={"final_consumer_problems": list(seal.problems)})
+            last_seal["F"]["row"] = updated_row
+            last_seal["F"]["problems"] = (
+                list(last_seal["F"].get("problems", [])) + revoke_problems)
+        f["summary"] = summary
+        f["conclusion"] = "audit_incomplete"
         return {"mode": mode, "conclusion": "audit_incomplete",
                 "complete_evidence": False, "covered_contract_passed": False,
-                "problems": f.get("problems", []),
-                "gaps": f.get("gaps", []) + seal.problems,
+                "problems": list(f.get("problems", [])) + revoke_problems,
+                "gaps": (list(f.get("gaps", [])) + list(seal.problems)
+                         + revoke_problems),
                 "stages": results, "seals": last_seal,
+                "summary": summary,
                 "summary_path": path_for_record(f["report"])}
     _, final_consumer_problems = stage_state(run_root, "F")
     summary = dict(f["summary"])
     summary["final_consumer_problems"] = final_consumer_problems
-    if summary.get("conclusion") == (
-            "real_batch_covered_contract_passed" if mode == "real"
-            else "synthetic_contract_passed") and final_consumer_problems:
-        # A pass claim cannot survive a non-consumable final record.
-        summary["conclusion"] = "audit_incomplete"
-        summary["producer_conclusion"] = "audit_incomplete"
-        summary["complete_evidence"] = False
-        summary["covered_contract_passed"] = False
-        summary["gaps"] = list(summary.get("gaps", [])) + final_consumer_problems
+    revoke_problems = []
+    if summary.get("conclusion") == pass_conclusion and final_consumer_problems:
+        # A pass claim cannot survive a non-consumable final record.  Withdraw
+        # the on-disk summary and rebind the seal hash; never mutate only the
+        # in-memory copy.
+        updated_row, revoke_problems, summary = _withdraw_pass_claim(
+            run_root, "F", attempt, Path(f["report"]), seal.row,
+            final_consumer_problems,
+            reason="final_consumer_not_consumable",
+            extra={"final_consumer_problems": final_consumer_problems})
+        summary["final_consumer_problems"] = final_consumer_problems
+        last_seal["F"]["row"] = updated_row
+        last_seal["F"]["problems"] = (
+            list(last_seal["F"].get("problems", [])) + revoke_problems)
+    if revoke_problems:
+        summary["gaps"] = list(summary.get("gaps", [])) + revoke_problems
+    f["summary"] = summary
+    f["conclusion"] = summary["conclusion"]
     return {
         "mode": mode, "conclusion": summary["conclusion"],
         "complete_evidence": bool(summary.get("complete_evidence")),
         "covered_contract_passed": bool(summary.get("covered_contract_passed")),
-        "problems": summary.get("problems", []),
+        "problems": list(summary.get("problems", [])) + revoke_problems,
         "gaps": summary.get("gaps", []),
         "stages": results, "seals": last_seal,
         "summary": summary, "summary_path": path_for_record(f["report"]),

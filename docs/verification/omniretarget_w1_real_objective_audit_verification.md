@@ -1,6 +1,6 @@
 # W1 真实训练目标审计实现与合成自测验证记录
 
-日期：2026-10-26（初版实现与合成自测；同日完成独立复核 8 P1 + 2 P2 修复）。对应草案：[W1 真实训练目标审计预注册草案](../plans/omniretarget_w1_real_objective_audit_prereg_draft.md)。**本次交付是实现与纯合成自测，不是真实数据审计、预注册执行或训练更新。** 草案仍为 `draft / not_registered / not_authorized / not_run`；`factor_selected=false`、`auto_execute=false`、最终交互 `not_ready`、生产接入 `false`。
+日期：2026-10-26（初版实现与合成自测；同日完成两轮独立复核修复：首轮 8 P1 + 2 P2，第二轮 3 P1 + 2 P2）。对应草案：[W1 真实训练目标审计预注册草案](../plans/omniretarget_w1_real_objective_audit_prereg_draft.md)。**本次交付是实现与纯合成自测，不是真实数据审计、预注册执行或训练更新。** 草案仍为 `draft / not_registered / not_authorized / not_run`；`factor_selected=false`、`auto_execute=false`、最终交互 `not_ready`、生产接入 `false`。
 
 ## 0. 结论与边界
 
@@ -9,7 +9,7 @@
 | 实现状态 | complete（R0/P/F 骨架、注册/准入、生产取证、batched VJP、独立参考、F 重放、账本/封口、CLI） |
 | 合成自测 | `synthetic_contract_passed`；`problems=[]`、`gaps=[]`、`complete_evidence=true` |
 | 权威合成命令 | `uv run --locked python scripts/audit_w1_real_objective.py --synthetic --out derived/audit/w1_real_objective_audit` |
-| 权威合成产物 | `derived/audit/w1_real_objective_audit/attempt_007/`（`attempt_001`–`attempt_006` 与顶层旧目录为更早实现运行，保留不改写） |
+| 权威合成产物 | `derived/audit/w1_real_objective_audit/attempt_009/`（`attempt_001`–`attempt_008` 与顶层旧目录为更早实现运行，保留不改写） |
 | 固定矩阵 | 2 个 train demo × 2 个完整窗口 = 4 窗；deterministic/diffusion 两个模型；`t=[0,250,500,999]`；噪声种子 `20261008` |
 | 行/数组 | objective rows **98**、gradient rows **14**；`objective_real_arrays.npz` 与 `gradient_real_arrays.npz` 全键通过 |
 | 调用计数 | conditioner **4**、model **4**、production VJP **4**、independent VJP **4**（均达到上限且不超） |
@@ -26,7 +26,7 @@
 | --- | --- |
 | [src/ireset/eval/w1_real_objective_audit.py](../../src/ireset/eval/w1_real_objective_audit.py) | 审计模块：固定矩阵、窗口键、注册/准入、生产 observer、独立 float64 参考、batched VJP、F 重放、publishing/seal 账本、授权/容差门与合成校准 |
 | [scripts/audit_w1_real_objective.py](../../scripts/audit_w1_real_objective.py) | 默认纯合成入口；`--calibrate-synthetic` 写冻结容差契约；`--real` 需授权记录+已校准契约+固定根直接子目录，当前未运行 |
-| [tests/test_w1_real_objective_audit.py](../../tests/test_w1_real_objective_audit.py) | **42 项**正向/反例：完整链路、observer 逐位透明、detach 拒绝、噪声公式、近 π 域、键多重集、账本/running/publishing/超限/封口写失败、父 unit 准入、F 重放篡改、CLI 拒绝；复核新增实际 VJP 计数、落盘梯度逐元素绑定、FK 点重算、跨 run 调用额度、RNG 恢复、合法负结果进入 F、校准证据重验、负成本、行字段/额外行、非数值数组 |
+| [tests/test_w1_real_objective_audit.py](../../tests/test_w1_real_objective_audit.py) | **48 项**正向/反例：完整链路、observer 逐位透明、detach 拒绝、噪声公式、近 π 域、键多重集、账本/running/publishing/超限/封口写失败、父 unit 准入、F 重放篡改、CLI 拒绝；首轮复核新增实际 VJP 计数、落盘梯度逐元素绑定、FK 点重算、跨 run 调用额度、RNG 恢复、合法负结果进入 F、校准证据重验、负成本、行字段/额外行、非数值数组；第二轮新增预算撤销 P 不启动 F 调用、F 实时截止、封口超时撤回磁盘声明、完整链调用余额、嵌套容器类型异常 |
 | [src/ireset/train/losses.py](../../src/ireset/train/losses.py) | `LossAssembler.__call__` 新增可选 `observer`：捕获 live 分项张量、FK 前 `L5`、归约中间量、预测/目标 FK 点；`observer=None` 数值路径逐位不变 |
 
 实现文件 SHA-256（合成产物写入时）：
@@ -34,17 +34,17 @@
 | 文件 | SHA-256 |
 | --- | --- |
 | `src/ireset/train/losses.py` | `04b74a45ff59c5acbf8b1fda9361b58c9e56d5466990122524a808071ab80820` |
-| `src/ireset/eval/w1_real_objective_audit.py` | `d4ba125dda0ee4c2d070277dd29de3ad3b6a79fe4e51685a3a34487dbe308df1` |
+| `src/ireset/eval/w1_real_objective_audit.py` | `594f0640cc47e932ff568e2a49fce4c2dbc465cdd7f47ee1cf4089e88b0f9ee1` |
 | `scripts/audit_w1_real_objective.py` | `6fa2584845decbc2dcb4244b4a11d60f92437a0e273a780b1a206d89c3498cde` |
-| `tests/test_w1_real_objective_audit.py` | `e3d5e2d613ba5766580a584ad4c8741d83cc01e8cddefb5e0872750900fd6712` |
+| `tests/test_w1_real_objective_audit.py` | `e66385d9fe3aad886e88484697130ebbbc69672db8e07d36c18c09051d89676c` |
 
 权威产物哈希：
 
 | 产物 | SHA-256 |
 | --- | --- |
-| `.../finalize/attempt_001/audit_summary.json` | `bdfe267c536e6ee1526510ceeb22d15ca1ae8c036a0ae435e4348db67d1a0e2d` |
+| `.../finalize/attempt_001/audit_summary.json` | `098b5067412393425bddadb014c8b5b1d5b6243504fd56b415caf5444b875af2` |
 | `.../finalize/attempt_001/independent_verification.json` | `74d0e8a78f988fe2da48c3066ecb063a24dca35f9c91b0af09a4307ad2c46500` |
-| `.../production/attempt_001/p_report.json` | `3f2dd980300bd6a137e25b64ac8884152d3a6dba745c73755d54c3c3d66eae20` |
+| `.../production/attempt_001/p_report.json` | `64eda19f018213083f6b6db4392a5e0795dd5c6c36cf3e76719c3e71c65736cc` |
 | `.../production/attempt_001/objective_real_arrays.npz` | `932f2f0cc3ef0c7bdaae2bdb34cb5361a17dee468df4699e45c80144a619f0cc` |
 | `.../production/attempt_001/gradient_real_arrays.npz` | `73cc59a3d2dfb4bfef26d11977dd8488b29d457eb7390556cd5fdd241f890a88` |
 
@@ -92,8 +92,8 @@
 
 ## 6. 测试与回归
 
-- `uv run --locked pytest tests/test_w1_real_objective_audit.py -q` -> **42 passed（14.62s）**。
-- 相关既有回归：`tests/test_w1_training_objective_audit.py tests/test_generation.py` -> **51 passed（33.85s）**；`tests/test_omniretarget_w1.py` -> **34 passed（40.33s）**；`tests/test_w1_de_numerics.py tests/test_omniretarget_w1_de.py` -> **73 passed（326.99s）**。
+- `uv run --locked pytest tests/test_w1_real_objective_audit.py -q` -> **48 passed（19.22s）**（首轮 42 项 + 第二轮 6 项参数化/反例）。
+- 相关既有回归：`tests/test_w1_training_objective_audit.py tests/test_generation.py tests/test_omniretarget_w1.py` -> **85 passed（66.75s）**；`tests/test_w1_de_numerics.py tests/test_omniretarget_w1_de.py` -> **73 passed（334.99s）**。
 - **全项目套件本轮未重跑**；旧 947 passed + 1 skipped 仅作历史范围记录，不冒充本次结果。
 - 合成校准命令 `--calibrate-synthetic` 生成 `mode=synthetic_calibrated`、非空 `evidence_sha256`、`observed` 与 98/14 行计数的契约；真实入口要求该模式，默认 `synthetic_default` 契约被拒绝。`tolerance_contract_problems` 现在重算证据哈希、4× 阈值推导关系，并用记录 seed 重跑纯合成校准；删除证据、替换哈希+放宽阈值、同步伪造 observed 三类反例均被拒绝。
 
@@ -131,3 +131,17 @@
 | 10 | [P2] 字符串数组触发 `np.isfinite` TypeError 中断复核 | `_check_arrays` 先做 shape/dtype/数值类型分派，再检查有限性；非数值数组记 `array_not_numeric` 并继续写 incomplete 报告 | `test_non_numeric_arrays_do_not_abort_verification`、`test_check_arrays_string_dtype_is_a_normal_problem` |
 
 复核修复后的权威合成结果：objective **98** 行、gradient **14** 行，`problems=[]`、`gaps=[]`、`complete_evidence=true`；R0/P/F 均 done/complete；调用 **4/4/4/4**、contact 0、训练更新/参数 FD/DDIM/checkpoint 写入 0；`audit_summary.json` sha `bdfe267c…`、`independent_verification.json` sha `74d0e8a7…`、`p_report.json` sha `3f2dd980…`。**仍未加载真实资产、未运行真实审计、未创建 cohort/预算/执行注册。**
+
+## 10. 第二轮独立复核修复（2026-10-26）
+
+第二轮只读复核在首轮修复后的实现上确认 3 P1 + 2 P2，并全部修复。权威合成运行重跑为 `attempt_009`，结论仍 `synthetic_contract_passed`；真实执行仍未启动。
+
+| # | 复核问题 | 修复 | 反例 |
+| --- | --- | --- | --- |
+| 1 | [P1] 预算撤销产生的 P terminal incomplete 仍进入 F 重放，两模型前向/求导白花 | `_p_budget_exhausted` 识别 P 封口的 `budget_exceeded_*`/`seal_tail_reserve_*` 及 `unit_deadline`/`AuditCallBudgetExceeded` gap；F 以 `replay=False` 只整理已有证据，不构造模型、不做前向或 VJP | `test_budget_revoked_p_does_not_start_f_model_calls`：P 被 `budget_exceeded_after_registration` 撤销后，F 调用计数停在 P 的 2/2/2/2，不再增加 |
+| 2 | [P1] F 只在 unit 准入时比较子/父截止，不检查当前时间；首单元返回后已超时，第二模型仍执行 | 每个 replay unit 前检查 `time.perf_counter() + replay_reserve_s >= deadline`；`replay_reserve_s` 取阶段 `reserve_s`（缺省回落 `SEAL_TAIL_RESERVE_S`）。耗尽即置 `replay_enabled=False`，后续 unit 只记 gap，不新增调用 | `test_f_live_deadline_stops_new_model_calls`：首单元后睡眠越过截止，第二模型未执行，`calls["model"]==1` |
+| 3 | [P1] F 封口失败只修改内存 summary；返回 audit_incomplete，但磁盘仍为 `synthetic_contract_passed/complete_evidence=true` | `_withdraw_pass_claim` 从磁盘读取 summary，改写为 audit_incomplete、complete_evidence/covered_contract_passed=false，追加撤回原因；`_report_hashes` 重算 `report_sha256`/`summary_sha256`，经 `_persist_row_entry` 原位更新索引与台账。撤回/重绑失败时行改 `publishing/complete=false`，保持不可消费 | `test_f_seal_timeout_revokes_on_disk_pass_claim`：F 封口注入 0s 预算后，磁盘 summary 与返回 summary 均为 audit_incomplete，`stage_state` 无 report/summary hash mismatch，行保留 `budget_exceeded_*` 原因 |
+| 4 | [P2] 入口只拒绝已耗尽的调用额度；历史每类用 1 次、剩 3 次仍启动需要 4 次的完整链，执行 P 两单元及 F 首单元后才抛 `AuditCallBudgetExceeded` | 新增 `FULL_CHAIN_CALLS={每类:4}`；在写 cohort、分配 R0 之前检查 `prior + required <= cap`，不足即 `SystemExit`，不启动任何阶段 | `test_insufficient_call_quota_stops_before_any_stage`：历史 1/1/1/1 时入口拒绝，索引仍只有原 R0 行，P/F 目录不存在，未进入任何阶段或模型构造 |
+| 5 | [P2] 只校验 P report 顶层映射；`units` 改为包含模型名的 list 时成员检查通过，随后 `.get` 抛 `AttributeError`，F 未写报告并留下 running | 读取成员前先校验 `units`、`unit_artifacts`、admission、`arrays_sha256`、call trace/counts 的容器类型；异常容器记 gap。缺失 artifact 声明记 gap，只有声明存在且哈希不符才记 problem | `test_f_nested_container_types_are_gaps_not_crashes`（`units` list / `unit_artifacts` list 两参数）：均写 incomplete 报告，不崩溃 |
+
+第二轮权威合成产物：`derived/audit/w1_real_objective_audit/attempt_009/`。objective **98** 行、gradient **14** 行、`problems=[]`、`gaps=[]`、`complete_evidence=true`、调用 **4/4/4/4**、contact 0、训练更新/参数 FD/DDIM/checkpoint 写入 0；`audit_summary.json` sha `098b5067…`、`independent_verification.json` sha `74d0e8a7…`、`p_report.json` sha `64eda19f…`，两份 NPZ 与首轮逐位相同。**仍未加载真实资产、未运行真实审计、未创建 cohort/预算/执行注册；`objective_coverage=partial`、`full_objective_contract_passed=null`、`attribution=attribution_insufficient`、最终交互 `not_ready`、生产接入 false 不变。**

@@ -506,10 +506,10 @@ def _replay_contexts(run_dir: Path):
 
 
 def _run_f_on(run: Path, provider, *, attempt: str = "attempt_extra_f",
-              calls=None):
+              calls=None, remaining_s: float = 120.0):
     r0, p, arrays, gradients = _replay_contexts(run)
     t0 = time.perf_counter()
-    budget = {"stage": "F", "remaining_s": 120.0}
+    budget = {"stage": "F", "remaining_s": remaining_s}
     scope = audit._unit_scope(r0["inputs"])
     audit.pre_register_attempt(
         run, "F", attempt, t0, scope=scope, budget=budget,
@@ -958,3 +958,146 @@ def test_check_arrays_string_dtype_is_a_normal_problem(tmp_path: Path):
     got, problems = audit._check_arrays(path, keys, schema)
     assert got
     assert any("array_not_numeric:x0" in p for p in problems)
+
+
+def test_budget_revoked_p_does_not_start_f_model_calls(tmp_path: Path,
+                                                       monkeypatch):
+    """A P attempt revoked by accounting must not fund a fresh F replay."""
+    original = audit.finish_attempt
+
+    def forced_p_seal(root, stage, attempt, t0, budget, row, *,
+                      status="done", extra=None):
+        if stage == "P":
+            budget = {**budget, "remaining_s": 0.0}
+        return original(root, stage, attempt, t0, budget, row,
+                        status=status, extra=extra)
+
+    monkeypatch.setattr(audit, "finish_attempt", forced_p_seal)
+    run = tmp_path / "p_budget_revoked"
+    result = audit.run_registered_audit(
+        run, audit.SyntheticObjectiveProvider(seed=20261026),
+        mode="synthetic", tolerance=audit.build_tolerance_contract())
+    assert result["conclusion"] == "audit_incomplete", result
+    f_summary = _load(_stage_files(run, "F") / "audit_summary.json")
+    assert f_summary["complete_evidence"] is False
+    assert f_summary["calls"]["counts"] == {
+        "conditioner": 2, "model": 2,
+        "production_vjp": 2, "independent_vjp": 2,
+    }
+    assert any("f_replay_skipped" in g and "parent_budget_exhausted" in g
+               for g in f_summary["gaps"]), f_summary["gaps"]
+    assert any("replay_skipped:deterministic" in g
+               for g in f_summary["gaps"]), f_summary["gaps"]
+
+
+def test_f_live_deadline_stops_new_model_calls(audit_dir: Path,
+                                               tmp_path: Path, monkeypatch):
+    """The second F unit must not start after the first overruns the deadline."""
+    run = tmp_path / "f_deadline"
+    shutil.copytree(audit_dir, run)
+    calls = audit.AuditCallBudget()
+    seen: list[str] = []
+    original = audit.production_objective_unit
+
+    def slow_unit(bundle, *args, **kwargs):
+        seen.append(bundle.model_type)
+        out = original(bundle, *args, **kwargs)
+        if len(seen) == 1:
+            time.sleep(2.6)
+        return out
+
+    monkeypatch.setattr(audit, "production_objective_unit", slow_unit)
+    result, *_ = _run_f_on(
+        run, audit.SyntheticObjectiveProvider(seed=20261026),
+        calls=calls, remaining_s=3.0)
+    assert seen == ["deterministic"], seen
+    assert calls.snapshot()["counts"]["model"] == 1
+    assert result["conclusion"] == "audit_incomplete", result
+    assert any("f_replay_deadline_exhausted:diffusion" in g
+               for g in result["gaps"]), result["gaps"]
+
+
+def test_f_seal_timeout_revokes_on_disk_pass_claim(tmp_path: Path,
+                                                   monkeypatch):
+    """A non-consumable F seal may not leave a pass summary on disk."""
+    original = audit.finish_attempt
+
+    def forced_f_seal(root, stage, attempt, t0, budget, row, *,
+                      status="done", extra=None):
+        if stage == "F":
+            budget = {**budget, "remaining_s": 0.0}
+        return original(root, stage, attempt, t0, budget, row,
+                        status=status, extra=extra)
+
+    monkeypatch.setattr(audit, "finish_attempt", forced_f_seal)
+    run = tmp_path / "f_seal_timeout"
+    result = audit.run_registered_audit(
+        run, audit.SyntheticObjectiveProvider(seed=20261026),
+        mode="synthetic", tolerance=audit.build_tolerance_contract())
+    assert result["conclusion"] == "audit_incomplete", result
+    summary_path = _stage_files(run, "F") / "audit_summary.json"
+    summary = _load(summary_path)
+    assert summary["conclusion"] == "audit_incomplete"
+    assert summary["producer_conclusion"] == "audit_incomplete"
+    assert summary["complete_evidence"] is False
+    assert summary["covered_contract_passed"] is False
+    row, problems = audit.stage_state(run, "F")
+    assert row is not None
+    assert row["status"] != "done"
+    assert row["complete"] is False
+    assert "budget_exceeded" in str(row.get("incomplete_reason"))
+    assert "report_hash_mismatch" not in problems, problems
+    assert "summary_hash_mismatch" not in problems, problems
+    # The returned in-memory summary matches the revoked disk artifact.
+    assert result["summary"]["conclusion"] == "audit_incomplete"
+    assert result["stages"]["F"]["summary"]["complete_evidence"] is False
+
+
+def test_insufficient_call_quota_stops_before_any_stage(tmp_path: Path):
+    """One prior call leaves 3, but a full chain needs 4: refuse up front."""
+    root = tmp_path / "quota"
+    audit.write_cohort(root, mode="synthetic")
+    t0 = time.perf_counter()
+    budget = {"stage": "R0", "remaining_s": 60.0}
+    audit.pre_register_attempt(root, "R0", "attempt_001", t0,
+                               scope={"s": 1}, budget=budget)
+    balance = audit.AuditCallBudget(prior_counts={
+        kind: 1 for kind in audit.CALL_CAPS}).snapshot()
+    sealed = audit.finish_attempt(
+        root, "R0", "attempt_001", t0, budget, {"complete": True},
+        status="done", extra={"call_balance": balance})
+    assert sealed.sealed
+
+    class NoCallsProvider(audit.SyntheticObjectiveProvider):
+        def model_factory(self):
+            raise AssertionError("the quota gate must stop before model work")
+
+    with pytest.raises(SystemExit, match="insufficient"):
+        audit.run_registered_audit(
+            root, NoCallsProvider(seed=20261026), mode="synthetic",
+            tolerance=audit.build_tolerance_contract())
+    assert len(audit.load_index(root)) == 1
+    assert not audit.stage_dir(root, "P").exists()
+    assert not audit.stage_dir(root, "F").exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected_gap"),
+    [
+        ("units", ["deterministic", "diffusion"], "p_units_not_a_mapping"),
+        ("unit_artifacts", ["deterministic"], "p_unit_artifacts_not_a_mapping"),
+    ],
+)
+def test_f_nested_container_types_are_gaps_not_crashes(
+        audit_dir: Path, tmp_path: Path, field: str, value, expected_gap: str):
+    run = tmp_path / f"bad_{field}"
+    shutil.copytree(audit_dir, run)
+    report_path = _stage_files(run, "P") / "p_report.json"
+    report = _load(report_path)
+    report[field] = value
+    report_path.write_text(json.dumps(report))
+    result, *_ = _run_f_on(
+        run, audit.SyntheticObjectiveProvider(seed=20261026))
+    assert any(expected_gap in g for g in result["gaps"]), result["gaps"]
+    assert result["conclusion"] == "audit_incomplete", result
+    assert (run / "finalize/attempt_extra_f/audit_summary.json").is_file()
