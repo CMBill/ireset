@@ -201,3 +201,14 @@ FK m² 与评估的 FK MPJPE m 在开方、归约上不同；不能把 `fk_m2` �
 - **限制**：近 π 精度负门（实现 0.061667 vs 独立 1.233622）、平行 6D 的 tokenizer `ok` 标志漏检（正式 Trainer/生成器仍拒绝，未使用的 NumPy decode 会抛错）、零 6D 解码占位仅由正式调用方守卫、float32 审计使用合成构造器、`loss_history` 6 位舍入不能做逐位对账。真实 G1 FK 对拍 `not_run`。
 - **测试**：`uv run --locked pytest tests/test_w1_training_objective_audit.py -q` -> **33 passed**（32.41s）；全项目套件未重跑，旧 947 passed + 1 skipped 仅作历史范围记录。
 - **边界**：未加载真实 dataset/cache/checkpoint，未对任何 W1 训练 checkpoint/生产模型做前向，真实数据训练更新为 0；A3 的采样/循环事实只使用随机初始化微型 `DiffusionG1` 与替身模块；未创建执行注册、cohort 或预算；`factor_selected=false`、`auto_execute=false`、最终交互 `not_ready`、生产接入 false。通过合成审计只表示实现契约在合成适用域成立；下一交付须按 §5 另立真实审计/单因素预注册并取得用户授权；无可区分假设时交付 `attribution_insufficient`。
+
+## 8. 当前源码重新验收（2026-10-27）
+
+按[证据更新计划](omniretarget_w1_training_objective_audit_refresh_plan.md)在 `losses.py` 可选 observer 改动后重新取得当前源码下的合成证据。§7 的 2026-10-22 运行与 `attempt_003` 保留为历史版本，不改写。
+
+- **身份**：HEAD `5dd7b6cc06c8a530ed145fc21570a7431f43b20a`，工作树 clean，tracked diff SHA-256 `e3b0c442…`（空 diff）；Python 3.12.13；`uv.lock` `f809284e…`；配置 `0e2cfa96…`（与 `attempt_003` 相同）。14 个绑定文件中唯一差异为 `src/ireset/train/losses.py`（`44894d23…` → `04b74a45…`），来源为提交 `9088287` 的 observer 接口改动；默认路径无标量变化，显式 observer 路径仅捕获已有张量引用。
+- **权威运行**：同一 CLI 自动分配 `derived/audit/w1_training_objective_audit/attempt_004/`，退出码 0，墙钟 6.162s；生产侧与独立复核均 `synthetic_contract_passed`，89 行（A0 22 + A1 23 + A2 14 + A3 19 + A4 11）、失败/缺口 0/0、5 项限制语义不变。`static_contract.json` 的 `date` 仍为固定设计日期 `2026-10-22`，实际执行时刻记在证据更新记录中。
+- **独立复核**：新进程调用不写盘的 `_verify_audit_artifacts_impl`，`problems=[]`、10 项检查（4 组 update replay、2 组 diffusion noise→x_t、2 组选模 raw 行、`(demo,start,t)` 键级明细、目标重算），调用前后目录 82 个文件哈希不变，无 `static_source_drift`。
+- **新旧比较**：全部 JSON 数值（objective 2442 / gradient 687 / update 345 / sampling 92 / selection 285 / s0 7 / independent 12 / static 128 / summary 306）与三个 NPZ（22/10/164 个数组）**逐位相等**；只有 `static_contract.json` 与 `audit_summary.json` 的 git 身份字段和 `losses.py` SHA-256 不同，其余 11 份工件字节相同。
+- **测试**：按本轮身份补跑两文件，`tests/test_w1_training_objective_audit.py` **33 passed（32.79s）**、`tests/test_w1_real_objective_audit.py` **58 passed（27.69s）**；全项目套件未重跑。
+- **保护与边界**：356 个旧证据文件执行前后逐字节一致，父审计目录新增仅 `attempt_004/` 的 82 个文件；冻结草案与更新计划本身未变，本节为父方案的唯一追加（11 行新增、0 删除）。`source=synthetic_only`；真实资产/数据/checkpoint/生产模型计算与真实数据训练更新仍为 0；未创建 cohort/预算/注册；`factor_selected=false`、`auto_execute=false`、最终交互 `not_ready`、生产接入 false。§5 的真实审计门与授权要求不变。

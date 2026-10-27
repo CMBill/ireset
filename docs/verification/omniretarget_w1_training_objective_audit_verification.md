@@ -1,6 +1,6 @@
 # W1 训练拟合与目标一致性合成审计验证记录
 
-日期：2026-10-22（A4 `(demo,start,t)` 键级多重集、A5 逐键明细对账与冻结反例语义补齐后重跑；第五轮 1 P1 + 1 P2 修复保留）。对应方案：[W1训练拟合与目标一致性单因素诊断执行方案](../plans/omniretarget_w1_training_fit_objective_audit_plan.md) A0–A5。**本次交付是纯合成审计实现与运行，不是真实数据审计或单因素训练预注册。**
+日期：2026-10-22（A4 `(demo,start,t)` 键级多重集、A5 逐键明细对账与冻结反例语义补齐后重跑；第五轮 1 P1 + 1 P2 修复保留）；**2026-10-27 补充当前源码重新验收（§11，权威产物改为 `attempt_004/`），§0–§10 保留为 `attempt_003` 的历史版本**。对应方案：[W1训练拟合与目标一致性单因素诊断执行方案](../plans/omniretarget_w1_training_fit_objective_audit_plan.md) A0–A5。**本次交付是纯合成审计实现与运行，不是真实数据审计或单因素训练预注册。**
 
 ## 0. 结论与边界
 
@@ -10,7 +10,7 @@
 | 退出码 | 0 |
 | 生产侧结论 | `synthetic_contract_passed` |
 | 独立复核结论 | `synthetic_contract_passed`；`problems=[]` |
-| 权威产物 | `derived/audit/w1_training_objective_audit/attempt_003/`（防覆盖入口；根目录与 `attempt_001/002/` 旧产物已被取代） |
+| 权威产物 | `derived/audit/w1_training_objective_audit/attempt_003/`（2026-10-22 历史版本；防覆盖入口，根目录与 `attempt_001/002/` 旧产物已被其取代。**当前合成权威为 `attempt_004/`，见 §11**） |
 | 审计行 | **A1–A4 67 + A0 静态 22 = 89**（A1 23、A2 14、A3 19、A4 11；A0 22） |
 | 失败/缺口 | **0 / 0** |
 | 已登记限制 | **5**（见 §8） |
@@ -28,7 +28,7 @@
 | [src/ireset/eval/training_objective_audit.py](../../src/ireset/eval/training_objective_audit.py) | 独立合成审计模块：A0 静态契约、A1/A2/A4 对拍、A3 循环/采样/RNG、A5 独立复核；不修改默认 loss、模型或数据入口 |
 | [scripts/audit_w1_training_objective.py](../../scripts/audit_w1_training_objective.py) | 默认纯合成入口；显式拒绝 manifest/cache/checkpoint/预注册/预算/demo/step/seed 等真实或研究输入；不调用旧诊断脚本 |
 | [tests/test_w1_training_objective_audit.py](../../tests/test_w1_training_objective_audit.py) | 33 项正向链与篡改反例（含 A4 键级 12 类变体、A5 证据攻击矩阵、DDIM 时间表/末步替换）；临时目录，不扫描生产历史 |
-| [derived/audit/w1_training_objective_audit/attempt_003/](../../derived/audit/w1_training_objective_audit/attempt_003/) | 权威合成产物：`static_contract.json`、`s0_formal_comparison.json`、`objective_rows.json`、`synthetic_inputs.npz`、`gradient_rows.json`、`gradient_arrays.npz`、`update_parity.json`、`update_arrays.npz`、`sampling_trace.json`、`rng_state_facts.json`、`selection_evidence.json`、`audit_summary.json`、`independent_verification.json` |
+| [derived/audit/w1_training_objective_audit/attempt_003/](../../derived/audit/w1_training_objective_audit/attempt_003/) | 2026-10-22 历史合成产物：`static_contract.json`、`s0_formal_comparison.json`、`objective_rows.json`、`synthetic_inputs.npz`、`gradient_rows.json`、`gradient_arrays.npz`、`update_parity.json`、`update_arrays.npz`、`sampling_trace.json`、`rng_state_facts.json`、`selection_evidence.json`、`audit_summary.json`、`independent_verification.json`（当前权威见 §11 的 `attempt_004/`） |
 
 权威运行基于已提交的 `c881a6ecfa6e76939486b4cf6e542b7c32790a39`；运行时本轮 A5 明细/反例语义代码与测试修复尚未提交，随后只同步了文档，未再改动代码或工件。`static_contract.json` 记录运行时的 `git.dirty=true`、tracked diff SHA-256 `f5560bc39cdb2b2947b8cfe8c021302aaecacaa8a3f79b8b5cd138b1609b2a05`，并单独登记三个实现文件 SHA-256：
 
@@ -204,3 +204,44 @@ uv run --locked pytest tests/test_w1_training_objective_audit.py -q
 - 未创建执行注册、cohort、预算或正式 run；`derived/audit/` 只是合成审计产物目录，不是研究 attempt。
 - 未选择训练拟合因素，未修改默认 loss/模型/数据入口、缓存、教师、checkpoint 或旧 final；旧 U0 `incomplete`、UR `no_quality_gain`、原 W1 F `not_ready`、r6 不可验收与融合候选不接入均保持不变。
 - 通过合成审计只表示实现契约在合成适用域成立；真实数据的拟合/泛化/物理质量仍需方案 §5 的正式预注册与用户授权。已起草[真实训练目标审计预注册草案](../plans/omniretarget_w1_real_objective_audit_prereg_draft.md)，状态为 `draft / not_registered / not_run`，不构成授权或执行记录。若没有可区分假设，下一交付应为 `attribution_insufficient`，而不是重跑旧探针或把 `not_ready` 升级。
+
+## 11. 当前源码重新验收（2026-10-27）
+
+`src/ireset/train/losses.py` 在提交 `9088287` 增加可选 observer 后，`attempt_003` 对当前源码的只读 A5 仅报 `static_source_drift:src/ireset/train/losses.py`。按[证据更新计划](../plans/omniretarget_w1_training_objective_audit_refresh_plan.md)重新取得当前源码下的合成证据。**§0–§10 的 2026-10-22 结果与 `attempt_003` 保留为历史版本，不改写。**
+
+| 项目 | 本轮实际结果 |
+| --- | --- |
+| 执行身份 | HEAD `5dd7b6cc06c8a530ed145fc21570a7431f43b20a`；工作树 clean；tracked diff SHA-256 `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`（空 diff）；Python 3.12.13；`uv.lock` `f809284e21406f7f3b51c33bf200f0e6aa567f32cce43bc15ab00797b6d69a44` |
+| 绑定差异 | 14 个绑定文件中唯一差异 `src/ireset/train/losses.py`：`44894d23…` → `04b74a45…`；其余源码、审计实现、测试与配置逐字节相同 |
+| 新权威产物 | `derived/audit/w1_training_objective_audit/attempt_004/`（防覆盖入口自动分配），退出码 0，墙钟 6.162s，UTC 07:10:54–07:11:01 |
+| 结论 | 生产侧、保存的独立复核与新进程只读 A5 均 `synthetic_contract_passed`，`problems=[]` |
+| 完整性 | A0 22 + A1 23 + A2 14 + A3 19 + A4 11 = **89 行**，失败/缺口 0/0，限制 5 项 |
+| 独立复核 | 10 项检查（4 组 update replay、2 组 noise→x_t、2 组选模 raw 行、键级明细、目标重算）；调用前后 82 个文件哈希不变 |
+| 测试 | `tests/test_w1_training_objective_audit.py` **33 passed（32.79s）**；`tests/test_w1_real_objective_audit.py` **58 passed（27.69s）**；两者均 exit 0，本轮补跑 |
+| 新旧数值 | 全部 JSON 数值与三个 NPZ **逐位相等**；仅身份字段与 `losses.py` SHA-256 不同 |
+| 旧证据保护 | 356 个旧证据文件逐一 SHA-256 不变；新增仅 `attempt_004/` 82 个文件；父方案仅追加 §8（11 行新增、0 删除），冻结草案与更新计划本身未变 |
+| 真实计算 | 0（dataset/cache/教师/G1 资产/checkpoint 加载、真实模型前向反向、真实数据更新均未发生） |
+
+新运行 `static_contract.json` 记录的 `git` 为 `commit=5dd7b6c…`、`dirty=false`、空 diff，与本轮执行身份一致；配置 `0e2cfa96…` 与 `attempt_003` 相同。`date` 字段仍是实现固定的 `2026-10-22`，实际执行日期以本表和证据更新记录为准，不为补日期改写工件。
+
+13 份核心工件中 11 份与 `attempt_003` 字节相同；仅两份 JSON 因身份字段变化：
+
+| 工件 | `attempt_004` SHA-256 |
+| --- | --- |
+| `static_contract.json` | `758db3150291f1256d349791c6cbb0a28a9e083e4b2e06053f4814d9bb031b35` |
+| `audit_summary.json` | `49a000371c9fd51d53e2bdefb9c9b2872e66f19218502a7cdb19e85a1dab36a0` |
+| `objective_rows.json` | `0ff3b7f28e09abbabd388c365a13ea3239980c706012c5d76c6885ca20a277d2`（与 `attempt_003` 相同） |
+| `synthetic_inputs.npz` | `a0e8549cc214f35c14d45828c846f794dcf2f59063846670f8cf13745552a246`（相同） |
+| `gradient_rows.json` | `a0244be6d2936d8fa6937a6f981af7b48098ac8c7e500e76dc90a3443c3d8b1b`（相同） |
+| `gradient_arrays.npz` | `753ebf65b7136920054994e85745d8749d78435956a066a253ca74eac901cd49`（相同） |
+| `update_parity.json` | `9c02de2e045b8920cfa499030355bac8691c5ed53d4e81b858900dafaf88aa42`（相同） |
+| `update_arrays.npz` | `f57aa924a839537bd98e96225036fb11ebebadb209ee2013b86349b0035e5b11`（相同） |
+| `sampling_trace.json` | `325ccf9f3499587c49271e3c2ebfbd07f4310fc9ba53e57b6ce2bc3505118c1a`（相同） |
+| `rng_state_facts.json` | `b4bb073b630f622b1d105aa0b460738c955aafcce1baac4c66dea42c2ddc6091`（相同） |
+| `selection_evidence.json` | `5fee54773718b28fc651d090f50927ce3e7d11def67611b407d33f12db760c24`（相同） |
+| `s0_formal_comparison.json` | `337c5336027cabd8102e2241063a48af629e29068f2627482210d14a993cbf05`（相同） |
+| `independent_verification.json` | `2ca8ac16e055e5561da71793e63e6c18c55f06148367118e3137e167285c51c0`（相同） |
+
+observer 改动的范围与逐位透明性证据（`tests/test_w1_real_objective_audit.py::test_observer_is_bitwise_transparent`）以及两次运行的完整日志、前后保护清单、只读复核结果、新旧逐字段对比，均保存在[证据更新执行记录](../../derived/audit/w1_training_objective_refresh/20261027T070845Z_5dd7b6c/report.md)（同目录 `identity.json`、`tests_evidence.json`、`audit_run.json`、`readonly_a5.json`、`new_vs_old.json`、`integrity_check.json`、`binding_check.json`、`protected_pre_manifest.json`、`protected_post_manifest.json`）。
+
+边界不变：`source=synthetic_only`；真实 dataset/cache/教师/G1 资产/checkpoint 加载、真实模型前向反向与真实数据 optimizer 更新均为 0；未创建真实 cohort、预算或注册；`factor_selected=false`、`auto_execute=false`、最终交互 `not_ready`、生产接入 false。原 5 项限制按原语义保留，未通过放宽容差、删负门或换输入取得通过。真实审计仍为 `draft / not_registered / not_authorized / not_run`，下一交付须按草案 §8 取得授权。
