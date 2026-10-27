@@ -944,6 +944,44 @@ def test_prior_call_counts_are_cohort_wide_and_fail_closed(tmp_path: Path):
     assert audit.prior_call_counts(current, fixed_root=fixed, mode="real") is None
 
 
+def test_markerless_legacy_sibling_does_not_block_cohort_history(
+        tmp_path: Path):
+    fixed = tmp_path / "fixed"
+    fixed.mkdir()
+    current = fixed / "current_run"
+    audit.write_cohort(current, mode="real")
+
+    # A pre-cohort study in the shared history root has no cohort.json and a
+    # bare-list costs.json.  It cannot belong to this cohort (write_cohort
+    # precedes every registered attempt), so it must be skipped.
+    legacy = fixed / "legacy_run"
+    legacy.mkdir()
+    (legacy / "costs.json").write_text(json.dumps([
+        {"stage": "register", "status": "done", "complete": True,
+         "wall_s": 4.0},
+    ]))
+    assert audit.prior_call_counts(
+        current, fixed_root=fixed, mode="real") == {
+            kind: 0 for kind in audit.CALL_CAPS}
+    history = audit.cohort_history(fixed, exclude_root=current)
+    assert history["known"] is True
+    assert history["runs"] == []
+    assert audit.cohort_attempts(
+        fixed, "R0", exclude_root=current) == 0
+
+    # A sibling that does carry this cohort's marker is still strict: a
+    # malformed ledger is unknown history, never silently skipped.
+    marked = fixed / "marked_run"
+    audit.write_cohort(marked, mode="real")
+    (marked / "costs.json").write_text("[]")
+    assert audit.prior_call_counts(
+        current, fixed_root=fixed, mode="real") is None
+    assert audit.cohort_history(
+        fixed, exclude_root=current)["known"] is False
+    assert audit.cohort_attempts(
+        fixed, "R0", exclude_root=current) is None
+
+
 def test_negative_costs_are_refused_by_both_entries(tmp_path: Path):
     root = tmp_path / "negative_cost"
     sealed = _seal_stage(root, "R0", "attempt_001")

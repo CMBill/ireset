@@ -666,10 +666,21 @@ def cohort_history(fixed_root: Path, *, exclude_root: Path | None = None,
             except (OSError, ValueError):
                 return {"known": False, "reason": f"unreadable_cohort:{sibling.name}",
                         "runs": runs}
+            if not isinstance(marker, dict):
+                return {"known": False, "reason": f"unreadable_cohort:{sibling.name}",
+                        "runs": runs}
         try:
             index = load_index(sibling)
             ledger = load_ledger(sibling)
         except (OSError, ValueError, TypeError):
+            if not marker:
+                # A legacy sibling from another study has no cohort marker and
+                # its own ledger schema.  It cannot be attributed to this
+                # cohort: a registered run writes cohort.json before any
+                # attempt.  Skip it instead of making this cohort's history
+                # unknown; a marked run with a broken ledger still fails
+                # closed below.
+                continue
             return {"known": False, "reason": f"unreadable_ledger:{sibling.name}",
                     "runs": runs}
         matching_marker = marker.get("cohort_id") == COHORT_ID
@@ -709,11 +720,21 @@ def cohort_attempts(fixed_root: Path, stage: str, *,
     for sibling in _cohort_roots(fixed_root):
         if exclude_root is not None and sibling.resolve() == Path(exclude_root).resolve():
             continue
+        marker_path = sibling / "cohort.json"
         try:
-            marker = read_json(sibling / "cohort.json") if (sibling / "cohort.json").is_file() else {}
+            marker = read_json(marker_path) if marker_path.is_file() else {}
+        except (OSError, ValueError, TypeError):
+            return None
+        if not isinstance(marker, dict):
+            return None
+        try:
             index = load_index(sibling)
             ledger = load_ledger(sibling)
         except (OSError, ValueError, TypeError):
+            if not marker:
+                # Markerless legacy run from another study: not attributable
+                # to this cohort.  A marked run still fails closed.
+                continue
             return None
         matching = (marker.get("cohort_id") == COHORT_ID
                     or any(r.get("cohort_id") == COHORT_ID for r in (*index, *ledger)))
@@ -770,9 +791,19 @@ def prior_call_counts(root: Path, *, fixed_root: Path,
             marker_path = sibling / "cohort.json"
             try:
                 marker = read_json(marker_path) if marker_path.is_file() else {}
+            except (OSError, ValueError, TypeError):
+                return None
+            if not isinstance(marker, Mapping):
+                return None
+            try:
                 index = load_index(sibling)
                 ledger = load_ledger(sibling)
             except (OSError, ValueError, TypeError):
+                if not marker:
+                    # Markerless legacy run from another study: not
+                    # attributable to this cohort.  A marked run still fails
+                    # closed.
+                    continue
                 return None
             matching = (isinstance(marker, Mapping)
                         and marker.get("cohort_id") == COHORT_ID)
