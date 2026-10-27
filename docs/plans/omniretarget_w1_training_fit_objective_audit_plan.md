@@ -6,7 +6,7 @@
 | --- | --- |
 | `static_code_review` | complete：完成下文列明的源代码与配置核对；不代表运行行为通过 |
 | `audit_implementation` / `synthetic_audit` | **complete / complete**（2026-10-22）：审计模块、CLI、33 项测试与权威合成运行完成；A4 已加入 `(demo, start, t)` 注册多重集，A5 独立重算键级多重集、逐键明细及冻结反例语义；结论仅 `synthetic_contract_passed`（合成适用域），不升级真实结论 |
-| `current_source_evidence` | **pending_refresh**（2026-10-27）：后续 `losses.py` observer 改动使当前源码对历史 `attempt_003` 的只读 A5 报身份漂移；按[证据更新计划](omniretarget_w1_training_objective_audit_refresh_plan.md)新建合成证据后再验收当前版本，历史完成记录保留 |
+| `current_source_evidence` | **complete**（2026-10-27）：当前源码已由 `attempt_004` 重新验收，生产侧与独立复核均为 `synthetic_contract_passed`，只读 A5 `problems=[]`、无身份漂移；详见[§8 当前源码重新验收](#8-当前源码重新验收2026-10-27)。`attempt_003` 保留为历史版本证据 |
 | `execution_registration` / `cohort` | not_created / not_assigned |
 | `real_data_audit` / `single_factor_experiment` | not_run / not_registered |
 | 本次新增真实数据训练更新 / 生产模型调用 | 0 / 0（A3 仅合成替身/微型模块） |
