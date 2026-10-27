@@ -979,8 +979,14 @@ def _p_budget_exhausted(p: Mapping[str, Any], seal: SealResult) -> str | None:
 
 
 def _persist_row_entry(root: Path, stage: str, attempt: str,
-                       row: Mapping[str, Any]) -> list[str]:
-    """Persist an updated row in place to both the index and the ledger."""
+                       row: Mapping[str, Any], *,
+                       timings: list[float] | None = None) -> list[str]:
+    """Persist an updated row in place to both the index and the ledger.
+
+    ``timings`` receives the duration of each write individually.  A caller
+    that derives a seal reserve from observed write latency must see the
+    index/ledger writes too, not only the summary rewrite.
+    """
     problems: list[str] = []
     measured = row.get("measured_wall_s")
     if not _nonneg(measured):
@@ -996,16 +1002,24 @@ def _persist_row_entry(root: Path, stage: str, attempt: str,
                        "measured_wall_s", "wall_s")
     }
     payload["complete"] = complete
+    start = time.perf_counter()
     try:
         upsert_index(root, stage, attempt, {
             **payload, "status": status, "measured_wall_s": float(measured)})
     except (OSError, ValueError, TypeError) as exc:
         problems.append(f"row_index_write_failed:{type(exc).__name__}")
+    finally:
+        if timings is not None:
+            timings.append(time.perf_counter() - start)
+    start = time.perf_counter()
     try:
         upsert_cost(root, stage, attempt, float(measured),
                     {**payload, "cohort_id": COHORT_ID}, status)
     except (OSError, ValueError, TypeError) as exc:
         problems.append(f"row_ledger_write_failed:{type(exc).__name__}")
+    finally:
+        if timings is not None:
+            timings.append(time.perf_counter() - start)
     return problems
 
 
@@ -1093,7 +1107,15 @@ def _withdraw_pass_claim(root: Path, stage: str, attempt: str,
                "seal_tail_reserve_s": float(tail)}
         if reason_override is not None:
             out["incomplete_reason"] = reason_override
-        problems += _persist_row_entry(root, stage, attempt, out)
+        start = time.perf_counter()
+        try:
+            problems += _persist_row_entry(
+                root, stage, attempt, out, timings=writes)
+        finally:
+            # The reserve must cover the index/ledger writes as well as the
+            # summary rewrite; keep the whole call's latency too so a wrapped
+            # or slow persistence is observed rather than under-estimated.
+            writes.append(time.perf_counter() - start)
         return out
 
     def unverifiable(target_status: str = "publishing") -> dict:
@@ -1117,20 +1139,36 @@ def _withdraw_pass_claim(root: Path, stage: str, attempt: str,
                 updated.update(status="publishing", complete=False,
                                incomplete_reason=(
                                    f"{reason}:withdraw_cost_unverifiable"))
-                problems += _persist_row_entry(root, stage, attempt, updated)
+                problems += _persist_row_entry(
+                    root, stage, attempt, updated, timings=writes)
             return updated, problems, summary
     else:
         cost = base_cost
-    updated = persist(status, cost, tail)
+    # Provisional rows stay ``publishing`` until the recorded cost is proven
+    # to cover the writes that produced it.  Only then is the terminal row
+    # written, and that write is verified in turn.  A consumer therefore never
+    # reads a terminal row whose cost may be understated.
+    target_status = status
+    sealed = False
+    updated = persist("publishing", cost, tail)
     for _ in range(SEAL_VERIFY_ROUNDS):
         observed = elapsed()
         if observed <= float(updated.get("measured_wall_s", 0.0)):
-            break
+            if sealed:
+                break
+            tail = reserve()
+            if observed + tail >= remaining:
+                updated = unverifiable()
+                break
+            updated = persist(target_status, observed + tail, tail)
+            sealed = True
+            continue
+        sealed = False
         tail = reserve()
         if observed + tail >= remaining:
             updated = unverifiable()
             break
-        updated = persist(status, observed + tail, tail)
+        updated = persist("publishing", observed + tail, tail)
     else:
         updated = unverifiable()
     if problems:
@@ -1140,7 +1178,8 @@ def _withdraw_pass_claim(root: Path, stage: str, attempt: str,
                   else "revoke_verify_failed")
         updated.update(status="publishing", complete=False,
                        incomplete_reason=f"{reason}:{suffix}")
-        problems += _persist_row_entry(root, stage, attempt, updated)
+        problems += _persist_row_entry(
+            root, stage, attempt, updated, timings=writes)
     return updated, problems, summary
 
 
@@ -4216,6 +4255,13 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float, budget: dict,
             problems.append("identity_not_reproducible")
     except Exception as exc:  # noqa: BLE001
         gaps.append(f"identity_reverification_failed:{type(exc).__name__}:{exc}")
+        # Identity that cannot be verified is a hard replay gate: F may
+        # organise the existing evidence, but must not construct models or
+        # spend calls on an attempt it cannot bind to the registration.
+        if replay_enabled:
+            replay_stop_reason = "identity_unverifiable"
+            gaps.append(f"f_replay_identity_gate_failed:{type(exc).__name__}")
+            replay_enabled = False
     impl_now = implementation_identity(PROJECT_ROOT)
     impl_sha = sha256_bytes(json.dumps(
         _jsonable(impl_now), sort_keys=True, separators=(",", ":")).encode())
@@ -5001,7 +5047,23 @@ def run_registered_audit(run_root: Path, provider, *, mode: str,
         last_seal["F"]["row"] = updated_row
         last_seal["F"]["problems"] = (
             list(last_seal["F"].get("problems", [])) + revoke_problems)
-    if not seal.terminal and summary.get("conclusion") == pass_conclusion:
+    # A withdrawal may have replaced the terminal row with ``publishing`` when
+    # its extra cost could not be proven.  Derive terminality from the row a
+    # consumer can actually read; the pre-withdrawal seal is stale.
+    final_row = last_seal.get("F", {}).get("row") or seal.row
+    final_status = str(final_row.get("status") or "")
+    terminal_now = final_status in ("done", "crashed", "timeout", "incomplete")
+    if terminal_now:
+        _, post_consumer_problems = stage_state(run_root, "F")
+        post_gate = [p for p in post_consumer_problems
+                     if p != "attempt_not_complete"]
+        if post_gate:
+            terminal_now = False
+            summary["final_consumer_problems"] = post_consumer_problems
+    last_seal["F"]["terminal"] = bool(terminal_now)
+    last_seal["F"]["sealed"] = bool(
+        terminal_now and final_row.get("complete") is True)
+    if not terminal_now and summary.get("conclusion") == pass_conclusion:
         # Unknown history cannot carry a pass conclusion even if the summary
         # did not claim complete evidence.
         summary["conclusion"] = "audit_incomplete"
@@ -5014,7 +5076,7 @@ def run_registered_audit(run_root: Path, provider, *, mode: str,
     # A publishing/running leftover is unknown history: the producer's
     # measured mismatch may stay in the summary artifact, but the final
     # consumer conclusion is incomplete, never a confirmed negative result.
-    result_conclusion = ("audit_incomplete" if not seal.terminal
+    result_conclusion = ("audit_incomplete" if not terminal_now
                          else summary.get("conclusion", "audit_incomplete"))
     f["conclusion"] = result_conclusion
     return {

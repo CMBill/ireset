@@ -1242,6 +1242,123 @@ def test_withdrawal_without_affordable_coverage_stays_publishing(
     assert summary["complete_evidence"] is False
 
 
+def test_withdrawal_slow_persist_then_kill_stays_publishing_and_covered(
+        tmp_path: Path, monkeypatch):
+    """A second slow persistence that lands before termination must leave a
+    non-consumable publishing row whose cost still covers that write."""
+    root, t0, budget, report, seal = _withdraw_fixture(tmp_path)
+    original = audit._persist_row_entry
+    calls = {"n": 0, "landed": []}
+
+    def slow_persist(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            time.sleep(1.3)
+        out = original(*args, **kwargs)
+        calls["landed"].append(time.perf_counter() - t0)
+        if calls["n"] == 2:
+            raise KeyboardInterrupt("simulated termination after the write")
+        return out
+
+    monkeypatch.setattr(audit, "_persist_row_entry", slow_persist)
+    with pytest.raises(KeyboardInterrupt):
+        audit._withdraw_pass_claim(
+            root, "F", "attempt_001", report, seal.row, ["forced_consumer"],
+            reason="forced_consumer", t0=t0, budget=budget,
+            preserve_conclusion=False)
+    assert calls["n"] == 2, calls
+    landed = calls["landed"][-1]
+    row = [r for r in audit.load_index(root)
+           if r.get("stage") == "F" and r.get("attempt") == "attempt_001"][-1]
+    assert row["status"] == "publishing", row
+    assert row["complete"] is False
+    assert float(row["measured_wall_s"]) >= landed, (row, landed)
+    assert float(row["seal_tail_reserve_s"]) >= 1.0, row
+    assert audit.stage_history(root, "F") is None
+
+
+def test_f_identity_exception_blocks_model_replay(tmp_path: Path):
+    """Unverifiable identity is a replay gate, not only a recorded gap."""
+    calls = {"n": 0}
+
+    class FlakyIdentity(audit.SyntheticObjectiveProvider):
+        def verify_identity(self):
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                raise OSError("identity store unavailable")
+            return super().verify_identity()
+
+    run = tmp_path / "identity_exception"
+    result = audit.run_registered_audit(
+        run, FlakyIdentity(seed=20261026), mode="synthetic",
+        tolerance=audit.build_tolerance_contract())
+    f_summary = _load(_stage_files(run, "F") / "audit_summary.json")
+    assert f_summary["calls"]["counts"] == {
+        "conditioner": 2, "model": 2,
+        "production_vjp": 2, "independent_vjp": 2,
+    }, f_summary["calls"]
+    assert any("identity_reverification_failed" in g
+               for g in f_summary["gaps"]), f_summary["gaps"]
+    assert any("f_replay_identity_gate_failed" in g
+               for g in f_summary["gaps"]), f_summary["gaps"]
+    assert any("replay_skipped:deterministic:identity_unverifiable" in g
+               for g in f_summary["gaps"]), f_summary["gaps"]
+    assert result["conclusion"] == "audit_incomplete", result
+
+
+def test_f_negative_result_withdrawing_past_coverage_is_incomplete(
+        tmp_path: Path, monkeypatch):
+    """A negative conclusion survives withdrawal, but unknown sealing is
+    ``audit_incomplete`` rather than a confirmed mismatch."""
+    original_p = audit.run_p_stage
+    original_seal = audit.finish_attempt
+    original_withdraw = audit._withdraw_pass_claim
+
+    def tampering_p(*args, **kwargs):
+        out = original_p(*args, **kwargs)
+        path = Path(out["paths"]["arrays"])
+        arrays = dict(np.load(path, allow_pickle=False))
+        arrays["prediction_deterministic"] = (
+            arrays["prediction_deterministic"] + np.float32(0.1))
+        np.savez(path, **arrays)
+        return out
+
+    def forced_f_seal(root, stage, attempt, t0, budget, row, *,
+                      status="done", extra=None):
+        if stage == "F":
+            budget = {**budget, "remaining_s": 0.0}
+        return original_seal(root, stage, attempt, t0, budget, row,
+                             status=status, extra=extra)
+
+    def exhausted_withdraw(root, stage, attempt, report_path, row, gaps,
+                           **kwargs):
+        # The withdrawal writes are charged to the same attempt: model the
+        # remaining budget being consumed by them.
+        kwargs["budget"] = {**kwargs["budget"], "remaining_s": 0.0}
+        return original_withdraw(root, stage, attempt, report_path, row, gaps,
+                                 **kwargs)
+
+    monkeypatch.setattr(audit, "run_p_stage", tampering_p)
+    monkeypatch.setattr(audit, "finish_attempt", forced_f_seal)
+    monkeypatch.setattr(audit, "_withdraw_pass_claim", exhausted_withdraw)
+    run = tmp_path / "negative_withdraw_publishing"
+    result = audit.run_registered_audit(
+        run, audit.SyntheticObjectiveProvider(seed=20261026),
+        mode="synthetic", tolerance=audit.build_tolerance_contract())
+    row, problems = audit.stage_state(run, "F")
+    assert row is not None and row["status"] == "publishing", (row, problems)
+    assert result["conclusion"] == "audit_incomplete", result
+    assert result["seals"]["F"]["terminal"] is False, result["seals"]
+    assert result["seals"]["F"]["sealed"] is False, result["seals"]
+    summary = _load(_stage_files(run, "F") / "audit_summary.json")
+    # The measured mismatch is preserved in the evidence; only the
+    # completeness/pass claim is withdrawn.
+    assert summary["conclusion"] == "synthetic_pipeline_mismatch", summary
+    assert summary["complete_evidence"] is False
+    assert any("f_evidence_completeness_withdrawn" in g
+               for g in summary["gaps"]), summary["gaps"]
+
+
 def test_f_negative_result_seal_failure_withdraws_completeness_only(
         tmp_path: Path, monkeypatch):
     """A measured mismatch stays a mismatch, but cannot claim complete evidence."""
