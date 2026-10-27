@@ -3,6 +3,8 @@
 日期：2026-10-26，按静态复核意见修订。状态：**draft，not_registered，not_authorized，not_run**。父方案：[W1训练拟合与目标一致性单因素诊断执行方案](omniretarget_w1_training_fit_objective_audit_plan.md) §5。合成审计结果见[验证记录](../verification/omniretarget_w1_training_objective_audit_verification.md)。
 
 > 2026-10-26 实施补充：审计器、CLI 与 **54 项**合成/反例测试已实现。三轮独立复核共 **13 P1 + 5 P2** 已全部修复：首轮实际 VJP 计数、落盘梯度逐元素绑定、FK 点重算、跨 run 调用额度、RNG 恢复、合法负结果进入 F、校准证据重验、负成本、行字段/额外行、非数值数组；第二轮预算撤销的 P 不启动 F 新调用、F 每次重放前实时截止+收口预留、F 封口失败同步撤回磁盘完成声明并更新封口哈希、入口先证明完整链调用余额、F 嵌套 `units`/`unit_artifacts` 容器类型异常只记 gap 不中断；第三轮撤回写盘纳入同一 attempt 成本覆盖（无法证明覆盖保持 publishing）、admission/输入绑定/前置消费者状态作为重放硬门、负结果封口失败保留 mismatch 但撤回 `complete_evidence` 并重绑哈希。合成自测 `synthetic_contract_passed`（98 objective + 14 gradient 行、0失败/0缺口、conditioner/model/production VJP/independent VJP 各 4 次即上限内、contact 0、更新/FD/DDIM/checkpoint 写入 0）；真实 provider、真实 checkpoint/G1 FK、cohort/预算与执行注册仍未运行/未创建。详见[实现与合成自测验证记录](../verification/omniretarget_w1_real_objective_audit_verification.md)。本文件仍是待授权草案，实施完成不勾选 §8。
+>
+> **2026-10-27 准入材料补充：**第四轮复核 2 P1+1 P2 与 1 项成本下限回归已修复，测试增至 **58 项**；[可审阅准入包与冻结校准契约](omniretarget_w1_real_objective_audit_admission_package.md)已生成（校准契约 SHA `2904fbc4…`、证据 `49371d30…`、准入包 `attempt_003` SHA `2cc733d3…`）。§8 八项仍全部未勾选；真实执行仍为 `not_run`，未创建 cohort/预算/执行注册。
 
 > 本文件定义待授权的范围、登记与验收契约。本轮修改仅为文档工作，不创建执行注册、cohort、预算或运行目录。完成 §8 前，真实数据审计仍为 `not_run`，`factor_selected=false`、`auto_execute=false`、最终交互 `not_ready`。文中的预算与调用数均为提案，不是已获授权或已验证可完成的运行额度。
 
@@ -233,6 +235,8 @@ F 同时核对每窗→batch 关系、失败/缺口、覆盖状态、调用次�
 ## 8. 执行授权与准入清单
 
 以下全部满足才允许真实执行；文档修改不勾选这些事项：
+
+> 2026-10-27 状态：可审阅的[准入包与冻结校准契约](omniretarget_w1_real_objective_audit_admission_package.md)已生成；校准契约 SHA `2904fbc4…`、证据 `49371d30…`，准入包 `attempt_003` SHA `2cc733d3…`，无授权/模板探测均被拒绝且未创建运行目录。下列 8 项仍未勾选，真实执行仍为 `not_run`。
 
 - [ ] 用户明确授权本问题的真实资产加载、四窗前向与输出空间求导；更新、参数 FD 和 DDIM 仍为 0。
 - [ ] 用户确认新 cohort 与固定历史范围、旧拒收记录保留、阶段不互借与历史不重置。

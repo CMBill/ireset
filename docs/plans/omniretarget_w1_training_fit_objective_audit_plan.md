@@ -212,3 +212,9 @@ FK m² 与评估的 FK MPJPE m 在开方、归约上不同；不能把 `fk_m2` �
 - **新旧比较**：全部 JSON 数值（objective 2442 / gradient 687 / update 345 / sampling 92 / selection 285 / s0 7 / independent 12 / static 128 / summary 306）与三个 NPZ（22/10/164 个数组）**逐位相等**；只有 `static_contract.json` 与 `audit_summary.json` 的 git 身份字段和 `losses.py` SHA-256 不同，其余 11 份工件字节相同。
 - **测试**：按本轮身份补跑两文件，`tests/test_w1_training_objective_audit.py` **33 passed（32.79s）**、`tests/test_w1_real_objective_audit.py` **58 passed（27.69s）**；全项目套件未重跑。
 - **保护与边界**：356 个旧证据文件执行前后逐字节一致，父审计目录新增仅 `attempt_004/` 的 82 个文件；冻结草案与更新计划本身未变，本节为父方案的唯一追加（11 行新增、0 删除）。`source=synthetic_only`；真实资产/数据/checkpoint/生产模型计算与真实数据训练更新仍为 0；未创建 cohort/预算/注册；`factor_selected=false`、`auto_execute=false`、最终交互 `not_ready`、生产接入 false。§5 的真实审计门与授权要求不变。
+
+## 9. 真实审计准入材料（2026-10-27）
+
+可审阅的[真实审计准入包与冻结校准契约](omniretarget_w1_real_objective_audit_admission_package.md)已生成：校准契约 SHA-256 `2904fbc4…`、证据 `49371d30…`；准入包 `derived/audit/w1_real_objective_audit/admission/attempt_003/` SHA-256 `2cc733d3…`，候选四窗、t/noise、98/14 行集、cohort/预算/调用上限与 §8 逐项状态均已列明。准入包只读元数据，`torch.load`、模型/VJP 调用为 0；无授权与 `authorized=false` 模板探测均 exit 1 且未创建运行目录。
+
+草案 §8 八项仍未勾选，真实 dataset/cache/checkpoint、真实前向/反向与真实数据更新为 0，未创建 cohort/预算/执行注册。§5 的真实审计门与 §6 的下一道门不变；授权后仍须按 R0→P→F 重新核验身份、四窗键、资产闭包、配置、实现快照、环境与 schema，R0 封口通过后才允许 P。
