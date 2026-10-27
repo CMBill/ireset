@@ -1,24 +1,28 @@
 # W1 真实训练目标审计准入包与冻结校准契约
 
-日期：2026-10-27（P2 授权严格化后更新）。状态：**准入包已生成、合成校准契约已冻结；未授权、未注册、未运行**。上级草案：[W1 真实训练目标审计预注册草案](omniretarget_w1_real_objective_audit_prereg_draft.md) §8。实现与合成自测见[验证记录](../verification/omniretarget_w1_real_objective_audit_verification.md)。
+日期：2026-10-27（P2 授权严格化后更新；同日用户授权并完成真实 R0→P→F）。状态：**准入包已生成、合成校准契约已冻结；真实四窗审计已执行一次并通过（覆盖范围 partial）**。上级草案：[W1 真实训练目标审计预注册草案](omniretarget_w1_real_objective_audit_prereg_draft.md) §8。实现与合成自测见[验证记录](../verification/omniretarget_w1_real_objective_audit_verification.md)；真实结果见[审计报告](../verification/omniretarget_w1_real_objective_audit_report.md)与验证记录 §15。
 
-> 本文件是供用户审阅的**准入材料**，不是执行授权。草案 §8 的八项检查全部未勾选；真实 dataset/cache/checkpoint 未加载，真实模型前向/反向、真实 G1 FK 与真实数据更新均为 0；未创建 cohort、预算或执行注册。真实审计仍为 `not_run`。
+> 本文件仍是**准入材料**，不是执行授权；实际授权记录为 `derived/audit/w1_real_objective_audit/authorization/attempt_002/authorization.json`（SHA `1071810f…`）。用户授权后只执行了 R0→P→F 一次：R0/P/F 全封口 `done/complete=true`，结论 `real_batch_covered_contract_passed`，`problems=[]`、`gaps=[]`。更新、参数 FD、DDIM、checkpoint 写入、修复与生产接入仍为 0；`objective_coverage=partial`、`full_objective_contract_passed=null`、最终交互 `not_ready`。
 
 ## 1. 交付物与执行身份
 
 | 项目 | 值 |
 | --- | --- |
-| 代码身份 | HEAD `5d022cafe4cb0e958e26c72fbbaf8a7afef02438`；P2 轮开始时工作树 clean，随后修改审计模块/准入模块/测试三个文件并同步文档（逐文件 before/after 哈希见执行记录 `identity.json.final_status`） |
+| 代码身份 | P2 时期 HEAD `5d022cafe4cb0e958e26c72fbbaf8a7afef02438`；真实执行 HEAD `b45cd7c654c2a2bb23d86fd76050f9ad651a7e67`（clean） |
 | 环境 | Python 3.12.13；`uv.lock` `f809284e…`；torch 2.14.0+cu126；CUDA runtime 12.6；RTX 3090 |
 | 训练配置 | `configs/train/omniretarget_motion.yaml` `0e2cfa96849ee2de14ac84b7343289090c606f78116bb79114ff81b046b521e0` |
 | 冻结校准契约 | `derived/audit/w1_real_objective_audit/tolerance_contract.json`，文件 SHA-256 `2904fbc41113ba379cee2e4de4704befcac3ae8bb69c3178bcf141e48fd38eb3` |
 | 校准证据 | `evidence_sha256=49371d30a0a03679a1352e32db4b9751cd4988d92359bd6fc63324ee8995852d` |
-| 准入包 | `derived/audit/w1_real_objective_audit/admission/attempt_004/admission_package.json`，SHA-256 `1cedbb159b8bd1892c010e8b6038e384d53452bc435dc94658c6d08a0ee48193` |
-| 包索引 | `.../admission/attempt_004/package_index.json`，SHA-256 `ca1e5fd09b7df378332b1928fb6a38f35c3cd1379b7c81c7390742ff3691ec55` |
+| 当前准入包 | `derived/audit/w1_real_objective_audit/admission/attempt_005/admission_package.json`，SHA-256 `1aadb296f1a94cd4bd39c654661712a6c46670fca0211ecf4a9b4452d86e45b8` |
+| 包索引 | `.../admission/attempt_005/package_index.json`，SHA-256 `bdedc33c5b13668e840179890978860d3815ef89e700674f19356108e3513192` |
+| 执行授权 | `derived/audit/w1_real_objective_audit/authorization/attempt_002/authorization.json`，SHA-256 `1071810f96325acd4a20d77395b7461864a8102f0268b10153c7e52908dcdfcb`；11 项 checklist 全 true、预算 180/360/360s、各 2 次、计数整数 0；`deterministic_algorithms=false` 显式冻结 |
+| 真实运行 | `derived/experiments/omniretarget_first/20261027_b45cd7c_w1_real_objective_audit`；R0/P/F attempt_001 全 `done/complete=true`；结论 `real_batch_covered_contract_passed`，`problems=[]`、`gaps=[]`；总成本 7.5015s/900s |
 | 执行记录 | `derived/audit/w1_real_objective_admission/20261027T113741Z_5d022ca_p2/`（P2）；`.../20261027T080142Z_ed143bc/` 为首轮准入包记录，保留 |
-| 新增代码 | [w1_real_admission.py](../../src/ireset/eval/w1_real_admission.py)、[w1_real_objective_admission.py](../../scripts/w1_real_objective_admission.py)、[test_w1_real_admission.py](../../tests/test_w1_real_admission.py)；P2 另修改 [w1_real_objective_audit.py](../../src/ireset/eval/w1_real_objective_audit.py) 与 [test_w1_real_objective_audit.py](../../tests/test_w1_real_objective_audit.py) |
+| 新增代码 | [w1_real_admission.py](../../src/ireset/eval/w1_real_admission.py)、[w1_real_objective_admission.py](../../scripts/w1_real_objective_admission.py)、[test_w1_real_admission.py](../../tests/test_w1_real_admission.py)；P2/执行前另修改 [w1_real_objective_audit.py](../../src/ireset/eval/w1_real_objective_audit.py) 与 [test_w1_real_objective_audit.py](../../tests/test_w1_real_objective_audit.py) |
 
-`attempt_001`（SHA `7b709112…`，未含审阅注意事项）、`attempt_002`（SHA `6d98a6cc…`，未绑定生成器）与 `attempt_003`（SHA `2cc733d3…`，P2 前）保留为被取代证据；`attempt_004` 为当前准入包。包内 `generator.files` 绑定生成器三个文件的 SHA-256（`d5486b3c…`、`299904ba…`、`bde54657…`）与校准契约 SHA；`implementation` 绑定 losses `04b74a45…`、审计模块 `ccd96bfc…`、真实 CLI `6fa25848…`、59 项测试 `2ae792e7…`。P2 只收紧授权门（schema、三个计数、预算/次数类型与阶段集），不触审计数值路径：合成 `attempt_016` 仍为 `synthetic_contract_passed`，98/14 行、调用 4/4/4/4，两份 NPZ 与 `attempt_015` 逐位相同。
+`attempt_001`（SHA `7b709112…`，未含审阅注意事项）、`attempt_002`（SHA `6d98a6cc…`，未绑定生成器）、`attempt_003`（SHA `2cc733d3…`，P2 前）与 `attempt_004`（SHA `1cedbb15…`，P2 后、执行前）保留为被取代证据；`attempt_005` 为当前准入包。包内 `generator.files` 绑定生成器三个文件的 SHA-256（`d5486b3c…`、`299904ba…`、`bde54657…`）与校准契约 SHA；`implementation` 绑定 losses `04b74a45…`、审计模块 `4a2c2172…`、真实 CLI `6fa25848…`、60 项审计测试 `5646f0bb…`。P2 只收紧授权门（schema、三个计数、预算/次数类型与阶段集），不触审计数值路径：合成 `attempt_016` 仍为 `synthetic_contract_passed`，98/14 行、调用 4/4/4/4，两份 NPZ 与 `attempt_015` 逐位相同。
+
+执行前修复提交 `b45cd7c`：无 `cohort.json` 且不可解析的旧历史目录不再使 cohort 历史变为未知；带本 cohort 标记的损坏台账仍 fail-closed。修复只影响 cohort 历史扫描，不改变目标/梯度/容差/窗口/预算语义。拒绝发生在建立 cohort 之前，无 attempt/计费/真实值/checkpoint/模型调用；修复后重新生成 `attempt_005` 并重发授权 `attempt_002`（范围与预算不变）。
 
 生成命令：
 
@@ -103,7 +107,7 @@ uv run --locked python scripts/w1_real_objective_admission.py \
 两条审阅注意事项已写入包内：
 
 - **同一受试者**：按冻结字典序，前两个合格 demo 均属 `sub10`。本审计只声明四窗上的实现符合性，不声明跨受试者覆盖；不得在看到数值后换 demo 或窗口。
-- **确定性设置**：当前 `torch.are_deterministic_algorithms_enabled()` 为 `false`。R0 必须记录实际设置；F 要求生产梯度逐位重放，若真实 CUDA 无法复现，F 登记 mismatch 而不是放宽阈值。是否在授权前显式开启确定性算法，应由用户在授权时明确，不能由执行方静默改变。
+- **确定性设置**：`torch.are_deterministic_algorithms_enabled()` 在冻结与执行时均为 `false`，授权记录显式固定该值，未在运行前静默开启。R0 记录实际设置（`tf32=false`、`autocast=false`）；F 要求生产梯度逐位重放，若真实 CUDA 无法复现则登记 mismatch 而不放宽。本次四窗上两模型 prediction/x_t/FK 点/分项/production 梯度均逐位复现，但该事实不外推为其他形状/算子/环境的确定性保证。
 
 窗口键在包内标记为 `candidate_pending_R0_registration`；R0 必须在读取窗口数值前重新推导并封存 `(demo,start,end,T,cache_key,split,input_sha)`。任一键缺失或窗口不合法即保留 gap，不静默替换。
 
@@ -173,29 +177,33 @@ uv run --locked python scripts/w1_real_objective_admission.py \
 
 R0 调用为 0。历史扫描根固定为 `derived/experiments/omniretarget_first/`，运行根必须是其直接子目录；同 cohort 全部 attempt 累计，阶段不互借，方案/实现/run 名变化不重置。已花额度、剩余额度、截止与调用余额写入事前登记；历史未知、额度不足或预留不足即停止，不启动实质工作。旧预测/融合历史只作引用，不转入余额。
 
+2026-10-27 实际执行（每阶段仅 attempt_001）：R0 **3.1723s**/180、P **2.4054s**/360、F **1.9237s**/360，合计 **7.5015s**/900；调用 conditioner/model/production VJP/independent VJP 各 **4/4/4/4**；索引/台账各 3 行、全部 `done/complete=true`，无 running/publishing 残留。无第二次尝试。
+
 ## 6. 草案 §8 逐项状态
 
-| # | §8 事项 | 当前状态 | 证据/缺口 |
+| # | §8 事项 | 当前状态 | 证据 |
 | ---: | --- | --- | --- |
-| 1 | 用户授权真实资产加载、四窗前向与输出空间求导；更新/FD/DDIM 仍 0 | **待用户授权** | 本文件不构成授权 |
-| 2 | 用户确认新 cohort、固定历史、旧拒收保留、阶段不互借、历史不重置 | **待用户确认** | 包内已冻结 cohort/根/预算语义；未创建 `cohort.json` |
-| 3 | 用户确认 180/360/360s、每阶段 2 次、收口预留、4 次完整前向与 8 次求导 | **待用户确认** | 包内 `cohort`/`call_matrix` 与草案一致 |
-| 4 | 真实工作前的登记/封口/消费者/父 unit 准入已实现并通过沙箱反例 | **工程项已完成** | 58 项测试覆盖 publishing/seal/预算/调用额度/父 unit 准入；真实路径未运行 |
-| 5 | 生产取证适配与独立参考合成对拍；batched VJP、计数、图保真已验证 | **工程项已完成** | 58 项测试含 observer 逐位透明、实际 VJP 计数、落盘梯度逐元素绑定；真实模型未运行 |
-| 6 | 数值域、梯度及标量逐字段容差完成纯合成校准并冻结 | **本轮完成** | 契约 SHA `2904fbc4…`、证据 `49371d30…`、独立核验通过 |
-| 7 | R0 登记下核验身份、四窗完整键、t/noise、配置、实现快照、环境与 schema；R0 封口后才启动 P | **未执行** | 准入包列出全部待核验对象；R0 代码已实现并有测试 |
-| 8 | 独立复核按 raw 键集、输入、梯度、调用与全阶段历史验收；整体 partial、最终交互 not_ready | **未执行** | F 代码已实现并有测试；真实 raw 尚不存在 |
+| 1 | 用户授权真实资产加载、四窗前向与输出空间求导；更新/FD/DDIM 仍 0 | **已完成** | 授权记录 `1071810f…`；三个计数器整数 0；运行未产生更新/FD/DDIM |
+| 2 | 用户确认新 cohort、固定历史、旧拒收保留、阶段不互借、历史不重置 | **已完成** | `cohort.json` SHA `dc904ab8…`；历史根固定；旧融合/预测记录只作引用 |
+| 3 | 用户确认 180/360/360s、每阶段 2 次、收口预留、4 次完整前向与 8 次求导 | **已完成** | 授权预算精确；实际 3.1723/2.4054/1.9237s，各 1 次尝试，调用各 4 |
+| 4 | 真实工作前的登记/封口/消费者/父 unit 准入已实现并通过沙箱反例 | **已完成** | `b45cd7c` 后 68 项 audit+admission 测试通过；真实路径 R0/P/F 封口通过 |
+| 5 | 生产取证适配与独立参考合成对拍；batched VJP、计数、图保真已验证 | **已完成** | observer 逐位透明、四类调用各 4、落盘梯度逐元素绑定；真实两模型重放逐位 |
+| 6 | 数值域、梯度及标量逐字段容差完成纯合成校准并冻结 | **已完成** | 契约 SHA `2904fbc4…`、证据 `49371d30…`、独立核验通过；无阈值被抬高 |
+| 7 | R0 登记下核验身份、四窗完整键、t/noise、配置、实现快照、环境与 schema；R0 封口后才启动 P | **已完成** | R0 `done/complete=true`；identity/admission 全过；四窗/包候选逐字段；checkpoint strict load 通过 |
+| 8 | 独立复核按 raw 键集、输入、梯度、调用与全阶段历史验收；整体 partial、最终交互 not_ready | **已完成** | F `done/complete=true`；98/14 行无缺/多/重；两模型逐位重放；`problems=[]/gaps=[]` |
 
-**八项检查全部未勾选。** 第 4–6 项是真实执行前的工程前提，不等于执行授权；第 1–3 项只能由用户明确确认；第 7–8 项只有在授权后的 R0→P→F 中才能产生证据。
+**八项均已完成并产生真实证据。** 覆盖范围仍为 `objective_coverage=partial`：真实 FK 几何/导数、参数梯度、累积/裁剪/AdamW/更新、选模和 DDIM 仍未审计；`full_objective_contract_passed=null`、`attribution=attribution_insufficient`、最终交互 `not_ready`。
 
 ## 7. 授权门与执行顺序
 
-### 7.1 当前拒绝证据
+### 7.1 授权前拒绝证据与授权后结果
 
 | 探测 | 命令 | 结果 |
 | --- | --- | --- |
 | 无授权 | `--real --out .../w1_real_objective_audit_unauthorized_probe --tolerance-contract ...` | **exit 1**：`--real requires --authorization (section 8 is not checked)`；探测目录未创建 |
 | 模板（`authorized=false`） | 同上，附 `--authorization .../authorization_request_template.json` | **exit 1**：`not_authorized` 与 11 项 `authorization_checklist:*`；探测目录未创建 |
+
+2026-10-27 用户授权后，`authorization/attempt_002/authorization.json`（SHA `1071810f…`）通过上述严格门；真实入口 exit 0，R0/P/F 全封口，结论 `real_batch_covered_contract_passed`。第一次入口在建立 cohort 前被无标记旧目录的未知历史拒绝，修复提交 `b45cd7c` 后重发授权；拒绝时无 cohort/attempt/计费/真实值/模型调用。
 
 授权记录模板已保存为 P2 执行记录中的 `authorization_request_template.json`（SHA-256 `2e4aabbc…`；首轮模板 `d11ae079…` 保留为历史），其 `authorized=false`、`template_only=true`，不能作为授权使用。有效授权记录必须满足 `authorization_problems` 的严格契约：
 
@@ -207,19 +215,20 @@ R0 调用为 0。历史扫描根固定为 `derived/experiments/omniretarget_firs
 
 记录本身的 SHA-256 会写入 cohort 与注册。P2 新增的严格性测试覆盖 **28 类变异**（2 schema、14 计数、5 预算秒、5 次数、2 阶段集），并保留“整数秒 `180` 合法”的正向用例。
 
-### 7.2 授权后的执行顺序
+### 7.2 已执行的顺序（2026-10-27）
 
-1. 用户创建并冻结授权记录；执行方核对其字段与 SHA，不再修改预算或矩阵。
-2. `uv run --locked python scripts/audit_w1_real_objective.py --real --out derived/experiments/omniretarget_first/<run> --authorization <record> --tolerance-contract <contract>`。
-3. **R0**：先写 running/complete=false 索引与台账，再核验全部固定身份与资产闭包，重新推导并封存四窗键、t/noise、配置、实现快照、环境与数组/梯度 schema；加载四窗并执行准入。R0 封口通过后才允许 P。
-4. **P**：同一 active attempt 内完成两模型各一次真实 conditioner→model 前向与生产/独立 batched VJP，保存 raw 数组、行、调用与 RNG 事实；首个确认 mismatch 后停止新 unit。
-5. **F**：独立 strict 加载、恢复 RNG、按注册重放、从 raw 重推行集与梯度、核对调用与全阶段历史、封口；失败/缺口/预算撤销/未知历史均不可消费。
-6. 出口：`real_batch_covered_contract_passed`（exit 0）、`real_batch_objective_mismatch`（exit 2）或 `audit_incomplete`（exit 3）。任何结果都保持 `objective_coverage=partial`、`attribution=attribution_insufficient`、最终交互 `not_ready`、生产接入 false。
+1. 用户授权并冻结授权记录；执行方核对字段与 SHA，未修改预算或矩阵。
+2. `uv run --locked python scripts/audit_w1_real_objective.py --real --out derived/experiments/omniretarget_first/20261027_b45cd7c_w1_real_objective_audit --authorization derived/audit/w1_real_objective_audit/authorization/attempt_002/authorization.json --tolerance-contract derived/audit/w1_real_objective_audit/tolerance_contract.json --device cuda`。
+3. **R0**：先写 running/complete=false 索引与台账，再核验全部固定身份与资产闭包，重新推导并封存四窗键、t/noise、配置、实现快照、环境与数组/梯度 schema；加载四窗并执行准入。R0 封口 `done/complete=true` 后才启动 P。
+4. **P**：两模型各一次真实 conditioner→model 前向与生产/独立 batched VJP，保存 raw 数组、行、调用与 RNG 事实；无 mismatch，未触发停止。
+5. **F**：独立 strict 加载、恢复 RNG、按注册重放、从 raw 重推行集与梯度、核对调用与全阶段历史、封口；两模型逐位重放成功。
+6. 出口：`real_batch_covered_contract_passed`（exit 0）。`objective_coverage=partial`、`attribution=attribution_insufficient`、最终交互 `not_ready`、生产接入 false。
 
 ## 8. 边界与下一交付
 
-- 本轮只生成准入包与冻结校准契约；未授权、未注册、未创建 cohort/预算，真实资产/checkpoint/模型调用为 0。
-- 准入包 `passed=true` 只表示所列元数据与文件哈希当前一致、候选窗口可按冻结规则推导；不表示四窗数值有效、checkpoint 可加载或目标实现正确。
-- 同一受试者与 `deterministic_algorithms=false` 已作为审阅注意事项写入包内；执行方不得在看到真实数值后更换窗口、t/noise、权重或容差。
-- 下一交付取决于用户是否授权：授权后按 §7.2 完成 R0→P→F；不授权则本包保持只读，草案继续 `draft / not_registered / not_authorized / not_run`。
+- 2026-10-27 已按用户授权完成真实 R0→P→F 一次：R0/P/F 全封口 `done/complete=true`，结论 `real_batch_covered_contract_passed`，98/98 objective、14/14 gradient、`problems=[]`、`gaps=[]`。
+- 覆盖范围仍是 partial：真实 FK 几何/导数、参数梯度、累积/裁剪/AdamW/更新、选模、DDIM 采样与端到端质量**未审计**；`full_objective_contract_passed=null`、`attribution=attribution_insufficient`、最终交互 `not_ready`、生产接入 false。
+- 同一受试者（两个 demo 均属 `sub10`）与 `deterministic_algorithms=false` 的边界保留；执行时未更换窗口、t/noise、权重或容差。本次逐位重放成功，但不构成其他形状/算子/环境的确定性保证。
+- 覆盖范围内未观察到目标偏离，因此**不触发**单因素诊断；若下一问题是端到端失败归因，应先另立方案扩展真实 FK/参数梯度/更新/DDIM 覆盖，再决定干预。任何干预仍须新预注册，不自动续训、改教师、扩数据或接入生产。
+- 真实报告：[W1 真实批次目标与输出空间梯度审计报告](../verification/omniretarget_w1_real_objective_audit_report.md)；执行记录与只读 post-check 见 `derived/audit/w1_real_objective_audit/authorization/attempt_002/`。
 - `factor_selected=false`、`auto_execute=false`、`final_interaction_method=not_ready`、`production_integration=false` 不变。

@@ -1,6 +1,6 @@
 # W1 真实训练目标审计实现与合成自测验证记录
 
-日期：2026-10-26（初版实现与合成自测；同日完成三轮独立复核修复：首轮 8 P1 + 2 P2，第二轮 3 P1 + 2 P2，第三轮 2 P1 + 1 P2；2026-10-27 完成第四轮 2 P1 + 1 P2，并在复核后修复 1 项 P2 成本下限回归；同日增补准入包与冻结校准契约，§13；P2 授权严格化 §14）。对应草案：[W1 真实训练目标审计预注册草案](../plans/omniretarget_w1_real_objective_audit_prereg_draft.md)。**本记录的前 12 节是实现与纯合成自测，第 13–14 节是准入材料与 P2 授权严格化；均不是真实数据审计、预注册执行或训练更新。** 草案仍为 `draft / not_registered / not_authorized / not_run`；`factor_selected=false`、`auto_execute=false`、最终交互 `not_ready`、生产接入 `false`。
+日期：2026-10-26（初版实现与合成自测；同日完成三轮独立复核修复：首轮 8 P1 + 2 P2，第二轮 3 P1 + 2 P2，第三轮 2 P1 + 1 P2；2026-10-27 完成第四轮 2 P1 + 1 P2，并在复核后修复 1 项 P2 成本下限回归；同日增补准入包与冻结校准契约，§13；P2 授权严格化 §14；用户授权后完成真实 R0→P→F，§15）。对应草案：[W1 真实训练目标审计预注册草案](../plans/omniretarget_w1_real_objective_audit_prereg_draft.md)。**本记录的前 12 节是实现与纯合成自测，第 13–14 节是准入材料与 P2 授权严格化，均不是真实数据审计；第 15 节是 2026-10-27 用户明确授权后的真实四窗执行，结论仅覆盖 partial 目标契约。** 真实报告见[W1 真实批次目标与输出空间梯度审计报告](omniretarget_w1_real_objective_audit_report.md)；`factor_selected=false`、`auto_execute=false`、最终交互 `not_ready`、生产接入 `false` 不变。
 
 ## 0. 结论与边界
 
@@ -15,8 +15,8 @@
 | 调用计数 | conditioner **4**、model **4**、production VJP **4**、independent VJP **4**（均达到上限且不超） |
 | 接触监督分支 | 执行 **0** 次（`w_contact=0`） |
 | 训练更新 / 参数 FD / DDIM / checkpoint 写入 | **0 / 0 / 0 / 0** |
-| 真实 dataset/cache/checkpoint/G1 FK | **未加载 / 未加载 / 未加载 / not_run** |
-| 新 cohort / 预算 / 执行注册 | **未创建** |
+| 真实 dataset/cache/checkpoint/G1 FK（本节合成记录时） | **未加载 / 未加载 / 未加载 / not_run**；真实执行见 §15：资产与 checkpoint 已加载、真实前向/梯度已完成，FK 仅审计到聚合 |
+| 新 cohort / 预算 / 执行注册（本节合成记录时） | **未创建**；真实执行见 §15：已创建并封口 |
 
 合成自测使用解析四窗、`_SyntheticConditioner`/`_SyntheticModel` 替身和 `SyntheticFK`；真实的 `LossAssembler`（含新增 observer）、`DiffusionG1`/`DDPMScheduler` 噪声路径和 batched VJP 被实际执行。真实 conditioner/backbone/checkpoint 的严格加载与四窗前向/求导仍未运行；因此本记录不构成真实数据行为、G1 FK 几何、参数梯度、累积/裁剪、AdamW 或选模证据。
 
@@ -238,3 +238,24 @@
 | 被取代 | `admission/attempt_003` 为 P2 前包，保留为历史证据 |
 
 边界不变：§8 八项未勾选；真实资产/checkpoint/模型前向反向/真实 G1 FK/真实数据更新为 0；未创建 cohort/预算/注册；`objective_coverage=partial`、`full_objective_contract_passed=null`、`attribution=attribution_insufficient`、`factor_selected=false`、`auto_execute=false`、最终交互 `not_ready`、生产接入 false。真实执行仍须用户明确授权后按 R0→P→F 进行。
+
+## 15. 真实 R0→P→F 执行（2026-10-27）
+
+用户明确授权后按草案 §8 执行一次完整真实链。详细报告见
+[W1 真实批次目标与输出空间梯度审计报告](omniretarget_w1_real_objective_audit_report.md)。
+
+| 项目 | 实际结果 |
+| --- | --- |
+| 授权 | `authorization/attempt_002/authorization.json`，SHA-256 `1071810f…`；11 项 checklist 全 true，预算 180/360/360s、每阶段 2 次、三个计数器为整数 0 |
+| 代码/包 | HEAD `b45cd7c` clean；准入包 `attempt_005` SHA `1aadb296…`；冻结契约 SHA `2904fbc4…` |
+| 运行根 | `derived/experiments/omniretarget_first/20261027_b45cd7c_w1_real_objective_audit` |
+| 结论 | `real_batch_covered_contract_passed`，exit 0，`problems=[]`、`failures=[]`、`gaps=[]`、`complete_evidence=true` |
+| R0 | identity/admission 全过；四窗、t/noise/alpha、配置、实现、环境、schema、checkpoint strict load 全部绑定；编码 max abs 5.7068e-8；R0 3.1723s |
+| P | 两模型各一次真实前向与 production/independent batched VJP；98/98 objective、14/14 gradient，全部 within_tolerance；contact 0；P 2.4054s |
+| 数值 | 生产 vs 独立最大 abs 1.0332e-9；含算术/对账 1.5134e-9；最大相对 1.2081e-7；梯度最大 abs 6.4061e-10、最大相对 1.6713e-7；最大 abs/limit 目标 7.29e-5、梯度 2.80e-5 |
+| F | fresh strict load + RNG 恢复；两模型 prediction/FK 点/分项/production 梯度逐位相等，diffusion `x_t` 亦逐位（deterministic 无 `x_t`）；independent 梯度绑定工件；重推 98/14 行多重集无缺/多/重；F 1.9237s |
+| 成本/调用 | 合计 **7.5015s/900s**；每阶段 1/2 次；调用 conditioner/model/production VJP/independent VJP 各 **4/4**；更新/FD/DDIM/checkpoint 写入 0 |
+| 逐位重放 | `deterministic_algorithms=false` 下两模型仍逐位复现；该事实不外推为其他形状/算子/环境的确定性保证 |
+| 判断 | 覆盖范围内通过，未观察到目标偏离；**不触发**单因素诊断。真实 FK 几何/导数、参数梯度、累积/裁剪/AdamW/更新、选模、DDIM 与端到端质量仍未审计；`full_objective_contract_passed=null`、`final_interaction_method=not_ready` |
+
+前置修复：第一次真实入口在建立 cohort 前被无 `cohort.json` 的旧归因目录（裸 list `costs.json`）误判为未知历史而拒绝；提交 `b45cd7c` 让无标记且不可解析的旧目录被跳过、带本 cohort 标记的损坏台账仍 fail-closed。拒绝时无 cohort/attempt/计费/真实值/checkpoint/模型调用；修复后 68 项 audit+admission 测试通过，准入包重发为 `attempt_005`，授权记录重发为 `attempt_002`（范围与预算不变）。只读 post-check `authorization/attempt_002/postcheck.py` 重算行算术、数组/工件哈希、阶段成本、调用余额、窗口/包绑定与实现/checkpoint 哈希，结果 `passed=true`、`problems=[]`。全项目套件本轮未重跑。

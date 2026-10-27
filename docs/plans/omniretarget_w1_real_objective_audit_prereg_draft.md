@@ -236,15 +236,15 @@ F 同时核对每窗→batch 关系、失败/缺口、覆盖状态、调用次�
 
 以下全部满足才允许真实执行；文档修改不勾选这些事项：
 
-> 2026-10-27 状态：可审阅的[准入包与冻结校准契约](omniretarget_w1_real_objective_audit_admission_package.md)已生成；校准契约 SHA `2904fbc4…`、证据 `49371d30…`，准入包 `attempt_004` SHA `1cedbb15…`（P2 授权严格化后），无授权/模板探测均被拒绝且未创建运行目录。下列 8 项仍未勾选，真实执行仍为 `not_run`。
+> 2026-10-27 状态：用户已明确授权并完成真实 R0→P→F 一次。授权记录 `derived/audit/w1_real_objective_audit/authorization/attempt_002/authorization.json`（SHA `1071810f…`），运行根 `derived/experiments/omniretarget_first/20261027_b45cd7c_w1_real_objective_audit`，结论 `real_batch_covered_contract_passed`（`problems=[]`、`gaps=[]`）。下列 8 项依据授权记录与真实运行产物勾选；文档编辑本身不构成授权。覆盖仍为 `objective_coverage=partial`，`full_objective_contract_passed=null`、最终交互 `not_ready`。
 
-- [ ] 用户明确授权本问题的真实资产加载、四窗前向与输出空间求导；更新、参数 FD 和 DDIM 仍为 0。
-- [ ] 用户确认新 cohort 与固定历史范围、旧拒收记录保留、阶段不互借与历史不重置。
-- [ ] 用户确认 R0/P/F 的 180/360/360s 提案、各阶段两次累计尝试、收口预留，以及含 F/独立参考在内的 4 次完整前向和 8 次求导上限。
-- [ ] 真实工作前的登记/封口/消费者及父 unit 准入已实现并通过沙箱反例。
-- [ ] 生产取证适配与独立参考完成合成对拍；batched VJP 支持、调用计数及图保真已验证。
-- [ ] 数值域、梯度及标量逐字段容差完成纯合成校准并冻结，当前 pending 项清零。
-- [ ] 执行时先在 R0 登记下核验身份和冻结四窗完整键、t/noise、配置、实现快照、环境及数组 schema；R0 封口通过后才启动 P。
-- [ ] 独立复核器按 raw 键集、输入、梯度、调用与全阶段历史验收；整体覆盖仍为 partial，最终交互仍 not_ready。
+- [x] 用户明确授权本问题的真实资产加载、四窗前向与输出空间求导；更新、参数 FD 和 DDIM 仍为 0。
+- [x] 用户确认新 cohort 与固定历史范围、旧拒收记录保留、阶段不互借与历史不重置。
+- [x] 用户确认 R0/P/F 的 180/360/360s 提案、各阶段两次累计尝试、收口预留，以及含 F/独立参考在内的 4 次完整前向和 8 次求导上限。
+- [x] 真实工作前的登记/封口/消费者及父 unit 准入已实现并通过沙箱反例。
+- [x] 生产取证适配与独立参考完成合成对拍；batched VJP 支持、调用计数及图保真已验证。
+- [x] 数值域、梯度及标量逐字段容差完成纯合成校准并冻结，当前 pending 项清零。
+- [x] 执行时先在 R0 登记下核验身份和冻结四窗完整键、t/noise、配置、实现快照、环境及数组 schema；R0 封口通过后才启动 P。
+- [x] 独立复核器按 raw 键集、输入、梯度、调用与全阶段历史验收；整体覆盖仍为 partial，最终交互仍 not_ready。
 
-当前上述真实执行事项均未完成确认：**草案修订完成不代表真实预注册或执行验收；真实数据审计、训练及单因素实验继续 `not_run`。**
+真实执行实际使用每阶段 attempt_001（各 1/2 次），总成本 7.5015s/900s，调用 conditioner/model/production VJP/independent VJP 各 4/4，接触分支 0，更新/FD/DDIM/checkpoint 写入 0。覆盖范围内未观察到目标偏离，不触发单因素诊断；真实 FK 几何/导数、参数梯度、累积/裁剪/AdamW/更新、选模、DDIM 与端到端质量仍未审计，不能从本次通过外推为完整目标契约或最终交互已验证。详见[真实审计报告](../verification/omniretarget_w1_real_objective_audit_report.md)。
