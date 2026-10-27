@@ -1157,18 +1157,23 @@ def _withdraw_pass_claim(root: Path, stage: str, attempt: str,
             if sealed:
                 break
             tail = reserve()
-            if observed + tail >= remaining:
+            # The previously registered cost is a floor: a withdrawal may add
+            # cost but never lower a conservative seal charge (that would hand
+            # budget back and accept an under-reported history).
+            cost = max(base_cost, observed + tail)
+            if cost >= remaining:
                 updated = unverifiable()
                 break
-            updated = persist(target_status, observed + tail, tail)
+            updated = persist(target_status, cost, tail)
             sealed = True
             continue
         sealed = False
         tail = reserve()
-        if observed + tail >= remaining:
+        cost = max(base_cost, observed + tail)
+        if cost >= remaining:
             updated = unverifiable()
             break
-        updated = persist("publishing", observed + tail, tail)
+        updated = persist("publishing", cost, tail)
     else:
         updated = unverifiable()
     if problems:

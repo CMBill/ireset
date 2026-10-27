@@ -1277,6 +1277,27 @@ def test_withdrawal_slow_persist_then_kill_stays_publishing_and_covered(
     assert audit.stage_history(root, "F") is None
 
 
+def test_withdrawal_never_lowers_the_registered_cost(tmp_path: Path):
+    """A withdrawal may add cost but must keep the old seal charge as a floor."""
+    root, t0, budget, report, seal = _withdraw_fixture(tmp_path)
+    old_cost = float(seal.row["measured_wall_s"])
+    reserved_cost = max(old_cost, 3.9099)
+    old_row = {**seal.row, "measured_wall_s": reserved_cost,
+               "sampled_wall_s": reserved_cost, "seal_tail_reserve_s": 2.9}
+    updated, problems, summary = audit._withdraw_pass_claim(
+        root, "F", "attempt_001", report, old_row, ["forced_consumer"],
+        reason="forced_consumer", t0=t0, budget=budget,
+        preserve_conclusion=False)
+    assert problems == [], problems
+    assert updated["status"] == "incomplete", updated
+    assert updated["complete"] is False
+    assert float(updated["measured_wall_s"]) >= reserved_cost, (
+        updated, reserved_cost)
+    history = audit.stage_history(root, "F")
+    assert history is not None and history >= reserved_cost, (history, reserved_cost)
+    assert summary["complete_evidence"] is False
+
+
 def test_f_identity_exception_blocks_model_replay(tmp_path: Path):
     """Unverifiable identity is a replay gate, not only a recorded gap."""
     calls = {"n": 0}
