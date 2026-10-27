@@ -52,6 +52,7 @@ from ireset.embodied.g1_spec import KPT_TO_SMPLH
 # ---------------------------------------------------------------------------
 
 AUDIT_SCHEMA = "w1_real_objective_audit_v1"
+AUTHORIZATION_SCHEMA = "w1_real_objective_authorization_v1"
 EXECUTION_ID = "w1_real_objective_audit_v1"
 COHORT_ID = "w1_real_objective_audit_v1"
 ACCOUNTING_SCHEMA = "pre_registered_v1"
@@ -5109,19 +5110,24 @@ AUTHORIZATION_REQUIRED = (
 
 
 def authorization_problems(record: Mapping[str, Any] | None) -> list[str]:
+    """Strict section-8 gate: declared types, exact budgets, explicit zeros."""
     problems: list[str] = []
     if not isinstance(record, Mapping):
         return ["authorization_not_a_mapping"]
+    if record.get("schema") != AUTHORIZATION_SCHEMA:
+        problems.append("authorization_schema")
     if record.get("authorized") is not True:
         problems.append("not_authorized")
     if record.get("cohort_id") != COHORT_ID:
         problems.append("authorization_cohort")
     if record.get("execution_id") != EXECUTION_ID:
         problems.append("authorization_execution")
-    if record.get("training_updates") != 0 or record.get("parameter_fd") != 0:
-        problems.append("authorization_exceeds_scope")
-    if record.get("ddim_calls") not in (0, None):
-        problems.append("authorization_ddim")
+    # Counters are JSON integers that must be explicitly zero.  ``0.0``,
+    # ``False``, ``"0"`` and ``None`` are different declarations and refused.
+    for key in ("training_updates", "parameter_fd", "ddim_calls"):
+        value = record.get(key)
+        if type(value) is not int or value != 0:
+            problems.append(f"authorization_counter:{key}")
     checklist = record.get("checklist")
     if not isinstance(checklist, Mapping):
         problems.append("authorization_checklist_missing")
@@ -5133,14 +5139,23 @@ def authorization_problems(record: Mapping[str, Any] | None) -> list[str]:
     if not isinstance(budgets, Mapping):
         problems.append("authorization_budgets_missing")
     else:
+        extra = sorted(str(k) for k in set(budgets) - set(STAGE_BUDGETS))
+        missing = sorted(set(STAGE_BUDGETS) - set(budgets))
+        if extra or missing:
+            problems.append(
+                f"authorization_budget_stages:extra={extra}:missing={missing}")
         for stage, spec in STAGE_BUDGETS.items():
             rec = budgets.get(stage)
             if not isinstance(rec, Mapping):
                 problems.append(f"authorization_budget:{stage}")
                 continue
-            if float(rec.get("budget_s", -1)) != spec["budget_s"]:
+            budget_s = rec.get("budget_s")
+            # Exact JSON number, never a coerced string/bool; int seconds
+            # (``180``) are the same value as ``180.0``.
+            if not _num(budget_s) or float(budget_s) != spec["budget_s"]:
                 problems.append(f"authorization_budget_size:{stage}")
-            if int(rec.get("attempts", -1)) != spec["attempts"]:
+            attempts = rec.get("attempts")
+            if type(attempts) is not int or attempts != spec["attempts"]:
                 problems.append(f"authorization_attempts:{stage}")
     return problems
 

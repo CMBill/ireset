@@ -1,6 +1,6 @@
 # W1 真实训练目标审计实现与合成自测验证记录
 
-日期：2026-10-26（初版实现与合成自测；同日完成三轮独立复核修复：首轮 8 P1 + 2 P2，第二轮 3 P1 + 2 P2，第三轮 2 P1 + 1 P2；2026-10-27 完成第四轮 2 P1 + 1 P2，并在复核后修复 1 项 P2 成本下限回归；同日增补准入包与冻结校准契约，§13）。对应草案：[W1 真实训练目标审计预注册草案](../plans/omniretarget_w1_real_objective_audit_prereg_draft.md)。**本记录的前 12 节是实现与纯合成自测，第 13 节是准入材料；均不是真实数据审计、预注册执行或训练更新。** 草案仍为 `draft / not_registered / not_authorized / not_run`；`factor_selected=false`、`auto_execute=false`、最终交互 `not_ready`、生产接入 `false`。
+日期：2026-10-26（初版实现与合成自测；同日完成三轮独立复核修复：首轮 8 P1 + 2 P2，第二轮 3 P1 + 2 P2，第三轮 2 P1 + 1 P2；2026-10-27 完成第四轮 2 P1 + 1 P2，并在复核后修复 1 项 P2 成本下限回归；同日增补准入包与冻结校准契约，§13；P2 授权严格化 §14）。对应草案：[W1 真实训练目标审计预注册草案](../plans/omniretarget_w1_real_objective_audit_prereg_draft.md)。**本记录的前 12 节是实现与纯合成自测，第 13–14 节是准入材料与 P2 授权严格化；均不是真实数据审计、预注册执行或训练更新。** 草案仍为 `draft / not_registered / not_authorized / not_run`；`factor_selected=false`、`auto_execute=false`、最终交互 `not_ready`、生产接入 `false`。
 
 ## 0. 结论与边界
 
@@ -9,7 +9,7 @@
 | 实现状态 | complete（R0/P/F 骨架、注册/准入、生产取证、batched VJP、独立参考、F 重放、账本/封口、CLI） |
 | 合成自测 | `synthetic_contract_passed`；`problems=[]`、`gaps=[]`、`complete_evidence=true` |
 | 权威合成命令 | `uv run --locked python scripts/audit_w1_real_objective.py --synthetic --out derived/audit/w1_real_objective_audit` |
-| 权威合成产物 | `derived/audit/w1_real_objective_audit/attempt_015/`（`attempt_001`–`attempt_014` 与顶层旧目录为更早实现运行，保留不改写） |
+| 权威合成产物 | `derived/audit/w1_real_objective_audit/attempt_016/`（P2 授权严格化后；`attempt_015` 及更早为历史实现运行，保留不改写） |
 | 固定矩阵 | 2 个 train demo × 2 个完整窗口 = 4 窗；deterministic/diffusion 两个模型；`t=[0,250,500,999]`；噪声种子 `20261008` |
 | 行/数组 | objective rows **98**、gradient rows **14**；`objective_real_arrays.npz` 与 `gradient_real_arrays.npz` 全键通过 |
 | 调用计数 | conditioner **4**、model **4**、production VJP **4**、independent VJP **4**（均达到上限且不超） |
@@ -26,7 +26,7 @@
 | --- | --- |
 | [src/ireset/eval/w1_real_objective_audit.py](../../src/ireset/eval/w1_real_objective_audit.py) | 审计模块：固定矩阵、窗口键、注册/准入、生产 observer、独立 float64 参考、batched VJP、F 重放、publishing/seal 账本、授权/容差门与合成校准 |
 | [scripts/audit_w1_real_objective.py](../../scripts/audit_w1_real_objective.py) | 默认纯合成入口；`--calibrate-synthetic` 写冻结容差契约；`--real` 需授权记录+已校准契约+固定根直接子目录，当前未运行 |
-| [tests/test_w1_real_objective_audit.py](../../tests/test_w1_real_objective_audit.py) | **58 项**正向/反例：完整链路、observer 逐位透明、detach 拒绝、噪声公式、近 π 域、键多重集、账本/running/publishing/超限/封口写失败、父 unit 准入、F 重放篡改、CLI 拒绝；首轮复核新增实际 VJP 计数、落盘梯度逐元素绑定、FK 点重算、跨 run 调用额度、RNG 恢复、合法负结果进入 F、校准证据重验、负成本、行字段/额外行、非数值数组；第二轮新增预算撤销 P 不启动 F 调用、F 实时截止、封口超时撤回磁盘声明、完整链调用余额、嵌套容器类型异常；第三轮新增撤回写盘计入同一 attempt 成本、无法证明覆盖保持 publishing、准入/绑定/前置消费者硬门阻断模型构造、负结果封口失败只撤回证据完整标志；第四轮新增慢写盘后终止仍保留覆盖的 publishing、身份异常阻断模型重放、负结果撤回未知封口返回 audit_incomplete、旧预留成本不得被撤回降低 |
+| [tests/test_w1_real_objective_audit.py](../../tests/test_w1_real_objective_audit.py) | **59 项**正向/反例：完整链路、observer 逐位透明、detach 拒绝、噪声公式、近 π 域、键多重集、账本/running/publishing/超限/封口写失败、父 unit 准入、F 重放篡改、CLI 拒绝；首轮复核新增实际 VJP 计数、落盘梯度逐元素绑定、FK 点重算、跨 run 调用额度、RNG 恢复、合法负结果进入 F、校准证据重验、负成本、行字段/额外行、非数值数组；第二轮新增预算撤销 P 不启动 F 调用、F 实时截止、封口超时撤回磁盘声明、完整链调用余额、嵌套容器类型异常；第三轮新增撤回写盘计入同一 attempt 成本、无法证明覆盖保持 publishing、准入/绑定/前置消费者硬门阻断模型构造、负结果封口失败只撤回证据完整标志；第四轮新增慢写盘后终止仍保留覆盖的 publishing、身份异常阻断模型重放、负结果撤回未知封口返回 audit_incomplete、旧预留成本不得被撤回降低；P2 新增授权记录严格类型/精确 schema·预算·次数/阶段集与显式计数零的反例 |
 | [src/ireset/train/losses.py](../../src/ireset/train/losses.py) | `LossAssembler.__call__` 新增可选 `observer`：捕获 live 分项张量、FK 前 `L5`、归约中间量、预测/目标 FK 点；`observer=None` 数值路径逐位不变 |
 
 实现文件 SHA-256（合成产物写入时）：
@@ -34,19 +34,19 @@
 | 文件 | SHA-256 |
 | --- | --- |
 | `src/ireset/train/losses.py` | `04b74a45ff59c5acbf8b1fda9361b58c9e56d5466990122524a808071ab80820` |
-| `src/ireset/eval/w1_real_objective_audit.py` | `2bc247589c68044396ff91f3651a323dc86b3ecae610c0d1fa0ff6bf377f8766` |
+| `src/ireset/eval/w1_real_objective_audit.py` | `ccd96bfc5a90a5761a80f76b54cb5f1bcd574dc7b403973f362eaa232aeafe1e` |
 | `scripts/audit_w1_real_objective.py` | `6fa2584845decbc2dcb4244b4a11d60f92437a0e273a780b1a206d89c3498cde` |
-| `tests/test_w1_real_objective_audit.py` | `1036c45cabeb3644a7cde4aba6f367894bec284cfc7bef8de4182435fd76ea9e` |
+| `tests/test_w1_real_objective_audit.py` | `2ae792e71b5cb3674aca652b2eaa81a910671d6bf1a2e68478597b3762543ba4` |
 
 权威产物哈希：
 
 | 产物 | SHA-256 |
 | --- | --- |
-| `.../finalize/attempt_001/audit_summary.json` | `a27c06c028d164f05082d552f639d3cf5531d470dabadade58c8d58649497116` |
-| `.../finalize/attempt_001/independent_verification.json` | `74d0e8a78f988fe2da48c3066ecb063a24dca35f9c91b0af09a4307ad2c46500` |
-| `.../production/attempt_001/p_report.json` | `b05512d68ea77180155769127ad8bdd397b15e7f36adc7dff277571f5fe7fe09` |
-| `.../production/attempt_001/objective_real_arrays.npz` | `932f2f0cc3ef0c7bdaae2bdb34cb5361a17dee468df4699e45c80144a619f0cc` |
-| `.../production/attempt_001/gradient_real_arrays.npz` | `73cc59a3d2dfb4bfef26d11977dd8488b29d457eb7390556cd5fdd241f890a88` |
+| `.../attempt_016/finalize/attempt_001/audit_summary.json` | `fc084933eff3a09478b91968162ea83b11c55be049ceaef3cc25f731fdfdafc2` |
+| `.../attempt_016/finalize/attempt_001/independent_verification.json` | `74d0e8a78f988fe2da48c3066ecb063a24dca35f9c91b0af09a4307ad2c46500` |
+| `.../attempt_016/production/attempt_001/p_report.json` | `578582ab14031df4b2b3761237cfbe3d366411874817b450047005f5f8d01d3f` |
+| `.../attempt_016/production/attempt_001/objective_real_arrays.npz` | `932f2f0cc3ef0c7bdaae2bdb34cb5361a17dee468df4699e45c80144a619f0cc` |
+| `.../attempt_016/production/attempt_001/gradient_real_arrays.npz` | `73cc59a3d2dfb4bfef26d11977dd8488b29d457eb7390556cd5fdd241f890a88` |
 
 ## 2. R0：注册、身份与准入
 
@@ -92,7 +92,7 @@
 
 ## 6. 测试与回归
 
-- `uv run --locked pytest tests/test_w1_real_objective_audit.py -q` -> **58 passed（28.81s）**（首轮 42 项 + 第二轮 6 项 + 第三轮 6 项 + 第四轮 4 项参数化/反例）。
+- `uv run --locked pytest tests/test_w1_real_objective_audit.py -q` -> **58 passed（28.81s）**（首轮 42 项 + 第二轮 6 项 + 第三轮 6 项 + 第四轮 4 项参数化/反例）；P2 后为 **59 passed（28.72s）**，见 §14。
 - 相关既有回归：`tests/test_w1_training_objective_audit.py tests/test_generation.py tests/test_omniretarget_w1.py` -> **85 passed（64.82s）**；`tests/test_w1_de_numerics.py tests/test_omniretarget_w1_de.py` -> **73 passed（333.75s）**（第三轮记录；第四轮未重跑相关回归）。
 - **全项目套件本轮未重跑**；旧 947 passed + 1 skipped 仅作历史范围记录，不冒充本次结果。
 - 合成校准命令 `--calibrate-synthetic` 生成 `mode=synthetic_calibrated`、非空 `evidence_sha256`、`observed` 与 98/14 行计数的契约；真实入口要求该模式，默认 `synthetic_default` 契约被拒绝。`tolerance_contract_problems` 现在重算证据哈希、4× 阈值推导关系，并用记录 seed 重跑纯合成校准；删除证据、替换哈希+放宽阈值、同步伪造 observed 三类反例均被拒绝。
@@ -187,7 +187,7 @@
 | 观测 | encode `9.082717760122705e-7`、loss `4.217589067052885e-9`、gradient `2.7271278616966023e-9`（atol） |
 | 推导 | `max(默认, 4×观测)`；三个观测键的 4× 值均低于默认，**无任何键被抬高**；`scale_floor`/`rotation_domain` 与 `term_overrides` 不变 |
 | 独立核验 | 记录目录 `verify_calibration.py` 重算规范证据哈希、在模块外重述默认表与 4× 规则、在新解释器重跑校准；`passed=true`、`problems=[]`、`keys_widened_above_default=[]` |
-| 反例 | 58 项测试中的删除证据、替换哈希并放宽、同步伪造 observed 均被 `tolerance_contract_problems` 拒绝 |
+| 反例 | P2 后的 59 项测试中，删除证据、替换哈希并放宽、同步伪造 observed 均被 `tolerance_contract_problems` 拒绝 |
 
 观测相对误差中的 loss `0.977` 是近零分母比值，冻结规则只用绝对项，不能读成 97% 容差。该契约证明阈值在真实数值打开前已冻结且未被删除/替换/协调放宽；不证明真实 float32/float64 差异、CUDA 确定性与 G1 FK 行为落在阈值内。
 
@@ -196,9 +196,9 @@
 | 项目 | 结果 |
 | --- | --- |
 | 实现 | [src/ireset/eval/w1_real_admission.py](../../src/ireset/eval/w1_real_admission.py)、[scripts/w1_real_objective_admission.py](../../scripts/w1_real_objective_admission.py)、[tests/test_w1_real_admission.py](../../tests/test_w1_real_admission.py) |
-| 当前包 | `derived/audit/w1_real_objective_audit/admission/attempt_003/admission_package.json`，SHA-256 `2cc733d3394497c92e4e407fd6a627ad0d1936496d7bba3a6b09caf7b3f79cfe`；索引 SHA `5a9da0ae…` |
+| §13 生成时的包（已被 §14 取代） | `derived/audit/w1_real_objective_audit/admission/attempt_003/admission_package.json`，SHA-256 `2cc733d3394497c92e4e407fd6a627ad0d1936496d7bba3a6b09caf7b3f79cfe`；索引 SHA `5a9da0ae…` |
 | 生成器绑定 | 包内 `generator.files`：`w1_real_admission.py` `258b60dc…`、`w1_real_objective_admission.py` `299904ba…`、`test_w1_real_admission.py` `bde54657…`；校准契约 SHA 同前 |
-| 当前包结论 | `passed=true`、`problems=[]`、`authorized=false`、`registered=false`、`run=not_run`、`section_8_checked=false` |
+| §13 结论 | `passed=true`、`problems=[]`、`authorized=false`、`registered=false`、`run=not_run`、`section_8_checked=false` |
 | 候选四窗 | `sub10_largebox_063` T=133、`sub10_largebox_085` T=148，各 start `[0,30]`、end `[60,90]`；按冻结字典序均为 `sub10` |
 | 固定身份 | manifest `a350a8b8…`、W1 注册 `5561f685…`、W1 final `7f1a9a59…`、预测注册 `5fcf8b3a…`、预测 final `ce9843fd…`、prereg `071c49d3…`、config `0e2cfa96…`、det ckpt `7b1efd57…`、diff ckpt `1f9c16b1…`、cache identity `90af39f1…`、root_stats `b9d9cc04…`，全部与登记相等 |
 | t/noise/alpha | `[0,250,500,999]`；noise seed `20261008` sha `cb09992b…`；alpha sha `9f3be039…` |
@@ -207,15 +207,34 @@
 | 只读范围 | `metadata_only=true`、`window_values_loaded=false`、`schedules_read=false`、`checkpoint_torch_load=false`、模型/conditioner/VJP 调用 0、未创建 cohort/注册 attempt |
 | 审阅注意事项 | ①两 demo 同属 `sub10`，不声明跨受试者覆盖；②`deterministic_algorithms=false`，F 要求逐位重放，失败登记 mismatch 而不放宽 |
 
-`attempt_001`（SHA `7b709112…`，未含审阅注意事项）与 `attempt_002`（SHA `6d98a6cc…`，未绑定生成器）保留为被取代证据；`attempt_003` 为当前准入包。包内资产**文件哈希**已核对；资产闭包、checkpoint step/可用性/有限性与 strict load 明确延期到 R0。
+`attempt_001`（SHA `7b709112…`，未含审阅注意事项）、`attempt_002`（SHA `6d98a6cc…`，未绑定生成器）与 `attempt_003`（SHA `2cc733d3…`，P2 前）保留为被取代证据；P2 后当前准入包为 `attempt_004`，见 §14。包内资产**文件哈希**已核对；资产闭包、checkpoint step/可用性/有限性与 strict load 明确延期到 R0。
 
 ### 13.3 测试与执行门
 
 - `uv run --locked pytest tests/test_w1_real_admission.py -q` -> **8 passed（5.08s）**：固定矩阵/只读范围、默认与放宽契约拒绝、checkpoint 漂移、manifest 漂移、motion 排除顺序、单一合格 demo 的 incomplete、授权模板非授权、包目录不覆盖。
-- `uv run --locked pytest tests/test_w1_real_objective_audit.py -q` -> **58 passed（28.31s）**（未改被审实现，重跑确认）。
+- `uv run --locked pytest tests/test_w1_real_objective_audit.py -q` -> **58 passed（28.31s）**（当时未改被审实现，重跑确认）；P2 后为 **59 passed（28.72s）**，见 §14。
 - 无授权真实入口：exit 1，`--real requires --authorization (section 8 is not checked)`，探测目录未创建。
 - `authorized=false` 模板：exit 1，`not_authorized` + 11 项 `authorization_checklist:*`，探测目录未创建。
 
 ### 13.4 边界
 
 `source=synthetic_only`（校准）＋ `metadata_only`（准入包）；真实资产/checkpoint/模型调用与真实数据更新 0；未创建 cohort/预算/执行注册；§8 八项未勾选；`objective_coverage=partial`、`full_objective_contract_passed=null`、`attribution=attribution_insufficient`、`factor_selected=false`、`auto_execute=false`、最终交互 `not_ready`、生产接入 false。下一交付须由用户明确授权后按 R0→P→F 执行；本记录不勾选 §8。
+
+## 14. P2 授权记录严格化（2026-10-27）
+
+用户复核指出 `authorization_problems` 偏宽：未检查 `schema`，预算/次数经 `float()`/`int()` 转换后比较，且允许 `ddim_calls=None`。本轮已修复并重新取得合成与准入包证据；**仍未授权、未注册、未运行**。执行记录 `derived/audit/w1_real_objective_admission/20261027T113741Z_5d022ca_p2/`（`report.md` SHA-256 `cf40b64d…`）。
+
+| 项目 | 结果 |
+| --- | --- |
+| 代码身份 | HEAD `5d022cafe4cb0e958e26c72fbbaf8a7afef02438`；P2 轮开始时 clean |
+| 修复 | 新增 `AUTHORIZATION_SCHEMA` 精确校验；三个计数要求 JSON 整数 0（拒绝 `0.0`/`False`/`"0"`/`None`）；`budget_s` 要求精确 JSON 数字（非 bool/字符串/null/NaN）；`attempts` 要求精确 JSON 整数；`budgets` 键集恰为 `R0/P/F` |
+| 测试 | `tests/test_w1_real_objective_audit.py` **59 passed（28.72s）**；`tests/test_w1_real_admission.py` **8 passed（5.09s）**；新反例覆盖 28 类变异 + 2 个正向用例 |
+| 合成重验 | `attempt_016`：`synthetic_contract_passed`、98/14 行、0失败/0缺口、调用 4/4/4/4；两份 NPZ 与 `attempt_015` 逐位相同，`independent_verification.json` 相同 |
+| 当前准入包 | `admission/attempt_004/`，SHA-256 `1cedbb159b8bd1892c010e8b6038e384d53452bc435dc94658c6d08a0ee48193`；索引 `ca1e5fd0…`；`passed=true/problems=[]/authorized=false/run=not_run/section_8_checked=false` |
+| 实现/生成器绑定 | audit module `ccd96bfc…`、tests `2ae792e7…`；admission module `d5486b3c…`、entry `299904ba…`、admission tests `bde54657…` |
+| 模板 | SHA `2e4aabbc…`，`authorized=false`；真实入口仍 exit 1（`not_authorized` + 11 项 checklist），探测目录未创建 |
+| 校准契约 | 文件 SHA `2904fbc4…` 与证据 `49371d30…` 未变；新模块下 `tolerance_contract_problems=[]` |
+| 保护 | 384 个旧审计文件清单；`attempt_016`/`attempt_015` 五项权威哈希全部相等；11 个引用资产相等；无真实运行目录 |
+| 被取代 | `admission/attempt_003` 为 P2 前包，保留为历史证据 |
+
+边界不变：§8 八项未勾选；真实资产/checkpoint/模型前向反向/真实 G1 FK/真实数据更新为 0；未创建 cohort/预算/注册；`objective_coverage=partial`、`full_objective_contract_passed=null`、`attribution=attribution_insufficient`、`factor_selected=false`、`auto_execute=false`、最终交互 `not_ready`、生产接入 false。真实执行仍须用户明确授权后按 R0→P→F 进行。

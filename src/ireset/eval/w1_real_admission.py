@@ -20,7 +20,7 @@ from typing import Any, Mapping
 from ireset.eval import w1_real_objective_audit as audit
 
 SCHEMA = "w1_real_objective_admission_package_v1"
-AUTHORIZATION_SCHEMA = "w1_real_objective_authorization_v1"
+AUTHORIZATION_SCHEMA = audit.AUTHORIZATION_SCHEMA
 SPLIT_TRAIN = Path("derived/data/split/train.json")
 
 _KNOWN_LIMITATIONS = [
@@ -81,8 +81,11 @@ def authorization_template() -> dict:
         },
         "notes": (
             "Template only. The user must create a separate authorization record "
-            "with authorized=true and every checklist item true; section 8 also "
-            "requires the pending admission items to be closed first."
+            "with authorized=true and every checklist item true; schema must "
+            "match; training_updates/parameter_fd/ddim_calls must be JSON "
+            "integer 0; budget_s/attempts must exactly equal the frozen values; "
+            "section 8 also requires the pending admission items to be closed "
+            "first."
         ),
     }
 
@@ -540,11 +543,13 @@ def build_admission_package(project_root: Path, *,
                 "tolerance_contract.json"
             ),
             "refusals": [
-                "authorized is not true",
-                "any checklist item is not true",
-                "budget or attempt cap differs from the frozen values",
-                "training_updates/parameter_fd are not 0",
-                "ddim_calls is not 0",
+                "schema is not w1_real_objective_authorization_v1",
+                "authorized is not exactly true",
+                "any checklist item is not exactly true",
+                "training_updates/parameter_fd/ddim_calls are not JSON integer 0",
+                "budget_s is not the exact frozen JSON number",
+                "attempts is not the exact frozen JSON integer",
+                "budget stages are not exactly R0/P/F",
                 "tolerance contract is not a completed synthetic calibration",
                 "run root is not a direct child of the fixed history root",
             ],

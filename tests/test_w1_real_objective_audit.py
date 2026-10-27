@@ -268,8 +268,9 @@ def test_tolerance_contract_validation():
     assert audit.load_tolerance_contract(Path("/nonexistent/tolerance.json"))[2] != []
 
 
-def test_authorization_contract_requires_every_checklist_item():
-    record = {
+def _valid_authorization() -> dict:
+    return {
+        "schema": audit.AUTHORIZATION_SCHEMA,
         "authorized": True,
         "cohort_id": audit.COHORT_ID,
         "execution_id": audit.EXECUTION_ID,
@@ -280,6 +281,10 @@ def test_authorization_contract_requires_every_checklist_item():
         "budgets": {k: {"budget_s": v["budget_s"], "attempts": v["attempts"]}
                     for k, v in audit.STAGE_BUDGETS.items()},
     }
+
+
+def test_authorization_contract_requires_every_checklist_item():
+    record = _valid_authorization()
     assert audit.authorization_problems(record) == []
     bad = json.loads(json.dumps(record))
     bad["checklist"]["tolerance_calibration"] = False
@@ -289,6 +294,58 @@ def test_authorization_contract_requires_every_checklist_item():
     bad["authorized"] = False
     assert "not_authorized" in audit.authorization_problems(bad)
     assert audit.load_authorization(Path("/nonexistent/auth.json"))[2] != []
+
+
+def test_authorization_contract_is_strict_about_types_and_values():
+    record = _valid_authorization()
+    assert audit.authorization_problems(record) == []
+
+    # Integer seconds are the same exact value as the frozen float.
+    integer_seconds = copy.deepcopy(record)
+    integer_seconds["budgets"]["R0"]["budget_s"] = 180
+    assert audit.authorization_problems(integer_seconds) == []
+
+    cases: list[tuple[dict, str]] = []
+
+    bad = copy.deepcopy(record)
+    del bad["schema"]
+    cases.append((bad, "authorization_schema"))
+    bad = copy.deepcopy(record)
+    bad["schema"] = "w1_real_objective_authorization_v0"
+    cases.append((bad, "authorization_schema"))
+
+    for key in ("training_updates", "parameter_fd", "ddim_calls"):
+        for value in (0.0, False, "0", None):
+            bad = copy.deepcopy(record)
+            bad[key] = value
+            cases.append((bad, f"authorization_counter:{key}"))
+    bad = copy.deepcopy(record)
+    bad["ddim_calls"] = 1
+    cases.append((bad, "authorization_counter:ddim_calls"))
+    bad = copy.deepcopy(record)
+    bad["training_updates"] = -1
+    cases.append((bad, "authorization_counter:training_updates"))
+
+    for value in ("180", True, None, 179.9, float("nan")):
+        bad = copy.deepcopy(record)
+        bad["budgets"]["R0"]["budget_s"] = value
+        cases.append((bad, "authorization_budget_size:R0"))
+    for value in (2.0, "2", True, 3, None):
+        bad = copy.deepcopy(record)
+        bad["budgets"]["R0"]["attempts"] = value
+        cases.append((bad, "authorization_attempts:R0"))
+
+    bad = copy.deepcopy(record)
+    bad["budgets"]["R3"] = {"budget_s": 1.0, "attempts": 1}
+    cases.append((bad, "authorization_budget_stages"))
+    bad = copy.deepcopy(record)
+    del bad["budgets"]["F"]
+    cases.append((bad, "authorization_budget_stages"))
+
+    for bad, expected in cases:
+        problems = audit.authorization_problems(bad)
+        assert any(p == expected or p.startswith(expected + ":")
+                   for p in problems), (expected, problems)
 
 
 def _seal_stage(root: Path, stage: str, attempt: str, *,

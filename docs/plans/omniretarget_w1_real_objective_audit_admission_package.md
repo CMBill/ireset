@@ -1,6 +1,6 @@
 # W1 真实训练目标审计准入包与冻结校准契约
 
-日期：2026-10-27。状态：**准入包已生成、合成校准契约已冻结；未授权、未注册、未运行**。上级草案：[W1 真实训练目标审计预注册草案](omniretarget_w1_real_objective_audit_prereg_draft.md) §8。实现与合成自测见[验证记录](../verification/omniretarget_w1_real_objective_audit_verification.md)。
+日期：2026-10-27（P2 授权严格化后更新）。状态：**准入包已生成、合成校准契约已冻结；未授权、未注册、未运行**。上级草案：[W1 真实训练目标审计预注册草案](omniretarget_w1_real_objective_audit_prereg_draft.md) §8。实现与合成自测见[验证记录](../verification/omniretarget_w1_real_objective_audit_verification.md)。
 
 > 本文件是供用户审阅的**准入材料**，不是执行授权。草案 §8 的八项检查全部未勾选；真实 dataset/cache/checkpoint 未加载，真实模型前向/反向、真实 G1 FK 与真实数据更新均为 0；未创建 cohort、预算或执行注册。真实审计仍为 `not_run`。
 
@@ -8,17 +8,17 @@
 
 | 项目 | 值 |
 | --- | --- |
-| 代码身份 | HEAD `ed143bc6585011c9b1c79b097ee17f973f9cd60f`；代码执行开始时 tracked diff 为空，随后新增三个源文件；文档同步后工作树另含 5 个文档修改与 1 个新增文档（逐文件哈希见执行记录 `identity.json.final_status.docs`） |
+| 代码身份 | HEAD `5d022cafe4cb0e958e26c72fbbaf8a7afef02438`；P2 轮开始时工作树 clean，随后修改审计模块/准入模块/测试三个文件并同步文档（逐文件 before/after 哈希见执行记录 `identity.json.final_status`） |
 | 环境 | Python 3.12.13；`uv.lock` `f809284e…`；torch 2.14.0+cu126；CUDA runtime 12.6；RTX 3090 |
 | 训练配置 | `configs/train/omniretarget_motion.yaml` `0e2cfa96849ee2de14ac84b7343289090c606f78116bb79114ff81b046b521e0` |
 | 冻结校准契约 | `derived/audit/w1_real_objective_audit/tolerance_contract.json`，文件 SHA-256 `2904fbc41113ba379cee2e4de4704befcac3ae8bb69c3178bcf141e48fd38eb3` |
 | 校准证据 | `evidence_sha256=49371d30a0a03679a1352e32db4b9751cd4988d92359bd6fc63324ee8995852d` |
-| 准入包 | `derived/audit/w1_real_objective_audit/admission/attempt_003/admission_package.json`，SHA-256 `2cc733d3394497c92e4e407fd6a627ad0d1936496d7bba3a6b09caf7b3f79cfe` |
-| 包索引 | `.../admission/attempt_003/package_index.json`，SHA-256 `5a9da0aebb7e0c2ff12cdbdd0d343c5a5d098c560a2020d8fa293a44e9f19993` |
-| 执行记录 | `derived/audit/w1_real_objective_admission/20261027T080142Z_ed143bc/` |
-| 新增代码 | [w1_real_admission.py](../../src/ireset/eval/w1_real_admission.py)、[w1_real_objective_admission.py](../../scripts/w1_real_objective_admission.py)、[test_w1_real_admission.py](../../tests/test_w1_real_admission.py) |
+| 准入包 | `derived/audit/w1_real_objective_audit/admission/attempt_004/admission_package.json`，SHA-256 `1cedbb159b8bd1892c010e8b6038e384d53452bc435dc94658c6d08a0ee48193` |
+| 包索引 | `.../admission/attempt_004/package_index.json`，SHA-256 `ca1e5fd09b7df378332b1928fb6a38f35c3cd1379b7c81c7390742ff3691ec55` |
+| 执行记录 | `derived/audit/w1_real_objective_admission/20261027T113741Z_5d022ca_p2/`（P2）；`.../20261027T080142Z_ed143bc/` 为首轮准入包记录，保留 |
+| 新增代码 | [w1_real_admission.py](../../src/ireset/eval/w1_real_admission.py)、[w1_real_objective_admission.py](../../scripts/w1_real_objective_admission.py)、[test_w1_real_admission.py](../../tests/test_w1_real_admission.py)；P2 另修改 [w1_real_objective_audit.py](../../src/ireset/eval/w1_real_objective_audit.py) 与 [test_w1_real_objective_audit.py](../../tests/test_w1_real_objective_audit.py) |
 
-`attempt_001`（SHA `7b709112…`，未含审阅注意事项）与 `attempt_002`（SHA `6d98a6cc…`，未绑定生成器）保留为被取代证据；`attempt_003` 为当前准入包。包内 `generator.files` 绑定生成器三个文件的 SHA-256（`258b60dc…`、`299904ba…`、`bde54657…`）与校准契约 SHA，`implementation` 仍只绑定真实审计运行时。被审计实现未改动，哈希仍与[验证记录 §1](../verification/omniretarget_w1_real_objective_audit_verification.md)一致：`losses.py` `04b74a45…`、审计模块 `2bc24758…`、真实 CLI `6fa25848…`、58 项测试 `1036c45c…`。
+`attempt_001`（SHA `7b709112…`，未含审阅注意事项）、`attempt_002`（SHA `6d98a6cc…`，未绑定生成器）与 `attempt_003`（SHA `2cc733d3…`，P2 前）保留为被取代证据；`attempt_004` 为当前准入包。包内 `generator.files` 绑定生成器三个文件的 SHA-256（`d5486b3c…`、`299904ba…`、`bde54657…`）与校准契约 SHA；`implementation` 绑定 losses `04b74a45…`、审计模块 `ccd96bfc…`、真实 CLI `6fa25848…`、59 项测试 `2ae792e7…`。P2 只收紧授权门（schema、三个计数、预算/次数类型与阶段集），不触审计数值路径：合成 `attempt_016` 仍为 `synthetic_contract_passed`，98/14 行、调用 4/4/4/4，两份 NPZ 与 `attempt_015` 逐位相同。
 
 生成命令：
 
@@ -68,7 +68,7 @@ uv run --locked python scripts/w1_real_objective_admission.py \
 
 58 项真实审计测试另覆盖反例：删除证据、替换哈希并放宽阈值、同步伪造 `observed` 后重算哈希，均被 `tolerance_contract_problems` 拒绝。
 
-本契约证明的是“阈值在真实数值打开前已按纯合成证据冻结，且未被删除/替换/协调放宽”；它**不证明**真实 float32/float64 差异、真实 CUDA 确定性或真实 G1 FK 行为落在阈值内。
+本契约证明的是“阈值在真实数值打开前已按纯合成证据冻结，且未被删除/替换/协调放宽”；它**不证明**真实 float32/float64 差异、真实 CUDA 确定性或真实 G1 FK 行为落在阈值内。P2 授权严格化后契约文件 SHA 与证据哈希不变；新模块下 `tolerance_contract_problems` 仍返回 `[]`（P2 执行记录 `integrity.json`）。
 
 ## 3. 固定审计矩阵
 
@@ -197,7 +197,15 @@ R0 调用为 0。历史扫描根固定为 `derived/experiments/omniretarget_firs
 | 无授权 | `--real --out .../w1_real_objective_audit_unauthorized_probe --tolerance-contract ...` | **exit 1**：`--real requires --authorization (section 8 is not checked)`；探测目录未创建 |
 | 模板（`authorized=false`） | 同上，附 `--authorization .../authorization_request_template.json` | **exit 1**：`not_authorized` 与 11 项 `authorization_checklist:*`；探测目录未创建 |
 
-授权记录模板已保存为执行记录中的 `authorization_request_template.json`（SHA `d11ae079…`），其 `authorized=false`、`template_only=true`，不能作为授权使用。有效授权记录必须包含：`schema=w1_real_objective_authorization_v1`、`authorized=true`、`cohort_id=execution_id=w1_real_objective_audit_v1`、`training_updates=0`、`parameter_fd=0`、`ddim_calls=0`、11 项 checklist 全为 true、R0/P/F 的 `budget_s` 与 `attempts` 与 §5 精确相等。记录本身的 SHA-256 会写入 cohort 与注册。
+授权记录模板已保存为 P2 执行记录中的 `authorization_request_template.json`（SHA-256 `2e4aabbc…`；首轮模板 `d11ae079…` 保留为历史），其 `authorized=false`、`template_only=true`，不能作为授权使用。有效授权记录必须满足 `authorization_problems` 的严格契约：
+
+- `schema` 必须精确等于 `w1_real_objective_authorization_v1`；`authorized` 必须为 `true`；`cohort_id` 与 `execution_id` 必须等于 `w1_real_objective_audit_v1`。
+- `training_updates`、`parameter_fd`、`ddim_calls` 必须是 **JSON 整数 0**；`0.0`、`false`、`"0"`、`null` 都是不同声明，均被拒绝。
+- 11 项 checklist 必须全为 `true`。
+- `budgets` 的键集必须恰为 `R0/P/F`；每阶段 `budget_s` 必须是精确 JSON 数字并等于冻结值（`180`/`360` 与 `180.0`/`360.0` 同值；字符串、bool、null、NaN、近似值均拒绝），`attempts` 必须是 JSON 整数且精确等于 2。
+- 不接受 `ddim_calls=None`；不接受额外或缺失阶段。
+
+记录本身的 SHA-256 会写入 cohort 与注册。P2 新增的严格性测试覆盖 **28 类变异**（2 schema、14 计数、5 预算秒、5 次数、2 阶段集），并保留“整数秒 `180` 合法”的正向用例。
 
 ### 7.2 授权后的执行顺序
 
