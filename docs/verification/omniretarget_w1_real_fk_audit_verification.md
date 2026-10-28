@@ -2,17 +2,17 @@
 
 日期：2026-10-28。状态：**`implemented_synthetic / calibrated / admission_ready / not_authorized / not_run`**。
 
-本记录覆盖方案 §4.1 的 I/C 工程工作、纯合成校准、只读准入包，以及两轮只读审阅问题（第一轮 8 P1 + 3 P2，第二轮 5 P1 + 3 P2）的修复。真实 R0→G→D→F、真实父数组数值读取、锁定 G1/MuJoCo 编译、checkpoint、cohort、预算与注册均未执行。所有通过结论均为**纯合成契约通过**，不替代真实证据，也不改变 `objective_coverage=partial`、`full_objective_contract_passed=null`、`factor_selected=false`、`auto_execute=false`、`final_interaction_method=not_ready`、`production_integration=false`。
+本记录覆盖方案 §4.1 的 I/C 工程工作、纯合成校准、只读准入包，以及三轮只读审阅问题（第一轮 8 P1 + 3 P2，第二轮 5 P1 + 3 P2，第三轮 1 P1 + 1 P2）的修复。真实 R0→G→D→F、真实父数组数值读取、锁定 G1/MuJoCo 编译、checkpoint、cohort、预算与注册均未执行。所有通过结论均为**纯合成契约通过**，不替代真实证据，也不改变 `objective_coverage=partial`、`full_objective_contract_passed=null`、`factor_selected=false`、`auto_execute=false`、`final_interaction_method=not_ready`、`production_integration=false`。
 
 ## 1. 实现身份
 
 | 文件 | SHA-256 |
 | --- | --- |
-| `src/ireset/eval/w1_real_fk_audit.py` | `8036553e6a8877f547ba635d44c67a50b54d910a39ccf7dac23d741c783276ee` |
+| `src/ireset/eval/w1_real_fk_audit.py` | `1e5fc55974978bda678c95ada69a5868abfa8b9795b3db80e6b47dc7a02a4c2c` |
 | `scripts/audit_w1_real_fk.py` | `ae1108a632b9bd097d8f23c82da79b16cd23d92675676e06fb93e73a03b749d9` |
-| `tests/test_w1_real_fk_audit.py` | `94b8f3fe3433e4ef714be5caeb601bbb8ad5fef0ac3df287f90d931c4204b9fa` |
+| `tests/test_w1_real_fk_audit.py` | `dce5885de5c2054768c039afdb18a911b94df848126dced3b7d779e02056e3a9` |
 | `src/ireset/train/losses.py`（仅新增可选注入） | `33f68d0bf1b9b5c31940b887bdf5413afebe192ee53fd0229782232abcf8f661` |
-| 预注册草案（最终字节，准入包绑定） | `ac66f7cd689e7b95e1f0df7529641153af66daec2c91251313942e60b28d9e51` |
+| 预注册草案（最终字节，准入包绑定） | `e6fb0407850bd308d371a53ca9857c987478a020921c6dc815a2a00362b57463` |
 
 `LossAssembler` 的 `fk=` / `static_frame=` 仍只是可选注入：默认值构造生产 `G1TorchFK` 并调用 `largebox_static_frame()`，生产数值路径不变；合成路径注入 29 关节合成 FK 与单位静态框，避免加载真实资产。`RealMujocoReference` 在真实 G 首次构造时校验 nq/nv、29 关节名称/顺序/qpos 地址/hinge 类型/限位、15 site 所属 body 与局部位姿；该路径未在 I/C 执行。
 
@@ -35,7 +35,7 @@
 uv run --locked pytest tests/test_w1_real_fk_audit.py -q
 ```
 
-→ **68 passed（36.72s，最终字节）**；同测试集在去重前的 37.14s 单次实测亦收录于草案 §10.1。
+→ **71 passed（50.15s）**。
 
 相关回归（父真实目标审计、真实准入、生成、标签质量、FK）：
 
@@ -45,7 +45,7 @@ uv run --locked pytest tests/test_w1_real_objective_audit.py \
   tests/test_label_quality.py tests/test_fk.py -q
 ```
 
-→ **107 passed（35.30s）**。全项目套件本轮未重跑。
+→ **107 passed（35.40s）**。全项目套件本轮未重跑。
 
 覆盖与方案 §9.1 的对应：
 
@@ -111,30 +111,30 @@ uv run --locked python scripts/audit_w1_real_fk.py --synthetic \
 - `synthetic/20261028_pre_drift/`、`20261028_pre_reffacts/`、`20261028_pre_withdrawal/`：更早的中间运行；
 - `synthetic/20261028_review10/`：第一轮审阅修复后的权威运行。其 G/D `call_delta` 因主 provider 未绑定计数器而全零，调用统计据此订正为“仅 F 计入”，其余工件保留；
 - `synthetic/20261028_review10_preduplicate/`：移除重复 helper 前的同语义运行；
-- `synthetic/20261028_review11_prefinal/`、`_prefinal2/`、`_prefinal3/`、`_prefinal4/`：第二轮修复过程中绑定早期模块/草案字节的中间运行（数值与最终运行一致，仅身份/时间戳不同）。
+- `synthetic/20261028_review11_prefinal/`–`_prefinal5/`：第二/三轮修复过程中绑定早期模块/草案字节的中间运行（数值与最终运行一致，仅身份/时间戳不同）。
 
 | 阶段 | 结果 | 成本（合成） |
 | --- | --- | ---: |
-| R0 | 绑定/窗口/键数/schema/输入 schema/零调用检查通过；父消费者与资产闭包在合成模式显式 `checked=false` | 1.1246s |
-| G | 122 几何行 + 20 梯度行，0 失败/0 缺口 | 1.4297s |
-| D | 4672 FD 行（32 状态 × 两个 h），0 失败/0 缺口 | 2.9971s |
-| F | 独立子进程重读磁盘、重算 G+D、逐位/容差对账、全 stencil 重放；`problems=[]` | 6.2528s |
+| R0 | 绑定/窗口/键数/schema/输入 schema/零调用检查通过；父消费者与资产闭包在合成模式显式 `checked=false` | 1.1087s |
+| G | 122 几何行 + 20 梯度行，0 失败/0 缺口 | 1.4430s |
+| D | 4672 FD 行（32 状态 × 两个 h），0 失败/0 缺口 | 3.0044s |
+| F | 独立子进程重读磁盘、重算 G+D、逐位/容差对账、全 stencil 重放；`problems=[]` | 6.2031s |
 
-合计 **11.8042s**（F 含子进程启动；逐次运行有几十毫秒波动），仅证明管线可运行，不是真实运行时间估计。
+合计 **11.7593s**（F 含子进程启动；逐次运行有几十毫秒波动），仅证明管线可运行，不是真实运行时间估计。
 
 最终产物：
 
 | 产物 | SHA-256 |
 | --- | --- |
-| R0 `registration/attempt_001/registration.json` | `da2fcd3033a50fa7031752e2e22fc1ffe2d0a4615415418e8a8f24847f8a010a` |
+| R0 `registration/attempt_001/registration.json` | `df1e17505d935b48db38e58477885338009b7f5957615ad8a2b7e13344b6e2b1` |
 | R0 `registration/attempt_001/admission.json` | `5c492f27bfe2bbe25c271fdd9a564ebee4733c3c6c824b177ada03a32c16f13c` |
-| `geometry/attempt_001/geometry_rows.json` | `7b0c98fdea019630987f37040074452e391afe8dca33695adc85fdfa5e112f28` |
+| `geometry/attempt_001/geometry_rows.json` | `a3658b69d5d0a625a8b9f0e29b4c02f077e9d73833aa01bc24b73299c0085e0d` |
 | `geometry/attempt_001/fk_geometry_arrays.npz` | `be251f2dcd17826ac374ccaf1e39ca0fa216f02aa4f919d0d68b3172e910ae29` |
 | `geometry/attempt_001/fk_gradient_arrays.npz` | `98f3b21cdf8ef3c4ff99ae9495b6bafd7c65a82c27ad331c05d41ce2dc100b8e` |
-| `derivative/attempt_001/fd_rows.json` | `7e450887e381890cd1bfcf297df868bfebe16fef50e8b12e23d67ee3a8996121` |
+| `derivative/attempt_001/fd_rows.json` | `98bb4fe75d13e9f2d4a811be4afe57454dda1195772a21085a6fdc593f38dfca` |
 | `derivative/attempt_001/fd_arrays.npz` | `3202046f95fd07913f4edf1d23c198edb1ef2ddd4673f8ea3e8f6b959bce216d` |
-| `finalize/attempt_001/fk_audit_final.json` | `d7e6d25f5f60c95e6bad45b070637be004aa3c1ba172e180ba934dea80b879d0` |
-| `finalize/attempt_001/independent_verification.json` | `d41f1c9865f04d7ded5f8eb63bf6a0c845acb13fdc03ace98acfa6c32750d1d5` |
+| `finalize/attempt_001/fk_audit_final.json` | `f5ddd094f4b395d6c2cc92a8c38f1f943953599b9831bc65defee6b5dcc69668` |
+| `finalize/attempt_001/independent_verification.json` | `0924ca9fbd77a077060eb811407fab399588cc0fdbe557f0d6f1490f2a0d3d88` |
 
 最终 `conclusion=synthetic_contract_passed`、`complete_evidence=true`、`covered_contract_passed=true`、`failures=[]`、`gaps=[]`、`verification_problems=[]`；四个阶段均 `done/complete=true` 且 `stage_state` 可消费。R0 不产生 FK/model 调用，无 `call_delta`；G/D/F 的 delta 逐项等于提案矩阵。
 
@@ -161,8 +161,8 @@ uv run --locked python scripts/audit_w1_real_fk.py --admission \
 
 | 项 | 值 |
 | --- | --- |
-| 包路径 | `derived/audit/w1_real_fk_audit/admission/attempt_012/admission_package.json` |
-| 包 SHA-256 | `c53e2ce4da7f7cd00b817879ede331a32c1eceee40b373bdec32fc3b3befe1cd` |
+| 包路径 | `derived/audit/w1_real_fk_audit/admission/attempt_013/admission_package.json` |
+| 包 SHA-256 | `883dd09bea692b5403a487d1e203c071f5ebbc931f18da7eb011e47c609788bc` |
 | `passed` | true（`problems=[]`） |
 | 状态 | `authorized=false / registered=false / run=not_run / section_9_2_checked=false` |
 | 父运行绑定 | 7/7 文件哈希匹配（注册/准入/p_report/两份数组/终局/独立复核） |
@@ -172,7 +172,7 @@ uv run --locked python scripts/audit_w1_real_fk.py --admission \
 | 运行时 | 契约 `TF32 off / highest / deterministic=false / autocast off`；构建进程内应用后 `applied=true`，`observed_after_setup` 五项全部满足 |
 | 读取范围 | 仅元数据/文件哈希；未加载窗口数组、未编译资产、未 `torch.load` checkpoint、未创建 cohort 或正式运行根 |
 
-包内 `implementation.files` 与草案/校准文件/证据哈希均与当前字节一致；改动任一被绑定文件会使准入包和真实入口拒绝。`attempt_001`–`attempt_011` 是逐步加入撤回成本、慢持久化、R0 实现漂移门、真实参考事实、审阅修复前实现与草案、两轮审阅修复实现、以及同步成本/耗时纪录的历史包；`attempt_012` 为当前权威。
+包内 `implementation.files` 与草案/校准文件/证据哈希均与当前字节一致；改动任一被绑定文件会使准入包和真实入口拒绝。`attempt_001`–`attempt_012` 是逐步加入撤回成本、慢持久化、R0 实现漂移门、真实参考事实、审阅修复前实现与草案、两/三轮审阅修复实现、以及同步成本/耗时纪录的历史包；`attempt_013` 为当前权威。
 
 包内 `r0_obligations` 明确列出真实 R0 必须落实的 7 项：资产闭包、父消费者状态、输入 schema/生效常数/域、调用点计数与单元预留、F 独立子进程、G/D 消费者门、生产运行时设置与父子复核。
 
@@ -207,7 +207,16 @@ uv run --locked python scripts/audit_w1_real_fk.py --admission \
 
 两轮修复均未改变校准证据哈希（`8f46fbe1…`）。第二轮权威合成运行在最终模块/草案字节下重新生成。
 
-## 8. 仍未执行与未覆盖
+## 8. 第三轮只读审阅修复（1 P1 + 1 P2）
+
+| # | 级别 | 问题 | 修复 | 反例/证据 |
+| --- | --- | --- | --- | --- |
+| 1 | P1 | `delta_settled` 只看是否为 Mapping；字段无效或 `counter.add` 超限时仍把预留标为已结算，空/部分 delta 也被结算为零 | 新增 `_worker_call_delta`：要求 delta 覆盖全部 8 类调用、每项为非负 JSON 整数，并与 worker 自身终态计数器快照逐项一致；合并任一字段超限即撤销结算并保持 `consumed=null` | `test_worker_call_delta_requires_a_complete_consistent_snapshot`、`test_f_does_not_settle_an_unmergeable_worker_delta`（已有 31632 再报 10545 → 合并失败、计数不变、预留未结算、历史未知） |
+| 2 | P2 | 最终调用矩阵否决只在 F 封口后修改返回值，磁盘摘要仍保留通过声明 | 矩阵判据前移到 `finish_attempt` 之前；不匹配时先把 F 摘要与独立验证重写为 `audit_incomplete`/`complete_evidence=false` 并重绑哈希，再以 incomplete 封口 | `test_call_matrix_mismatch_withdraws_the_disk_claim`（`kernel64_fk_batch` 期望 +3 → 磁盘摘要 `audit_incomplete`、验证 `complete_evidence=false`、`stage_state(F)` 报 `attempt_not_complete`） |
+
+第三轮未改变校准证据哈希；权威合成运行在最终模块/草案字节下重新生成（`review11`），历史 `_prefinal*` 中间运行保留对照。
+
+## 9. 仍未执行与未覆盖
 
 - 未勾选方案 §9.2 九项；未创建真实 cohort/预算/注册；未执行真实 R0/G/D/F。
 - 未读取父 `objective_real_arrays.npz` 的数值数组（准入包只哈希文件）、未编译锁定 MJCF/URDF、未加载两份 checkpoint。
@@ -219,7 +228,7 @@ uv run --locked python scripts/audit_w1_real_fk.py --admission \
 - I/C 的 `scene_setup_forward=0` 是合成事实；真实 G/F 每个 stage 应各为 1，由 R0/G 首个已登记单元核验。
 - 真实入口在无授权、无校准、无准入包或运行根不是固定历史根直接子目录时拒绝，且在读取数组/加载资产/创建运行根之前退出（测试覆盖）。
 
-## 9. 复现命令
+## 10. 复现命令
 
 ```bash
 uv run --locked pytest tests/test_w1_real_fk_audit.py -q
@@ -240,9 +249,9 @@ uv run --locked python scripts/audit_w1_real_fk.py --real \
   --out derived/experiments/omniretarget_first/<new_run> \
   --authorization <authorization.json> \
   --tolerance-contract derived/audit/w1_real_fk_audit/tolerance_contract.json \
-  --admission-package derived/audit/w1_real_fk_audit/admission/attempt_012/admission_package.json
+  --admission-package derived/audit/w1_real_fk_audit/admission/attempt_013/admission_package.json
 ```
 
-## 10. 边界
+## 11. 边界
 
 `objective_coverage=partial`、`full_objective_contract_passed=null`、`attribution=attribution_insufficient`、`factor_selected=false`、`auto_execute=false`、`final_interaction_method=not_ready`、`production_integration=false`。旧 U0 `incomplete`、UR `no_quality_gain`、原 F `not_ready`、预测 r6 不可验收、旋转融合不接入均保持不变。真实通过/失败只能由取得授权后的 R0→G→D→F 产生，不能由本记录外推。

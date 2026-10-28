@@ -1404,10 +1404,14 @@ def test_f_merges_an_aborted_worker_delta_and_keeps_unsettled_unknown(
     def fake_worker(spec, out_dir, timeout_s, project_root):
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
+        full = {kind: 0 for kind in m.CALL_CAPS}
+        full["mj_forward"] = 1200
+        full["loss_assembler"] = 2
         meta = {"pid": 999999, "ppid": m.os.getpid(),
                 "exit_reason": "worker_exception:RuntimeError",
-                "units": [], "call_delta": {"mj_forward": 1200,
-                                            "loss_assembler": 2}}
+                "units": [], "call_delta": dict(full),
+                "counts": {"schema": "w1_real_fk_call_budget_v1",
+                           "counts": dict(full), "within_caps": True}}
         (out_dir / "worker_meta.json").write_text(json.dumps(meta))
         return meta, ["f_worker_exit:3"]
 
@@ -1457,6 +1461,106 @@ def test_f_merges_an_aborted_worker_delta_and_keeps_unsettled_unknown(
 # ---------------------------------------------------------------------------
 # per-unit deadlines inside the compute loops
 # ---------------------------------------------------------------------------
+
+
+def test_worker_call_delta_requires_a_complete_consistent_snapshot():
+    full = {kind: 0 for kind in m.CALL_CAPS}
+    full["mj_forward"] = 11
+    delta, problems = m._worker_call_delta(
+        {"call_delta": dict(full), "counts": {"counts": dict(full)}})
+    assert delta == full and not problems
+    # An empty or partial delta must not settle the reservation at zero.
+    assert m._worker_call_delta(
+        {"call_delta": {}, "counts": {"counts": dict(full)}})[0] is None
+    partial = dict(full)
+    partial.pop("fd_pose_eval")
+    assert m._worker_call_delta(
+        {"call_delta": partial, "counts": {"counts": partial}})[0] is None
+    # The delta must agree with the worker's own terminal counter snapshot.
+    other = dict(full)
+    other["mj_forward"] = 12
+    assert "f_worker_call_delta_inconsistent" in m._worker_call_delta(
+        {"call_delta": dict(full), "counts": {"counts": other}})[1]
+    assert "f_worker_call_counts_missing" in m._worker_call_delta(
+        {"call_delta": dict(full)})[1]
+    bad = dict(full)
+    bad["mj_forward"] = True
+    assert m._worker_call_delta(
+        {"call_delta": bad, "counts": {"counts": bad}})[0] is None
+
+
+def test_f_does_not_settle_an_unmergeable_worker_delta(
+        self_test, tmp_path, monkeypatch):
+    target, g, d, provider = _f_inputs(self_test, tmp_path,
+                                       tamper=lambda *_: None)
+    counter, t0, budget = _registered_f_attempt(
+        target, self_test["stages"]["R0"]["registration_sha256"])
+    counter.add("mj_forward", 31632)
+
+    def fake_worker(spec, out_dir, timeout_s, project_root):
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        full = {kind: 0 for kind in m.CALL_CAPS}
+        full["mj_forward"] = int(m.CALL_CAPS["mj_forward"]) - 31632 + 1
+        meta = {"pid": 999997, "ppid": m.os.getpid(),
+                "exit_reason": "worker_exception:RuntimeError",
+                "units": [], "call_delta": dict(full),
+                "counts": {"counts": dict(full)}}
+        (out_dir / "worker_meta.json").write_text(json.dumps(meta))
+        return meta, ["f_worker_exit:3"]
+
+    monkeypatch.setattr(m, "_run_recompute_worker", fake_worker)
+    f = m.run_f_stage(
+        target, "F", "attempt_999", t0, budget,
+        self_test["stages"]["R0"]["registration_sha256"],
+        g, d, provider, counter, self_test["tolerance_contract"],
+        recompute="subprocess", g_expected=g["artifact_hashes"],
+        d_expected=d["artifact_hashes"])
+    assert f["conclusion"] == "audit_incomplete"
+    assert "f_worker_call_cap:mj_forward" in f["verification_problems"]
+    assert "f_call_settlement_unknown" in f["verification_problems"]
+    # The failed merge does not move the counter and the reservation stays
+    # unsettled so later attempts cannot claim a fresh quota.
+    assert counter.counts["mj_forward"] == 31632
+    reservation = json.loads(
+        (m.stage_dir(target, "F") / "attempt_999" /
+         "call_reservations.json").read_text())
+    assert reservation["consumed"] is None
+    assert any("reservation_unsettled:F:attempt_999" in p
+               for p in m._reservation_problems(target))
+
+
+def test_call_matrix_mismatch_withdraws_the_disk_claim(monkeypatch, tmp_path):
+    real = m.full_chain_calls
+
+    def inflated():
+        calls = real()
+        calls["kernel64_fk_batch"] += m.STAGE_NOMINAL["G"][
+            "kernel64_fk_batch"]
+        return calls
+
+    monkeypatch.setattr(m, "full_chain_calls", inflated)
+    result = m.synthetic_self_test(tmp_path / "run", seed=20261028)
+    assert result["conclusion"] == "audit_incomplete"
+    assert result["complete_evidence"] is False
+    assert result["covered_contract_passed"] is False
+    assert any("synthetic_call_matrix:kernel64_fk_batch" in p
+               for p in result["problems"])
+    run_root = Path(result["run_root"])
+    if not run_root.is_absolute():
+        run_root = m.PROJECT_ROOT / run_root
+    summary = json.loads(
+        (run_root / "finalize/attempt_001/fk_audit_final.json").read_text())
+    assert summary["conclusion"] == "audit_incomplete"
+    assert summary["complete_evidence"] is False
+    assert summary["covered_contract_passed"] is False
+    verification = json.loads(
+        (run_root / "finalize/attempt_001/"
+         "independent_verification.json").read_text())
+    assert verification["complete_evidence"] is False
+    _row, problems = m.stage_state(run_root, "F")
+    assert "attempt_not_complete" in problems
+    assert m.stage_history(run_root, "F") is not None  # terminal, honest
 
 
 def test_geometry_deadline_stops_the_second_model(synthetic, monkeypatch):

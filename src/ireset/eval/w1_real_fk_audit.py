@@ -4355,6 +4355,39 @@ def _file_sha(path: Any) -> str | None:
     return sha256_file(p)
 
 
+def _worker_call_delta(meta: Mapping[str, Any]
+                       ) -> tuple[dict[str, int] | None, list[str]]:
+    """Validate a worker-reported call delta as the complete exact snapshot.
+
+    A partial or empty mapping would settle the reservation at an understated
+    count, so the delta must cover every call kind and agree with the worker's
+    own terminal counter snapshot.
+    """
+    delta = meta.get("call_delta")
+    if not isinstance(delta, Mapping):
+        return None, ["f_worker_call_delta_missing"]
+    if set(delta) != set(CALL_CAPS):
+        return None, [f"f_worker_call_delta_keys:"
+                      f"{len(set(delta) ^ set(CALL_CAPS))}"]
+    out: dict[str, int] = {}
+    for kind in CALL_CAPS:
+        value = delta[kind]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None, [f"f_worker_call_unknown:{kind}"]
+        out[kind] = int(value)
+    counts = meta.get("counts")
+    snap = counts.get("counts") if isinstance(counts, Mapping) else None
+    if not isinstance(snap, Mapping) or set(snap) != set(CALL_CAPS):
+        return None, ["f_worker_call_counts_missing"]
+    for kind in CALL_CAPS:
+        value = snap[kind]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None, [f"f_worker_call_counts_invalid:{kind}"]
+    if {kind: int(snap[kind]) for kind in CALL_CAPS} != out:
+        return None, ["f_worker_call_delta_inconsistent"]
+    return out, []
+
+
 def _artifact_hash_problems(paths: Mapping[str, Any] | None,
                             expected: Mapping[str, Any] | None,
                             keys: Sequence[str], tag: str,
@@ -4770,11 +4803,21 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float,
                             units.append(dict(unit))
                     process = dict(worker_meta)
                     verification += worker_problems
-                    # A timed-out or killed worker reports no delta; those
-                    # calls are unknown, so the reservation must stay
-                    # unsettled instead of being settled at zero.
-                    delta_settled = isinstance(
-                        worker_meta.get("call_delta"), Mapping)
+                    # The delta must be complete and mergeable; a partial,
+                    # empty or cap-exceeding report leaves the reservation
+                    # unknown instead of settling it at an understated count.
+                    worker_delta, delta_problems = _worker_call_delta(
+                        worker_meta)
+                    verification += delta_problems
+                    delta_settled = worker_delta is not None
+                    if worker_delta is not None:
+                        for kind, value in worker_delta.items():
+                            try:
+                                counter.add(kind, value)
+                            except FkCallBudgetExceeded:
+                                verification.append(
+                                    f"f_worker_call_cap:{kind}")
+                                delta_settled = False
                     if not delta_settled:
                         verification.append("f_call_settlement_unknown")
                     runtime = worker_meta.get("runtime")
@@ -4827,18 +4870,6 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float,
                             and fresh_d_rows is not None
                             and fresh_g_arrays is not None
                             and fresh_d_arrays is not None)
-                    raw_delta = worker_meta.get("call_delta") or {}
-                    for kind, value in raw_delta.items():
-                        if kind not in CALL_CAPS \
-                                or not isinstance(value, int) \
-                                or isinstance(value, bool) or value < 0:
-                            verification.append(
-                                f"f_worker_call_unknown:{kind}")
-                            continue
-                        try:
-                            counter.add(kind, int(value))
-                        except FkCallBudgetExceeded:
-                            verification.append(f"f_worker_call_cap:{kind}")
         after = counter.snapshot()["counts"]
         f_delta = {k: int(after[k]) - int(before[k]) for k in after}
         if reservation_path is not None:
@@ -5869,6 +5900,39 @@ def run_registered_audit(run_root: Path, provider: FkProvider, *, mode: str,
              "failures": [], "gaps": [f"f_stage_aborted:{exc}"],
              "summary": {}, "report": None, "verification_path": None,
              "units": [], "recompute_process": {}}
+    call_matrix_problems: list[str] = []
+    if mode == "synthetic":
+        expected_calls = full_chain_calls()
+        expected_calls["scene_setup_forward"] = 0
+        final_counts = counter.snapshot()["counts"]
+        call_matrix_problems = [
+            f"synthetic_call_matrix:{kind}:"
+            f"{int(final_counts.get(kind, 0))}!={int(expected_calls[kind])}"
+            for kind in CALL_CAPS
+            if int(final_counts.get(kind, 0)) != int(expected_calls[kind])]
+    if call_matrix_problems:
+        # The full-chain call matrix is part of the verdict, not a post-hoc
+        # note: withdraw the already-published pass claims before sealing so
+        # the disk never keeps a passing summary for a rejected chain.
+        f.update(complete_evidence=False, covered_contract_passed=False,
+                 conclusion="audit_incomplete")
+        if f.get("report") and Path(f["report"]).is_file():
+            try:
+                f["summary"] = _rewrite_summary_incomplete(
+                    Path(f["report"]), "synthetic_call_matrix_mismatch",
+                    call_matrix_problems)
+            except (OSError, ValueError, TypeError) as exc:
+                call_matrix_problems.append(
+                    f"call_matrix_withdraw_failed:{type(exc).__name__}")
+        if f.get("verification_path") and Path(
+                f["verification_path"]).is_file():
+            try:
+                _rewrite_summary_incomplete(
+                    Path(f["verification_path"]),
+                    "synthetic_call_matrix_mismatch", call_matrix_problems)
+            except (OSError, ValueError, TypeError) as exc:
+                call_matrix_problems.append(
+                    f"call_matrix_withdraw_failed:{type(exc).__name__}")
     results["F"] = f
     f_report = Path(f["report"]) if f.get("report") else None
     f_artifacts = {}
@@ -5918,16 +5982,6 @@ def run_registered_audit(run_root: Path, provider: FkProvider, *, mode: str,
             t0=t0, budget=budget)
         seals["F"]["row"] = updated_row
         revoke_problems += withdraw_problems
-    call_matrix_problems: list[str] = []
-    if mode == "synthetic":
-        expected_calls = full_chain_calls()
-        expected_calls["scene_setup_forward"] = 0
-        final_counts = counter.snapshot()["counts"]
-        call_matrix_problems = [
-            f"synthetic_call_matrix:{kind}:"
-            f"{int(final_counts.get(kind, 0))}!={int(expected_calls[kind])}"
-            for kind in CALL_CAPS
-            if int(final_counts.get(kind, 0)) != int(expected_calls[kind])]
     if call_matrix_problems:
         conclusion = "audit_incomplete"
         complete = False

@@ -339,7 +339,7 @@ G 与 F 可以复用同一套独立 NumPy/MuJoCo 参考公式；F 的独立性�
 | --- | --- |
 | `src/ireset/eval/w1_real_fk_audit.py` | 固定 122 行几何/梯度键、32 状态/4672 行 FD 键生成器与 schema；独立 NumPy/SciPy 解码、`D_decode`、`J35`/`J38`、损失与梯度；29 关节/15 site 合成长链（torch 生产替身 + NumPy 参考）；调用计数；cohort/index/ledger/publishing 封口；R0→G→D→F；纯合成校准；授权/准入门 |
 | `scripts/audit_w1_real_fk.py` | `--synthetic`（默认）、`--calibrate-synthetic`、`--admission`、`--real`；真实模式在读取数组、加载资产或创建正式运行根之前校验授权、校准、准入包和固定历史根 |
-| `tests/test_w1_real_fk_audit.py` | **68 passed（37.14s，单次实测）**；覆盖列/行 6D 混用、wxyz/xyzw、退化 6D、clamp 正负边界/外侧、`R.T`/枢轴/尺度反例、分母 3600/900、梯度分组与 clamp 零梯度、父绑定逐位、FD 域缺口、键多重集/行字段/数组篡改、账本负成本/running/publishing/半损坏/外部 cohort/慢持久化/撤回成本、授权与准入严格门、真实入口零写入拒绝、合成全链与资产隔离；另覆盖设备绑定、live 标量、调用点计数、预算撤销门、F 单元准入/截止/独立进程、工件逐文件哈希与重叠冲突、R0 资产闭包/父消费者状态/输入 schema、撤回 publishing 先行、负 clamp 边界、全链逐阶段调用计数与索引/台账同快照、worker 中断结算与未结算预留、几何/FD 单元内截止、梯度明细逐字段绑定、双 NPZ 独立 schema、缺失 NPZ 不抛异常、TF32 运行时契约 |
+| `tests/test_w1_real_fk_audit.py` | **71 passed（50.66s，单次实测）**；覆盖列/行 6D 混用、wxyz/xyzw、退化 6D、clamp 正负边界/外侧、`R.T`/枢轴/尺度反例、分母 3600/900、梯度分组与 clamp 零梯度、父绑定逐位、FD 域缺口、键多重集/行字段/数组篡改、账本负成本/running/publishing/半损坏/外部 cohort/慢持久化/撤回成本、授权与准入严格门、真实入口零写入拒绝、合成全链与资产隔离；另覆盖设备绑定、live 标量、调用点计数、预算撤销门、F 单元准入/截止/独立进程、工件逐文件哈希与重叠冲突、R0 资产闭包/父消费者状态/输入 schema、撤回 publishing 先行、负 clamp 边界、全链逐阶段调用计数与索引/台账同快照、worker 中断结算与未结算预留、几何/FD 单元内截止、梯度明细逐字段绑定、双 NPZ 独立 schema、缺失 NPZ 不抛异常、TF32 运行时契约、worker delta 完整性校验与调用矩阵否决撤回 |
 | `src/ireset/train/losses.py` | 仅增加可选 `fk=`/`static_frame=` 注入（默认仍构造 `G1TorchFK` 与 `largebox_static_frame()`）；用于无真实资产的合成解码/FK。`test_generation.py` + `test_label_quality.py` 回归 **26 passed** |
 
 合成测试证明：`LossAssembler` 的真实训练 `decode_clip` 路径被实际执行；合成 fixture 不调用 `largebox_static_frame()`；`w_contact=0` 时 contact 分支执行数为 0。
@@ -387,7 +387,7 @@ G 与 F 可以复用同一套独立 NumPy/MuJoCo 参考公式；F 的独立性�
 
 ### 10.5 当前状态
 
-- 已完成：I/C 实现、68 项测试、冻结校准、纯合成 R0→G→D→F、只读准入包。
+- 已完成：I/C 实现、71 项测试、冻结校准、纯合成 R0→G→D→F、只读准入包。
 - 未完成/未授权：§9.2 九项、真实 cohort/预算/注册、真实 R0/G/D/F、真实资产闭包编译、任何训练或生产接入。
 - 下一交付：用户审阅 §9.2 与准入包后明确授权；R0 先重核父哈希/父消费者状态/四窗/生效常数/输入 schema/资产闭包/环境，再按 R0→G→D→F 执行。
 
@@ -423,3 +423,10 @@ G 与 F 可以复用同一套独立 NumPy/MuJoCo 参考公式；F 的独立性�
 | 6 | P2 | 两份 NPZ 未分别执行完整 schema 检查 | geometry/gradient/FD 三个文件分别按冻结 schema 校验必需键、dtype、shape 与非数值类型后才合并；gradient 文件另与 fresh 分区逐元素比较。反例：清空 gradient NPZ 并重绑哈希 → `g_gradient_arrays_schema_missing` |
 | 7 | P2 | 缺失 NPZ 在记录最终哈希时抛 `FileNotFoundError` | 最终哈希改用 `_file_sha`（缺失返回 `None`）；缺口在读取阶段登记，报告仍可写出。反例：删除 geometry NPZ → `audit_incomplete` 且 `g_arrays_missing`/`g_arrays_file_missing`，不抛异常 |
 | 8 | P2 | 官方入口未落实冻结的 TF32 配置 | 新增 `RUNTIME_REQUIREMENTS`/`configure_production_runtime`：真实入口在构造 provider 前应用 TF32 off、`highest`、关 autocast；R0 复核实际值，F 父/子进程分别记录并互比；准入包绑定运行时契约。反例：打开 TF32/high 后 `runtime_facts_problems` 报错，应用后全部满足 |
+
+### 10.8 第三轮只读审阅修复轮（1 P1 + 1 P2）
+
+| # | 级别 | 问题 | 修复与反例 |
+| --- | --- | --- | --- |
+| 1 | P1 | `delta_settled` 只看是否为 Mapping；字段无效或 `counter.add` 超限时仍把预留标为已结算，空/部分 delta 也被结算为零 | 新增 `_worker_call_delta`：要求 delta 覆盖全部 8 类调用、每项为非负 JSON 整数，且与 worker 自身终态计数器快照逐项一致；合并任一字段超限即撤销结算。反例：`mj_forward` 已 31632 再报 10545 时合并失败、计数不变、预留 `consumed=null` 且 `_reservation_problems` 报未结算；空/部分 delta 与计数器不一致均判未知 |
+| 2 | P2 | 最终调用矩阵否决只在 F 封口后修改返回值，磁盘 `fk_audit_final.json` 仍保留通过声明 | 在 `finish_attempt` 之前执行矩阵判据；不匹配时先把 F 摘要与独立验证重写为 `audit_incomplete`/`complete_evidence=false` 并重绑哈希，再以 incomplete 封口。反例：令 `full_chain_calls` 的 `kernel64_fk_batch` 多 3 后，磁盘摘要为 `audit_incomplete`、验证文件 `complete_evidence=false`、`stage_state(F)` 报 `attempt_not_complete` |
