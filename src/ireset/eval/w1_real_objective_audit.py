@@ -444,6 +444,19 @@ def load_ledger(root: Path) -> list[dict]:
     return _load_rows(_ledger_path(root), "invocations")
 
 
+def _read_registration(root: Path, which: str) -> tuple[list[dict] | None, str | None]:
+    """Read one half of a run's registration; ``None`` rows means unusable.
+
+    Index and ledger are read separately so a damaged half cannot hide the
+    cohort evidence that survived in the other half.
+    """
+    try:
+        rows = load_index(root) if which == "index" else load_ledger(root)
+    except (OSError, ValueError, TypeError):
+        return None, which
+    return rows, None
+
+
 def save_index(root: Path, rows: list[dict]) -> None:
     write_json(_index_path(root), {"attempts": rows})
 
@@ -669,28 +682,30 @@ def cohort_history(fixed_root: Path, *, exclude_root: Path | None = None,
             if not isinstance(marker, dict):
                 return {"known": False, "reason": f"unreadable_cohort:{sibling.name}",
                         "runs": runs}
-        try:
-            index = load_index(sibling)
-            ledger = load_ledger(sibling)
-        except (OSError, ValueError, TypeError):
-            if not marker:
-                # A legacy sibling from another study has no cohort marker and
-                # its own ledger schema.  It cannot be attributed to this
-                # cohort: a registered run writes cohort.json before any
-                # attempt.  Skip it instead of making this cohort's history
-                # unknown; a marked run with a broken ledger still fails
-                # closed below.
-                continue
-            return {"known": False, "reason": f"unreadable_ledger:{sibling.name}",
-                    "runs": runs}
+        index, broken_index = _read_registration(sibling, "index")
+        ledger, broken_ledger = _read_registration(sibling, "ledger")
+        broken = broken_index or broken_ledger
         matching_marker = marker.get("cohort_id") == COHORT_ID
         matching_rows = any(
             r.get("cohort_id") == COHORT_ID
             and r.get("accounting_schema") == ACCOUNTING_SCHEMA
-            for r in (*index, *ledger)
+            for r in (*(index or []), *(ledger or []))
         )
-        if not (matching_marker or matching_rows):
+        matching = matching_marker or matching_rows
+        if not matching and not marker:
+            # A legacy sibling from another study has no cohort marker and
+            # its own ledger schema.  It cannot be attributed to this
+            # cohort: a registered run writes cohort.json before any
+            # attempt.  Skip it instead of making this cohort's history
+            # unknown.
             continue
+        if broken:
+            # A member (marker or surviving registration row) whose other
+            # half is unreadable: membership is known, accounting is not.
+            # Never drop evidence that was read successfully.
+            return {"known": False, "reason": f"unreadable_{broken}:{sibling.name}",
+                    "runs": runs}
+        index, ledger = index or [], ledger or []
         if marker and marker.get("cohort_id") not in (None, COHORT_ID):
             return {"known": False, "reason": f"foreign_cohort:{sibling.name}",
                     "runs": runs}
@@ -727,19 +742,18 @@ def cohort_attempts(fixed_root: Path, stage: str, *,
             return None
         if not isinstance(marker, dict):
             return None
-        try:
-            index = load_index(sibling)
-            ledger = load_ledger(sibling)
-        except (OSError, ValueError, TypeError):
-            if not marker:
-                # Markerless legacy run from another study: not attributable
-                # to this cohort.  A marked run still fails closed.
-                continue
-            return None
+        index, broken_index = _read_registration(sibling, "index")
+        ledger, broken_ledger = _read_registration(sibling, "ledger")
         matching = (marker.get("cohort_id") == COHORT_ID
-                    or any(r.get("cohort_id") == COHORT_ID for r in (*index, *ledger)))
-        if not matching:
+                    or any(r.get("cohort_id") == COHORT_ID
+                           for r in (*(index or []), *(ledger or []))))
+        if not matching and not marker:
+            # Markerless legacy run from another study: not attributable
+            # to this cohort.
             continue
+        if broken_index or broken_ledger:
+            return None
+        index, ledger = index or [], ledger or []
         index_attempts = {r.get("attempt") for r in index if r.get("stage") == stage}
         ledger_attempts = {e.get("attempt") for e in ledger if e.get("stage") == stage}
         disk = _disk_attempts(sibling, stage)
@@ -795,22 +809,19 @@ def prior_call_counts(root: Path, *, fixed_root: Path,
                 return None
             if not isinstance(marker, Mapping):
                 return None
-            try:
-                index = load_index(sibling)
-                ledger = load_ledger(sibling)
-            except (OSError, ValueError, TypeError):
-                if not marker:
-                    # Markerless legacy run from another study: not
-                    # attributable to this cohort.  A marked run still fails
-                    # closed.
-                    continue
-                return None
+            index, broken_index = _read_registration(sibling, "index")
+            ledger, broken_ledger = _read_registration(sibling, "ledger")
             matching = (isinstance(marker, Mapping)
                         and marker.get("cohort_id") == COHORT_ID)
             matching = matching or any(
-                r.get("cohort_id") == COHORT_ID for r in (*index, *ledger))
-            if not matching:
+                r.get("cohort_id") == COHORT_ID
+                for r in (*(index or []), *(ledger or [])))
+            if not matching and not marker:
+                # Markerless legacy run from another study: not attributable
+                # to this cohort.
                 continue
+            if broken_index or broken_ledger:
+                return None
             if isinstance(marker, Mapping) and marker.get("cohort_id") not in (None, COHORT_ID):
                 continue
             roots.append(sibling)

@@ -912,6 +912,75 @@ def test_calibration_evidence_is_reverified():
     assert any("calibration_" in p and "reproducible" in p for p in problems), problems
 
 
+@pytest.mark.parametrize("damaged", ["index", "ledger"])
+def test_damaged_registration_half_never_hides_a_cohort_member(
+        tmp_path: Path, damaged: str):
+    """A readable half that names this cohort must fail closed, not be dropped.
+
+    The markerless-skip branch exists for legacy runs of other studies.  It
+    must not swallow a member of this cohort whose cohort.json is missing and
+    whose other registration half is damaged: the surviving half is already
+    proof of membership, so the history is unknown (never silently cheaper).
+    """
+    fixed = tmp_path / "fixed"
+    fixed.mkdir()
+    current = fixed / "current_run"
+    audit.write_cohort(current, mode="real")
+
+    run = fixed / "damaged_run"
+    assert _seal_real_stage(run).sealed
+    (run / "cohort.json").unlink()
+    broken_path = run / ("attempts_index.json" if damaged == "index"
+                         else "costs.json")
+    broken_path.write_text(json.dumps([]))
+
+    history = audit.cohort_history(fixed, exclude_root=current)
+    assert history["known"] is False
+    assert history["reason"] == f"unreadable_{damaged}:damaged_run"
+    assert audit.cohort_attempts(fixed, "R0", exclude_root=current) is None
+    assert audit.prior_call_counts(current, fixed_root=fixed, mode="real") is None
+
+
+def test_markerless_member_with_intact_registration_is_still_counted(
+        tmp_path: Path):
+    """The fail-closed rule above must not reject an attributable run."""
+    fixed = tmp_path / "fixed"
+    fixed.mkdir()
+    current = fixed / "current_run"
+    audit.write_cohort(current, mode="real")
+
+    run = fixed / "markerless_member"
+    balance = audit.AuditCallBudget().snapshot()
+    assert _seal_real_stage(run, call_balance=balance).sealed
+    (run / "cohort.json").unlink()
+
+    history = audit.cohort_history(fixed, exclude_root=current)
+    assert history["known"] is True
+    assert len(history["runs"]) == 1
+    assert history["total_s"] > 0.0
+    assert audit.cohort_attempts(fixed, "R0", exclude_root=current) == 1
+    assert audit.prior_call_counts(
+        current, fixed_root=fixed, mode="real") == dict.fromkeys(audit.CALL_CAPS, 0)
+
+
+def test_foreign_marker_with_damaged_half_still_fails_closed(tmp_path: Path):
+    """A marker that names some cohort plus an unreadable half stays unknown."""
+    fixed = tmp_path / "fixed"
+    fixed.mkdir()
+    current = fixed / "current_run"
+    audit.write_cohort(current, mode="real")
+    foreign = fixed / "foreign_run"
+    audit.write_cohort(foreign, mode="real")
+    marker = _load(foreign / "cohort.json")
+    marker["cohort_id"] = "some_other_cohort"
+    (foreign / "cohort.json").write_text(json.dumps(marker))
+    (foreign / "costs.json").write_text(json.dumps([]))
+
+    assert audit.cohort_history(fixed, exclude_root=current)["known"] is False
+    assert audit.cohort_attempts(fixed, "R0", exclude_root=current) is None
+    assert audit.prior_call_counts(current, fixed_root=fixed, mode="real") is None
+
+
 def test_prior_call_counts_are_cohort_wide_and_fail_closed(tmp_path: Path):
     fixed = tmp_path / "fixed"
     fixed.mkdir()
@@ -942,6 +1011,20 @@ def test_prior_call_counts_are_cohort_wide_and_fail_closed(tmp_path: Path):
     audit.write_cohort(orphan, mode="real")
     (orphan / "registration" / "attempt_001").mkdir(parents=True)
     assert audit.prior_call_counts(current, fixed_root=fixed, mode="real") is None
+
+
+def _seal_real_stage(root: Path, *, stage: str = "R0",
+                     attempt: str = "attempt_001", call_balance=None):
+    t0 = time.perf_counter()
+    audit.write_cohort(root, mode="real")
+    budget = {"stage": stage, "remaining_s": 60.0}
+    audit.pre_register_attempt(root, stage, attempt, t0, scope={"s": 1},
+                               budget=budget, call_balance=call_balance)
+    extra = {"complete": True}
+    if call_balance is not None:
+        extra["call_balance"] = call_balance
+    return audit.finish_attempt(root, stage, attempt, t0, budget,
+                                {"complete": True}, status="done", extra=extra)
 
 
 def test_markerless_legacy_sibling_does_not_block_cohort_history(
