@@ -1688,3 +1688,57 @@ def test_production_runtime_is_applied_and_verified():
         torch.backends.cuda.matmul.allow_tf32 = original[0]
         torch.backends.cudnn.allow_tf32 = original[1]
         torch.set_float32_matmul_precision(original[2])
+
+
+def test_r0_charges_launch_and_import_time(tmp_path, monkeypatch):
+    original = m.run_r0
+
+    def stop_after_r0(*args, **kwargs):
+        result = original(*args, **kwargs)
+        result["passed"] = False
+        result["problems"].append("synthetic_stop_after_r0")
+        return result
+
+    monkeypatch.setattr(m, "run_r0", stop_after_r0)
+    started = m.time.perf_counter() - 5.0
+    root = tmp_path / "run"
+    result = m.run_registered_audit(
+        root, m.SyntheticFkProvider(seed=20261028), mode="synthetic",
+        tolerance=m.build_default_tolerance_contract(),
+        r0_started_perf=started)
+    assert result["conclusion"] == "audit_incomplete"
+    row = m.load_index(root)[0]
+    assert row["stage"] == "R0"
+    assert row["budget"]["startup_elapsed_s"] >= 5.0
+    assert row["measured_wall_s"] >= m.time.perf_counter() - started
+    assert m.stage_history(root, "R0") >= 5.0
+
+
+def test_expired_r0_launch_stops_before_loading_inputs(tmp_path, monkeypatch):
+    provider = m.SyntheticFkProvider(seed=20261028)
+
+    def forbidden():
+        raise AssertionError("expired R0 must not read input arrays")
+
+    monkeypatch.setattr(provider, "load_inputs", forbidden)
+    root = tmp_path / "run"
+    result = m.run_registered_audit(
+        root, provider, mode="synthetic",
+        tolerance=m.build_default_tolerance_contract(),
+        r0_started_perf=m.time.perf_counter() - 181.0)
+    assert result["conclusion"] == "audit_incomplete"
+    assert set(result["stages"]) == {"R0"}
+    assert "input_load_failed:TimeoutError" in result["problems"]
+    assert all(value == 0 for value in result["calls"]["counts"].values())
+    assert m.stage_history(root, "R0") >= 181.0
+
+
+@pytest.mark.parametrize("started", [float("nan"), float("inf"), True, -1.0])
+def test_invalid_r0_launch_clock_creates_no_run(tmp_path, started):
+    root = tmp_path / "run"
+    with pytest.raises(ValueError, match="invalid R0 launch clock"):
+        m.run_registered_audit(
+            root, m.SyntheticFkProvider(seed=20261028), mode="synthetic",
+            tolerance=m.build_default_tolerance_contract(),
+            r0_started_perf=started)
+    assert not root.exists()

@@ -3748,13 +3748,16 @@ def run_r0(root: Path, stage: str, attempt: str, t0: float, budget: dict,
         problems.append("synthetic_parent_fixture_missing")
     parent_consumer = _parent_consumer_state(project_root, mode=mode)
     problems += parent_consumer["problems"]
-    assets = _asset_closure_facts(project_root, mode=mode)
-    problems += assets["problems"]
+    assets = {"checked": False, "problems": []}
     try:
+        _ensure_stage_deadline(t0, budget)
+        assets = _asset_closure_facts(project_root, mode=mode)
+        _ensure_stage_deadline(t0, budget)
         inputs = provider.load_inputs()
         input_facts = _input_schema_facts(inputs)
-    except (OSError, ValueError, TypeError, KeyError) as exc:
+    except (OSError, ValueError, TypeError, KeyError, TimeoutError) as exc:
         input_facts = {"problems": [f"input_load_failed:{type(exc).__name__}"]}
+    problems += assets["problems"]
     problems += input_facts.get("problems", [])
     env = environment_facts()
     runtime = getattr(provider, "runtime", None)
@@ -5638,7 +5641,12 @@ def run_registered_audit(run_root: Path, provider: FkProvider, *, mode: str,
                          admission_package: Mapping[str, Any] | None = None,
                          admission_sha: str | None = None,
                          fixed_root: Path = HISTORY_ROOT,
-                         project_root: Path = PROJECT_ROOT) -> dict:
+                         project_root: Path = PROJECT_ROOT,
+                         r0_started_perf: float | None = None) -> dict:
+    if r0_started_perf is not None and (
+            not _nonneg(r0_started_perf)
+            or float(r0_started_perf) > time.perf_counter()):
+        raise ValueError("invalid R0 launch clock")
     run_root = Path(run_root).expanduser().resolve()
     run_root.mkdir(parents=True, exist_ok=True)
     if mode not in ("synthetic", "real"):
@@ -5744,8 +5752,10 @@ def run_registered_audit(run_root: Path, provider: FkProvider, *, mode: str,
         return out
 
     # --- R0 -----------------------------------------------------------------
-    t0 = time.perf_counter()
+    t0 = (time.perf_counter() if r0_started_perf is None
+          else float(r0_started_perf))
     budget = budget_for(run_root, "R0", fixed_root=fixed_root, mode=mode)
+    budget["startup_elapsed_s"] = max(0.0, time.perf_counter() - t0)
     attempt = allocate_attempt(run_root, "R0")
     pre_register_attempt(run_root, "R0", attempt, t0, scope=scope,
                          budget=budget, call_balance=counter.snapshot())

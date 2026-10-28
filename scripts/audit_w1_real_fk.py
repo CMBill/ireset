@@ -26,6 +26,11 @@ Real (only after explicit user authorization):
 
 from __future__ import annotations
 
+import os
+import time
+
+_ENTRY_STARTED_PERF = time.perf_counter()
+
 import argparse
 import hashlib
 import json
@@ -227,7 +232,9 @@ def main() -> int:
         result = run_registered_audit(
             out, provider, mode="real", tolerance=contract,
             authorization_sha=auth_sha, authorization=record,
-            admission_package=package, admission_sha=package_sha)
+            admission_package=package, admission_sha=package_sha,
+            r0_started_perf=float(os.environ.get(
+                "W1_REAL_FK_AUDIT_LAUNCH_PERF", _ENTRY_STARTED_PERF)))
         result["authorization_sha256"] = auth_sha
         result["tolerance_contract_sha256"] = contract_sha
         result["admission_package_sha256"] = package_sha
