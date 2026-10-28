@@ -327,7 +327,7 @@ G 与 F 可以复用同一套独立 NumPy/MuJoCo 参考公式；F 的独立性�
 
 下一项交付先是 **I/C 的实现、纯合成自测和可审阅冻结准入包**，之后才申请本方案 §9.2 的真实执行授权。准入包须列出源码身份、校准观测/证据哈希、精确数组/键 schema、名义工作量、全阶段调用/成本上限与未覆盖层；不能把本文件的提案数字登记成已执行或已授权事实。
 
-截至 2026-10-28，本方案的 I/C 工程工作已完成（见 §10）：审计器、CLI、39 项测试、纯合成校准与 R0→G→D→F 自测均已完成；冻结校准契约与只读准入包已生成。真实 cohort、预算、注册与正式 R0/G/D/F 均未创建或执行，§9.2 九项仍未勾选。旧真实审计的已覆盖通过结论及全部质量负结果保持不变。
+截至 2026-10-28，本方案的 I/C 工程工作已完成（见 §10）：审计器、CLI、58 项测试、纯合成校准与 R0→G→D→F 自测均已完成；冻结校准契约与只读准入包已生成。真实 cohort、预算、注册与正式 R0/G/D/F 均未创建或执行，§9.2 九项仍未勾选。旧真实审计的已覆盖通过结论及全部质量负结果保持不变。
 
 ## 10. I/C 实施、纯合成校准与准入包（2026-10-28）
 
@@ -339,7 +339,7 @@ G 与 F 可以复用同一套独立 NumPy/MuJoCo 参考公式；F 的独立性�
 | --- | --- |
 | `src/ireset/eval/w1_real_fk_audit.py` | 固定 122 行几何/梯度键、32 状态/4672 行 FD 键生成器与 schema；独立 NumPy/SciPy 解码、`D_decode`、`J35`/`J38`、损失与梯度；29 关节/15 site 合成长链（torch 生产替身 + NumPy 参考）；调用计数；cohort/index/ledger/publishing 封口；R0→G→D→F；纯合成校准；授权/准入门 |
 | `scripts/audit_w1_real_fk.py` | `--synthetic`（默认）、`--calibrate-synthetic`、`--admission`、`--real`；真实模式在读取数组、加载资产或创建正式运行根之前校验授权、校准、准入包和固定历史根 |
-| `tests/test_w1_real_fk_audit.py` | **43 passed（26.37s）**；覆盖列/行 6D 混用、wxyz/xyzw、退化 6D、clamp 边界/外侧、`R.T`/枢轴/尺度反例、分母 3600/900、梯度分组与 clamp 零梯度、父绑定逐位、FD 域缺口、键多重集/行字段/数组篡改、账本负成本/running/publishing/半损坏/外部 cohort/慢持久化/撤回成本、授权与准入严格门、真实入口零写入拒绝、合成全链与资产隔离 |
+| `tests/test_w1_real_fk_audit.py` | **58 passed（32.23s）**；覆盖列/行 6D 混用、wxyz/xyzw、退化 6D、clamp 正负边界/外侧、`R.T`/枢轴/尺度反例、分母 3600/900、梯度分组与 clamp 零梯度、父绑定逐位、FD 域缺口、键多重集/行字段/数组篡改、账本负成本/running/publishing/半损坏/外部 cohort/慢持久化/撤回成本、授权与准入严格门、真实入口零写入拒绝、合成全链与资产隔离；另覆盖设备绑定、live 标量、调用点计数、预算撤销门、F 单元准入/截止/独立进程、工件逐文件哈希与重叠冲突、R0 资产闭包/父消费者状态/输入 schema、撤回 publishing 先行与负 clamp 边界 |
 | `src/ireset/train/losses.py` | 仅增加可选 `fk=`/`static_frame=` 注入（默认仍构造 `G1TorchFK` 与 `largebox_static_frame()`）；用于无真实资产的合成解码/FK。`test_generation.py` + `test_label_quality.py` 回归 **26 passed** |
 
 合成测试证明：`LossAssembler` 的真实训练 `decode_clip` 路径被实际执行；合成 fixture 不调用 `largebox_static_frame()`；`w_contact=0` 时 contact 分支执行数为 0。
@@ -348,7 +348,7 @@ G 与 F 可以复用同一套独立 NumPy/MuJoCo 参考公式；F 的独立性�
 
 纯合成校准（seed `20261028`，64 状态，4 个 FD 状态 × 35/38 维 × 两个 h）写入：
 
-- `derived/audit/w1_real_fk_audit/tolerance_contract.json`，SHA-256 `82209619f85da976565edd2af3af485a38b726bc783fc6e49ccc11cbb75f8023`；
+- `derived/audit/w1_real_fk_audit/tolerance_contract.json`，SHA-256 `4e51b7d7e9327b1693782c39286b2e8121200c14db0e3889a629025ed0490bb4`；
 - 证据 SHA-256 `8f46fbe1830d4576f61ff85c8384a78e057ff3f5a900299e5c8c3440e3df0ed9`；
 - `mode=synthetic_calibrated`，`real_asset_loaded/real_checkpoint_loaded/real_dataset_loaded=false`，`real_model_calls=0`。
 
@@ -369,23 +369,42 @@ G 与 F 可以复用同一套独立 NumPy/MuJoCo 参考公式；F 的独立性�
 
 ### 10.3 纯合成 R0→G→D→F
 
-运行根 `derived/audit/w1_real_fk_audit/synthetic/20261028/`：
+运行根 `derived/audit/w1_real_fk_audit/synthetic/20261028_review10/`（审阅修复轮后的权威合成运行；`synthetic/20261028/` 为修复前历史运行，`synthetic/20261028_review10_preduplicate/` 为移除重复 helper 前的同语义运行，均保留对照）：
 
 - R0/G/D/F 四次尝试均 `done/complete=true`、可消费；结论 **`synthetic_contract_passed`**，`complete_evidence=true`、`covered_contract_passed=true`、`problems=[]`、`gaps=[]`。
-- G：122 几何行 + 20 梯度行，0 失败；D：4672 FD 行，0 失败/0 缺口；F 新 provider/后端重读磁盘、重算 G+D、逐位/容差对账与全 stencil 重放通过，独立验证 `problems=[]`。
+- G：122 几何行 + 20 梯度行，0 失败；D：4672 FD 行，0 失败/0 缺口；F 在**独立派生的 Python 子进程**（`spawned_python_subprocess`，记录 pid/ppid/python）中重读磁盘、重算 G+D、逐位/容差对账与全 stencil 重放，独立验证 `problems=[]`。
+- F 的单元准入逐项 `admitted=true`（父进程 `artifact_read`/`recompute_backend` + 子进程 `recompute_backend`/`geometry_replay`/`fd_replay`）；R0 记录输入 schema/生效常数/域、父消费者状态与资产闭包事实（合成为 `checked=false`，不伪造）。
 - 调用与提案矩阵一致：G `loss_assembler=2`、`production_fk_batch=4`、`kernel64_fk_batch=3`、`production_vjp=2`、`mj_forward=1200`、`mj_jac_site=7200`；D `mj_forward=9344`、`fd_pose_eval=9344`；F `mj_forward=10544`、`mj_jac_site=7200`、`fd_pose_eval=9344`。合成模式 `scene_setup_forward=0`（真实模式应为 1）。
 - 全链零计数均为 JSON 整数 0：`checkpoint_loads`、`conditioner_calls`、`model_calls`、`parameter_backward`、`parameter_fd`、`optimizer_steps`、`training_updates`、`ddim_calls`、`checkpoint_writes`、`contact_branch_executions`。
-- 合成成本 R0 1.1040s / G 1.3501s / D 2.9289s / F 2.9780s = **8.3610s**；仅证明管线可运行，**不是**真实运行时间估计。
+- 合成成本 R0 1.1195s / G 1.4331s / D 2.9642s / F 6.2167s = **11.7335s**（F 含子进程启动）；仅证明管线可运行，**不是**真实运行时间估计。
 - 边界保持：`objective_coverage=partial`、`full_objective_contract_passed=null`、`factor_selected=false`、`auto_execute=false`、`final_interaction_method=not_ready`、`production_integration=false`。
 
 ### 10.4 准入包与仍未覆盖的内容
 
-`--admission` 生成只读准入包，绑定：父运行 7 个文件的既有 SHA-256、固定四窗、122/4672/32 schema 与键哈希、实现文件哈希、环境、冻结校准证据、阶段成本/尝试上限、全链调用上限和 §6 零计数。该包不读取父数组、不编译资产、不加载 checkpoint、不创建 cohort 或正式运行根；其自身状态保持 `authorized=false / registered=false / run=not_run`。
+`--admission` 生成只读准入包，绑定：父运行 7 个文件的既有 SHA-256、固定四窗、122/4672/32 schema 与键哈希、实现文件哈希、环境、冻结校准证据、阶段成本/尝试上限、全链调用上限和 §6 零计数。该包不读取父数组、不编译资产、不加载 checkpoint、不创建 cohort 或正式运行根；其自身状态保持 `authorized=false / registered=false / run=not_run`，并列出 R0 必须落实的 6 项义务（资产闭包、父消费者状态、输入 schema/生效常数/域、调用点计数与单元预留、F 独立子进程、G/D 消费者门）。
 
 仍未覆盖并须在结论中保留：真实生产 float32/CUDA 前向、真实 MuJoCo 几何/编译后地址、真实父 FK 逐位绑定、真实 FD/F 重放、网络参数梯度、累积/裁剪/AdamW/更新、选模、DDIM 与端到端动作质量。F 的独立性来自新进程/新后端/磁盘重读；参考公式与 G 共用同一套 NumPy/MuJoCo 实现，不是第三套数学证明。
 
 ### 10.5 当前状态
 
-- 已完成：I/C 实现、39 项测试、冻结校准、纯合成 R0→G→D→F、只读准入包。
+- 已完成：I/C 实现、58 项测试、冻结校准、纯合成 R0→G→D→F、只读准入包。
 - 未完成/未授权：§9.2 九项、真实 cohort/预算/注册、真实 R0/G/D/F、真实资产闭包编译、任何训练或生产接入。
-- 下一交付：用户审阅 §9.2 与准入包后明确授权；R0 先重核父哈希/四窗/生效常数/资产闭包/环境，再按 R0→G→D→F 执行。
+- 下一交付：用户审阅 §9.2 与准入包后明确授权；R0 先重核父哈希/父消费者状态/四窗/生效常数/输入 schema/资产闭包/环境，再按 R0→G→D→F 执行。
+
+### 10.6 只读审阅修复轮（11 项）
+
+外部只读审阅提出 8 项 P1 + 3 项 P2，全部在本轮修复并以反例固定：
+
+| # | 级别 | 问题 | 修复与反例 |
+| --- | --- | --- | --- |
+| 1 | P1 | 真实 CUDA 路径设备冲突（CPU leaf vs CUDA assembler） | `_capture_run` 从 `assembler.device` 创建全部 leaf/输入张量；反例：声明 `cuda:0` 的 assembler 记录实际传入的 `device` 必须等于 `cuda:0` |
+| 2 | P1 | G/D 预算撤销后仍继续并最终通过 | 每阶段封口后与 D/F 前重新 `stage_state`；`incomplete`/publishing/未知历史一律停止；纯数值 mismatch 仍可继续定位。反例：预算撤销的 G 后 D/F 不再启动、零新调用 |
+| 3 | P1 | F 无实时截止/逐单元准入（`unit_admission` 无调用点） | F 在工件读取、后端构造、G 重算、D 重放前逐单元调用 `unit_admission`（子进程内同样执行）；反例：未注册父 attempt 与截止不足均在构造后端/新增 FK 前停止 |
+| 4 | P1 | FK 标量审计用元素重算值替代真实 live 标量 | batch 标量行改用 `run.fk_m2`，并与 live tensor 和元素归约三方对账；反例：live 标量 +5e-7 时 batch 行失败而窗口行仍过 |
+| 5 | P1 | G 两份 NPZ 合并且 gradient 覆盖 geometry，冲突被掩盖 | 分别核验路径/记录哈希、schema、行结构与重叠数组逐位一致后才合并；反例：仅改 gradient NPZ → `sha_mismatch`；同步更新哈希 → `overlap_conflict` |
+| 6 | P1 | R0 未落实资产闭包/父消费者状态/输入 schema/常数/域 | 新增资产闭包（4 个锁定文件 + 全部 mesh/include 引用哈希；空闭包或缺失即失败）、父 R0/P/F 盘×索引×台账消费者状态、输入 dtype/形状/非空/有限/限位顺序/生效 float32 常数/6D 与 clamp 域事实；合成模式显式 `checked=false` 不伪造 |
+| 7 | P1 | 撤回先写可消费 `incomplete` 再查成本 | 撤回两阶段：先 `publishing` 并核验覆盖，再写终态并再次核验；任一未证明即保持 publishing 并返回失败。反例：首次写必须是 publishing；终态写越界时保持 publishing/unknown |
+| 8 | P1 | 生产 FK 调用数是预设 +2 而非实际计数 | 新增 `_CountingFk` 在真实 `site_world_positions` 调用点计数；G/D/F 在计算前持久化单元调用上界预留，中断不返还。反例：assembler 未执行 FK 时计数为 0；成功捕获计数与真实 FK 调用数相等 |
+| 9 | P2 | F 未启动新进程 | F 重算在 `spawned_python_subprocess` 中执行并记录 pid/ppid/python/exit_reason/call_delta；父进程核验 pid 不同于自身 |
+| 10 | P2 | clamp 导数域只查 `+1`，未传播到梯度裁决 | FD 分段检查改为 `|u±h|` 双侧（含 -1 与恰在边界）；解码导数域缺口使对应梯度行为 `domain_gap`。反例：`u=-1` 时 normalized38 对应 FD 行与 W0 梯度行为 gap 而非 pass |
+| 11 | P2 | 可解析坏工件在验证容器类型前 `.get()` 崩溃 | 先做 JSON 容器/行结构/键类型与 NPZ 可读性校验，异常转为 verification gap 并诚实封口。反例：`fd_rows.json=[]` 返回 `audit_incomplete` 而不抛异常 |

@@ -108,13 +108,23 @@ def test_scalar_denominators(synthetic):
         batch = rows[f"fk_scalar|{model}|batch"]
         assert batch["lfk_denominator"] == 3600
         assert batch["batch_equals_window_mean"] is True
+        # The batch row audits the live production scalar; window rows use the
+        # production element means and only agree at float32 resolution.
+        assert batch["production_scalar_source"] == "live_fk_m2"
+        assert batch["production_m2_bits"]
         window_means = []
         for wid in m.WINDOW_IDS:
             row = rows[f"fk_scalar|{model}|{wid}"]
             assert row["lfk_denominator"] == 900
+            assert row["production_scalar_source"] == \
+                "production_elements_window_mean"
             window_means.append(row["production_lfk"])
         assert batch["production_lfk"] == pytest.approx(
-            float(np.mean(window_means)), abs=1e-12)
+            float(np.mean(window_means)),
+            abs=1e-6 * max(1.0, abs(batch["production_lfk"])))
+        assert batch["production_m2_from_elements"] == pytest.approx(
+            batch["production_m2"],
+            abs=1e-6 * max(1.0, abs(batch["production_m2"])))
 
 
 def test_gradient_denominator_is_not_multiplied_by_three(synthetic):
@@ -123,7 +133,8 @@ def test_gradient_denominator_is_not_multiplied_by_three(synthetic):
     for model in m.MODELS:
         elements = arrays[f"fk_elements_{model}"]
         scalar = arrays[f"fk_scalar_production_{model}"][-1]
-        assert scalar == pytest.approx(float(elements.mean()), abs=1e-12)
+        assert scalar == pytest.approx(
+            float(elements.mean()), abs=1e-6 * max(1.0, abs(scalar)))
         weighted = elements * 3.0
         assert scalar != pytest.approx(float(weighted.mean()), abs=1e-9)
 
@@ -650,6 +661,27 @@ def test_synthetic_self_test_end_to_end(self_test):
     assert calls["scene_setup_forward"] == 0  # synthetic: no MuJoCo compile
     for stage in ("R0", "G", "D", "F"):
         assert self_test["seals"][stage]["terminal"] is True
+    # R0 now records the input schema/constants/domain facts it used to defer
+    registration = self_test["stages"]["R0"]["registration"]
+    assert registration["inputs"]["problems"] == []
+    assert registration["parent_consumer_state"]["checked"] is False
+    assert registration["locked_assets"]["checked"] is False
+    checks = self_test["stages"]["R0"]["admission"]["checks"]
+    assert checks["input_schema"] is True
+    # F recomputed in a separate process and recorded its identity
+    process = self_test["recompute_process"]
+    assert process["start_method"] == "spawned_python_subprocess"
+    assert process["exit_reason"] == "ok"
+    assert process["pid"] != m.os.getpid()
+    assert process["ppid"] == m.os.getpid()
+    assert any(unit.get("source") == "worker" for unit in self_test["units"])
+    assert all(unit.get("admitted") for unit in self_test["units"])
+    # F verifies G/D artifacts against the sealed per-file hashes
+    assert self_test["prerequisite_consumer_states"] == {"G": [], "D": []}
+    verification = json.loads(Path(self_test["stages"]["F"]["verification_path"])
+                              .read_text())
+    assert verification["artifact_hashes"]["g_expected"]["arrays"]
+    assert verification["artifact_hashes"]["d_expected"]["arrays"]
 
 
 def test_synthetic_self_test_is_asset_free(self_test):
@@ -695,20 +727,35 @@ def test_finalize_rejects_tampered_saved_artifacts(self_test, tmp_path):
     arrays["prod_fk_pred_det"] = arrays["prod_fk_pred_det"].copy()
     arrays["prod_fk_pred_det"][0, 0, 0, 0] += np.float32(0.01)
     np.savez(npz_path, **arrays)
+    counter, t0, budget = _registered_f_attempt(
+        target, self_test["stages"]["R0"]["registration_sha256"])
     provider = m.SyntheticFkProvider(seed=20261028)
     provider.fixture_path = source / "fixture" / "synthetic_parent_arrays.npz"
     provider.fixture_sha256 = m.sha256_file(provider.fixture_path)
-    counter = m.CallCounter(m.CALL_CAPS)
     provider.bind_counter(counter)
     f = m.run_f_stage(
-        target, "F", "attempt_999", m.time.perf_counter(),
-        {"remaining_s": 600.0, "reserve_s": 90.0},
+        target, "F", "attempt_999", t0, budget,
         self_test["stages"]["R0"]["registration_sha256"],
-        g, d, provider, counter, self_test["tolerance_contract"])
+        g, d, provider, counter, self_test["tolerance_contract"],
+        recompute="in_process", g_expected=g["artifact_hashes"])
     assert f["conclusion"] == "audit_incomplete"
     assert f["verification_problems"]
     texts = " ".join(f["verification_problems"])
-    assert "array_not_bitwise" in texts or "status" in texts
+    assert "array_not_bitwise" in texts or "status" in texts or \
+        "sha_mismatch" in texts
+
+
+def _registered_f_attempt(root: Path, registration_sha: str,
+                          *, remaining_s: float = 600.0,
+                          reserve_s: float = 90.0):
+    """Pre-register an F attempt so unit admission has a live parent row."""
+    m.write_cohort(root, mode="synthetic")
+    budget = {"remaining_s": remaining_s, "reserve_s": reserve_s,
+              "attempts": 2, "attempts_used": 0}
+    t0 = m.time.perf_counter()
+    m.pre_register_attempt(root, "F", "attempt_999", t0, scope={}, budget=budget,
+                           registration_sha=registration_sha)
+    return m.CallCounter(m.CALL_CAPS), t0, budget
 
 
 # ---------------------------------------------------------------------------
@@ -819,3 +866,390 @@ def test_implementation_drift_helper():
     assert drift == ["implementation_drift:a"]
     assert m._implementation_drift(current, None) == [
         "r0_expected_implementation_missing"]
+
+
+# ---------------------------------------------------------------------------
+# review round: device / live scalar / call counting / stage gates / F process
+# ---------------------------------------------------------------------------
+
+
+def test_capture_binds_tensors_to_the_assembler_device(monkeypatch, tmp_path):
+    provider = m.SyntheticFkProvider(seed=20261028)
+    provider.prepare_fixture(tmp_path)
+    inputs = provider.load_inputs()
+    inner = provider._assembler_obj(inputs)
+    recorded = {}
+
+    class DeclaredCudaAssembler:
+        device = "cuda:0"
+
+        def __init__(self, inner):
+            self.inner = inner
+
+        def __call__(self, pred, batch, observer=None):
+            recorded["pred"] = str(pred.device)
+            recorded["x0"] = str(batch["x0"].device)
+            return self.inner(pred.to("cpu"),
+                              {"x0": batch["x0"].to("cpu")},
+                              observer=observer)
+
+    real_tensor = torch.tensor
+
+    def spy(data, *args, **kwargs):
+        recorded["tensor_device"] = kwargs.get("device")
+        kwargs = {k: v for k, v in kwargs.items() if k != "device"}
+        return real_tensor(data, *args, **kwargs)
+
+    monkeypatch.setattr(m.torch, "tensor", spy)
+    run = m._capture_run(DeclaredCudaAssembler(inner), inputs.x0,
+                         inputs.prediction["deterministic"], None,
+                         want_gradient=False)
+    # The leaves must be created on the assembler device; a hard-coded CPU
+    # leaf is exactly the CUDA device conflict this counterexample pins.
+    assert recorded["tensor_device"] == "cuda:0"
+    assert run.fk_m2 >= 0.0
+
+
+def test_shifted_live_scalar_fails_the_batch_row(synthetic, monkeypatch):
+    provider = m.SyntheticFkProvider(seed=20261028)
+    provider.fixture_path = Path(synthetic["provider"].fixture_path)
+    provider.fixture_sha256 = synthetic["provider"].fixture_sha256
+    inputs = provider.load_inputs()
+    original = m.SyntheticFkProvider.production_capture
+
+    def shifted(self, model, pred, *, want_gradient=True):
+        from dataclasses import replace
+        run = original(self, model, pred, want_gradient=want_gradient)
+        return replace(run, fk_m2=run.fk_m2 + 5e-7)
+
+    monkeypatch.setattr(m.SyntheticFkProvider, "production_capture", shifted)
+    counter = m.CallCounter(m.CALL_CAPS)
+    provider.bind_counter(counter)
+    geometry = m.compute_geometry(provider, inputs, synthetic["tolerance"])
+    batch = next(r for r in geometry["rows"]
+                 if r["key"] == "fk_scalar|deterministic|batch")
+    assert batch["status"] == "mismatch"
+    assert "live_scalar_differs_from_elements" in batch["problems"] or \
+        "element_tolerance" in batch["problems"]
+    windows = [r for r in geometry["rows"]
+               if r["key"].startswith("fk_scalar|deterministic|W")]
+    assert all(r["status"] == "pass" for r in windows)
+
+
+def test_production_fk_calls_are_counted_at_the_call_site(monkeypatch,
+                                                          tmp_path):
+    provider = m.SyntheticFkProvider(seed=1)
+    provider.prepare_fixture(tmp_path)
+    inputs = provider.load_inputs()
+    counter = m.CallCounter(m.CALL_CAPS)
+    provider.bind_counter(counter)
+
+    class RaisingAssembler:
+        device = "cpu"
+
+        def __call__(self, *args, **kwargs):
+            raise RuntimeError("no FK call happened")
+
+    # A preset increment would show 2 even though the assembler never ran FK.
+    with pytest.raises(RuntimeError):
+        m._capture_run(RaisingAssembler(), inputs.x0,
+                       inputs.prediction["deterministic"], counter,
+                       want_gradient=False)
+    assert counter.counts["production_fk_batch"] == 0
+    assert counter.counts["loss_assembler"] == 1
+
+    # A successful capture counts exactly the FK evaluations that ran.
+    calls = {"n": 0}
+    original = m._SyntheticFkAdapter.site_world_positions
+
+    def counting(self, *args, **kwargs):
+        calls["n"] += 1
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(m._SyntheticFkAdapter, "site_world_positions", counting)
+    counter_success = m.CallCounter(m.CALL_CAPS)
+    provider.bind_counter(counter_success)
+    provider.production_capture("deterministic",
+                                inputs.prediction["deterministic"],
+                                want_gradient=False)
+    assert calls["n"] == 2
+    assert counter_success.counts["production_fk_batch"] == calls["n"]
+
+
+def test_budget_revoked_g_stops_the_chain(monkeypatch, tmp_path):
+    def revoked_g(root, stage, attempt, *args, **kwargs):
+        adir = m.stage_dir(root, stage) / attempt
+        adir.mkdir(parents=True, exist_ok=True)
+        rows = adir / "geometry_rows.json"
+        rows.write_text("{}")
+        return {"passed": False, "problems": [],
+                "failures": [],
+                "gaps": ["budget_exceeded_after_registration"],
+                "paths": {"rows": str(rows)}, "artifact_hashes": {},
+                "call_delta": {}}
+
+    monkeypatch.setattr(m, "run_g_stage", revoked_g)
+    result = m.synthetic_self_test(tmp_path / "run", seed=20261028)
+    assert result["conclusion"] == "audit_incomplete"
+    assert "D" not in result["stages"]
+    assert "F" not in result["stages"]
+    assert any("attempt_not_complete" in p for p in result["gaps"])
+    assert result["calls"]["counts"]["loss_assembler"] == 0
+    assert not (tmp_path / "run" / "derivative").exists()
+
+
+def _f_inputs(self_test, tmp_path, *, tamper=None):
+    source = Path(self_test["run_root"])
+    if not source.is_absolute():
+        source = m.PROJECT_ROOT / source
+    target = tmp_path / "run"
+    shutil.copytree(source, target)
+    g = copy.deepcopy(self_test["stages"]["G"])
+    d = copy.deepcopy(self_test["stages"]["D"])
+    for key in ("arrays", "gradient_arrays", "rows"):
+        g["paths"][key] = str(target / Path(g["paths"][key]).relative_to(source))
+    for key in ("arrays", "rows"):
+        d["paths"][key] = str(target / Path(d["paths"][key]).relative_to(source))
+    if tamper is not None:
+        tamper(g, d)
+    provider = m.SyntheticFkProvider(seed=20261028)
+    provider.fixture_path = target / "fixture" / "synthetic_parent_arrays.npz"
+    provider.fixture_sha256 = m.sha256_file(provider.fixture_path)
+    return target, g, d, provider
+
+
+def test_f_refuses_an_unregistered_parent_attempt(self_test, tmp_path):
+    target, g, d, provider = _f_inputs(self_test, tmp_path)
+    counter = m.CallCounter(m.CALL_CAPS)
+    provider.bind_counter(counter)
+    f = m.run_f_stage(
+        target, "F", "attempt_999", m.time.perf_counter(),
+        {"remaining_s": 600.0, "reserve_s": 90.0},
+        self_test["stages"]["R0"]["registration_sha256"],
+        g, d, provider, counter, self_test["tolerance_contract"],
+        recompute="in_process")
+    assert f["conclusion"] == "audit_incomplete"
+    assert any("f_unit_not_admitted:artifact_read" in p
+               for p in f["verification_problems"])
+    assert not any(counter.counts.values())
+
+
+def test_f_deadline_blocks_before_backend(self_test, tmp_path):
+    target, g, d, provider = _f_inputs(self_test, tmp_path)
+    counter, t0, _ = _registered_f_attempt(
+        target, self_test["stages"]["R0"]["registration_sha256"])
+    provider.bind_counter(counter)
+    f = m.run_f_stage(
+        target, "F", "attempt_999", t0,
+        {"remaining_s": 1.0, "reserve_s": 5.0},
+        self_test["stages"]["R0"]["registration_sha256"],
+        g, d, provider, counter, self_test["tolerance_contract"],
+        recompute="in_process")
+    assert f["conclusion"] == "audit_incomplete"
+    assert any("unit_deadline" in p for p in f["verification_problems"])
+    assert not f["recompute_process"]
+    assert not any(counter.counts.values())
+
+
+def test_f_verifies_gradient_npz_hash_separately(self_test, tmp_path):
+    def tamper(g, d):
+        path = Path(g["paths"]["gradient_arrays"])
+        with np.load(path) as z:
+            arrays = {k: z[k] for k in z.files}
+        arrays["grad_production_raw_deterministic"] = (
+            arrays["grad_production_raw_deterministic"].copy())
+        arrays["grad_production_raw_deterministic"][0, 0, 0] += np.float32(1e-3)
+        np.savez(path, **arrays)
+
+    target, g, d, provider = _f_inputs(self_test, tmp_path, tamper=tamper)
+    counter, t0, budget = _registered_f_attempt(
+        target, self_test["stages"]["R0"]["registration_sha256"])
+    provider.bind_counter(counter)
+    f = m.run_f_stage(
+        target, "F", "attempt_999", t0, budget,
+        self_test["stages"]["R0"]["registration_sha256"],
+        g, d, provider, counter, self_test["tolerance_contract"],
+        recompute="in_process", g_expected=g["artifact_hashes"])
+    assert "g_gradient_arrays_sha_mismatch" in f["verification_problems"]
+    assert f["conclusion"] == "audit_incomplete"
+
+
+def test_f_detects_overlap_conflict_between_geometry_and_gradient_npz(
+        self_test, tmp_path):
+    def tamper(g, d):
+        path = Path(g["paths"]["arrays"])
+        with np.load(path) as z:
+            saved = {k: z[k] for k in z.files}
+        saved["grad_production_raw_deterministic"] = (
+            saved["grad_production_raw_deterministic"].copy())
+        saved["grad_production_raw_deterministic"][0, 0, 0] += np.float32(1e-3)
+        np.savez(path, **saved)
+        g["artifact_hashes"]["arrays"] = m.sha256_file(path)
+
+    target, g, d, provider = _f_inputs(self_test, tmp_path, tamper=tamper)
+    counter, t0, budget = _registered_f_attempt(
+        target, self_test["stages"]["R0"]["registration_sha256"])
+    provider.bind_counter(counter)
+    f = m.run_f_stage(
+        target, "F", "attempt_999", t0, budget,
+        self_test["stages"]["R0"]["registration_sha256"],
+        g, d, provider, counter, self_test["tolerance_contract"],
+        recompute="in_process", g_expected=g["artifact_hashes"])
+    assert "g_overlap_conflict:grad_production_raw_deterministic" in \
+        f["verification_problems"]
+    assert f["conclusion"] == "audit_incomplete"
+
+
+def test_malformed_fd_rows_become_gaps_not_exceptions(self_test, tmp_path):
+    def tamper(g, d):
+        Path(d["paths"]["rows"]).write_text("[]")
+
+    target, g, d, provider = _f_inputs(self_test, tmp_path, tamper=tamper)
+    counter, t0, budget = _registered_f_attempt(
+        target, self_test["stages"]["R0"]["registration_sha256"])
+    provider.bind_counter(counter)
+    f = m.run_f_stage(
+        target, "F", "attempt_999", t0, budget,
+        self_test["stages"]["R0"]["registration_sha256"],
+        g, d, provider, counter, self_test["tolerance_contract"],
+        recompute="in_process", g_expected=g["artifact_hashes"],
+        d_expected=d["artifact_hashes"])
+    assert "d_rows_not_a_mapping" in f["verification_problems"]
+    assert f["conclusion"] == "audit_incomplete"
+
+
+def test_negative_clamp_boundary_is_a_domain_gap(tmp_path):
+    provider = m.SyntheticFkProvider(seed=20261028)
+    provider._fixture["prediction"]["deterministic"][0, 0, 9] = -1.0
+    provider.prepare_fixture(tmp_path)
+    inputs = provider.load_inputs()
+    tolerance = m.build_default_tolerance_contract()
+    counter = m.CallCounter(m.CALL_CAPS)
+    provider.bind_counter(counter)
+    geometry = m.compute_geometry(provider, inputs, tolerance)
+    grad_row = next(r for r in geometry["grad_rows"]
+                    if r["key"] == "fk_gradient|deterministic|raw|W0")
+    assert grad_row["status"] == "domain_gap"
+    assert "gradient_domain_gap" in grad_row["problems"]
+    counter_d = m.CallCounter(m.CALL_CAPS)
+    provider.bind_counter(counter_d)
+    fd = m.compute_fd(provider, inputs, geometry["arrays"], tolerance)
+    rows = [r for r in fd["rows"]
+            if r.get("family") == "normalized38"
+            and r.get("model") == "deterministic"
+            and r.get("window_id") == "W0"
+            and r.get("local_frame") == 0 and r.get("dim") == 9]
+    assert rows and all(r["status"] == "domain_gap" for r in rows)
+    assert not fd["failures"]
+
+
+def test_asset_closure_hashes_every_reference(tmp_path):
+    assert m._asset_closure_facts(tmp_path, mode="synthetic")["checked"] is False
+    project = tmp_path / "project"
+    robots = project / "derived/robots"
+    assets = project / "resources/robots/g1_holosoma/assets"
+    robots.mkdir(parents=True)
+    assets.mkdir(parents=True)
+    (assets / "a.obj").write_text("o a")
+    (robots / "assets").mkdir()
+    (robots / "assets/a.urdf.obj").write_text("o u")
+    xml = ('<mujoco><compiler meshdir="../../resources/robots/g1_holosoma/assets"/>'
+           '<asset><mesh file="a.obj"/></asset></mujoco>')
+    (robots / "g1_29dof_locked.xml").write_text(xml)
+    (robots / "g1_29dof_locked_w_largebox.xml").write_text(xml)
+    (robots / "g1_29dof_locked.urdf").write_text(
+        '<robot><link><visual><geometry>'
+        '<mesh filename="assets/a.urdf.obj"/></geometry></visual></link></robot>')
+    (robots / "lock_record.json").write_text("{}")
+    facts = m._asset_closure_facts(project, mode="real")
+    assert facts["checked"] is True
+    assert not facts["problems"]
+    assert facts["reference_count"] == 2
+    (assets / "a.obj").unlink()
+    broken = m._asset_closure_facts(project, mode="real")
+    assert any("asset_reference_missing" in p for p in broken["problems"])
+
+
+def test_parent_consumer_state_requires_complete_rows(tmp_path):
+    project = tmp_path / "project"
+    base = project / m.PARENT_RUN
+    rows = []
+    for stage, dirname in m._PARENT_STAGE_DIRS.items():
+        (base / dirname / "attempt_001").mkdir(parents=True, exist_ok=True)
+        rows.append({"stage": stage, "attempt": "attempt_001",
+                     "status": "done", "complete": True})
+    m.save_index(base, rows)
+    m.save_ledger(base, rows)
+    summary = project / m.PARENT_FILES["audit_summary"][0]
+    summary.parent.mkdir(parents=True, exist_ok=True)
+    summary.write_text(json.dumps({
+        "conclusion": "real_batch_covered_contract_passed",
+        "complete_evidence": True}))
+    state = m._parent_consumer_state(project, mode="real")
+    assert state["checked"] is True
+    assert not state["problems"]
+    assert m._parent_consumer_state(project, mode="synthetic")["checked"] is False
+    rows[0]["complete"] = False
+    m.save_index(base, rows)
+    broken = m._parent_consumer_state(project, mode="real")
+    assert any("parent_stage_R0" in p for p in broken["problems"])
+
+
+def test_input_schema_facts_reject_bad_shapes(synthetic):
+    inputs = synthetic["inputs"]
+    assert not m._input_schema_facts(inputs)["problems"]
+    bad = m.FkInputs(**{**inputs.__dict__, "x0": inputs.x0[:, :30]})
+    assert any("input_shape:x0" in p
+               for p in m._input_schema_facts(bad)["problems"])
+    bad_limits = m.FkInputs(**{**inputs.__dict__,
+                              "joint_hi": inputs.joint_lo.copy()})
+    assert any("joint_limits_not_ordered" in p
+               for p in m._input_schema_facts(bad_limits)["problems"])
+
+
+def test_withdraw_publishes_before_any_terminal_claim(tmp_path, monkeypatch):
+    report, row = _sealed_f_row(tmp_path)
+    statuses = []
+    real_index = m.upsert_index
+
+    def record(root, stage, attempt, entry):
+        statuses.append(entry.get("status"))
+        return real_index(root, stage, attempt, entry)
+
+    monkeypatch.setattr(m, "upsert_index", record)
+    t0 = m.time.perf_counter()
+    updated, problems, _ = m.withdraw_attempt_claim(
+        tmp_path, "F", "attempt_001", report, row, [],
+        reason="f_seal_or_consumer_not_consumable",
+        t0=t0, budget={"remaining_s": 100.0, "reserve_s": 90.0})
+    assert statuses and statuses[0] == "publishing"
+    assert updated["status"] == "incomplete"
+    assert updated["measured_wall_s"] >= m.time.perf_counter() - t0
+    assert not problems
+
+
+def test_withdraw_stays_publishing_when_terminal_write_outruns_budget(
+        tmp_path, monkeypatch):
+    report, row = _sealed_f_row(tmp_path)
+    clock = {"t": 100.0}
+    real_index = m.upsert_index
+
+    def fake_clock():
+        return clock["t"]
+
+    def jumpy_upsert(root, stage, attempt, entry):
+        result = real_index(root, stage, attempt, entry)
+        clock["t"] += 10.0 if entry.get("status") == "incomplete" else 0.01
+        return result
+
+    monkeypatch.setattr(m.time, "perf_counter", fake_clock)
+    monkeypatch.setattr(m, "upsert_index", jumpy_upsert)
+    updated, problems, _ = m.withdraw_attempt_claim(
+        tmp_path, "F", "attempt_001", report, row, [],
+        reason="f_seal_or_consumer_not_consumable",
+        t0=clock["t"], budget={"remaining_s": 5.0, "reserve_s": 0.0})
+    assert "withdraw_cost_unverifiable" in problems
+    assert updated["status"] == "publishing"
+    assert updated["complete"] is False
+    state, state_problems = m.stage_state(tmp_path, "F")
+    assert state is None and state_problems
