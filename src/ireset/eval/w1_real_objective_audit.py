@@ -692,17 +692,21 @@ def cohort_history(fixed_root: Path, *, exclude_root: Path | None = None,
             for r in (*(index or []), *(ledger or []))
         )
         matching = matching_marker or matching_rows
-        if not matching and not marker:
-            # A legacy sibling from another study has no cohort marker and
-            # its own ledger schema.  It cannot be attributed to this
-            # cohort: a registered run writes cohort.json before any
-            # attempt.  Skip it instead of making this cohort's history
-            # unknown.
+        if not matching:
+            if broken and marker:
+                # Marked, unattributable and half-unreadable: membership
+                # cannot be ruled out, so this is unknown rather than foreign.
+                return {"known": False,
+                        "reason": f"unreadable_{broken}:{sibling.name}",
+                        "runs": runs}
+            # A complete foreign cohort, or a markerless legacy run of
+            # another study: a registered run writes cohort.json before any
+            # attempt, so neither belongs to this cohort.
             continue
         if broken:
-            # A member (marker or surviving registration row) whose other
-            # half is unreadable: membership is known, accounting is not.
-            # Never drop evidence that was read successfully.
+            # The surviving half attributes this run to the cohort while the
+            # other half is unreadable: membership is known, accounting is
+            # not.  Never drop evidence that was read successfully.
             return {"known": False, "reason": f"unreadable_{broken}:{sibling.name}",
                     "runs": runs}
         index, ledger = index or [], ledger or []
@@ -747,9 +751,12 @@ def cohort_attempts(fixed_root: Path, stage: str, *,
         matching = (marker.get("cohort_id") == COHORT_ID
                     or any(r.get("cohort_id") == COHORT_ID
                            for r in (*(index or []), *(ledger or []))))
-        if not matching and not marker:
-            # Markerless legacy run from another study: not attributable
-            # to this cohort.
+        if not matching:
+            if (broken_index or broken_ledger) and marker:
+                # Marked, unattributable and half-unreadable: unknown.
+                return None
+            # Complete foreign cohort, or markerless legacy run: not this
+            # cohort's attempts.
             continue
         if broken_index or broken_ledger:
             return None
@@ -816,9 +823,12 @@ def prior_call_counts(root: Path, *, fixed_root: Path,
             matching = matching or any(
                 r.get("cohort_id") == COHORT_ID
                 for r in (*(index or []), *(ledger or [])))
-            if not matching and not marker:
-                # Markerless legacy run from another study: not attributable
-                # to this cohort.
+            if not matching:
+                if (broken_index or broken_ledger) and marker:
+                    # Marked, unattributable and half-unreadable: unknown.
+                    return None
+                # Complete foreign cohort, or markerless legacy run: not
+                # this cohort's calls.
                 continue
             if broken_index or broken_ledger:
                 return None

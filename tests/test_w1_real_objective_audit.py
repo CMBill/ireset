@@ -981,6 +981,47 @@ def test_foreign_marker_with_damaged_half_still_fails_closed(tmp_path: Path):
     assert audit.prior_call_counts(current, fixed_root=fixed, mode="real") is None
 
 
+def test_complete_foreign_cohort_is_skipped_not_counted(tmp_path: Path):
+    """A complete foreign run must neither block the budget nor blend in."""
+    fixed = tmp_path / "fixed"
+    fixed.mkdir()
+    current = fixed / "current_run"
+    audit.write_cohort(current, mode="real")
+
+    foreign = fixed / "foreign_run"
+    balance = audit.AuditCallBudget().snapshot()
+    assert _seal_real_stage(foreign, call_balance=balance).sealed
+    _relabel_as_foreign(foreign)
+
+    history = audit.cohort_history(fixed, exclude_root=current)
+    assert history["known"] is True, history
+    assert history["runs"] == []
+    assert history["total_s"] == 0.0
+    assert audit.cohort_attempts(fixed, "R0", exclude_root=current) == 0
+    assert audit.prior_call_counts(
+        current, fixed_root=fixed, mode="real") == dict.fromkeys(audit.CALL_CAPS, 0)
+    budget = audit.budget_for(current, "R0", fixed_root=fixed, mode="real")
+    assert budget["prior_total_s"] == 0.0
+    assert budget["prior_stage_s"] == 0.0
+    assert budget["attempts_used"] == 0
+
+
+def test_foreign_cohort_with_damaged_half_still_fails_closed(tmp_path: Path):
+    """Half-damage keeps a fully foreign run unknown, not silently skipped."""
+    fixed = tmp_path / "fixed"
+    fixed.mkdir()
+    current = fixed / "current_run"
+    audit.write_cohort(current, mode="real")
+    foreign = fixed / "foreign_run"
+    assert _seal_real_stage(foreign).sealed
+    _relabel_as_foreign(foreign)
+    (foreign / "costs.json").write_text(json.dumps([]))
+
+    assert audit.cohort_history(fixed, exclude_root=current)["known"] is False
+    assert audit.cohort_attempts(fixed, "R0", exclude_root=current) is None
+    assert audit.prior_call_counts(current, fixed_root=fixed, mode="real") is None
+
+
 def test_prior_call_counts_are_cohort_wide_and_fail_closed(tmp_path: Path):
     fixed = tmp_path / "fixed"
     fixed.mkdir()
@@ -1025,6 +1066,20 @@ def _seal_real_stage(root: Path, *, stage: str = "R0",
         extra["call_balance"] = call_balance
     return audit.finish_attempt(root, stage, attempt, t0, budget,
                                 {"complete": True}, status="done", extra=extra)
+
+
+def _relabel_as_foreign(run: Path, cohort_id: str = "some_other_cohort") -> None:
+    """Rewrite a sealed run's marker and both registration halves as foreign."""
+    marker = _load(run / "cohort.json")
+    marker["cohort_id"] = cohort_id
+    marker["execution_id"] = "foreign_execution"
+    (run / "cohort.json").write_text(json.dumps(marker))
+    for name, key in (("attempts_index.json", "attempts"),
+                      ("costs.json", "invocations")):
+        doc = _load(run / name)
+        for row in doc[key]:
+            row["cohort_id"] = cohort_id
+        (run / name).write_text(json.dumps(doc))
 
 
 def test_markerless_legacy_sibling_does_not_block_cohort_history(
