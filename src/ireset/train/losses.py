@@ -48,14 +48,21 @@ class LossWeights:
 class LossAssembler:
     """Pre-loads tokenizer tensors/FK on device; call per training step."""
 
-    def __init__(self, tokenizer, weights: LossWeights, device, use_fk: bool = True) -> None:
+    def __init__(self, tokenizer, weights: LossWeights, device, use_fk: bool = True,
+                 *, fk=None, static_frame=None) -> None:
         self.w = weights
         self.device = device
         self.mean, self.std = tokenizer.root_stats.to_torch(device)
         self.lo = torch.tensor(tokenizer.lo, dtype=torch.float32, device=device)
         self.hi = torch.tensor(tokenizer.hi, dtype=torch.float32, device=device)
-        self.fk = G1TorchFK(device=device, dtype=torch.float32) if use_fk else None
-        R_g, x_g = largebox_static_frame()
+        self.fk = (fk if fk is not None
+                   else G1TorchFK(device=device, dtype=torch.float32) if use_fk else None)
+        # ``static_frame`` is an audit-only injection: compiling the largebox
+        # scene is a real-asset operation, so a pure-synthetic decode/FK fixture
+        # must be able to construct the assembler without it.  It is unused when
+        # ``w_contact == 0``.  Defaults keep the production path unchanged.
+        R_g, x_g = (largebox_static_frame() if static_frame is None
+                    else static_frame)
         self.R_g = torch.tensor(R_g, dtype=torch.float32, device=device)
         self.x_g = torch.tensor(x_g, dtype=torch.float32, device=device)
 

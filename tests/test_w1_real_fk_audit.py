@@ -1,0 +1,821 @@
+"""I/C counterexamples for the W1 real FK geometry/derivative audit.
+
+These tests are pure synthetic: no real dataset, cache, checkpoint, G1 asset
+or MuJoCo model is opened.  They cover draft section 9.1 (decode/geometry,
+Jacobian/gradient, evidence independence, admission/calls, ledger/seal).
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+import math
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from ireset.eval import w1_real_fk_audit as m
+
+
+@pytest.fixture(scope="module")
+def synthetic(tmp_path_factory):
+    root = tmp_path_factory.mktemp("fk_fixture")
+    provider = m.SyntheticFkProvider(seed=20261028)
+    provider.prepare_fixture(root)
+    inputs = provider.load_inputs()
+    tolerance = m.build_default_tolerance_contract()
+    counter = m.CallCounter(m.CALL_CAPS)
+    provider.bind_counter(counter)
+    geometry = m.compute_geometry(provider, inputs, tolerance)
+    counter_d = m.CallCounter(m.CALL_CAPS)
+    provider.bind_counter(counter_d)
+    fd = m.compute_fd(provider, inputs, geometry["arrays"], tolerance)
+    return {
+        "provider": provider,
+        "inputs": inputs,
+        "tolerance": tolerance,
+        "geometry": geometry,
+        "fd": fd,
+        "g_calls": counter.snapshot()["counts"],
+        "d_calls": counter_d.snapshot()["counts"],
+    }
+
+
+@pytest.fixture(scope="module")
+def self_test(tmp_path_factory):
+    root = tmp_path_factory.mktemp("fk_selftest") / "run"
+    return m.synthetic_self_test(root, seed=20261028)
+
+
+# ---------------------------------------------------------------------------
+# fixed matrix and synthetic forward chain
+# ---------------------------------------------------------------------------
+
+
+def test_fixed_key_matrix():
+    geometry = m.required_geometry_rows()
+    fd = m.required_fd_rows()
+    assert len(geometry) == 122
+    assert len(set(geometry)) == 122
+    assert len(fd) == 4672
+    assert len(set(fd)) == 4672
+    assert len(m.fd_states()) == 32
+    assert m.FD_TANGENT_ROWS == 2240
+    assert m.FD_NORMALIZED_ROWS == 2432
+    assert m.FD_POSE_EVALUATIONS == 9344
+    assert m.FK_DENOMINATOR_BATCH == 3600
+    assert m.FK_DENOMINATOR_WINDOW == 900
+
+
+def test_geometry_matrix_passes(synthetic):
+    rows = synthetic["geometry"]["rows"]
+    grad = synthetic["geometry"]["grad_rows"]
+    assert len(rows) == 122
+    assert len(grad) == 20
+    assert not [r for r in rows if r["status"] != "pass"]
+    assert not [r for r in grad if r["status"] != "pass"]
+    counts = synthetic["g_calls"]
+    nominal = m.STAGE_NOMINAL["G"]
+    for kind in ("loss_assembler", "production_fk_batch",
+                 "kernel64_fk_batch", "production_vjp", "mj_forward",
+                 "mj_jac_site"):
+        assert counts[kind] == nominal[kind], kind
+    assert counts["fd_pose_eval"] == 0
+
+
+def test_fd_matrix_passes(synthetic):
+    assert len(synthetic["fd"]["rows"]) == 4672
+    assert not synthetic["fd"]["failures"]
+    assert not synthetic["fd"]["gaps"]
+    counts = synthetic["d_calls"]
+    assert counts["mj_forward"] == m.FD_POSE_EVALUATIONS
+    assert counts["fd_pose_eval"] == m.FD_POSE_EVALUATIONS
+    assert counts["mj_jac_site"] == 0
+
+
+def test_scalar_denominators(synthetic):
+    rows = {r["key"]: r for r in synthetic["geometry"]["rows"]
+            if r["key"].startswith("fk_scalar|")}
+    assert len(rows) == 10
+    for model in m.MODELS:
+        batch = rows[f"fk_scalar|{model}|batch"]
+        assert batch["lfk_denominator"] == 3600
+        assert batch["batch_equals_window_mean"] is True
+        window_means = []
+        for wid in m.WINDOW_IDS:
+            row = rows[f"fk_scalar|{model}|{wid}"]
+            assert row["lfk_denominator"] == 900
+            window_means.append(row["production_lfk"])
+        assert batch["production_lfk"] == pytest.approx(
+            float(np.mean(window_means)), abs=1e-12)
+
+
+def test_gradient_denominator_is_not_multiplied_by_three(synthetic):
+    """The FK loss denominator is B*F*S=3600, never 3*3600."""
+    arrays = synthetic["geometry"]["arrays"]
+    for model in m.MODELS:
+        elements = arrays[f"fk_elements_{model}"]
+        scalar = arrays[f"fk_scalar_production_{model}"][-1]
+        assert scalar == pytest.approx(float(elements.mean()), abs=1e-12)
+        weighted = elements * 3.0
+        assert scalar != pytest.approx(float(weighted.mean()), abs=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# decode / rotation conventions
+# ---------------------------------------------------------------------------
+
+
+def test_rot6d_uses_matrix_columns_not_rows():
+    rng = np.random.default_rng(3)
+    R, r6 = m._random_rotation_features(rng, (8,))
+    recovered, ok = m.independent_rot6d_to_mat(r6)
+    assert ok.all()
+    assert np.abs(recovered - R).max() < 1e-12
+    rows = np.concatenate([R[:, 0, :], R[:, 1, :]], axis=1)
+    wrong, _ = m.independent_rot6d_to_mat(rows)
+    assert np.abs(wrong - R).max() > 1e-2
+
+
+def test_quaternion_order_wxyz_vs_xyzw():
+    rng = np.random.default_rng(4)
+    R, _ = m._random_rotation_features(rng, (1,))
+    quat = m.mat_to_quat_wxyz_np(R)
+    assert np.abs(m.quat_to_mat_wxyz_np(quat) - R).max() < 1e-12
+    xyzw = np.roll(quat, -1, axis=-1)
+    wrong = m.quat_to_mat_wxyz_np(xyzw)
+    assert np.abs(wrong - R).max() > 1e-3
+
+
+def test_decode_domain_and_clamp():
+    lo, hi = m.synthetic_joint_limits()
+    std = np.array([0.31, 0.27, 0.19])
+    x0 = np.zeros((1, 38))
+    x0[0, 3:9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+    x0[0, 9:38] = 0.0
+    normal = m.independent_decode(x0, np.zeros(3), std, lo, hi)
+    assert normal["ok"].all()
+    boundary = x0.copy()
+    boundary[0, 9] = 1.0
+    _, dom = m.decode_jacobian_np(boundary, std, lo, hi)
+    assert not dom["ok"][0]
+    assert dom["clamp_boundary"][0, 0]
+    outside = x0.copy()
+    outside[0, 9] = 1.2
+    D, dom = m.decode_jacobian_np(outside, std, lo, hi)
+    assert dom["ok"][0]
+    assert D[0, 6, 9] == 0.0
+    degenerate = x0.copy()
+    degenerate[0, 3:6] = 0.0
+    _, dom = m.decode_jacobian_np(degenerate, std, lo, hi)
+    assert not dom["ok"][0]
+    assert not dom["ok_6d"][0]
+
+
+def test_random_rotation_positive_domain_stays_away_from_pi():
+    rng = np.random.default_rng(5)
+    R, _ = m._random_rotation_features(rng, (32,))
+    quat = m.mat_to_quat_wxyz_np(R)
+    assert np.abs(quat[:, 0]).min() > np.cos((math.pi - 0.25) / 2.0) - 1e-12
+
+
+# ---------------------------------------------------------------------------
+# Jacobian / gradient counterexamples
+# ---------------------------------------------------------------------------
+
+
+def test_wrong_rotation_frame_breaks_j35():
+    rng = np.random.default_rng(6)
+    chain = m.build_synthetic_chain()
+    pos = rng.normal(0, 0.2, (1, 3))
+    R, _ = m._random_rotation_features(rng, (1,))
+    q = rng.uniform(-0.6, 0.6, (1, 29))
+    _, J_nv = m.synthetic_fk_jac_np(chain, pos, R, q)
+    fd = []
+    h = 1e-6
+    for k in range(35):
+        pp, Rp, qp = m._tangent_perturbation(pos[0], R[0], q[0], k, h)
+        pm, Rm, qm = m._tangent_perturbation(pos[0], R[0], q[0], k, -h)
+        fp = m.synthetic_fk_np(chain, pp[None], Rp[None], qp[None])[0]
+        fm = m.synthetic_fk_np(chain, pm[None], Rm[None], qm[None])[0]
+        fd.append((fp - fm) / (2 * h))
+    fd = np.stack(fd, axis=-1)
+    Rt = np.swapaxes(R, 1, 2)
+    correct = np.array(J_nv, copy=True)
+    correct[..., 3:6] = np.einsum("nsck,nkj->nscj", J_nv[..., 3:6], Rt)
+    assert np.abs(fd - correct).max() < 1e-8
+    missing_rt = np.array(J_nv, copy=True)
+    assert np.abs(fd - missing_rt).max() > 1e-3
+
+
+def test_wrong_joint_pivot_breaks_j35():
+    rng = np.random.default_rng(7)
+    chain = m.build_synthetic_chain()
+    pos = rng.normal(0, 0.2, (1, 3))
+    R, _ = m._random_rotation_features(rng, (1,))
+    q = rng.uniform(-0.6, 0.6, (1, 29))
+    Rs, ps = m._chain_forward_np(chain, pos, R, q)
+    kp, J = m.synthetic_fk_jac_np(chain, pos, R, q)
+    k = 5
+    h = 1e-6
+    qp = q.copy(); qm = q.copy()
+    qp[0, k] += h; qm[0, k] -= h
+    fp = m.synthetic_fk_np(chain, pos, R, qp)[0]
+    fm = m.synthetic_fk_np(chain, pos, R, qm)[0]
+    fd = (fp - fm) / (2 * h)
+    assert np.abs(fd - J[0, :, :, 6 + k]).max() < 1e-8
+    omega = Rs[k][0] @ chain.axes[k]
+    wrong = np.cross(omega, kp[0] - ps[k][0])
+    assert np.abs(fd - wrong).max() > 1e-3
+
+
+def test_wrong_joint_scale_breaks_j38():
+    std = np.array([0.31, 0.27, 0.19])
+    lo, hi = m.synthetic_joint_limits()
+    rng = np.random.default_rng(8)
+    R, r6 = m._random_rotation_features(rng, (1,))
+    x0 = np.zeros((1, 38))
+    x0[0, 3:9] = r6
+    x0[0, 9:38] = rng.uniform(-0.7, 0.7, 29)
+    D, _ = m.decode_jacobian_np(x0, std, lo, hi)
+    J = rng.normal(size=(15, 3, 35))
+    J38 = np.einsum("sck,kj->scj", J, D[0])
+    wrong = np.array(D, copy=True)
+    wrong[0, 6:, 9:] *= 2.0
+    J38_wrong = np.einsum("sck,kj->scj", J, wrong[0])
+    assert np.abs(J38 - J38_wrong).max() > 1e-9
+
+
+def test_gradient_group_gate_rejects_zero_and_clamped():
+    ref = np.linspace(-1e-3, 1e-3, 38)
+    zero = m.gradient_group_stats(np.zeros(38), ref)
+    assert zero["problems"]
+    got = ref.copy()
+    clamped = np.zeros(29, dtype=bool)
+    clamped[0] = True
+    got[9] = 1e-3
+    bad = m.gradient_group_stats(got, ref, clamped)
+    assert "clamped_nonzero" in bad["problems"]
+    good = m.gradient_group_stats(ref.copy(), ref)
+    assert not good["problems"]
+
+
+def test_loss_and_gradient_follow_j38():
+    rng = np.random.default_rng(9)
+    J = rng.normal(size=(1, 15, 3, 38))
+    pred = rng.normal(size=(1, 15, 3))
+    target = pred + 0.01 * rng.normal(size=(1, 15, 3))
+    out = m.fk_loss_and_gradient(J, pred, target)
+    assert out["denominator"] == 15.0
+    assert out["grad_weighted"] == pytest.approx(2 * out["grad_raw"])
+    assert np.abs(out["grad_weighted"]).max() > 0
+
+
+# ---------------------------------------------------------------------------
+# evidence independence / tamper detection
+# ---------------------------------------------------------------------------
+
+
+def test_key_multiset_detects_missing_extra_duplicate():
+    keys = m.required_geometry_rows()
+    assert not m._key_multiset_problems(
+        [{"key": k} for k in keys], keys)
+    assert m._key_multiset_problems([{"key": k} for k in keys[:-1]], keys)
+    assert m._key_multiset_problems(
+        [{"key": k} for k in keys] + [{"key": "extra"}], keys)
+    assert m._key_multiset_problems(
+        [{"key": k} for k in keys] + [{"key": keys[0]}], keys)
+
+
+def test_array_compare_detects_tamper():
+    saved = {
+        "prod": np.ones((2, 3), dtype=np.float32),
+        "ref": np.ones((2, 3), dtype=np.float64),
+        "mask": np.ones((2,), dtype=bool),
+    }
+    fresh = {k: v.copy() for k, v in saved.items()}
+    assert not m._array_compare_problems(
+        saved, fresh, bitwise_keys=("prod",))
+    tampered = copy.deepcopy(fresh)
+    tampered["prod"][0, 0] += 1e-4
+    assert m._array_compare_problems(
+        saved, tampered, bitwise_keys=("prod",))
+    tampered = copy.deepcopy(fresh)
+    tampered["ref"][0, 0] += 1e-3
+    assert m._array_compare_problems(
+        saved, tampered, bitwise_keys=("prod",))
+    tampered = copy.deepcopy(fresh)
+    tampered["ref"][0, 0] = np.nan
+    assert m._array_compare_problems(
+        saved, tampered, bitwise_keys=("prod",))
+    tampered = copy.deepcopy(fresh)
+    del tampered["mask"]
+    assert m._array_compare_problems(
+        saved, tampered, bitwise_keys=("prod",))
+
+
+def test_row_compare_detects_field_changes(synthetic):
+    row = next(r for r in synthetic["geometry"]["rows"]
+               if r["key"].startswith("fk_scalar|deterministic|W0"))
+    assert not m._compare_row_fields(row, copy.deepcopy(row), row["key"])
+    for field, value in (
+        ("status", "mismatch"),
+        ("lfk_denominator", 901),
+        ("production_lfk", row["production_lfk"] + 1e-6),
+    ):
+        other = copy.deepcopy(row)
+        other[field] = value
+        assert m._compare_row_fields(other, row, row["key"]), field
+    other = copy.deepcopy(row)
+    del other["lfk_denominator"]
+    assert m._compare_row_fields(other, row, row["key"])
+    batch = next(r for r in synthetic["geometry"]["rows"]
+                 if r["key"] == "fk_scalar|deterministic|batch")
+    assert not m._compare_row_fields(batch, copy.deepcopy(batch), batch["key"])
+    other = copy.deepcopy(batch)
+    other["batch_equals_window_mean"] = False
+    assert m._compare_row_fields(other, batch, batch["key"])
+
+
+def test_production_geometry_mutation_is_detected(synthetic):
+    row = next(r for r in synthetic["geometry"]["rows"]
+               if r["key"] == "production_fk|pred_det|W0")
+    arrays = synthetic["geometry"]["arrays"]
+    prod = arrays["prod_fk_pred_det"][0].astype(np.float64)
+    ref = arrays["ref_fk_pred_det"][0]
+    tol = m.tolerance_record(synthetic["tolerance"], "production_fk")
+    ok = m.compare_values(prod, ref, tol)
+    assert ok["status"] == "pass"
+    bad = prod.copy()
+    bad[0, 0, 0] += 0.01
+    assert m.compare_values(bad, ref, tol)["status"] == "mismatch"
+    transposed = np.swapaxes(prod, 1, 2)
+    assert m.compare_values(transposed, ref, tol)["status"] == "mismatch"
+
+
+def test_parent_binding_requires_bitwise(synthetic):
+    arrays = synthetic["geometry"]["arrays"]
+    parent = arrays["parent_fk_pred_det"]
+    assert m._bitwise_equal(arrays["prod_fk_pred_det"], parent)
+    shifted = parent.copy()
+    shifted[0, 0, 0, 0] = np.nextafter(shifted[0, 0, 0, 0], np.float32(1.0))
+    assert not m._bitwise_equal(arrays["prod_fk_pred_det"], shifted)
+
+
+def test_calibration_contract_and_margins():
+    contract = m.synthetic_calibration(seed=20261028)
+    assert contract["mode"] == "synthetic_calibrated"
+    assert contract["evidence_sha256"]
+    assert not m.tolerance_contract_problems(contract)
+    observed = contract["calibration"]["observed"]
+    assert set(observed) == set(m.TOLERANCE_PROPOSALS)
+    for key, rec in observed.items():
+        assert 4.0 * rec["max_ratio_of_proposal"] <= 1.0, key
+    excluded = contract["calibration"]["excluded_cases"]
+    assert excluded["near_pi"]["included_in_tolerance"] is False
+    assert excluded["clamp_boundary"]["derivative_ok"] is False
+    assert excluded["degenerate_6d"]["derivative_ok"] is False
+    assert excluded["clamp_outside"]["derivative_value"] == 0.0
+    assert excluded["zero_residual"]["fk_m2"] == 0.0
+
+
+def test_tolerance_widening_is_rejected():
+    contract = m.synthetic_calibration(seed=20261028)
+    widened = copy.deepcopy(contract)
+    widened["tolerances"]["production_fk"]["atol"] *= 2.0
+    assert m.tolerance_contract_problems(widened)
+    default = m.build_default_tolerance_contract()
+    assert not m.tolerance_contract_problems(default)
+    default["tolerances"]["decode_float32"]["rtol"] = 1e-3
+    assert m.tolerance_contract_problems(default)
+
+
+def test_calibration_evidence_tamper_is_rejected():
+    contract = m.synthetic_calibration(seed=20261028)
+    tampered = copy.deepcopy(contract)
+    tampered["calibration"]["observed"]["production_fk"][
+        "max_ratio_of_proposal"] = 0.0
+    assert m.tolerance_contract_problems(tampered)
+    # widening observed + rehashing still fails the 4x proposal rule
+    tampered = copy.deepcopy(contract)
+    tampered["calibration"]["observed"]["production_fk"][
+        "max_ratio_of_proposal"] = 0.5
+    tampered["calibration_sha256"] = m._canonical_sha256(
+        tampered["calibration"])
+    tampered["evidence_sha256"] = tampered["calibration_sha256"]
+    assert m.tolerance_contract_problems(tampered, recompute=False)
+
+
+def test_calibration_is_deterministic_and_evidence_free_of_real_reads():
+    a = m.synthetic_calibration(seed=20261028)
+    b = m.synthetic_calibration(seed=20261028)
+    assert a["calibration_sha256"] == b["calibration_sha256"]
+    assert a["calibration"]["real_asset_loaded"] is False
+    assert a["calibration"]["real_checkpoint_loaded"] is False
+    assert a["calibration"]["real_dataset_loaded"] is False
+    assert a["calibration"]["real_model_calls"] == 0
+
+
+# ---------------------------------------------------------------------------
+# accounting / seal
+# ---------------------------------------------------------------------------
+
+
+def test_negative_and_non_finite_costs_are_rejected(tmp_path):
+    for value in (-1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError):
+            m.upsert_cost(tmp_path, "G", "attempt_001", value, {}, "running")
+
+
+def test_publishing_row_is_not_consumable(tmp_path):
+    (m.stage_dir(tmp_path, "G") / "attempt_001").mkdir(parents=True)
+    row = {
+        "status": "publishing", "complete": False,
+        "measured_wall_s": 1.0, "wall_s": 1.0,
+        "accounting_schema": m.ACCOUNTING_SCHEMA,
+        "cohort_id": m.COHORT_ID,
+    }
+    m.save_index(tmp_path, [{"stage": "G", "attempt": "attempt_001", **row}])
+    m.save_ledger(tmp_path, [{"stage": "G", "attempt": "attempt_001", **row}])
+    state, problems = m.stage_state(tmp_path, "G")
+    assert state is None
+    assert "stage_not_terminal" in problems
+
+
+def test_stage_history_unknown_on_half_damaged_ledger(tmp_path):
+    (m.stage_dir(tmp_path, "G") / "attempt_001").mkdir(parents=True)
+    row = {
+        "status": "done", "complete": True,
+        "measured_wall_s": 2.0, "wall_s": 2.0,
+        "accounting_schema": m.ACCOUNTING_SCHEMA,
+        "cohort_id": m.COHORT_ID,
+    }
+    m.save_index(tmp_path, [{"stage": "G", "attempt": "attempt_001", **row}])
+    (tmp_path / "costs.json").write_text("{not json")
+    assert m.stage_history(tmp_path, "G") is None
+    assert m.total_history(tmp_path) is None
+
+
+def test_stage_history_rejects_negative_history(tmp_path):
+    (m.stage_dir(tmp_path, "G") / "attempt_001").mkdir(parents=True)
+    row = {
+        "status": "done", "complete": True,
+        "measured_wall_s": -5.0, "wall_s": -5.0,
+        "accounting_schema": m.ACCOUNTING_SCHEMA,
+        "cohort_id": m.COHORT_ID,
+    }
+    m.save_index(tmp_path, [{"stage": "G", "attempt": "attempt_001", **row}])
+    m.save_ledger(tmp_path, [{"stage": "G", "attempt": "attempt_001", **row}])
+    assert m.stage_history(tmp_path, "G") is None
+
+
+def test_cohort_attribution_foreign_legacy_and_member(tmp_path):
+    fixed = tmp_path / "runs"
+    member = fixed / "member"
+    foreign = fixed / "foreign"
+    legacy = fixed / "legacy"
+    for p in (member, foreign, legacy):
+        (m.stage_dir(p, "G") / "attempt_001").mkdir(parents=True)
+    m.write_cohort(member, mode="synthetic")
+    row = {
+        "status": "done", "complete": True,
+        "measured_wall_s": 3.0, "wall_s": 3.0,
+        "accounting_schema": m.ACCOUNTING_SCHEMA,
+        "cohort_id": m.COHORT_ID,
+        "call_balance": m.CallCounter(m.CALL_CAPS).snapshot(),
+    }
+    m.save_index(member, [{"stage": "G", "attempt": "attempt_001", **row}])
+    m.save_ledger(member, [{"stage": "G", "attempt": "attempt_001", **row}])
+    m.write_json(foreign / "cohort.json", {
+        "cohort_id": "another_cohort", "execution_id": "another",
+        "accounting_schema": m.ACCOUNTING_SCHEMA})
+    (legacy / "costs.json").write_text("{broken")
+    history = m.cohort_history(fixed)
+    assert history["known"] is True
+    assert history["total_s"] == pytest.approx(3.0)
+    assert len(history["runs"]) == 1
+    assert history["runs"][0]["run"] == m.path_for_record(member)
+
+
+def test_attempt_limit_blocks_before_registration(tmp_path):
+    budget = {"attempts": 2, "attempts_used": 2, "remaining_s": 100.0,
+              "reserve_s": 10.0}
+    with pytest.raises(SystemExit):
+        m.pre_register_attempt(tmp_path, "G", "attempt_003", 0.0,
+                               scope={}, budget=budget)
+
+
+def test_finish_attempt_seals_consumable_row(tmp_path):
+    (tmp_path).mkdir(parents=True, exist_ok=True)
+    m.write_cohort(tmp_path, mode="synthetic")
+    budget = {"remaining_s": 100.0, "reserve_s": 10.0}
+    t0 = m.time.perf_counter()
+    attempt = "attempt_001"
+    m.pre_register_attempt(tmp_path, "G", attempt, t0, scope={},
+                           budget={**budget, "attempts": 2, "attempts_used": 0})
+    seal = m.finish_attempt(
+        tmp_path, "G", attempt, t0, budget,
+        {"complete": True, "report": None, "summary": None},
+        status="done", extra={"call_balance": None})
+    assert seal.sealed and seal.terminal
+    row, problems = m.stage_state(tmp_path, "G")
+    assert row is not None and row["complete"] is True
+    assert problems == []
+
+
+def test_budget_for_isolated_synthetic_root(tmp_path):
+    m.write_cohort(tmp_path, mode="synthetic")
+    budget = m.budget_for(tmp_path, "R0", fixed_root=tmp_path, mode="synthetic")
+    assert budget["remaining_s"] == pytest.approx(m.STAGE_BUDGETS["R0"]["budget_s"])
+
+
+# ---------------------------------------------------------------------------
+# authorization / admission
+# ---------------------------------------------------------------------------
+
+
+def test_authorization_template_is_refused():
+    template = m.authorization_template()
+    assert "not_authorized" in m.authorization_problems(template)
+    record = copy.deepcopy(template)
+    record["authorized"] = True
+    record["checklist"] = {k: True for k in m.AUTHORIZATION_REQUIRED}
+    for stage, spec in m.STAGE_BUDGETS.items():
+        record["budgets"][stage] = {"budget_s": spec["budget_s"],
+                                    "attempts": spec["attempts"]}
+    record["draft_sha256"] = "0" * 64
+    record["tolerance_evidence_sha256"] = "1" * 64
+    record["admission_package_sha256"] = "2" * 64
+    assert not m.authorization_problems(record)
+    # strict zero declarations: 0.0 / False / "0" are refused
+    for value in (0.0, False, "0", None):
+        bad = copy.deepcopy(record)
+        bad["training_updates"] = value
+        assert m.authorization_problems(bad)
+    # exact budgets
+    for value in (179.9, "180", True, None):
+        bad = copy.deepcopy(record)
+        bad["budgets"]["R0"]["budget_s"] = value
+        assert m.authorization_problems(bad)
+    bad = copy.deepcopy(record)
+    bad["budgets"]["R0"]["attempts"] = 3
+    assert m.authorization_problems(bad)
+    bad = copy.deepcopy(record)
+    bad["budgets"].pop("D")
+    assert m.authorization_problems(bad)
+    bad = copy.deepcopy(record)
+    bad["state_fd"]["rows"] = 4671
+    assert m.authorization_problems(bad)
+
+
+def test_admission_package_problems():
+    assert m.admission_package_problems(None)
+    package = {
+        "schema": m.ADMISSION_SCHEMA,
+        "passed": False,
+        "problems": ["x"],
+        "status": {"authorized": True, "registered": True, "run": "run"},
+        "read_scope": {"window_values_loaded": True,
+                       "checkpoint_torch_load": True,
+                       "cohort_created": True,
+                       "registered_attempt_created": True,
+                       "conditioner_forward_calls": 1,
+                       "model_forward_calls": 1,
+                       "vjp_calls": 1},
+        "parent_anchors": {},
+        "key_counts": {"geometry": 1, "fd": 2, "states": 3},
+        "implementation": {"files": {}},
+        "tolerance": {"mode": "synthetic_default"},
+    }
+    problems = m.admission_package_problems(package)
+    for expected in ("admission_not_passed", "admission_has_problems",
+                     "admission_must_be_pre_authorization",
+                     "admission_must_not_be_registered",
+                     "admission_must_not_be_run", "admission_key_counts",
+                     "admission_tolerance_not_calibrated"):
+        assert expected in problems
+
+
+def _run_cli(*args: str) -> subprocess.CompletedProcess:
+    script = Path(__file__).resolve().parents[1] / "scripts" / "audit_w1_real_fk.py"
+    return subprocess.run(
+        [sys.executable, str(script), *args],
+        capture_output=True, text=True, timeout=120)
+
+
+def test_real_entry_refuses_without_authorization(tmp_path):
+    out = tmp_path / "run"
+    proc = _run_cli("--real", "--out", str(out))
+    assert proc.returncode != 0
+    assert "authorization" in (proc.stdout + proc.stderr).lower()
+    assert not out.exists()
+
+
+def test_synthetic_entry_guard_rejects_experiment_roots():
+    forbidden = (m.PROJECT_ROOT / "derived/experiments/omniretarget_first/"
+                 "fk_guard_probe")
+    proc = _run_cli("--synthetic", "--out", str(forbidden))
+    assert proc.returncode != 0
+    assert not forbidden.exists()
+    proc = _run_cli("--synthetic", "--out",
+                    str(m.PROJECT_ROOT / "src/ireset/eval/fk_guard_probe"))
+    assert proc.returncode != 0
+
+
+# ---------------------------------------------------------------------------
+# end-to-end and tamper resistance
+# ---------------------------------------------------------------------------
+
+
+def test_synthetic_self_test_end_to_end(self_test):
+    assert self_test["conclusion"] == "synthetic_contract_passed"
+    assert self_test["complete_evidence"] is True
+    assert self_test["covered_contract_passed"] is True
+    assert not self_test["problems"]
+    assert not self_test["gaps"]
+    assert self_test["boundaries"]["full_objective_contract_passed"] is None
+    assert self_test["boundaries"]["final_interaction_method"] == "not_ready"
+    assert self_test["boundaries"]["production_integration"] is False
+    calls = self_test["calls"]["counts"]
+    zeros = self_test["zero_counters"]
+    for key in m.ZERO_COUNTERS:
+        assert zeros[key] == 0, key
+    assert calls["scene_setup_forward"] == 0  # synthetic: no MuJoCo compile
+    for stage in ("R0", "G", "D", "F"):
+        assert self_test["seals"][stage]["terminal"] is True
+
+
+def test_synthetic_self_test_is_asset_free(self_test):
+    assert self_test["stages"]["R0"]["registration"]["parent"]["mode"] == \
+        "synthetic_fixture"
+    assert not self_test["stages"]["R0"]["registration"]["environment"][
+        "note"].startswith("real")
+
+
+def test_synthetic_does_not_call_largebox_static_frame(monkeypatch, tmp_path):
+    def boom():
+        raise AssertionError("real asset was loaded")
+
+    monkeypatch.setattr("ireset.train.losses.largebox_static_frame", boom)
+    provider = m.SyntheticFkProvider(seed=20261028)
+    provider.prepare_fixture(tmp_path)
+    inputs = provider.load_inputs()
+    run = provider.production_capture(
+        "deterministic", inputs.prediction["deterministic"],
+        want_gradient=False)
+    assert run.fk_m2 >= 0.0
+
+
+def test_finalize_rejects_tampered_saved_artifacts(self_test, tmp_path):
+    source = Path(self_test["run_root"])
+    if not source.is_absolute():
+        source = m.PROJECT_ROOT / source
+    target = tmp_path / "tampered"
+    shutil.copytree(source, target)
+    g = copy.deepcopy(self_test["stages"]["G"])
+    d = copy.deepcopy(self_test["stages"]["D"])
+    for key in ("arrays", "gradient_arrays", "rows"):
+        g["paths"][key] = str(target / Path(g["paths"][key]).relative_to(source))
+    for key in ("arrays", "rows"):
+        d["paths"][key] = str(target / Path(d["paths"][key]).relative_to(source))
+    rows_path = Path(g["paths"]["rows"])
+    payload = json.loads(rows_path.read_text())
+    payload["rows"][0]["status"] = "mismatch"
+    rows_path.write_text(json.dumps(payload))
+    npz_path = Path(g["paths"]["arrays"])
+    with np.load(npz_path) as z:
+        arrays = {k: z[k] for k in z.files}
+    arrays["prod_fk_pred_det"] = arrays["prod_fk_pred_det"].copy()
+    arrays["prod_fk_pred_det"][0, 0, 0, 0] += np.float32(0.01)
+    np.savez(npz_path, **arrays)
+    provider = m.SyntheticFkProvider(seed=20261028)
+    provider.fixture_path = source / "fixture" / "synthetic_parent_arrays.npz"
+    provider.fixture_sha256 = m.sha256_file(provider.fixture_path)
+    counter = m.CallCounter(m.CALL_CAPS)
+    provider.bind_counter(counter)
+    f = m.run_f_stage(
+        target, "F", "attempt_999", m.time.perf_counter(),
+        {"remaining_s": 600.0, "reserve_s": 90.0},
+        self_test["stages"]["R0"]["registration_sha256"],
+        g, d, provider, counter, self_test["tolerance_contract"])
+    assert f["conclusion"] == "audit_incomplete"
+    assert f["verification_problems"]
+    texts = " ".join(f["verification_problems"])
+    assert "array_not_bitwise" in texts or "status" in texts
+
+
+# ---------------------------------------------------------------------------
+# withdrawal cost / slow persistence
+# ---------------------------------------------------------------------------
+
+
+def _sealed_f_row(tmp_path):
+    m.write_cohort(tmp_path, mode="synthetic")
+    adir = m.stage_dir(tmp_path, "F") / "attempt_001"
+    adir.mkdir(parents=True)
+    report = adir / "fk_audit_final.json"
+    report.write_text(json.dumps({
+        "schema": "w1_real_fk_audit_summary_v1",
+        "conclusion": "synthetic_contract_passed",
+        "complete_evidence": True,
+        "covered_contract_passed": True,
+        "failures": [], "gaps": [],
+    }))
+    row = {
+        "status": "done", "complete": True, "measured_wall_s": 1.0,
+        "wall_s": 1.0, "accounting_schema": m.ACCOUNTING_SCHEMA,
+        "cohort_id": m.COHORT_ID, "report": str(report),
+        "summary": str(report),
+    }
+    m.save_index(tmp_path, [{"stage": "F", "attempt": "attempt_001", **row}])
+    m.save_ledger(tmp_path, [{"stage": "F", "attempt": "attempt_001", **row}])
+    return report, row
+
+
+def test_withdraw_attempt_claim_rewrites_and_charges(tmp_path):
+    report, row = _sealed_f_row(tmp_path)
+    updated, problems, summary = m.withdraw_attempt_claim(
+        tmp_path, "F", "attempt_001", report, row, ["revoked_for_test"],
+        reason="f_seal_or_consumer_not_consumable",
+        t0=m.time.perf_counter() - 0.05,
+        budget={"remaining_s": 100.0, "reserve_s": 90.0})
+    assert not problems
+    assert updated["status"] == "incomplete"
+    assert updated["complete"] is False
+    assert updated["measured_wall_s"] >= 1.0
+    on_disk = json.loads(report.read_text())
+    assert on_disk["conclusion"] == "audit_incomplete"
+    assert on_disk["complete_evidence"] is False
+    assert on_disk["covered_contract_passed"] is False
+    assert "revoked_for_test" in on_disk["gaps"]
+    state, state_problems = m.stage_state(tmp_path, "F")
+    assert state is not None and state["complete"] is False
+    assert "attempt_not_complete" in state_problems
+
+
+def test_slow_withdraw_cost_is_not_published_as_success(tmp_path, monkeypatch):
+    report, row = _sealed_f_row(tmp_path)
+    real_upsert = m.upsert_index
+
+    def slow_upsert(*args, **kwargs):
+        m.time.sleep(0.03)
+        return real_upsert(*args, **kwargs)
+
+    monkeypatch.setattr(m, "upsert_index", slow_upsert)
+    monkeypatch.setattr(m, "SEAL_TAIL_RESERVE_S", 0.001)
+    updated, problems, _ = m.withdraw_attempt_claim(
+        tmp_path, "F", "attempt_001", report, row, [],
+        reason="f_seal_or_consumer_not_consumable",
+        t0=m.time.perf_counter(),
+        budget={"remaining_s": 0.02, "reserve_s": 0.0})
+    assert "withdraw_cost_unverifiable" in problems
+    assert updated["status"] == "publishing"
+    assert updated["complete"] is False
+    state, state_problems = m.stage_state(tmp_path, "F")
+    assert state is None
+    assert state_problems
+
+
+def test_slow_seal_is_not_published_as_success(tmp_path, monkeypatch):
+    m.write_cohort(tmp_path, mode="synthetic")
+    t0 = m.time.perf_counter()
+    budget = {"remaining_s": 0.5, "reserve_s": 0.0,
+              "attempts": 2, "attempts_used": 0}
+    m.pre_register_attempt(tmp_path, "G", "attempt_001", t0, scope={},
+                           budget=budget)
+    real_upsert = m.upsert_index
+
+    def slow_upsert(*args, **kwargs):
+        m.time.sleep(0.03)
+        return real_upsert(*args, **kwargs)
+
+    monkeypatch.setattr(m, "upsert_index", slow_upsert)
+    monkeypatch.setattr(m, "SEAL_TAIL_RESERVE_S", 0.001)
+    seal = m.finish_attempt(
+        tmp_path, "G", "attempt_001", t0,
+        {"remaining_s": 0.02, "reserve_s": 0.0},
+        {"complete": True, "report": None, "summary": None},
+        status="done", extra={"call_balance": None})
+    assert not seal.sealed
+    assert seal.row["complete"] is False
+    assert seal.row["status"] in ("publishing", "incomplete")
+    if seal.row["status"] == "publishing":
+        state, problems = m.stage_state(tmp_path, "G")
+        assert state is None and problems
+
+
+def test_implementation_drift_helper():
+    current = {"files": {"a": "1", "b": "2"}}
+    assert not m._implementation_drift(current, current)
+    drift = m._implementation_drift(
+        current, {"files": {"a": "x", "b": "2"}})
+    assert drift == ["implementation_drift:a"]
+    assert m._implementation_drift(current, None) == [
+        "r0_expected_implementation_missing"]
