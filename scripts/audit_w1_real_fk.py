@@ -46,6 +46,7 @@ from ireset.eval.w1_real_fk_audit import (  # noqa: E402
     authorization_problems,
     build_admission_package,
     build_default_tolerance_contract,
+    configure_production_runtime,
     load_authorization,
     load_tolerance_contract,
     run_registered_audit,
@@ -94,6 +95,10 @@ def _print_result(result: dict) -> None:
     counts = (result.get("calls") or {}).get("counts")
     if counts:
         print(f"[fk-audit] calls={counts}")
+    runtime = result.get("runtime")
+    if isinstance(runtime, dict) and runtime:
+        print(f"[fk-audit] runtime_applied={runtime.get('applied')} "
+              f"after={runtime.get('after')}")
     if result.get("summary_path"):
         print(f"[fk-audit] summary={result['summary_path']}")
 
@@ -211,7 +216,14 @@ def main() -> int:
             import torch
 
             device = "cuda" if torch.cuda.is_available() else "cpu"
+        # Apply the frozen numeric runtime before any CUDA/FK work; R0 and the
+        # spawned F worker re-verify the same flags.
+        runtime = configure_production_runtime()
+        if runtime["problems"]:
+            raise SystemExit(
+                f"production runtime cannot be applied: {runtime['problems']}")
         provider = RealFkProvider(ROOT, device=device)
+        provider.runtime = runtime
         result = run_registered_audit(
             out, provider, mode="real", tolerance=contract,
             authorization_sha=auth_sha, authorization=record,

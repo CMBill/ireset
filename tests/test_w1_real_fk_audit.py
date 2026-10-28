@@ -610,8 +610,15 @@ def test_admission_package_problems():
                      "admission_must_be_pre_authorization",
                      "admission_must_not_be_registered",
                      "admission_must_not_be_run", "admission_key_counts",
-                     "admission_tolerance_not_calibrated"):
+                     "admission_tolerance_not_calibrated",
+                     "admission_runtime_contract"):
         assert expected in problems
+    applied = copy.deepcopy(package)
+    applied["runtime"] = {"requirements": dict(m.RUNTIME_REQUIREMENTS),
+                          "applied": False,
+                          "observed_after_setup": dict(m.RUNTIME_REQUIREMENTS)}
+    assert "admission_runtime_not_applied" in \
+        m.admission_package_problems(applied)
 
 
 def _run_cli(*args: str) -> subprocess.CompletedProcess:
@@ -676,6 +683,24 @@ def test_synthetic_self_test_end_to_end(self_test):
     assert process["ppid"] == m.os.getpid()
     assert any(unit.get("source") == "worker" for unit in self_test["units"])
     assert all(unit.get("admitted") for unit in self_test["units"])
+    # G and D count their real calls; only F's worker delta used to survive.
+    for stage in ("G", "D", "F"):
+        delta = self_test["stages"][stage]["call_delta"]
+        nominal = m.STAGE_NOMINAL[stage]
+        for kind in ("loss_assembler", "production_fk_batch",
+                     "production_vjp", "mj_forward", "mj_jac_site",
+                     "fd_pose_eval"):
+            assert delta.get(kind, 0) == nominal[kind], (stage, kind)
+    # The index and the ledger carry the same terminal call snapshot.
+    run_root = Path(self_test["run_root"])
+    if not run_root.is_absolute():
+        run_root = m.PROJECT_ROOT / run_root
+    for stage in ("R0", "G", "D", "F"):
+        index = [r for r in m.load_index(run_root) if r["stage"] == stage]
+        ledger = [r for r in m.load_ledger(run_root) if r["stage"] == stage]
+        assert len(index) == len(ledger) == 1
+        assert index[0]["call_balance"] == ledger[0]["call_balance"], stage
+    assert self_test["calls"]["counts"]["loss_assembler"] == 4
     # F verifies G/D artifacts against the sealed per-file hashes
     assert self_test["prerequisite_consumer_states"] == {"G": [], "D": []}
     verification = json.loads(Path(self_test["stages"]["F"]["verification_path"])
@@ -747,13 +772,14 @@ def test_finalize_rejects_tampered_saved_artifacts(self_test, tmp_path):
 
 def _registered_f_attempt(root: Path, registration_sha: str,
                           *, remaining_s: float = 600.0,
-                          reserve_s: float = 90.0):
+                          reserve_s: float = 90.0,
+                          attempt: str = "attempt_999"):
     """Pre-register an F attempt so unit admission has a live parent row."""
     m.write_cohort(root, mode="synthetic")
     budget = {"remaining_s": remaining_s, "reserve_s": reserve_s,
               "attempts": 2, "attempts_used": 0}
     t0 = m.time.perf_counter()
-    m.pre_register_attempt(root, "F", "attempt_999", t0, scope={}, budget=budget,
+    m.pre_register_attempt(root, "F", attempt, t0, scope={}, budget=budget,
                            registration_sha=registration_sha)
     return m.CallCounter(m.CALL_CAPS), t0, budget
 
@@ -1253,3 +1279,308 @@ def test_withdraw_stays_publishing_when_terminal_write_outruns_budget(
     assert updated["complete"] is False
     state, state_problems = m.stage_state(tmp_path, "F")
     assert state is None and state_problems
+
+
+# ---------------------------------------------------------------------------
+# call accounting: chain-level counts, seal snapshots, reservations
+# ---------------------------------------------------------------------------
+
+
+def _registered_stage_attempt(root: Path, stage: str,
+                              registration_sha: str = "0" * 64,
+                              *, remaining_s: float = 600.0,
+                              reserve_s: float = 90.0) -> tuple[dict, float]:
+    m.write_cohort(root, mode="synthetic")
+    budget = {"remaining_s": remaining_s, "reserve_s": reserve_s,
+              "attempts": 2, "attempts_used": 0}
+    t0 = m.time.perf_counter()
+    m.pre_register_attempt(root, stage, "attempt_001", t0, scope={},
+                           budget=budget, registration_sha=registration_sha)
+    return budget, t0
+
+
+def test_seal_writes_the_same_call_snapshot_to_index_and_ledger(tmp_path):
+    budget, t0 = _registered_stage_attempt(tmp_path, "G")
+    counter = m.CallCounter(m.CALL_CAPS)
+    counter.add("mj_forward", 7)
+    seal = m.finish_attempt(
+        tmp_path, "G", "attempt_001", t0, budget,
+        {"complete": True, "report": None, "summary": None,
+         "registration_sha256": "0" * 64},
+        status="done", extra={"call_balance": counter.snapshot()})
+    assert seal.sealed
+    index = m.load_index(tmp_path)[0]
+    ledger = m.load_ledger(tmp_path)[0]
+    assert index["call_balance"] == ledger["call_balance"]
+    assert index["call_balance"]["counts"]["mj_forward"] == 7
+    _row, problems = m.stage_state(tmp_path, "G")
+    assert not problems
+
+    tampered = dict(index)
+    tampered["call_balance"] = m.CallCounter(m.CALL_CAPS).snapshot()
+    m.save_index(tmp_path, [tampered])
+    _row, problems = m.stage_state(tmp_path, "G")
+    assert "call_balance_disagreement" in problems
+    assert m.stage_history(tmp_path, "G") is None
+
+
+def test_prior_calls_unknown_when_a_reservation_is_unsettled(tmp_path):
+    budget, t0 = _registered_stage_attempt(tmp_path, "G")
+    counter = m.CallCounter(m.CALL_CAPS)
+    counter.add("mj_forward", 3)
+    m.finish_attempt(
+        tmp_path, "G", "attempt_001", t0, budget,
+        {"complete": True, "report": None, "summary": None,
+         "registration_sha256": "0" * 64},
+        status="done", extra={"call_balance": counter.snapshot()})
+    assert m.prior_call_counts(tmp_path, fixed_root=tmp_path,
+                               mode="synthetic") is not None
+    path = m._reserve_unit_calls(tmp_path, "G", "attempt_001", {
+        "unit": {"units": 1, "reserved": {"mj_forward": 5}}})
+    assert m.prior_call_counts(tmp_path, fixed_root=tmp_path,
+                               mode="synthetic") is None
+    _row, problems = m.stage_state(tmp_path, "G")
+    assert any("reservation_unsettled" in p for p in problems)
+    m._complete_unit_calls(path, {"mj_forward": 3})
+    assert m.prior_call_counts(tmp_path, fixed_root=tmp_path,
+                               mode="synthetic") is not None
+
+
+def _worker_spec(root: Path, fixture: Path, *, registration_sha: str,
+                 reserve_s: float = 0.0) -> dict:
+    return {
+        "schema": "w1_real_fk_recompute_v1",
+        "mode": "synthetic", "root": str(root), "stage": "F",
+        "attempt": "attempt_001",
+        "registration_sha256": registration_sha,
+        "deadline_perf": m.time.perf_counter() + 600.0,
+        "deadline_epoch": m.time.time() + 600.0,
+        "reserve_s": reserve_s,
+        "project_root": str(m.PROJECT_ROOT),
+        "device": "cpu", "seed": 20261028,
+        "fixture_path": str(fixture),
+        "fixture_sha256": m.sha256_file(fixture),
+        "tolerance": m.build_default_tolerance_contract(),
+    }
+
+
+def test_worker_settles_known_calls_when_fd_aborts(tmp_path, monkeypatch):
+    fixture_dir = tmp_path / "fixture"
+    provider = m.SyntheticFkProvider(seed=20261028)
+    provider.prepare_fixture(fixture_dir)
+    fixture = fixture_dir / "synthetic_parent_arrays.npz"
+    root = tmp_path / "run"
+    budget, _t0 = _registered_stage_attempt(root, "F",
+                                           registration_sha="a" * 64)
+    out = tmp_path / "worker"
+    out.mkdir()
+    spec_path = out / "spec.json"
+    spec_path.write_text(json.dumps(_worker_spec(
+        root, fixture, registration_sha="a" * 64)))
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("fd_exploded")
+
+    monkeypatch.setattr(m, "compute_fd", boom)
+    code = m._recompute_worker_main(str(spec_path), str(out))
+    meta = json.loads((out / "worker_meta.json").read_text())
+    assert code == 3
+    assert meta["exit_reason"].startswith("worker_exception")
+    # Geometry already ran; those calls must not be reported as zero.
+    assert meta["call_delta"]["loss_assembler"] == 2
+    assert meta["call_delta"]["production_fk_batch"] == 4
+    assert meta["call_delta"]["production_vjp"] == 2
+    assert meta["call_delta"]["mj_forward"] == 1200
+    assert meta["call_delta"]["mj_jac_site"] == 7200
+    assert meta["call_delta"]["fd_pose_eval"] == 0
+
+
+def test_f_merges_an_aborted_worker_delta_and_keeps_unsettled_unknown(
+        self_test, tmp_path, monkeypatch):
+    target, g, d, provider = _f_inputs(self_test, tmp_path, tamper=lambda *_: None)
+    counter, t0, budget = _registered_f_attempt(
+        target, self_test["stages"]["R0"]["registration_sha256"])
+
+    def fake_worker(spec, out_dir, timeout_s, project_root):
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        meta = {"pid": 999999, "ppid": m.os.getpid(),
+                "exit_reason": "worker_exception:RuntimeError",
+                "units": [], "call_delta": {"mj_forward": 1200,
+                                            "loss_assembler": 2}}
+        (out_dir / "worker_meta.json").write_text(json.dumps(meta))
+        return meta, ["f_worker_exit:3"]
+
+    monkeypatch.setattr(m, "_run_recompute_worker", fake_worker)
+    f = m.run_f_stage(
+        target, "F", "attempt_999", t0, budget,
+        self_test["stages"]["R0"]["registration_sha256"],
+        g, d, provider, counter, self_test["tolerance_contract"],
+        recompute="subprocess", g_expected=g["artifact_hashes"],
+        d_expected=d["artifact_hashes"])
+    assert f["conclusion"] == "audit_incomplete"
+    assert counter.counts["mj_forward"] == 1200
+    assert counter.counts["loss_assembler"] == 2
+    reservation = json.loads(
+        (m.stage_dir(target, "F") / "attempt_999" /
+         "call_reservations.json").read_text())
+    assert reservation["consumed"]["mj_forward"] == 1200
+
+    # A worker that reports no delta leaves the reservation unsettled.
+    counter2, t0b, budget2 = _registered_f_attempt(
+        target, self_test["stages"]["R0"]["registration_sha256"],
+        attempt="attempt_1000")
+
+    def fake_worker_no_delta(spec, out_dir, timeout_s, project_root):
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        meta = {"pid": 999998, "ppid": m.os.getpid(),
+                "exit_reason": "worker_exception:RuntimeError", "units": []}
+        (out_dir / "worker_meta.json").write_text(json.dumps(meta))
+        return meta, ["f_worker_exit:3"]
+
+    monkeypatch.setattr(m, "_run_recompute_worker", fake_worker_no_delta)
+    f2 = m.run_f_stage(
+        target, "F", "attempt_1000", t0b, budget2,
+        self_test["stages"]["R0"]["registration_sha256"],
+        g, d, provider, counter2, self_test["tolerance_contract"],
+        recompute="subprocess", g_expected=g["artifact_hashes"],
+        d_expected=d["artifact_hashes"])
+    assert "f_call_settlement_unknown" in f2["verification_problems"]
+    assert "f_reservation_left_unsettled" in f2["verification_problems"]
+    reservation2 = json.loads(
+        (m.stage_dir(target, "F") / "attempt_1000" /
+         "call_reservations.json").read_text())
+    assert reservation2["consumed"] is None
+
+
+# ---------------------------------------------------------------------------
+# per-unit deadlines inside the compute loops
+# ---------------------------------------------------------------------------
+
+
+def test_geometry_deadline_stops_the_second_model(synthetic, monkeypatch):
+    provider = synthetic["provider"]
+    counter = m.CallCounter(m.CALL_CAPS)
+    provider.bind_counter(counter)
+    ticks = iter(range(0, 10 ** 6))
+    monkeypatch.setattr(m, "_CLOCK", lambda: float(next(ticks)))
+    # Calls: start(0), 3x reference, 3x kernel, capture-det(7),
+    # jac-det(8), capture-diff(9) -> expired at 9.
+    with pytest.raises(TimeoutError):
+        m.compute_geometry(provider, synthetic["inputs"],
+                           synthetic["tolerance"], deadline=9.0)
+    assert counter.counts["loss_assembler"] == 1
+    assert counter.counts["production_fk_batch"] == 2
+    assert counter.counts["production_vjp"] == 1
+
+
+def test_fd_deadline_stops_before_the_next_state(synthetic, monkeypatch):
+    provider = synthetic["provider"]
+    counter = m.CallCounter(m.CALL_CAPS)
+    provider.bind_counter(counter)
+    ticks = iter(range(0, 10 ** 7))
+    monkeypatch.setattr(m, "_CLOCK", lambda: float(next(ticks)))
+    with pytest.raises(TimeoutError):
+        m.compute_fd(provider, synthetic["inputs"],
+                     synthetic["geometry"]["arrays"],
+                     synthetic["tolerance"], deadline=3.0)
+    per_state = 2 * len(m.FD_STEPS) * (m.TANGENT_DIM + m.X0_DIM)
+    assert counter.counts["fd_pose_eval"] == 2 * per_state
+    assert counter.counts["fd_pose_eval"] < m.FD_POSE_EVALUATIONS
+
+
+# ---------------------------------------------------------------------------
+# F evidence: gradient rows and per-file NPZ schemas
+# ---------------------------------------------------------------------------
+
+
+def test_f_binds_saved_gradient_rows_to_the_main_table(self_test, tmp_path):
+    def tamper(g, d):
+        path = Path(g["paths"]["rows"])
+        payload = json.loads(path.read_text())
+        row = payload["gradient_rows"][0]
+        row["max_abs_error"] = 123.0
+        path.write_text(json.dumps(payload))
+        g["artifact_hashes"]["rows"] = m.sha256_file(path)
+
+    target, g, d, provider = _f_inputs(self_test, tmp_path, tamper=tamper)
+    counter, t0, budget = _registered_f_attempt(
+        target, self_test["stages"]["R0"]["registration_sha256"])
+    provider.bind_counter(counter)
+    f = m.run_f_stage(
+        target, "F", "attempt_999", t0, budget,
+        self_test["stages"]["R0"]["registration_sha256"],
+        g, d, provider, counter, self_test["tolerance_contract"],
+        recompute="in_process", g_expected=g["artifact_hashes"],
+        d_expected=d["artifact_hashes"])
+    assert f["conclusion"] == "audit_incomplete"
+    texts = " ".join(f["verification_problems"])
+    assert "gradient_vs_main_table" in texts or "max_abs_error" in texts
+
+
+def test_f_validates_each_npz_schema_before_merging(self_test, tmp_path):
+    def tamper(g, d):
+        path = Path(g["paths"]["gradient_arrays"])
+        np.savez(path)  # emptied but hash rebound below
+        g["artifact_hashes"]["gradient_arrays"] = m.sha256_file(path)
+
+    target, g, d, provider = _f_inputs(self_test, tmp_path, tamper=tamper)
+    counter, t0, budget = _registered_f_attempt(
+        target, self_test["stages"]["R0"]["registration_sha256"])
+    provider.bind_counter(counter)
+    f = m.run_f_stage(
+        target, "F", "attempt_999", t0, budget,
+        self_test["stages"]["R0"]["registration_sha256"],
+        g, d, provider, counter, self_test["tolerance_contract"],
+        recompute="in_process", g_expected=g["artifact_hashes"],
+        d_expected=d["artifact_hashes"])
+    assert f["conclusion"] == "audit_incomplete"
+    assert any(p.startswith("g_gradient_arrays_schema_missing:")
+               for p in f["verification_problems"])
+
+
+def test_f_missing_npz_reports_a_gap_instead_of_raising(self_test, tmp_path):
+    def tamper(g, d):
+        Path(g["paths"]["arrays"]).unlink()
+
+    target, g, d, provider = _f_inputs(self_test, tmp_path, tamper=tamper)
+    counter, t0, budget = _registered_f_attempt(
+        target, self_test["stages"]["R0"]["registration_sha256"])
+    provider.bind_counter(counter)
+    f = m.run_f_stage(
+        target, "F", "attempt_999", t0, budget,
+        self_test["stages"]["R0"]["registration_sha256"],
+        g, d, provider, counter, self_test["tolerance_contract"],
+        recompute="in_process", g_expected=g["artifact_hashes"],
+        d_expected=d["artifact_hashes"])
+    assert f["conclusion"] == "audit_incomplete"
+    texts = " ".join(f["verification_problems"])
+    assert "g_arrays_missing" in texts or "g_arrays_file_missing" in texts
+
+
+# ---------------------------------------------------------------------------
+# frozen production runtime (TF32 off)
+# ---------------------------------------------------------------------------
+
+
+def test_production_runtime_is_applied_and_verified():
+    original = (torch.backends.cuda.matmul.allow_tf32,
+                torch.backends.cudnn.allow_tf32,
+                torch.get_float32_matmul_precision())
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
+        assert m.runtime_facts_problems(m.environment_facts())
+        runtime = m.configure_production_runtime()
+        assert runtime["applied"] is True, runtime["problems"]
+        for key, want in m.RUNTIME_REQUIREMENTS.items():
+            assert runtime["after"][key] == want, key
+        assert not m.runtime_facts_problems(runtime["after"])
+        # Requirements cannot be silently rewritten.
+        assert m.runtime_facts_problems({"cudnn_allow_tf32": True})
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = original[0]
+        torch.backends.cudnn.allow_tf32 = original[1]
+        torch.set_float32_matmul_precision(original[2])

@@ -1111,6 +1111,7 @@ class SyntheticFkProvider:
         self.fixture_path: Path | None = None
         self.fixture_sha256: str | None = None
         self.metadata_extra: dict = {}
+        self.runtime: dict | None = None
 
     def bind_counter(self, counter: CallCounter) -> None:
         self._counter = counter
@@ -1401,6 +1402,7 @@ class RealFkProvider:
         self._kernel: Any = None
         self._counter: CallCounter | None = None
         self._scene_setup_counted = False
+        self.runtime: dict | None = None
 
     def bind_counter(self, counter: CallCounter) -> None:
         self._counter = counter
@@ -1618,6 +1620,21 @@ def _scalar_for_scope(elements: np.ndarray, scope: str) -> tuple[float, int, int
 # geometry computation (G stage)
 # ---------------------------------------------------------------------------
 
+#: Indirection so a controlled-clock counterexample can expire a deadline
+#: *between* compute units without touching the process wall clock.
+_CLOCK = time.perf_counter
+
+
+def _now() -> float:
+    return float(_CLOCK())
+
+
+def _ensure_deadline(deadline: float | None, reserve: float = 0.0,
+                     unit: str = "compute") -> None:
+    """Refuse to start a new compute unit past the stage deadline."""
+    if deadline is not None and _now() + float(reserve) >= float(deadline):
+        raise TimeoutError(f"unit_deadline:{unit}")
+
 
 def _decode_inputs(inputs: FkInputs) -> dict[str, np.ndarray]:
     return {
@@ -1629,8 +1646,15 @@ def _decode_inputs(inputs: FkInputs) -> dict[str, np.ndarray]:
 
 
 def compute_geometry(provider: FkProvider, inputs: FkInputs,
-                     tolerance: Mapping[str, Any]) -> dict:
-    """Compute the 122-row geometry matrix and its arrays."""
+                     tolerance: Mapping[str, Any], *,
+                     deadline: float | None = None,
+                     reserve: float = 0.0) -> dict:
+    """Compute the 122-row geometry matrix and its arrays.
+
+    ``deadline`` is re-checked before every model batch and every reference
+    kernel call, so an expired stage cannot keep issuing FK/VJP work.
+    """
+    _ensure_deadline(deadline, reserve, "geometry_start")
     constants = effective_constants(
         inputs.root_mean, inputs.root_std, inputs.joint_lo, inputs.joint_hi)
     mean32 = constants["mean32"].astype(np.float64)
@@ -1642,20 +1666,20 @@ def compute_geometry(provider: FkProvider, inputs: FkInputs,
         inp: independent_decode(x, mean32, std32, lo32, hi32)
         for inp, x in logical.items()
     }
-    ref_fk = {
-        inp: np.asarray(provider.reference_positions(
+    ref_fk: dict[str, np.ndarray] = {}
+    for inp in LOGICAL_INPUTS:
+        _ensure_deadline(deadline, reserve, f"reference_positions:{inp}")
+        ref_fk[inp] = np.asarray(provider.reference_positions(
             ref_decode[inp]["pos"], ref_decode[inp]["R"],
             ref_decode[inp]["q"])).reshape(
                 len(WINDOW_IDS), WINDOW, N_SITES, 3)
-        for inp in LOGICAL_INPUTS
-    }
-    kernel = {
-        inp: np.asarray(provider.kernel64_positions(
+    kernel: dict[str, np.ndarray] = {}
+    for inp in LOGICAL_INPUTS:
+        _ensure_deadline(deadline, reserve, f"kernel64_positions:{inp}")
+        kernel[inp] = np.asarray(provider.kernel64_positions(
             ref_decode[inp]["pos"], ref_decode[inp]["R"],
             ref_decode[inp]["q"])).reshape(
                 len(WINDOW_IDS), WINDOW, N_SITES, 3)
-        for inp in LOGICAL_INPUTS
-    }
 
     rows: list[dict] = []
     grad_rows: list[dict] = []
@@ -1677,10 +1701,12 @@ def compute_geometry(provider: FkProvider, inputs: FkInputs,
     independent_grad: dict[str, dict] = {}
 
     for model in MODELS:
+        _ensure_deadline(deadline, reserve, f"production_capture:{model}")
         run = provider.production_capture(
             model, inputs.prediction[model], want_gradient=True)
         runs[model] = run
         pred_dec = ref_decode[model]
+        _ensure_deadline(deadline, reserve, f"reference_jacobians:{model}")
         J35 = provider.reference_jacobians(
             pred_dec["pos"], pred_dec["R"], pred_dec["q"]).reshape(
                 len(WINDOW_IDS), WINDOW, N_SITES, 3, TANGENT_DIM)
@@ -1973,8 +1999,15 @@ def _tangent_perturbation(pos: np.ndarray, R: np.ndarray, q: np.ndarray,
 
 def compute_fd(provider: FkProvider, inputs: FkInputs,
                grad_arrays: Mapping[str, np.ndarray],
-               tolerance: Mapping[str, Any]) -> dict:
-    """Run the fixed 4672-row state/input FD matrix."""
+               tolerance: Mapping[str, Any], *,
+               deadline: float | None = None,
+               reserve: float = 0.0) -> dict:
+    """Run the fixed 4672-row state/input FD matrix.
+
+    ``deadline`` is re-checked before every fixed state, so an expired stage
+    cannot keep evaluating poses.
+    """
+    _ensure_deadline(deadline, reserve, "fd_start")
     constants = effective_constants(
         inputs.root_mean, inputs.root_std, inputs.joint_lo, inputs.joint_hi)
     mean32 = constants["mean32"].astype(np.float64)
@@ -1988,6 +2021,7 @@ def compute_fd(provider: FkProvider, inputs: FkInputs,
     gaps: list[str] = []
 
     for offset, state in enumerate(states):
+        _ensure_deadline(deadline, reserve, f"fd_state:{offset}")
         model = state["model"]
         wid = state["window_id"]
         widx = WINDOW_IDS.index(wid)
@@ -2262,6 +2296,50 @@ def _row_identity_problems(row: Mapping[str, Any], *, kind: str) -> list[str]:
     return problems
 
 
+def _call_balance_problems(index_row: Mapping[str, Any],
+                           ledger_row: Mapping[str, Any]) -> list[str]:
+    """Index and ledger must publish one identical terminal call snapshot."""
+    a = index_row.get("call_balance")
+    b = ledger_row.get("call_balance")
+    if a is None and b is None:
+        return []
+    if a is None or b is None:
+        return ["call_balance_single_sided"]
+    counts_a = _call_counts_from_balance(a)
+    counts_b = _call_counts_from_balance(b)
+    if counts_a is None or counts_b is None or counts_a != counts_b:
+        return ["call_balance_disagreement"]
+    return []
+
+
+def _reservation_problems(root: Path) -> list[str]:
+    """An unsettled call reservation means unproven quota: unknown history."""
+    problems: list[str] = []
+    for stage in STAGE_BUDGETS:
+        base = stage_dir(root, stage)
+        if not base.is_dir():
+            continue
+        try:
+            dirs = sorted(p for p in base.iterdir() if p.is_dir())
+        except OSError:
+            problems.append("reservation_dir_unreadable")
+            continue
+        for directory in dirs:
+            path = directory / "call_reservations.json"
+            if not path.is_file():
+                continue
+            try:
+                data = read_json(path)
+            except (OSError, ValueError, TypeError):
+                problems.append(
+                    f"reservation_unreadable:{stage}:{directory.name}")
+                continue
+            if not isinstance(data, Mapping) or data.get("consumed") is None:
+                problems.append(
+                    f"reservation_unsettled:{stage}:{directory.name}")
+    return problems
+
+
 def stage_history(root: Path, stage: str,
                   *, allow_current: tuple[str, str] | None = None) -> float | None:
     try:
@@ -2275,6 +2353,8 @@ def stage_history(root: Path, stage: str,
             return None
         if set(disk) != set(index_by) or set(disk) != set(ledger_by):
             return None
+        if _reservation_problems(root):
+            return None
         total = 0.0
         for attempt, row in index_by.items():
             if allow_current == (stage, attempt):
@@ -2282,6 +2362,7 @@ def stage_history(root: Path, stage: str,
             e = ledger_by[attempt]
             problems = _row_identity_problems(row, kind="index")
             problems += _row_identity_problems(e, kind="ledger")
+            problems += _call_balance_problems(row, e)
             if problems:
                 return None
             if row.get("status") != e.get("status"):
@@ -2474,6 +2555,8 @@ def prior_call_counts(root: Path, *, fixed_root: Path,
     roots.append(Path(root))
     totals = {kind: 0 for kind in CALL_CAPS}
     for run_root in roots:
+        if _reservation_problems(run_root):
+            return None
         try:
             index = [r for r in load_index(run_root)
                      if r.get("cohort_id") == COHORT_ID
@@ -2609,6 +2692,11 @@ def finish_attempt(root: Path, stage: str, attempt: str, t0: float,
     (stage_dir(root, stage) / attempt).mkdir(parents=True, exist_ok=True)
     row = {**row, "stage": stage, "attempt": attempt,
            "accounting_schema": ACCOUNTING_SCHEMA, "cohort_id": COHORT_ID}
+    balance = extra.get("call_balance")
+    if isinstance(balance, Mapping):
+        # The index and the ledger must carry the same terminal snapshot; the
+        # index used to keep only the pre-registration balance.
+        row["call_balance"] = dict(balance)
     row = _report_hashes(row)
     writes: list[float] = []
     problems: list[str] = []
@@ -2734,8 +2822,10 @@ def stage_state(root: Path, stage: str) -> tuple[dict | None, list[str]]:
         return None, ["stage_not_terminal"]
     attempt = terminal[0]
     row = index_by[attempt]
+    problems += _reservation_problems(root)
     problems += _row_identity_problems(row, kind="index")
     problems += _row_identity_problems(ledger_by[attempt], kind="ledger")
+    problems += _call_balance_problems(row, ledger_by[attempt])
     if row.get("complete") is not True:
         problems.append("attempt_not_complete")
     if row.get("status") != "done" or ledger_by[attempt].get("status") != "done":
@@ -3241,9 +3331,63 @@ def environment_facts() -> dict:
             torch.backends.cuda.matmul.allow_tf32),
         "cudnn_allow_tf32": bool(torch.backends.cudnn.allow_tf32),
         "float32_matmul_precision": torch.get_float32_matmul_precision(),
+        "autocast_enabled": _autocast_enabled(),
         "cpu_threads": torch.get_num_threads(),
         "note": ("production path must be CUDA/float32 with TF32 and autocast "
                  "off; the independent reference is CPU/float64"),
+    }
+
+
+#: Frozen production numeric runtime.  ``configure_production_runtime`` makes
+#: the settleable flags true for TF32-off and records the values that cannot
+#: be forced (deterministic_algorithms, autocast) as hard requirements.
+RUNTIME_REQUIREMENTS = {
+    "cuda_matmul_allow_tf32": False,
+    "cudnn_allow_tf32": False,
+    "float32_matmul_precision": "highest",
+    "deterministic_algorithms": False,
+    "autocast_enabled": False,
+}
+
+
+def _autocast_enabled() -> bool:
+    fn = getattr(torch, "is_autocast_enabled", None)
+    if callable(fn):
+        try:
+            return bool(fn())
+        except Exception:  # noqa: BLE001 -- probe signature varies by release
+            return False
+    return False
+
+
+def runtime_facts_problems(facts: Mapping[str, Any] | None) -> list[str]:
+    if not isinstance(facts, Mapping):
+        return ["runtime_facts_missing"]
+    return [f"runtime_not_met:{key}"
+            for key, want in RUNTIME_REQUIREMENTS.items()
+            if facts.get(key) != want]
+
+
+def configure_production_runtime() -> dict:
+    """Apply the frozen production runtime before any real FK/model work.
+
+    The official real entry and the spawned F worker both call this; the
+    before/after facts are recorded so the parent/child configuration can be
+    cross-checked instead of assumed.
+    """
+    before = environment_facts()
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.set_float32_matmul_precision("highest")
+    after = environment_facts()
+    problems = runtime_facts_problems(after)
+    return {
+        "schema": "w1_real_fk_runtime_v1",
+        "requirements": dict(RUNTIME_REQUIREMENTS),
+        "before": {k: before.get(k) for k in RUNTIME_REQUIREMENTS},
+        "after": {k: after.get(k) for k in RUNTIME_REQUIREMENTS},
+        "applied": not problems,
+        "problems": problems,
     }
 
 
@@ -3613,17 +3757,16 @@ def run_r0(root: Path, stage: str, attempt: str, t0: float, budget: dict,
         input_facts = {"problems": [f"input_load_failed:{type(exc).__name__}"]}
     problems += input_facts.get("problems", [])
     env = environment_facts()
+    runtime = getattr(provider, "runtime", None)
     current_impl = implementation_identity(project_root)
     if mode == "real":
         problems += _implementation_drift(current_impl, expected_implementation)
         if not env["cuda_available"]:
             problems.append("real_requires_cuda")
-        if env["deterministic_algorithms"]:
-            problems.append("deterministic_algorithms_must_be_false")
-        if env["cuda_matmul_allow_tf32"] or env["cudnn_allow_tf32"]:
-            problems.append("tf32_must_be_disabled")
-        if env["float32_matmul_precision"] != "highest":
-            problems.append("matmul_precision_must_be_highest")
+        problems += runtime_facts_problems(env)
+        if isinstance(runtime, Mapping):
+            problems += [f"provider_{p}" for p in
+                         runtime_facts_problems(runtime.get("after"))]
     weights = LossWeights(w_fk=2.0, w_contact=0.0).as_dict()
     if weights.get("w_fk") != 2.0 or weights.get("w_contact") != 0.0:
         problems.append("loss_weights_not_frozen")
@@ -3669,7 +3812,9 @@ def run_r0(root: Path, stage: str, attempt: str, t0: float, budget: dict,
         "call_balance": counter.snapshot(),
         "zero_counters": {k: 0 for k in ZERO_COUNTERS},
         "implementation": current_impl,
-        "environment": env,        "boundaries": dict(BOUNDARIES),
+        "environment": env,
+        "runtime": runtime,
+        "boundaries": dict(BOUNDARIES),
         "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
     registration_path = adir / "registration.json"
@@ -3702,7 +3847,8 @@ def run_r0(root: Path, stage: str, attempt: str, t0: float, budget: dict,
                 str(p).startswith("implementation_drift")
                 or p == "r0_expected_implementation_missing"
                 for p in problems),
-            "environment": True,
+            "environment": (not runtime_facts_problems(env)
+                            if mode == "real" else True),
         },
         "parent_consumer_state": parent_consumer,
         "asset_closure": assets,
@@ -3787,13 +3933,28 @@ def run_g_stage(root: Path, stage: str, attempt: str, t0: float,
         },
     })
     before = counter.snapshot()["counts"]
-    geometry = compute_geometry(provider, inputs, tolerance)
-    after = counter.snapshot()["counts"]
-    delta = {k: int(after[k]) - int(before[k]) for k in after}
-    _complete_unit_calls(reservation_path, delta)
+    delta: dict[str, int] = {}
+    reservation_problems: list[str] = []
+    completed = False
+    try:
+        geometry = compute_geometry(
+            provider, inputs, tolerance,
+            deadline=t0 + float(budget["remaining_s"]),
+            reserve=float(budget.get("reserve_s", 0.0)))
+        completed = True
+    finally:
+        # Settle whatever was actually executed even if the unit aborted:
+        # an interrupted stage must not look like zero calls.
+        after = counter.snapshot()["counts"]
+        delta = {k: int(after[k]) - int(before[k]) for k in after}
+        try:
+            _complete_unit_calls(reservation_path, delta, complete=completed)
+        except (OSError, ValueError, TypeError) as exc:
+            reservation_problems.append(
+                f"call_reservation_unsettled:{type(exc).__name__}")
     nominal = STAGE_NOMINAL["G"]
     problems: list[str] = []
-    gaps: list[str] = []
+    gaps: list[str] = list(reservation_problems)
     rows = geometry["rows"]
     key_problems = _key_multiset_problems(rows, required_geometry_rows())
     if key_problems:
@@ -3804,6 +3965,10 @@ def run_g_stage(root: Path, stage: str, attempt: str, t0: float,
     for kind, value in delta.items():
         if int(value) > int(nominal[kind]):
             gaps.append(f"stage_call_delta_exceeds_nominal:{kind}:{value}")
+    for kind in ("loss_assembler", "production_fk_batch",
+                 "production_vjp", "mj_forward", "mj_jac_site"):
+        if int(nominal[kind]) > 0 and int(delta.get(kind, 0)) == 0:
+            gaps.append(f"stage_call_delta_zero:{kind}")
     adir = stage_dir(root, stage) / attempt
     adir.mkdir(parents=True, exist_ok=True)
     arrays_path = adir / "fk_geometry_arrays.npz"
@@ -3840,6 +4005,7 @@ def run_g_stage(root: Path, stage: str, attempt: str, t0: float,
     artifact_hashes = {
         "arrays": sha256_file(arrays_path),
         "gradient_arrays": sha256_file(grad_path),
+        "rows": sha256_file(rows_path),
     }
     return {
         "passed": not gaps,
@@ -3902,19 +4068,34 @@ def run_d_stage(root: Path, stage: str, attempt: str, t0: float,
         },
     })
     before = counter.snapshot()["counts"]
-    fd = compute_fd(provider, inputs, grad_arrays, tolerance)
-    after = counter.snapshot()["counts"]
-    delta = {k: int(after[k]) - int(before[k]) for k in after}
-    _complete_unit_calls(reservation_path, delta)
+    delta: dict[str, int] = {}
+    reservation_problems: list[str] = []
+    completed = False
+    try:
+        fd = compute_fd(provider, inputs, grad_arrays, tolerance,
+                        deadline=t0 + float(budget["remaining_s"]),
+                        reserve=float(budget.get("reserve_s", 0.0)))
+        completed = True
+    finally:
+        after = counter.snapshot()["counts"]
+        delta = {k: int(after[k]) - int(before[k]) for k in after}
+        try:
+            _complete_unit_calls(reservation_path, delta, complete=completed)
+        except (OSError, ValueError, TypeError) as exc:
+            reservation_problems.append(
+                f"call_reservation_unsettled:{type(exc).__name__}")
     nominal = STAGE_NOMINAL["D"]
     problems: list[str] = []
-    gaps = list(fd["gaps"])
+    gaps = list(fd["gaps"]) + reservation_problems
     key_problems = _key_multiset_problems(fd["rows"], required_fd_rows())
     if key_problems:
         gaps += key_problems
     for kind, value in delta.items():
         if int(value) > int(nominal[kind]):
             gaps.append(f"stage_call_delta_exceeds_nominal:{kind}:{value}")
+    for kind in ("mj_forward", "fd_pose_eval"):
+        if int(nominal[kind]) > 0 and int(delta.get(kind, 0)) == 0:
+            gaps.append(f"stage_call_delta_zero:{kind}")
     adir = stage_dir(root, stage) / attempt
     adir.mkdir(parents=True, exist_ok=True)
     fd_path = adir / "fd_arrays.npz"
@@ -3944,7 +4125,8 @@ def run_d_stage(root: Path, stage: str, attempt: str, t0: float,
         "rows": fd["rows"],
         "paths": {"arrays": str(fd_path), "rows": str(rows_path),
                   "call_reservations": str(reservation_path)},
-        "artifact_hashes": {"arrays": sha256_file(fd_path)},
+        "artifact_hashes": {"arrays": sha256_file(fd_path),
+                            "rows": sha256_file(rows_path)},
         "call_delta": delta,
     }
 
@@ -4113,17 +4295,64 @@ def _artifact_rows(data: Mapping[str, Any] | None, key: str, tag: str,
 
 
 def _artifact_npz(path: Any, tag: str,
-                  problems: list[str]) -> dict[str, np.ndarray] | None:
+                  problems: list[str],
+                  schema: Mapping[str, Mapping[str, Any]] | None = None
+                  ) -> dict[str, np.ndarray] | None:
     p = Path(path) if path else None
     if p is None or not p.is_file():
         problems.append(f"{tag}_missing")
         return None
     try:
         with np.load(p) as z:
-            return {k: z[k] for k in z.files}
+            arrays = {k: z[k] for k in z.files}
     except (OSError, ValueError, TypeError):
         problems.append(f"{tag}_unreadable")
         return None
+    if schema is not None:
+        problems += _npz_schema_problems(arrays, schema, tag)
+    return arrays
+
+
+def _geometry_file_schema() -> dict[str, dict[str, Any]]:
+    """The geometry NPZ holds both partitions; the gradient NPZ a subset."""
+    return {**geometry_array_schema(), **gradient_array_schema()}
+
+
+def _npz_schema_problems(arrays: Mapping[str, np.ndarray],
+                         schema: Mapping[str, Mapping[str, Any]],
+                         tag: str) -> list[str]:
+    problems: list[str] = []
+    missing = sorted(set(schema) - set(arrays))
+    extra = sorted(set(arrays) - set(schema))
+    if missing:
+        problems.append(f"{tag}_schema_missing:{len(missing)}")
+    if extra:
+        problems.append(f"{tag}_schema_extra:{len(extra)}")
+    for key in sorted(set(schema) & set(arrays)):
+        arr = np.asarray(arrays[key])
+        want = schema[key]
+        if str(arr.dtype) != want["dtype"]:
+            problems.append(f"{tag}_schema_dtype:{key}")
+        if list(arr.shape) != list(want["shape"]):
+            problems.append(f"{tag}_schema_shape:{key}")
+        if arr.dtype.kind not in "fbiu":
+            problems.append(f"{tag}_schema_not_numeric:{key}")
+    return problems
+
+
+def _split_fk_arrays(arrays: Mapping[str, np.ndarray]
+                     ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    """Split a full geometry array set into (geometry, gradient) partitions."""
+    grad_keys = set(gradient_array_schema())
+    return ({k: v for k, v in arrays.items() if k not in grad_keys},
+            {k: v for k, v in arrays.items() if k in grad_keys})
+
+
+def _file_sha(path: Any) -> str | None:
+    p = Path(path) if path else None
+    if p is None or not p.is_file():
+        return None
+    return sha256_file(p)
 
 
 def _artifact_hash_problems(paths: Mapping[str, Any] | None,
@@ -4177,6 +4406,9 @@ def _recompute_worker_main(spec_path: str, out_dir: str) -> int:
     provider: FkProvider | None = None
     delta: dict[str, int] = {}
     exit_reason = "ok"
+    before = counter.snapshot()["counts"]
+    runtime: dict = {"applied": False, "mode": mode, "problems": [],
+                     "requirements": dict(RUNTIME_REQUIREMENTS)}
 
     def admit(name: str) -> list[str]:
         problems: list[str] = []
@@ -4201,18 +4433,23 @@ def _recompute_worker_main(spec_path: str, out_dir: str) -> int:
             provider.fixture_path = Path(spec["fixture_path"])
             provider.fixture_sha256 = spec.get("fixture_sha256")
         else:
+            runtime = configure_production_runtime()
+            if runtime["problems"]:
+                exit_reason = "runtime_not_applied"
             provider = RealFkProvider(Path(spec["project_root"]),
                                       device=spec.get("device", "cuda"))
         provider.bind_counter(counter)
-        if admit("recompute_backend"):
+        if exit_reason == "ok" and admit("recompute_backend"):
             exit_reason = "backend_not_admitted"
-        else:
+        elif exit_reason == "ok":
             before = counter.snapshot()["counts"]
             inputs = provider.load_inputs()
             if admit("geometry_replay"):
                 exit_reason = "geometry_not_admitted"
             else:
-                geometry = compute_geometry(provider, inputs, tolerance)
+                geometry = compute_geometry(
+                    provider, inputs, tolerance,
+                    deadline=deadline_perf, reserve=reserve)
                 write_json(out / "fresh_geometry_rows.json", {
                     "schema": "w1_real_fk_fresh_rows_v1",
                     "rows": geometry["rows"],
@@ -4224,7 +4461,8 @@ def _recompute_worker_main(spec_path: str, out_dir: str) -> int:
                     exit_reason = "fd_not_admitted"
                 else:
                     fd = compute_fd(provider, inputs, geometry["arrays"],
-                                    tolerance)
+                                    tolerance, deadline=deadline_perf,
+                                    reserve=reserve)
                     write_json(out / "fresh_fd_rows.json", {
                         "schema": "w1_real_fk_fresh_rows_v1",
                         "rows": fd["rows"], "failures": fd["failures"],
@@ -4233,13 +4471,15 @@ def _recompute_worker_main(spec_path: str, out_dir: str) -> int:
                     np.savez(out / "fresh_geometry_arrays.npz",
                              **geometry["arrays"])
                     np.savez(out / "fresh_fd_arrays.npz", **fd["arrays"])
-                    after = counter.snapshot()["counts"]
-                    delta = {k: int(after[k]) - int(before[k])
-                             for k in after}
     except (TimeoutError, FkCallBudgetExceeded) as exc:
         exit_reason = f"{type(exc).__name__}:{exc}"
     except Exception as exc:  # noqa: BLE001 -- must still report honestly
         exit_reason = f"worker_exception:{type(exc).__name__}:{exc}"
+    finally:
+        # Always settle the calls that actually happened.  An aborted worker
+        # used to report an empty delta, letting the parent under-count.
+        after = counter.snapshot()["counts"]
+        delta = {k: int(after[k]) - int(before[k]) for k in after}
     meta = {
         "schema": "w1_real_fk_recompute_process_v1",
         "pid": os.getpid(), "ppid": os.getppid(),
@@ -4248,6 +4488,7 @@ def _recompute_worker_main(spec_path: str, out_dir: str) -> int:
         "mode": mode, "exit_reason": exit_reason,
         "units": units, "call_delta": delta,
         "counts": counter.snapshot(),
+        "runtime": runtime,
         "elapsed_s": time.perf_counter() - started,
         "fixture_sha256": getattr(provider, "fixture_sha256", None),
         "metadata": provider.metadata() if provider is not None else None,
@@ -4333,6 +4574,14 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float,
         return problems
 
     verification: list[str] = [str(p) for p in prerequisite_problems]
+    if mode == "real":
+        parent_runtime = getattr(provider, "runtime", None)
+        if not isinstance(parent_runtime, Mapping):
+            verification.append("f_parent_runtime_missing")
+        else:
+            verification += [
+                f"f_parent_runtime_mismatch:{p}"
+                for p in runtime_facts_problems(parent_runtime.get("after"))]
     gaps: list[str] = []
     failures: list[str] = []
     g_saved_rows: list[dict] = []
@@ -4379,17 +4628,20 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float,
             "fd_states": (d_rows or {}).get("state_count"),
         }
         _artifact_hash_problems(g_paths, expected_g,
-                                ("arrays", "gradient_arrays"), "g",
+                                ("arrays", "gradient_arrays", "rows"), "g",
                                 verification)
-        _artifact_hash_problems(d_paths, expected_d, ("arrays",), "d",
+        _artifact_hash_problems(d_paths, expected_d, ("arrays", "rows"), "d",
                                 verification)
         g_arrays = _artifact_npz(g_paths.get("arrays"), "g_arrays",
-                                 verification)
-        g_grad = _artifact_npz(g_paths.get("gradient_arrays"), "g_gradient_arrays",
-                               verification)
+                                 verification, _geometry_file_schema())
+        g_grad = _artifact_npz(g_paths.get("gradient_arrays"),
+                               "g_gradient_arrays", verification,
+                               gradient_array_schema())
         d_arrays = _artifact_npz(d_paths.get("arrays"), "d_arrays",
-                                 verification)
+                                 verification, fd_array_schema())
         _artifact_overlap_problems(g_arrays, g_grad, "g", verification)
+        # ``_artifact_npz`` validated each file's own schema above; merging
+        # alone would let the geometry file mask an emptied gradient file.
         verification += _key_multiset_problems(
             [r for r in g_saved_rows
              if not str(r.get("key", "")).startswith("fk_gradient|")],
@@ -4408,12 +4660,14 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float,
     fresh_d_arrays: dict[str, np.ndarray] | None = None
     process: dict = {}
     worker_meta: dict = {}
+    f_delta: dict[str, int] = {}
     if not verification:
         out_dir = stage_dir(root, stage) / attempt / "recompute"
         out_dir.mkdir(parents=True, exist_ok=True)
         before = counter.snapshot()["counts"]
-        f_delta: dict[str, int] = {}
         reservation_path: Path | None = None
+        delta_settled = True
+        recompute_done = False
         try:
             reservation_path = _reserve_unit_calls(root, stage, attempt, {
                 "fresh_process": {
@@ -4453,8 +4707,9 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float,
                     fresh_inputs = fresh_provider.load_inputs()
                     blocked = admit("geometry_replay")
                     if not blocked:
-                        geometry = compute_geometry(fresh_provider,
-                                                    fresh_inputs, tolerance)
+                        geometry = compute_geometry(
+                            fresh_provider, fresh_inputs, tolerance,
+                            deadline=deadline, reserve=reserve)
                         fresh_g_arrays = geometry["arrays"]
                         fresh_g_rows = geometry["rows"]
                         fresh_g_grad = geometry["grad_rows"]
@@ -4462,10 +4717,13 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float,
                         blocked = admit("fd_replay")
                         if not blocked:
                             fd = compute_fd(fresh_provider, fresh_inputs,
-                                            fresh_g_arrays, tolerance)
+                                            fresh_g_arrays, tolerance,
+                                            deadline=deadline,
+                                            reserve=reserve)
                             fresh_d_arrays = fd["arrays"]
                             fresh_d_rows = fd["rows"]
                             unit_hint = "recompute"
+                            recompute_done = True
                 except (TimeoutError, FkCallBudgetExceeded) as exc:
                     blocked = [f"{type(exc).__name__}"]
                 except Exception as exc:  # noqa: BLE001
@@ -4512,6 +4770,22 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float,
                             units.append(dict(unit))
                     process = dict(worker_meta)
                     verification += worker_problems
+                    # A timed-out or killed worker reports no delta; those
+                    # calls are unknown, so the reservation must stay
+                    # unsettled instead of being settled at zero.
+                    delta_settled = isinstance(
+                        worker_meta.get("call_delta"), Mapping)
+                    if not delta_settled:
+                        verification.append("f_call_settlement_unknown")
+                    runtime = worker_meta.get("runtime")
+                    if mode == "real":
+                        if not isinstance(runtime, Mapping):
+                            verification.append("f_worker_runtime_missing")
+                        else:
+                            after_facts = runtime.get("after")
+                            verification += [
+                                f"f_worker_runtime_mismatch:{p}"
+                                for p in runtime_facts_problems(after_facts)]
                     if not worker_problems and worker_meta.get(
                             "exit_reason") == "ok":
                         geometry_rows = _artifact_read_json(
@@ -4548,6 +4822,11 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float,
                             except (OSError, ValueError):
                                 verification.append(
                                     "reference_facts_unreadable")
+                        recompute_done = (
+                            fresh_g_rows is not None
+                            and fresh_d_rows is not None
+                            and fresh_g_arrays is not None
+                            and fresh_d_arrays is not None)
                     raw_delta = worker_meta.get("call_delta") or {}
                     for kind, value in raw_delta.items():
                         if kind not in CALL_CAPS \
@@ -4563,12 +4842,23 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float,
         after = counter.snapshot()["counts"]
         f_delta = {k: int(after[k]) - int(before[k]) for k in after}
         if reservation_path is not None:
-            try:
-                _complete_unit_calls(reservation_path, f_delta,
-                                     complete=not verification)
-            except (OSError, ValueError, TypeError) as exc:
-                verification.append(
-                    f"f_reservation_write_failed:{type(exc).__name__}")
+            if delta_settled:
+                try:
+                    _complete_unit_calls(reservation_path, f_delta,
+                                         complete=not verification)
+                except (OSError, ValueError, TypeError) as exc:
+                    verification.append(
+                        f"f_reservation_write_failed:{type(exc).__name__}")
+            else:
+                # Leave ``consumed`` unset: an interrupted worker's calls are
+                # unknown and a later attempt must not get a fresh quota.
+                verification.append("f_reservation_left_unsettled")
+        if recompute_done:
+            for kind in ("loss_assembler", "production_fk_batch",
+                         "production_vjp", "mj_forward", "mj_jac_site",
+                         "fd_pose_eval"):
+                if int(f_delta.get(kind, 0)) == 0:
+                    verification.append(f"f_call_delta_zero:{kind}")
 
     # 3. arrays
     if g_arrays is not None and g_grad is not None:
@@ -4580,20 +4870,43 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float,
                 "prediction_", "kernel64_"))]
             verification += _array_compare_problems(
                 saved_arrays, fresh_g_arrays, bitwise_keys=bitwise_keys)
+            # The gradient file is also compared as its own partition so a
+            # schema-valid but substituted file cannot hide behind the merge.
+            _fresh_geo, fresh_grad = _split_fk_arrays(fresh_g_arrays)
+            verification += _array_compare_problems(
+                g_grad, fresh_grad,
+                bitwise_keys=[k for k in g_grad if k in bitwise_keys])
     if d_arrays is not None and fresh_d_arrays is not None:
         verification += _array_compare_problems(
             d_arrays, fresh_d_arrays, bitwise_keys=())
     # 4. rows and all detail fields
+    saved_grad_by_key = {str(r["key"]): r for r in g_saved_grad}
     if fresh_g_rows is not None:
         saved_by_key = {str(r["key"]): r for r in g_saved_rows}
-        fresh_by_key = {str(r["key"]): r for r in
-                        [*fresh_g_rows, *(fresh_g_grad or [])]}
-        if set(saved_by_key) != set(fresh_by_key):
+        fresh_main = {str(r["key"]): r for r in fresh_g_rows}
+        fresh_grad_by_key = {str(r["key"]): r for r in (fresh_g_grad or [])}
+        if set(saved_by_key) != set(fresh_main):
             verification.append("geometry_row_key_set")
         else:
             for key in sorted(saved_by_key):
                 verification += _compare_row_fields(
-                    fresh_by_key[key], saved_by_key[key], key)
+                    fresh_main[key], saved_by_key[key], key)
+        # The separately saved gradient table is bound to both the main table
+        # and the fresh recomputation; existing alone is not evidence.
+        if set(saved_grad_by_key) != set(fresh_grad_by_key):
+            verification.append("gradient_row_key_set")
+        else:
+            for key in sorted(saved_grad_by_key):
+                verification += _compare_row_fields(
+                    fresh_grad_by_key[key], saved_grad_by_key[key], key)
+        for key, row in sorted(saved_grad_by_key.items()):
+            main_row = saved_by_key.get(key)
+            if main_row is None:
+                verification.append(f"{key}:gradient_row_not_in_main_table")
+            else:
+                verification += [
+                    f"{problem}:gradient_vs_main_table"
+                    for problem in _compare_row_fields(row, main_row, key)]
     if fresh_d_rows is not None:
         saved_d = {str(r["key"]): r for r in d_saved_rows}
         fresh_d_by_key = {str(r["key"]): r for r in fresh_d_rows}
@@ -4635,14 +4948,13 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float,
         "artifact_hashes": {
             "g_expected": expected_g, "d_expected": expected_d,
             "g_actual": {
-                "arrays": (sha256_file(Path(g_paths["arrays"]))
-                           if g_paths.get("arrays") else None),
-                "gradient_arrays": (sha256_file(Path(g_paths["gradient_arrays"]))
-                                    if g_paths.get("gradient_arrays") else None),
+                "arrays": _file_sha(g_paths.get("arrays")),
+                "gradient_arrays": _file_sha(g_paths.get("gradient_arrays")),
+                "rows": _file_sha(g_paths.get("rows")),
             },
             "d_actual": {
-                "arrays": (sha256_file(Path(d_paths["arrays"]))
-                           if d_paths.get("arrays") else None),
+                "arrays": _file_sha(d_paths.get("arrays")),
+                "rows": _file_sha(d_paths.get("rows")),
             },
         },
         "complete_evidence": complete, "covered_contract_passed": covered,
@@ -4686,6 +4998,7 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float,
         "report": str(summary_path),
         "verification_path": str(verification_path),
         "call_snapshot": counter.snapshot(),
+        "call_delta": f_delta,
         "units": units,
         "recompute_process": process,
     }
@@ -4864,6 +5177,15 @@ def admission_package_problems(package: Mapping[str, Any] | None) -> list[str]:
     if tolerance.get("mode") != "synthetic_calibrated" \
             or not tolerance.get("evidence_sha256"):
         problems.append("admission_tolerance_not_calibrated")
+    runtime = package.get("runtime")
+    if not isinstance(runtime, Mapping) \
+            or runtime.get("requirements") != RUNTIME_REQUIREMENTS:
+        problems.append("admission_runtime_contract")
+    else:
+        if runtime.get("applied") is not True:
+            problems.append("admission_runtime_not_applied")
+        if runtime.get("observed_after_setup") != RUNTIME_REQUIREMENTS:
+            problems.append("admission_runtime_observation")
     return problems
 
 
@@ -4882,6 +5204,11 @@ def build_admission_package(project_root: Path,
             or not tolerance_contract.get("evidence_sha256")):
         raise ValueError("admission requires a completed calibration")
     problems: list[str] = []
+    # Demonstrate in this process that the frozen production runtime can be
+    # applied; a real R0 would otherwise fail on the first attempt.
+    runtime_check = configure_production_runtime()
+    problems += [f"runtime_apply:{p}" for p in runtime_check["problems"]]
+    environment = environment_facts()
     parent: dict[str, dict] = {}
     for name, (rel, want) in PARENT_FILES.items():
         p = root / rel
@@ -5000,7 +5327,24 @@ def build_admission_package(project_root: Path,
         "weights": LossWeights(w_fk=2.0, w_contact=0.0).as_dict(),
         "zero_counters": {k: 0 for k in ZERO_COUNTERS},
         "implementation": impl,
-        "environment": environment_facts(),
+        "environment": environment,
+        "runtime": {
+            "requirements": dict(RUNTIME_REQUIREMENTS),
+            "observed_before_setup": dict(runtime_check["before"]),
+            "observed_after_setup": dict(runtime_check["after"]),
+            "applied": runtime_check["applied"],
+            "problems": list(runtime_check["problems"]),
+            "applied_by": [
+                "scripts/audit_w1_real_fk.py --real "
+                "(before provider construction)",
+                "ireset.eval.w1_real_fk_audit._recompute_worker_main "
+                "(spawned F worker)",
+            ],
+            "verified_by": [
+                "R0 environment gate + provider runtime facts",
+                "F parent/worker runtime facts comparison",
+            ],
+        },
         "coverage": {
             "objective_coverage": "partial",
             "audited": [
@@ -5074,6 +5418,9 @@ def build_admission_package(project_root: Path,
                           "run inside the worker"),
             "stage_gate": ("G/D are re-consumed before D/F; a budget-revoked "
                            "stage stops the chain instead of passing"),
+            "runtime": ("TF32 off / matmul precision highest / autocast off "
+                        "are applied by the real entry and the spawned F "
+                        "worker and re-verified in R0 and F"),
         },
         "review_notes": notes,
         "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -5184,7 +5531,8 @@ def withdraw_attempt_claim(root: Path, stage: str, attempt: str,
         timed(upsert_cost, root, stage, attempt, float(cost),
               {"complete": False, "incomplete_reason": reason,
                "revoked_reason": reason, "sampled_wall_s": elapsed,
-               "seal_tail_reserve_s": float(tail)}, status)
+               "seal_tail_reserve_s": float(tail),
+               "call_balance": updated.get("call_balance")}, status)
         return updated
 
     def unknown() -> None:
@@ -5316,6 +5664,17 @@ def run_registered_audit(run_root: Path, provider: FkProvider, *, mode: str,
                 f"cumulative call budget insufficient: {insufficient}")
     write_cohort(run_root, mode=mode, authorization_sha=authorization_sha)
     counter = CallCounter(CALL_CAPS, dict(prior))
+    if mode == "real":
+        runtime = configure_production_runtime()
+        if runtime["problems"]:
+            raise SystemExit(
+                f"production runtime cannot be applied: {runtime['problems']}")
+        setattr(provider, "runtime", runtime)
+    binder = getattr(provider, "bind_counter", None)
+    if callable(binder):
+        # Without this the G/D stages would silently record delta=0 and only
+        # F's worker delta would reach the cohort ledger.
+        binder(counter)
     base_counts = dict(prior)
     fixture_seconds = None
     if mode == "synthetic":
@@ -5338,6 +5697,7 @@ def run_registered_audit(run_root: Path, provider: FkProvider, *, mode: str,
                 "fixture_build_s": fixture_seconds,
                 "calls": counter.snapshot(),
                 "zero_counters": {k: 0 for k in ZERO_COUNTERS},
+                "runtime": getattr(provider, "runtime", None),
                 "boundaries": dict(BOUNDARIES)}
 
     def sealed_hashes(row: Mapping[str, Any] | None,
@@ -5498,9 +5858,9 @@ def run_registered_audit(run_root: Path, provider: FkProvider, *, mode: str,
                         project_root=project_root, recompute="subprocess",
                         g_expected=sealed_hashes(
                             g_row, g.get("paths"),
-                            ("arrays", "gradient_arrays")),
+                            ("arrays", "gradient_arrays", "rows")),
                         d_expected=sealed_hashes(
-                            d_row, d.get("paths"), ("arrays",)))
+                            d_row, d.get("paths"), ("arrays", "rows")))
     except (TimeoutError, FkCallBudgetExceeded) as exc:
         f = {"passed": False, "complete_evidence": False,
              "covered_contract_passed": False,
@@ -5558,15 +5918,30 @@ def run_registered_audit(run_root: Path, provider: FkProvider, *, mode: str,
             t0=t0, budget=budget)
         seals["F"]["row"] = updated_row
         revoke_problems += withdraw_problems
+    call_matrix_problems: list[str] = []
+    if mode == "synthetic":
+        expected_calls = full_chain_calls()
+        expected_calls["scene_setup_forward"] = 0
+        final_counts = counter.snapshot()["counts"]
+        call_matrix_problems = [
+            f"synthetic_call_matrix:{kind}:"
+            f"{int(final_counts.get(kind, 0))}!={int(expected_calls[kind])}"
+            for kind in CALL_CAPS
+            if int(final_counts.get(kind, 0)) != int(expected_calls[kind])]
+    if call_matrix_problems:
+        conclusion = "audit_incomplete"
+        complete = False
+        covered = False
     return {
         "mode": mode,
         "conclusion": conclusion,
         "complete_evidence": complete,
         "covered_contract_passed": covered,
         "problems": list(f.get("verification_problems", []))
-        + seal.problems + revoke_problems,
+        + seal.problems + revoke_problems + call_matrix_problems,
         "failures": f.get("failures", []),
-        "gaps": f.get("gaps", []) + seal.problems + revoke_problems,
+        "gaps": f.get("gaps", []) + seal.problems + revoke_problems
+        + call_matrix_problems,
         "stages": results,
         "seals": seals,
         "prerequisite_consumer_states": prerequisite_states,
@@ -5577,6 +5952,7 @@ def run_registered_audit(run_root: Path, provider: FkProvider, *, mode: str,
         "fixture_build_s": fixture_seconds,
         "calls": counter.snapshot(),
         "zero_counters": {k: 0 for k in ZERO_COUNTERS},
+        "runtime": getattr(provider, "runtime", None),
         "boundaries": dict(BOUNDARIES),
     }
 
