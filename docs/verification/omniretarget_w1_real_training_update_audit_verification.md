@@ -1,7 +1,7 @@
 # W1 真实网络参数梯度与优化更新链路审计 —— I/C 工程与纯合成验收记录
 
 日期：2026-10-29。方案：[omniretarget_w1_real_training_update_audit_prereg_draft.md](../plans/omniretarget_w1_real_training_update_audit_prereg_draft.md)
-（v0.6）。状态：**I/C 实现、第四轮审阅修复与纯合成验收完成；真实 provider/授权/注册/真实 R0→P→I→F 未实施**。
+（v0.7）。状态：**I/C 实现、第五轮审阅修复与纯合成验收完成；真实 provider/授权/注册/真实 R0→P→I→F 未实施**。
 
 本记录只覆盖合成证据与冻结准入材料。没有读取真实 checkpoint 张量、真实 NPZ 数值、数据集或 G1 资产，
 没有执行真实网络前向/反向、真实 FK、真实参数更新或生产 checkpoint 写入。
@@ -12,7 +12,7 @@
 | --- | --- |
 | `src/ireset/eval/w1_real_training_update_audit.py` | 审计器：roster/行目录、合成 fixture、P/I 捕获、独立参考、有效 float32 AdamW、跨路径传播、R0/P/I/F、预算/封口、校准、准入、真实门 |
 | `scripts/audit_w1_real_training_update.py` | CLI：`--synthetic`、`--calibrate-synthetic`、`--admission`、`--real`（门后拒绝） |
-| `tests/test_w1_real_training_update_audit.py` | 45 项纯合成反例/接口测试（v0.5 为 39 项，v0.6 新增 6 项第四轮反例） |
+| `tests/test_w1_real_training_update_audit.py` | 51 项纯合成反例/接口测试（v0.6 为 46 项，v0.7 新增 5 项第五轮反例） |
 | `src/ireset/train/trainer.py` | 抽出共享 `predict` / `begin_update` / `accumulate_micro` / `clip_gradients` / `step_optimizer`，新增只读 observer、审计注入 `loss_fn`/`build_optimizer` 与 `clip_coefficient`；默认路径不变 |
 
 共享单元由原生 `Trainer.run` 与审计共同调用。`observer=None` 与 `observer={}` 的
@@ -21,14 +21,14 @@ theta/m/v/step 逐位相等，loss/parts 与全局 RNG 不变；NaN 输入的异
 
 ## 2. 冻结校准与有效 float32 契约
 
-目录：`derived/audit/w1_real_training_update_audit/`。v0.4/v0.5 的旧校准保存在
-`history/v0.4_5d9230cf/` 与 `history/v0.5_9a964372/`（后者由 attempt_004 内嵌 contract 原字节重建并核对 SHA），
-以下为 v0.6 当前文件。
+目录：`derived/audit/w1_real_training_update_audit/`。v0.4/v0.5/v0.6 的旧校准保存在
+`history/v0.4_5d9230cf/`、`history/v0.5_9a964372/` 与 `history/v0.6_582ea60a/`，
+以下为 v0.7 当前文件。
 
 | 工件 | SHA-256 |
 | --- | --- |
-| `tolerance_contract.json` | `582ea60a73b2852cc676e9eeee4e5003394f673567171e5efb37f9f86191177d` |
-| 校准 evidence（contract 内） | `56ae9663f3d1c103071986a16a4f95c75136e5919a5eb72ccff71efa8b46c0ee` |
+| `tolerance_contract.json` | `3bce1fd5c60f2da5acb94d3d14f338e241e652ae362d147e24483573703adcf1` |
+| 校准 evidence（contract 内） | `8c8d983cc1c8b04e626a75594aaf22a364b8641dab5c0b5dff5a6d5077722595` |
 | `adamw_fp32_contract.json`（规范化内容哈希） | `6d7a24d0cd077454120dfbaaad37fcc378b10572e4a33a26df8ca09f7e0003e1` |
 
 `tolerance_contract_problems(recompute=True)` 在新进程重跑校准并逐项通过；`4×observed` 全部 ≤ 1。
@@ -42,21 +42,24 @@ theta/m/v/step 逐位相等，loss/parts 与全局 RNG 不变；NaN 输入的异
 | `output_cotangent` | 0.0171 | 0.0683 |
 | `parameter_gradient` | 0.0904 | 0.3617 |
 | `global_norm_clip` | 0.0007 | 0.0029 |
-| `theta_cross_path` | 0.0116 | 0.0464 |
-| `state_cross_path` | **0.1569** | **0.6277** |
-| `delta_cross_path` | 0.0745 | 0.2980 |
-| `delta_same_input` | 0.1471 | 0.5883 |
+| `theta_cross_path` | 0.0752 | 0.3008 |
+| `state_cross_path` | **0.1448** | **0.5793** |
+| `delta_cross_path` | **0.1489** | **0.5955** |
+| `delta_same_input` | 0.2314 | 0.9255 |
 
-后四项取全链通过行与标量近例的最大值（`source=synthetic_chain+scalar_near_1e-7`）。
+后四项按**各比较门自身的适用性**取全链观测与标量近例的最大值（`source=synthetic_chain+scalar_near_1e-7`）：
+只要该门自身通过（例如 m/v 的 `m_ok`/`v_ok`），即使整行因更新量不可辨而 `audit_incomplete` 也计入；
+直接 failure 或被该门拒绝的行不计入。
 
-**状态校准的分母修复（v0.6）**：旧 `max_state_ratio` 用 `ZERO_STATE_ABS=1e-6` 掩码排除了
-`1e-17` 量级的 m/v，且分母用 `max(|m_p|,|m_i|)`；这与原始门
-`abs(a-b)≤atol+rtol*abs(reference)` 不一致。现 `_state_cross_path_ratio` 覆盖每个
-`abs(reference)>0` 的坐标、分母为 `atol+rtol*abs(reference)`、`reference==0` 且 `a≠b`
-记为无界。同 seed 校准链在旧 `rtol=5e-4` 下的真实最大值为 **0.313871**（4×=**1.255>1**，
-旧记录 0.009235 只统计了大状态），因此 v0.6 把 `state_cross_path` 提案调到 **`1e-3`**；
-同一全坐标规则重算 **0.156936**、4×=**0.628**。该 2× 放宽只用于原始状态相对比较，
-零/符号直接失败、同输入逐位公式门、更新量门和 `m=0 vs 1e-9`/50% 状态差异拒绝均不变。
+**逐门适用性校准（v0.7）**：v0.6 按整行 `classification=passed` 过滤，漏掉了仅 `parameter_delta_precision_gap`
+的行的已通过 m/v 比较。同 seed 校准链中 `diffusion:u1:cross_attn.v.weight` 仅记
+`parameter_delta_precision_gap`，旧 `rtol=1e-3` 下状态归一化误差 **0.289626**（4×=**1.1585>1**，
+旧 0.156936 低估），从原始 NPZ 重算一致。现 `_row_ratio_observations` 对 theta/state/delta/same-delta
+分别只检查该门自身的 `*_ok` 或 `same_input_formula_passed`，并排除 direct failure；`state_cross_path`
+因此由 `1e-3` 重定为 **`2e-3`**（重算 **0.144813**、4×=**0.579**）。同一修正使可辨跨路径更新量在旧
+`5e-4` 下的 **0.297752**（4×=**1.191>1**）进入统计，`delta_cross_path` 由 `5e-4` 重定为 **`1e-3`**
+（重算 **0.148876**、4×=**0.5955**）。`delta_same_input` 0.231385（4×=0.9255）与 `theta_cross_path`
+0.075190（4×=0.3008）也在逐门统计下重算；无阈值被无证据抬高。
 
 有效求值契约：
 
@@ -71,9 +74,10 @@ theta/m/v/step 逐位相等，loss/parts 与全局 RNG 不变；NaN 输入的异
   relative-L2≤2e-4/cosine≥1-1e-6；100×1e-9 全清零在带外由 group 门拒绝，深带全擦除由
   `zero_erased` 拒绝，~1e-12 的真实相消噪声仍通过。
 - 输出 cotangent 除整张量门（atol 2e-8/rtol 2e-4）外，另按 `pos`(0:3)、`rot6d`(3:9)、
-  `joint`(9:38) 三组执行独立 relative-L2≤2e-4/cosine≥1-1e-6 且生产非全零；组参考小于
-  `1e-10` 时用 1e-6 绝对零噪声门并拒绝整组擦除。组事实与 problems 进入 I 行 canonical hash，
-  F 重放重新计算并拒绝任何只改分组事实的行漂移。
+  `joint`(9:38) 三组执行独立 relative-L2≤2e-4/cosine≥1-1e-6 且生产非全零。**分组零噪声门同样要求
+  参考与生产两侧范数均在 1e-10 深带**：v0.7 前参考 joint 1e-13、生产 joint 1e-8（范数 8.34e-7）
+  会被 `max_abs≤1e-6` 放过；现由 `tiny_group_joint` 拒绝，两侧均在深带的合法噪声仍通过。组事实与
+  problems 进入 I 行 canonical hash，F 重放重新计算并拒绝任何只改分组事实的行漂移。
 - 更新量可辨裕量：`B_delta≤0.25*5e-4*abs(delta_ref)` 才标可辨；0.25 使写入舍入误差不被
   同门归一化，`4×observed≤proposal` 可满足。跨路径 m/v/theta 保留原始相对门，只有精确双零
   才等价；零/符号/单侧零更新显式记录并按 §6.4 分类。
@@ -92,16 +96,16 @@ theta/m/v/step 逐位相等，loss/parts 与全局 RNG 不变；NaN 输入的异
 | 正确但不可辨的小更新 | `audit_incomplete` + precision gap | 通过 |
 | 从实测差异反推/缩窄区间 | 原始量重推拒绝 | 通过 |
 
-## 3. 权威纯合成全链 R0→P→I→F（v0.6）
+## 3. 权威纯合成全链 R0→P→I→F（v0.7）
 
-运行根：`derived/audit/w1_real_training_update_audit/synthetic/v0.6_final/`。
+运行根：`derived/audit/w1_real_training_update_audit/synthetic/v0.7_final/`。
 
 - 配置/规模：full `omniretarget_motion` 网络（d_model 240、4 layers、6 heads、time_window 31）；
   roster **130 deterministic + 134 diffusion = 264** 个 tensor，行目录 **3864 = 14N+168**。
 - 四窗 `sub10_largebox_063/085` 两个 demo 的重叠窗；每模型两个连续更新、各 4 个 B=4 micro；
   16 个诊断 micro/路径；CPU generator seed `20261008`。
 - 四 stage 全部 `done`/sealed，索引与台账一一对应；四份 reservation `consumed` 全部结算，
-  `prior_call_counts` 等于终态累计快照。
+  `prior_call_counts` 等于终态累计快照（16 更新/64 backbone forwards）。
 - 调用矩阵精确等于方案 §7.2 全链名义值：checkpoint loads 8、model/conditioner constructions 8/8、
   native optimizer 4、conditioner/backbone forwards 64/64、add_noise 32、draw units 48、
   production loss 32、production FK **64**、parameter backward 32、output/total VJP 32/32、
@@ -111,57 +115,57 @@ theta/m/v/step 逐位相等，loss/parts 与全局 RNG 不变；NaN 输入的异
 - `training_updates=16`（native 8 + explicit 8）；全部零计数为 JSON 整数 0（FD/state FD/DDIM/
   validation/selection/生产 checkpoint 写入/contact 分支）。
 - **结论：`audit_incomplete`**，`complete_evidence=true`，`covered_contract_passed=false`，
-  `failures=[]`、`problems=[]`。I 与 F 各 600 条必测 gap：`parameter_delta_precision_gap`
-  **392**、`cross_path_sensitivity_gap` **208**、`cross_path_bound_unverifiable` **0**。
-  v0.5 的 219 个 sensitivity gap 因本轮状态校准覆盖小坐标并采用 `1e-3` 相对门而减少 11；
-  392 个 precision gap 不变。v0.4 的 660/340/2 与 F 合计 1002 条是旧 F 对 I 行 gap 与
-  I 报告 gap 的重复计数；旧工件保留不改写。
+  `failures=[]`、`problems=[]`。I 与 F 各 577 条必测 gap：`parameter_delta_precision_gap`
+  **392**、`cross_path_sensitivity_gap` **185**、`cross_path_bound_unverifiable` **0**。
+  v0.6 的 208 个 sensitivity gap 因逐门适用性校准把状态门改为 `2e-3`、可辨跨路径更新量门改为
+  `1e-3` 而减少 23；392 个 precision gap 不变。v0.4 的 660/340/2 与 F 合计 1002 条是旧 F 对
+  I 行 gap 与 I 报告 gap 的重复计数；旧工件保留不改写。
 - 失败/缺口原因：step 1 的 `m/√v≈0.1` 更新约 `1e-5`，而 |theta|~0.1–1 的 float32 写入分辨率为
   `1e-8–6e-8`，大量坐标低于 §6.2 的 5e-4 可辨门；其余为跨路径近相消敏感性。区间输入预算改为
   梯度门允许集合并逐节点向外 R32 舍入后，0 个坐标落在可信区间外。
-- F：独立 Python 子进程（pid≠父、ppid=父、exit 0），继承父绝对截止并在读取/构造/micro/backward/
-  VJP/clip/update 前重查父 running 登记；重建 schedule、重读磁盘、逐位重放 P/I；保存报告逐字段
-  （loss/parts/gnorm/coef/RNG digest/arrays hash/state presence）、两文件 rows 与报告内嵌 rows、
-  两侧行多重集/数组 schema/原始量分类、cotangent 三组事实全部复核，`verification_problems=[]`，
-  worker problems=[]。
-- 成本：R0 **1.1862s**、P **13.6780s**、I **57.6963s**、F **86.6444s**，合计 **159.205s**；
+- F：独立 Python 子进程（pid 1756071、ppid 1753379，pid≠ppid；exit 0），继承父绝对截止并在
+  读取/构造/micro/backward/VJP/clip/update 前重查父 running 登记；重建 schedule、重读磁盘、
+  逐位重放 P/I；保存报告逐字段（loss/parts/gnorm/coef/RNG digest/arrays hash/state presence）、
+  两文件 rows 与报告内嵌 rows、两侧行多重集/数组 schema/原始量分类、cotangent 三组事实全部复核，
+  `verification_problems=[]`，worker problems=[]。
+- 成本：R0 **1.1844s**、P **13.7212s**、I **58.6262s**、F **87.9758s**，合计 **161.5076s**；
   每阶段 1/2 次、无借额（R0 240/P 900/I 900/F 1200s）。
-- 工件：实际 **6.895 GiB**；逐类上界单链 **7.145 GiB**、cohort（每阶段 2 次 attempt）**14.236 GiB
-  ≤16 GiB**。
-- 关键 SHA：`audit_result.json` `a03b6fc3e74bc57207d5de5198d8200986b1c00dfdc8f9086faccbc14faf7575`、
-  `finalize/attempt_001/training_update_final.json` `ffbb939b1d863224945acd44c9d72a0353ca14548b83789a3dec933380ea827b`、
-  `registration/attempt_001/registration.json` `c9d3a08e35209a2d4196b40b7412bd7efa459257ddf9af16c7274269395b53b6`；
-  R0 registration 绑定方案 v0.6 `f69694c68832d759ecb68526cb5fb9619a79d5ef662aa82fe1cacf781a53ae89`。
+- 工件：实际 **6.895 GiB**（7,404,293,302 bytes）；逐类上界单链 **7.145 GiB**、cohort（每阶段
+  2 次 attempt）**14.236 GiB≤16 GiB**。
+- 关键 SHA：`audit_result.json` `3ba3a0ef1c2dd7617051b8aecf2f4be80280ab8e73ed804cb15d2e6d7504f1fb`、
+  `finalize/attempt_001/training_update_final.json` `5fdfc905975622e051270e36c9d5ac484661660ce350f7b8e866fcc06033c954`、
+  `registration/attempt_001/registration.json` `7fcb1b19953cdfbcdc5499acd785321616427028311e06dc678d4945fdf2b2bd`；
+  R0 registration 绑定方案 v0.7 `df2a1a2b7fb51821855044f47d316f6a3ba49d8312cd890773f5212aef0104d9`。
 
-## 4. 准入包（v0.6）
+## 4. 准入包（v0.7）
 
-路径：`derived/audit/w1_real_training_update_audit/admission/attempt_008/admission_package.json`，
-SHA-256 **`dc163b6001ae9eef57153ddd797aee05d464b93384fb4b7cb6a36a77142c0c93`**。
+路径：`derived/audit/w1_real_training_update_audit/admission/attempt_009/admission_package.json`，
+SHA-256 **`27d54a3f52ffaa1d22012d5e398121afce0286939a75fafcbd4246b6db2ff112`**。
 
 - `passed=true`、`problems=[]`；`status={authorized:false, registered:false, run:not_run,
   section_10_2_checked:false}`。
-- 绑定 tolerance contract 文件 SHA `582ea60a…`、evidence `56ae9663…`、fp32 canonical
+- 绑定 tolerance contract 文件 SHA `3bce1fd5…`、evidence `8c8d983c…`、fp32 canonical
   `6d7a24d0…`、roster `264`/3864 行、两份父运行 7+3 个文件哈希、两 checkpoint 与 train config。
 - `read_scope`：metadata-only；`window_values_loaded=false`、`checkpoint_torch_load=false`、
   `cohort_created=false`、`registered_attempt_created=false`、conditioner/model/VJP/optimizer 调用 0；
   只构造了 CPU 随机初始化 roster（2 个 model constructor）。
-- 实现文件哈希与 v0.6 权威运行 R0 registration 完全一致（方案 SHA `f69694c6…`、
-  审计模块 `fbe46689…`、测试 `b816ea01…`）；消费侧 `admission_package_problems` 返回空。
+- 实现文件哈希与 v0.7 权威运行 R0 registration 完全一致（方案 SHA `df2a1a2b…`、
+  审计模块 `0bad2712…`、测试 `8aaf5974…`）；消费侧 `admission_package_problems` 返回空。
 - 资源上界 `one_chain_gib=7.145`、`estimated_artifacts_gib=14.236`、`within_cap=true`。
 - 授权模板十项 checklist 仍全为 `null`；真实模式在授权/准入/调用余额校验后仍拒绝
   （`real_provider_not_registered_in_ic`）。
 
 ## 5. 测试
 
-- 新增模块：`uv run --locked pytest tests/test_w1_real_training_update_audit.py -q` → **46 passed（93.85s）**。
-  v0.6 新增 7 项第四轮反例：小状态/门的实际分母校准；撤回写入最终累计快照并与 `consumed`
-  对账；P 阶段在 backward 前执行本地截止（慢 forward 后无 backward/step 计数）；主 P/I
-  `unit_admission` 守卫拒绝封口/未登记父尝试；I 在 reference context 前检查、过期时不执行 240 次参考 FK；cotangent joint 组清零被分组门拒绝、缺失
-  cotangent 记为 `group_shape` 且不崩溃、行哈希捕获分组篡改；F 在 `remaining=300s/reserve=180s`
-  时仍 spawn 且 deadline 只扣一次预留。
-- 相关回归（v0.6 重跑）：`tests/test_omniretarget_w1.py`、`tests/test_w1_de_numerics.py`、
+- 新增模块：`uv run --locked pytest tests/test_w1_real_training_update_audit.py -q` → **51 passed（96.58s）**。
+  v0.7 新增 5 项第五轮反例：逐门适用性校准（precision-gap 行计入、失败门/direct failure 不计入、
+  无界状态记 inf）；校准链上 theta/state/delta/same 四门逐一满足 4× 规则且 state/delta 最大值 >0.1；
+  分组零噪声门对参考 1e-13/生产 8.34e-7 的 joint 拒绝、两侧深带仍通过；受控时钟在 FK 后输出 VJP
+  前停止且 `independent_output_vjp=0`；最后一次参数 VJP 后过期时 `i_clip_2` 先于 clip 触发，
+  clip 只执行 3 次、`explicit_reference_updates`/diagnostic/formula 均为 3（旧实现为 4）。
+- 相关回归（v0.7 重跑）：`tests/test_omniretarget_w1.py`、`tests/test_w1_de_numerics.py`、
   `tests/test_w1_training_objective_audit.py`、`tests/test_w1_real_objective_audit.py`、
-  `tests/test_w1_real_admission.py`、`tests/test_w1_real_fk_audit.py` 合计 **263 passed（148.51s）**。
+  `tests/test_w1_real_admission.py`、`tests/test_w1_real_fk_audit.py` 合计 **263 passed（152.14s）**。
 - 全项目套件本轮未重跑；不把历史全量计数当作本轮验收。
 
 ## 6. 复现命令
@@ -171,35 +175,33 @@ uv run --locked pytest tests/test_w1_real_training_update_audit.py -q
 uv run --locked python scripts/audit_w1_real_training_update.py --calibrate-synthetic
 uv run --locked python scripts/audit_w1_real_training_update.py --synthetic \
   --tolerance-contract derived/audit/w1_real_training_update_audit/tolerance_contract.json \
-  --out derived/audit/w1_real_training_update_audit/synthetic/v0.6_final
+  --out derived/audit/w1_real_training_update_audit/synthetic/v0.7_final
 uv run --locked python scripts/audit_w1_real_training_update.py --admission
 ```
 
-## 7. 第四轮审阅修复映射（4 P1 + 1 P2）
+## 7. 第五轮审阅修复映射（3 P1）
 
 | # | 缺口 | 修复与反例 |
 | --- | --- | --- |
-| P1-1 | 校准仍排除小 m/v | `_state_cross_path_ratio` 覆盖全部 `abs(reference)>0` 坐标、用门分母；旧 5e-4 实测 0.313871（4×=1.255>1），改 1e-3 后 0.156936（4×=0.628）；`m=0 vs 1e-9`、50%、单侧零仍拒绝 |
-| P1-2 | F 撤回封口保存执行前余额 | pre-seal 否决把 `counter.snapshot()` 传入撤回，索引/台账保存最终累计；`final-before==consumed` 逐类对账；矩阵否决反例 `prior_call_counts`=16 更新/64 forwards，不再是 8/32 |
-| P1-3 | 主 P/I 截止检查为空操作 | `check()` 无条件 `_ensure_deadline`，主链在 backward/clip/step/VJP 前执行；主 P/I 另传 `_stage_unit_guard`（running/cohort/registration/deadline）；慢 forward 反例在 backward 前停止且 `production_parameter_backward=0` |
-| P1-4 | 输出 cotangent 缺分组门 | `compare_cotangent_gradient` 增加 `pos/rot6d/joint` independent relative-L2/cosine 与整组擦除检查；行保存 `group_gates`/problems/`group_max_ratio`，F 按 canonical hash 绑定；joint 清零反例整张量通过但分组拒绝 |
-| P2-5 | F 重复扣收口预留 | `deadline=t0+remaining-reserve` 为唯一工作截止；pre-spawn、timeout、worker guard、`unit_admission` 都直接比较 `perf_counter()` 与该截止；300s/180s 反例仍 spawn，deadline 约 120s |
+| P1-1 | 状态校准漏掉仅 precision gap 的行 | `_row_ratio_observations` 按 theta/state/delta/same 各自的门适用性统计（`*_ok`/`same_input_formula_passed`，排除 failure 与未通过门）；`cross_attn.v.weight` 0.289626（4×=1.1585>1）进入统计，`state_cross_path` 重定 2e-3 后 0.144813（4×=0.579）；同一修正暴露 delta 0.297752（4×=1.191>1），`delta_cross_path` 重定 1e-3 后 0.148876（4×=0.5955） |
+| P1-2 | 分组零噪声门缺生产侧范数 | `_gradient_group_gate` 的 tiny 分支要求 `max(rn,gn)≤1e-10`；参考 joint 1e-13/生产 joint 1e-8（范数 8.34e-7）由 `tiny_group_joint` 拒绝，两侧深带合法噪声仍通过 |
+| P1-3 | I 在输出 VJP/clip/参考更新前仍可过期执行且计数提前 | 新增 `i_output_vjp_{u}_{m}`、`i_clip_{u}` 检查；`i_update_{u}` 保留在 AdamW 行循环前；`explicit_reference_updates`/`diagnostic_parameter_update_events`/`optimizer_formula_checks` 移到实际 AdamW 计算之后。受控时钟：FK 后停止时 output VJP=0；最后一次参数 VJP 后停止时 clip=3、三个计数=3（旧实现 4/4） |
 
-v0.5 的第三轮 8 P1+4 P2 修复与 39 项测试保留在历史（`admission/attempt_004`、`synthetic/v0.5_final`），
-当前权威为 v0.6。
+v0.6 的第四轮 4 P1+1 P2 修复与 46 项测试保留在历史（`synthetic/history/v0.6_final_plan_f69694c6/`、
+`admission/attempt_008`），当前权威为 v0.7。
 
 ## 8. 边界与未覆盖
 
 - 真实 provider、真实 checkpoint strict load、真实父数组/条件、四窗真实输入、真实网络参数反向、
   真实 FK/资产闭包、真实 AdamW 更新、真实 R0→P→I→F、真实授权/注册均未实施或未运行。
 - 合成全链的 `audit_incomplete` 只说明该矩阵在冻结精度门下不能证明覆盖通过；不说明 AdamW/网络实现
-  错误，也不说明真实链会通过或失败。600 条 gap 是精度/相消的必测不完整，不是 failure。
+  错误，也不说明真实链会通过或失败。577 条 gap 是精度/相消的必测不完整，不是 failure。
 - 选模、DDIM、端到端质量、干预收益、数据 loader/epoch 等价、生产接入仍 `not_audited`；
   `objective_coverage=partial`、`full_objective_contract_passed=null`、
   `attribution=attribution_insufficient`、`factor_selected=false`、`auto_execute=false`、
   `final_interaction_method=not_ready`、`production_integration=false`。
 - U0 `incomplete`、UR `no_quality_gain`、原 F `not_ready`、旧预测 r6 不可验收、旋转融合不接入全部保留。
-- 下一步：复阅 v0.6/校准/准入包，另行实施真实 provider 并取得方案明确的真实授权；在此之前不得创建
+- 下一步：复阅 v0.7/校准/准入包，另行实施真实 provider 并取得方案明确的真实授权；在此之前不得创建
   真实 cohort 或消耗真实调用额度。
 
 ## 9. 历史证据
@@ -211,8 +213,12 @@ v0.5 的第三轮 8 P1+4 P2 修复与 39 项测试保留在历史（`admission/a
   `synthetic/history/v0.5_final_plan_7ca93760/`，对应准入 `admission/attempt_003/`（SHA `a9c8b50e…`）；
   方案 `991d2d38…` 的权威运行为 `synthetic/v0.5_final/` 与 `admission/attempt_004/`（SHA `c7b4fae2…`），
   611 条 gap（392/219/0）、39 tests。
-- v0.6 文档冻结前用旧方案字节运行过一次 v0.6 语义链，已移入
-  `synthetic/history/v0.6_pre_plan_*/`（计划外中间运行，不作为准入依据）；之后发现缺失
-  cotangent 时分组门会 `KeyError`，修复为记录 `group_shape` 并补测试，修复前运行移入 `synthetic/history/v0.6_pre_nonefix_*/`；再加 I reference-context 检查前的运行移入 `synthetic/history/v0.6_pre_refctx_*/`，加检查后、改方案前的运行移入 `synthetic/history/v0.6_pre_plan46_*/`。`admission/attempt_005/`（`f05fc5a0…`）、
-  `attempt_006/`（`05875d09…`）与 `attempt_007/`（`accb923f…`）为中间版本，不作准入依据。
-  当前权威为方案 `f69694c6…`、`synthetic/v0.6_final/` 与 `admission/attempt_008/`（SHA `dc163b60…`）。
+- v0.6：方案 `f69694c6…` 的权威运行 `synthetic/v0.6_final/` 已移入
+  `synthetic/history/v0.6_final_plan_f69694c6/`，对应准入 `admission/attempt_008/`
+  （SHA `dc163b60…`），600 条 gap（392/208/0）、46 tests；校准 `history/v0.6_582ea60a/`。
+  文档冻结前的 `v0.6_pre_*` 中间运行保留在 `synthetic/history/`；`admission/attempt_005/`
+  （`f05fc5a0…`）、`attempt_006/`（`05875d09…`）与 `attempt_007/`（`accb923f…`）为中间版本，
+  不作准入依据。
+- v0.7：文档冻结前用 v0.6 方案字节运行过的 `v0.7_pre` 保留在
+  `synthetic/history/v0.7_pre_plan_f69694c6/`，不作为准入依据；当前权威为方案 `df2a1a2b…`、
+  `synthetic/v0.7_final/` 与 `admission/attempt_009/`（SHA `27d54a3f…`）。

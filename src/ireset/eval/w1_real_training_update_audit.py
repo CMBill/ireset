@@ -287,8 +287,8 @@ TOLERANCE_PROPOSALS = {
     "parameter_gradient": {"atol": 1e-8, "rtol": 2e-4},
     "global_norm_clip": {"atol": 1e-7, "rtol": 2e-4},
     "theta_cross_path": {"atol": 2e-7, "rtol": 2e-6},
-    "state_cross_path": {"atol": 0.0, "rtol": 1e-3},
-    "delta_cross_path": {"atol": 0.0, "rtol": 5e-4},
+    "state_cross_path": {"atol": 0.0, "rtol": 2e-3},
+    "delta_cross_path": {"atol": 0.0, "rtol": 1e-3},
     "delta_same_input": {"atol": 0.0, "rtol": 5e-4},
     "independent_float64": {"atol": 1e-12, "rtol": 1e-9},
 }
@@ -2102,8 +2102,9 @@ def _gradient_group_gate(got: Any, ref: Any, *,
     The whole-tensor relative-L2 can hide an exactly-zero group when the
     remaining groups are large; the plan requires the three registered groups
     to pass their own gates.  A group whose reference norm is below the
-    nonzero band uses the calibrated absolute zero-noise floor; an exactly
-    zero production group with a non-zero reference is an erasure.
+    nonzero band uses the calibrated absolute zero-noise floor only when the
+    production norm is inside the same deep-noise band; an exactly zero
+    production group with a non-zero reference is an erasure.
     """
     g_all = np.asarray(got, dtype=np.float64)
     r_all = np.asarray(ref, dtype=np.float64)
@@ -2138,9 +2139,14 @@ def _gradient_group_gate(got: Any, ref: Any, *,
             if not ok:
                 problems.append(f"{name}:group_{label}")
         else:
-            ok = (max_abs <= ZERO_GRADIENT_ABS
+            # The absolute floor is only valid when both norms sit inside the
+            # deep cancellation band; a production group far outside it is a
+            # real difference, not zero noise.
+            deep = max(rn, gn) <= ZERO_GRADIENT_NOISE_SCALE
+            ok = (deep and max_abs <= ZERO_GRADIENT_ABS
                   and not (rn > 0.0 and gn == 0.0))
             entry["tiny_gate_abs"] = ZERO_GRADIENT_ABS
+            entry["tiny_noise_scale"] = ZERO_GRADIENT_NOISE_SCALE
             if not ok:
                 problems.append(f"{name}:tiny_group_{label}")
         entry["ok"] = bool(ok)
@@ -2989,6 +2995,7 @@ def run_i_stage(root: Path, stage: str, attempt: str, t0: float,
                     ref = ref_ctx.evaluate(pred_np, MICRO_SCHEDULE[u][m])
                     for gap in ref["problems"]:
                         gaps.append(f"i_fk_{gap}:{model_type}:u{u}:m{m}")
+                    check(f"i_output_vjp_{u}_{m}")
                     pred64 = pred_det.cpu().double()
                     target64 = batch["x0"].detach().cpu().double()
                     domain = {"min_angle_rad": 1e-6, "min_sin_theta": 1e-3}
@@ -3155,6 +3162,7 @@ def run_i_stage(root: Path, stage: str, attempt: str, t0: float,
                             else "mismatch",
                             failure=None if cmp_rec["ok"] else "objective"))
                 # independent clip of the I gradient
+                check(f"i_clip_{u}")
                 clip = _clip_independent(i_accum, float(provider.config["grad_clip"]))
                 counter.add("independent_clip_formula")
                 p_gnorm = float(p_rec["updates"][f"u{u}"]["gnorm"])
@@ -3181,9 +3189,6 @@ def run_i_stage(root: Path, stage: str, attempt: str, t0: float,
                     if norm_cmp["ok"] and coef_cmp["ok"] else "mismatch",
                     failure=None if norm_cmp["ok"] and coef_cmp["ok"]
                     else "global_clip"))
-                counter.add("explicit_reference_updates")
-                counter.add("diagnostic_parameter_update_events")
-                counter.add("optimizer_formula_checks")
                 check(f"i_update_{u}")
                 # final accumulated/clipped and AdamW state rows
                 for name in names:
@@ -3332,6 +3337,11 @@ def run_i_stage(root: Path, stage: str, attempt: str, t0: float,
                     if row.get("gaps"):
                         gaps += [f"i_adamw_gap:{model_type}:u{u}:{name}:{g}"
                                  for g in row["gaps"]]
+                # The explicit reference update is the AdamW computation
+                # above; count it only after it actually executed.
+                counter.add("explicit_reference_updates")
+                counter.add("diagnostic_parameter_update_events")
+                counter.add("optimizer_formula_checks")
                 # step continuity row (once per model, at update 2)
                 p_next = {n: p_rec["arrays"].get(f"theta_before/u2/{n}")
                           for n in names}
@@ -5620,6 +5630,35 @@ def _interval_recompute_problems(g: np.ndarray, theta: np.ndarray,
     return problems
 
 
+def _row_ratio_observations(row: Mapping[str, Any]) -> dict[str, float]:
+    """Per-gate applicable observations from one ``adamw:`` row.
+
+    A row classified ``audit_incomplete`` only because the update delta is
+    below the float32 write resolution still ran and passed its m/v
+    comparison, so its state ratio is a valid sensitivity observation.
+    Filtering by the whole-row classification hides exactly those rows.  A
+    gate that failed is not a positive observation, and a direct failure is
+    not a numeric-sensitivity sample.
+    """
+    if row.get("status") == "none_parameter" or row.get("failure"):
+        return {}
+    flags = row.get("cross_path_flags") or {}
+    out: dict[str, float] = {}
+    if flags.get("theta_ok") and row.get("max_theta_ratio") is not None:
+        out["theta_cross_path"] = float(row["max_theta_ratio"])
+    if (int(row.get("state_ratio_applicable") or 0) > 0
+            and flags.get("m_ok") and flags.get("v_ok")):
+        value = row.get("max_state_ratio")
+        out["state_cross_path"] = (math.inf if value is None
+                                   else float(value))
+    if flags.get("delta_ok") and row.get("max_delta_ratio") is not None:
+        out["delta_cross_path"] = float(row["max_delta_ratio"])
+    if (row.get("same_input_formula_passed")
+            and row.get("max_same_delta_ratio") is not None):
+        out["delta_same_input"] = float(row["max_same_delta_ratio"])
+    return out
+
+
 def _observed_from_chain(seed: int, device: str) -> dict:
     config = dict(MODEL_CONFIG)
     config.update(d_model=8, n_layers=1, n_heads=2, ffn_mult=2, time_window=3)
@@ -5681,20 +5720,8 @@ def _observed_from_chain(seed: int, device: str) -> dict:
                         ratios["global_norm_clip"] = max(
                             ratios["global_norm_clip"], float(cmp["max_ratio"]))
             if key.startswith("adamw:"):
-                if row.get("classification") != "passed":
-                    continue
-                for tag, name in (("max_theta_ratio", "theta_cross_path"),
-                                  ("max_state_ratio", "state_cross_path"),
-                                  ("max_delta_ratio", "delta_cross_path"),
-                                  ("max_same_delta_ratio",
-                                   "delta_same_input")):
-                    value = row.get(tag)
-                    if value is not None:
-                        ratios[name] = max(ratios[name], float(value))
-                    elif name == "state_cross_path":
-                        # A raw-gate pass cannot contain a coordinate whose
-                        # reference is zero with a non-zero production value.
-                        ratios[name] = math.inf
+                for name, value in _row_ratio_observations(row).items():
+                    ratios[name] = max(ratios[name], value)
     return {key: _ratio_record(value, source="synthetic_chain")
             for key, value in ratios.items()}
 

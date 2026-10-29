@@ -10,6 +10,7 @@ or MuJoCo model is read.
 from __future__ import annotations
 
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -635,7 +636,8 @@ def test_calibration_state_ratio_is_normalized_and_maxed():
     ratio, count = A._state_cross_path_ratio(
         np.array([1e-9]), np.array([1e-9 * (1 + 1e-4)]), spec)
     assert count == 1
-    assert ratio == pytest.approx(1e-4 / (1e-3 * (1 + 1e-4)), rel=1e-9)
+    assert ratio == pytest.approx(
+        1e-4 / (spec["rtol"] * (1 + 1e-4)), rel=1e-9)
     merged = A._merge_ratio_records([
         A._ratio_record(0.1, source="chain"),
         A._ratio_record(0.4, source="scalar")])
@@ -1080,3 +1082,177 @@ def test_f_stage_deducts_the_reserve_once(tmp_path, monkeypatch, chain):
     remaining = spec["deadline_perf_counter"] - deadline_before
     assert 110.0 < remaining <= 121.0
     assert not any("reservation_settle" in p for p in problems)
+
+
+# ---------------------------------------------------------------------------
+# third review-round counterexamples: per-gate calibration applicability,
+# the group deep-noise band and the remaining I-stage deadline units
+# ---------------------------------------------------------------------------
+
+
+def test_calibration_uses_per_gate_applicability():
+    row = {
+        "status": "synthetic_verified",
+        "classification": "audit_incomplete",
+        "failure": None,
+        "gaps": ["parameter_delta_precision_gap"],
+        "cross_path_flags": {"m_ok": True, "v_ok": True,
+                             "theta_ok": True, "delta_ok": True},
+        "state_ratio_applicable": 128,
+        "max_state_ratio": 0.28962621440972725,
+        "max_theta_ratio": 0.01,
+        "max_delta_ratio": 0.2977519726068185,
+        "max_same_delta_ratio": 0.2313849592711368,
+        "same_input_formula_passed": True,
+    }
+    obs = A._row_ratio_observations(row)
+    assert obs["state_cross_path"] == pytest.approx(0.28962621440972725)
+    assert obs["delta_cross_path"] == pytest.approx(0.2977519726068185)
+    assert obs["theta_cross_path"] == pytest.approx(0.01)
+    assert obs["delta_same_input"] == pytest.approx(0.2313849592711368)
+    # A gate that did not pass is not a positive observation, even when the
+    # row has no direct failure.
+    failed = dict(row, cross_path_flags={
+        "m_ok": False, "v_ok": False, "theta_ok": True, "delta_ok": False})
+    failed_obs = A._row_ratio_observations(failed)
+    assert "state_cross_path" not in failed_obs
+    assert "delta_cross_path" not in failed_obs
+    assert failed_obs["theta_cross_path"] == pytest.approx(0.01)
+    # Direct failures are not numeric-sensitivity samples.
+    assert A._row_ratio_observations(dict(row, failure="same_input_formula")) == {}
+    assert A._row_ratio_observations(dict(row, status="none_parameter")) == {}
+    # An applicable-but-unbounded state may never be silently dropped.
+    unbounded = dict(row, max_state_ratio=None, state_ratio_unbounded=True)
+    assert math.isinf(
+        A._row_ratio_observations(unbounded)["state_cross_path"])
+
+
+def test_calibration_chain_applies_the_4x_rule_to_every_gate(chain):
+    rows = [r for r in chain["i"]["rows"]
+            if str(r["key"]).startswith("adamw:")
+            and r.get("status") != "none_parameter"]
+    maxima: dict[str, float] = {}
+    for row in rows:
+        for name, value in A._row_ratio_observations(row).items():
+            maxima[name] = max(maxima.get(name, 0.0), value)
+    for name in ("theta_cross_path", "state_cross_path",
+                 "delta_cross_path", "delta_same_input"):
+        assert math.isfinite(maxima[name])
+        assert 4.0 * maxima[name] <= 1.0, (name, maxima[name])
+    # The precision-gap rows must be inside the statistic: filtering by the
+    # whole-row classification leaves both maxima below 0.1.
+    assert maxima["state_cross_path"] > 0.1
+    assert maxima["delta_cross_path"] > 0.1
+    precision = [r for r in rows
+                 if r.get("classification") == "audit_incomplete"
+                 and r.get("gaps") == ["parameter_delta_precision_gap"]
+                 and (r.get("cross_path_flags") or {}).get("m_ok")
+                 and (r.get("cross_path_flags") or {}).get("v_ok")]
+    assert precision
+    for row in precision:
+        obs = A._row_ratio_observations(row)
+        assert obs["state_cross_path"] == pytest.approx(
+            float(row["max_state_ratio"]))
+
+
+def test_cotangent_group_tiny_gate_requires_both_norms_in_the_deep_band():
+    spec = A.TOLERANCE_PROPOSALS["output_cotangent"]
+    ref = np.ones((2, 38), np.float64)
+    got = ref.copy()
+    ref[..., 9:] = 1e-13
+    got[..., 9:] = 1e-8
+    whole = A.compare_gradient(got, ref, spec, name="cot")
+    assert whole["ok"] is True
+    rec = A.compare_cotangent_gradient(got, ref, spec, name="cot")
+    assert rec["ok"] is False
+    assert "cot:tiny_group_joint" in rec["group_gate_problems"]
+    joint = rec["groups"]["group_gates"]["joint"]
+    assert joint["reference_norm"] < A.ZERO_GRADIENT_NOISE_SCALE
+    assert joint["production_norm"] > A.ZERO_GRADIENT_NOISE_SCALE
+    assert joint["tiny_noise_scale"] == A.ZERO_GRADIENT_NOISE_SCALE
+    assert joint["ok"] is False
+    # A genuinely deep-band production group still uses the absolute floor.
+    ref_deep = ref.copy()
+    got_deep = ref.copy()
+    ref_deep[..., 9:] = 1e-13
+    got_deep[..., 9:] = 2e-13
+    deep = A.compare_cotangent_gradient(got_deep, ref_deep, spec, name="deep")
+    assert deep["ok"] is True
+    assert deep["group_gate_problems"] == []
+    assert deep["groups"]["group_gates"]["joint"]["ok"] is True
+
+
+def _install_fake_clock(monkeypatch):
+    import types
+    clock = {"now": 0.0}
+    monkeypatch.setattr(A, "time", types.SimpleNamespace(
+        perf_counter=lambda: clock["now"],
+        strftime=time.strftime, time=time.time))
+    return clock
+
+
+def test_i_stage_checks_deadline_before_output_vjp(chain, tmp_path,
+                                                   monkeypatch):
+    clock = _install_fake_clock(monkeypatch)
+    original_evaluate = A.ReferenceContext.evaluate
+    calls = {"n": 0}
+
+    def expire_after_fk(self, *args, **kwargs):
+        calls["n"] += 1
+        result = original_evaluate(self, *args, **kwargs)
+        if calls["n"] == 1:
+            clock["now"] = 200.0
+        return result
+
+    monkeypatch.setattr(A.ReferenceContext, "evaluate", expire_after_fk)
+    counter = A.CallCounter(A.CALL_CAPS)
+    with pytest.raises(TimeoutError) as caught:
+        A.run_i_stage(
+            tmp_path / "I", "I", "attempt_001", 0.0,
+            {"remaining_s": 100.0, "reserve_s": 0.0}, chain["provider"],
+            counter, chain["provider"].roster, chain["root"] / "P",
+            tolerance={"tolerances": A.TOLERANCE_PROPOSALS},
+            out_dir=tmp_path / "I")
+    assert "i_output_vjp_1_0" in str(caught.value)
+    assert counter.counts["independent_output_vjp"] == 0
+    assert counter.counts["independent_total_vjp"] == 0
+
+
+def test_i_stage_checks_deadline_before_clip_and_counts_after_update(
+        chain, tmp_path, monkeypatch):
+    clock = _install_fake_clock(monkeypatch)
+    original_accumulate = A._accumulate_f32
+    seen = {"n": 0}
+
+    def expire_after_last_vjp(*args, **kwargs):
+        seen["n"] += 1
+        result = original_accumulate(*args, **kwargs)
+        if seen["n"] == len(A.MODELS) * len(A.UPDATES) * A.MICRO_COUNT:
+            clock["now"] = 200.0
+        return result
+
+    monkeypatch.setattr(A, "_accumulate_f32", expire_after_last_vjp)
+    clip_calls = {"n": 0}
+    original_clip = A._clip_independent
+
+    def counted_clip(*args, **kwargs):
+        clip_calls["n"] += 1
+        return original_clip(*args, **kwargs)
+
+    monkeypatch.setattr(A, "_clip_independent", counted_clip)
+    counter = A.CallCounter(A.CALL_CAPS)
+    with pytest.raises(TimeoutError) as caught:
+        A.run_i_stage(
+            tmp_path / "I", "I", "attempt_001", 0.0,
+            {"remaining_s": 100.0, "reserve_s": 0.0}, chain["provider"],
+            counter, chain["provider"].roster, chain["root"] / "P",
+            tolerance={"tolerances": A.TOLERANCE_PROPOSALS},
+            out_dir=tmp_path / "I")
+    assert "i_clip_2" in str(caught.value)
+    assert counter.counts["independent_total_vjp"] == (
+        len(A.MODELS) * len(A.UPDATES) * A.MICRO_COUNT)
+    assert clip_calls["n"] == 3
+    assert counter.counts["independent_clip_formula"] == 3
+    assert counter.counts["explicit_reference_updates"] == 3
+    assert counter.counts["diagnostic_parameter_update_events"] == 3
+    assert counter.counts["optimizer_formula_checks"] == 3
