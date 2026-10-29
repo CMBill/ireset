@@ -151,6 +151,11 @@ class TrainConfig:
                     time_window=self.time_window)
 
 
+def clip_coefficient(max_norm: float, total_norm: float) -> float:
+    """Native clip_grad_norm_ scaling; below one even at total_norm == max_norm."""
+    return min(1.0, float(max_norm) / (float(total_norm) + 1e-6))
+
+
 class Trainer:
     def __init__(self, cfg: TrainConfig, tokenizer, train_ds, val_ds, out_dir: Path,
                  identity: dict | None = None,
@@ -444,9 +449,9 @@ class Trainer:
         if observer is not None:
             g = float(gnorm)
             observer["gnorm"] = g
-            observer["clip_coef"] = (min(1.0, float(self.cfg.grad_clip) / (g + 1e-6))
-                                     if g > float(self.cfg.grad_clip) else 1.0)
-            observer["clip_triggered"] = bool(g > float(self.cfg.grad_clip))
+            coef = clip_coefficient(float(self.cfg.grad_clip), g)
+            observer["clip_coef"] = coef
+            observer["clip_triggered"] = bool(coef < 1.0)
             observer["postclip"] = {
                 name: (param.grad.detach().clone()
                        if param.grad is not None else None)

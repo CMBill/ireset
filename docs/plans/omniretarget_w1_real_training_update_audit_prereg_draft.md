@@ -1,12 +1,14 @@
 # W1 真实网络参数梯度与优化更新链路审计预注册方案
 
-日期：2026-10-29。版本：v0.4。状态：**`ic_implemented_synthetic_complete / not_registered / not_authorized / not_run`**。
+日期：2026-10-29。版本：v0.5。状态：**`ic_implemented_synthetic_complete_reviewfixed / not_registered / not_authorized / not_run`**。
 
 本次交付只起草/修订方案。静态核对基于 HEAD `f7f5c94b291b27127ad8fdc7e4b783c91f97ada7` 的源码、配置及父报告；没有读取真实 checkpoint 张量、NPZ 数值或数据集，没有执行网络、FK、反向或参数更新。下文的预算、调用上限和数值门均为待审阅提案，尚未分配或校准。
 
 v0.2 已按首轮审阅的 1 P1+2 P2 修订有效 float32 求值、更新量可辨性和逐元素状态零值门；v0.3 按第二轮 1 P2 补齐跨路径相消的误差传播和分类，见 §4.3、§6.4 和 §11。同输入公式错误仍为 failure；允许的上游数值差异被相消放大、无法证明跨路径一致时为必测 gap，不能通过。
 
 v0.4 记录 I/C 实施与纯合成验收（仅合成数据/随机初始化/解析 FK，未读真实 checkpoint、NPZ、资产或数据集）：共享 update unit、审计器/CLI/测试、有效 float32 求值契约、容差校准、更新量/局部清零/20% 偏差/1 ULP 相消反例、F 新进程重放与准入包均已完成。合成全链为 **`audit_incomplete`（`complete_evidence=true`、`covered_contract_passed=false`、`failures=[]`、`problems=[]`）**，原因是必测的 `parameter_delta_precision_gap`、`cross_path_sensitivity_gap` 和 2 个 `cross_path_bound_unverifiable`，不是实现错误。校准同时证明了：(i) 当前 CUDA/float32 默认 **foreach** dispatch 与 §4.3.1 求值图逐位一致，CUDA 单 tensor/`foreach=False` 路径不同，契约绑定默认 foreach；(ii) 独立 `x_t` 必须使用生产 **binary32** `alpha_cumprod` 提升到 float64 的有效常数；(iii) 数学零梯度在 float32 autograd 中留下约 1e-9 的相消噪声，1e-30 的极小门不可行，改为经校准的 1e-6 绝对零噪声门。真实 provider、注册、授权和 R0→P→I→F 真实 stage 仍未实施。
+
+v0.5 记录第三轮审阅的 **8 P1+4 P2** 修复与重跑（仍仅合成）：零噪声门只适用于深相消带且拒绝非零擦除；m/v/theta 跨路径保留原始相对门并显式记录零/符号/单侧更新分歧；F 对账保存报告、RNG 与两侧行多重集；worker 仅在完整快照核验合并后结算，并继承父截止/逐单元准入；否决在 terminal 前撤回磁盘声明；撤回纳入 publishing/成本下限协议；完整数值负结果可进入 F 并保留失败；区间逐节点向外 R32 舍入且输入预算覆盖梯度门允许集合；clip 边界与原生 `min(1,clip/(norm+1e-6))` 一致；校准状态比值按 rtol 归一化并取全链+标量最大；工件上界逐类计算。重跑校准 contract `9a964372…`、evidence `85246d75…`、fp32 canonical `6d7a24d0…`；full 合成全链 **`audit_incomplete`（complete_evidence=true、covered=false、failures/problems 空、I/F 各 611 条必测 gap：392 `parameter_delta_precision_gap` + 219 `cross_path_sensitivity_gap` + 0 `cross_path_bound_unverifiable`）**，`training_updates=16`，调用矩阵精确，F 新进程逐位重放；工件 6.895 GiB，单链上界 7.145 GiB、cohort 上界 14.236 GiB≤16 GiB；新模块 **39 passed**，相关回归 **263 passed**（全项目套件未重跑）。真实 provider/授权/注册/真实 R0→P→I→F 仍未实施。
 
 ## 0. 唯一问题与覆盖边界
 
@@ -282,15 +284,15 @@ F 的独立性来自新进程、新状态和磁盘重读；数学参考可与 I 
 | loss/分母归约 | `2e-6` | `2e-5` | 公式、权重、单位和非空性 |
 | total 输出 cotangent | `2e-8` | `2e-4` | p/r6d/q 分组 relative-L2/cosine |
 | micro/pre/post-clip 参数梯度 | `1e-8` | `2e-4` | 逐参数及 model/conditioner 分组门 |
-| global norm/clip 系数 | `1e-7` | `2e-4` | 独立公式含 `1e-6`，实际触发状态 |
+| global norm/clip 系数 | `1e-7` | `2e-4` | 独立公式无条件 `min(1,clip/(norm+1e-6))`，`coef<1` 即触发；`norm==clip` 也必须缩放 |
 | P vs I 的 theta | `2e-7` | `2e-6` | 仅作大底数交叉检查；不能替代以下更新量/公式门 |
-| 可辨坐标的同输入更新量 | `0` | `5e-4` | P/I 各对 §6.2 独立重推的自身未舍入增量核验；不加 ULP 或固定绝对项 |
-| P vs I 的可辨更新量 | `0` | `5e-4` | 原始跨路径门，以 I 的未舍入增量为参考；失败/零分支分歧按 §6.4 分类，不能转为通过 |
-| P/I 有效 m/v 的数值路径比较 | `0` | `5e-4` | 原始跨路径门，含逐元素及 model/conditioner 分组，v≥0；失败/零值分歧按 §6.4 分类 |
+| 可辨坐标的同输入更新量 | `0` | `5e-4` | 仅当 `B_delta≤0.25*rtol*abs(delta_ref)` 且确已改变存储值时可辨；更紧写界按 §6.2 记 gap；不加 ULP 或固定绝对项 |
+| P vs I 的可辨更新量 | `0` | `5e-4` | 原始跨路径门，以 I 的未舍入增量为参考；单侧可辨/单侧零增量显式记分歧，失败/零分支分歧按 §6.4 分类，不能转为通过 |
+| P/I 有效 m/v 的数值路径比较 | `0` | `5e-4` | 保留原始逐元素相对门；只有两侧精确同为零才绝对等价；零/符号分歧与单侧零更新记录并按 §6.4 分类，v≥0 |
 | P-m/P-v 与 P-gradient 公式对账 | 逐位 | 不适用 | §4.3 有效求值图；同时核对每个坐标的零/非零、符号和状态存在性 |
 | P-theta/step 的更新公式对账 | 逐位 | 不适用 | 同输入有效 float32 结果；取消固定 8 ULP 豁免 |
 
-常规 close 为逐元素 `abs(a-b)≤atol+rtol*abs(reference)`；覆盖通过要求全部适用门满足，不能择一通过。跨路径原始门失败时只按 §6.4 区分 failure/gap，不改阈值或把失败改成通过；其他硬门无条件执行。每个梯度 tensor/固定分组在参考 norm≥`1e-10` 时还要求 relative-L2≤`2e-4`、cosine≥`1-1e-6` 且生产非全零；更小时改用**经校准的绝对零噪声门** `max_abs_diff≤1e-6`（`ZERO_GRADIENT_ABS`），cosine 记 null+原因。该门只处理数学零梯度（例如 attention key bias 的 softmax 相消）在 float32 autograd 中留下的约 1e-9 噪声；1e-30 提案不可行，且该门不放宽任何非零比较。跨路径 m/v/theta 的零/符号等价同样使用经校准的 `ZERO_STATE_ABS=1e-6`。该梯度规则不能复用为 m/v 的绝对容差或更新量门。
+常规 close 为逐元素 `abs(a-b)≤atol+rtol*abs(reference)`；覆盖通过要求全部适用门满足，不能择一通过。跨路径原始门失败时只按 §6.4 区分 failure/gap，不改阈值或把失败改成通过；其他硬门无条件执行。每个梯度 tensor/固定分组在参考 norm≥`1e-10` 时还要求 relative-L2≤`2e-4`、cosine≥`1-1e-6` 且生产非全零；更小时改用**经校准的绝对零噪声门** `max_abs_diff≤1e-6`（`ZERO_GRADIENT_ABS`），cosine 记 null+原因。该门只处理数学零梯度（例如 attention key bias 的 softmax 相消）在 float32 autograd 中留下的约 `1e-12–1e-9` 噪声；1e-30 提案不可行。**零噪声豁免只适用于两侧范数均不超过 `ZERO_GRADIENT_NOISE_SCALE=1e-10` 的深相消带**；范数高于该带的 tensor 是非零比较，必须通过 relative-L2/cosine。即使在同一深带内，参考非零而生产全零（全擦除）也拒绝，并记录 `nonzero_erased` 坐标数；该门不放宽任何非零比较。跨路径 m/v/theta **不再使用绝对 close 豁免**：保留原始相对门，只有两侧精确同为零才等价；零/符号分歧和单侧零更新/单侧可辨增量显式记录并按 §6.4 分类。该梯度规则不能复用为 m/v 的绝对容差或更新量门。
 
 ### 6.2 更新量可辨性与精度缺口
 
@@ -299,10 +301,10 @@ P/I 共同前态已是精确绑定的 float32 值。实测增量用 `float64(the
 对每条路径 `X∈{P,I}`，用其自身 post-clip 梯度和共同前态独立重推有效求值，取**最终参数 FMA 写入之前**的增量：`delta_ref64_X=(theta_decay32-theta_before32)+h32*ratio32_X`。乘数和前态来自绑定输入及独立求值，不能从实测后态反推。`B_delta_X` 只覆盖该路径最终写入的舍入：RN32 取独立有效后态上下相邻有限 float32 间距较大值的一半，以 float64 保存，渐进下溢同样按相邻值区间处理；FTZ 影响结果、无法界定或溢出即 gap。前置节点已形成明确的有效 float32 输入，不将 `B_theta`、§6.4 的输入传播区间或前态 ULP 再累加到此界；界的生成不读实测误差。逐坐标规则为：
 
 1. 每路径 `delta_ref64_X==0` 时单列 `expected_no_change`，该路径实测增量必须为零，同输入公式门仍须通过。零分支不使用相对误差除法，也不声称观察到非零衰减/更新效应；P/I 参考零/非零不同另记跨路径分歧，按 §6.4 分类。
-2. 每路径非零参考仅在 `B_delta_X≤5e-4*abs(delta_ref64_X)` 且有效参考确实改变存储值时，标 `update_delta_observable_X=true`，要求 `abs(delta_measured_X-delta_ref64_X)≤5e-4*abs(delta_ref64_X)`；不给判据再加 `B_delta_X`、ULP 或 `1e-9`。同输入公式门也必须通过。两侧均可辨时另保留原始跨路径门 `abs(delta_measured_P-delta_ref64_I)≤5e-4*abs(delta_ref64_I)`；此跨路径门失败按 §6.4 分类，不冒充自身舍入不足。
+2. 每路径非零参考仅在 `B_delta_X≤0.25*5e-4*abs(delta_ref64_X)` 且有效参考确实改变存储值时，标 `update_delta_observable_X=true`，要求 `abs(delta_measured_X-delta_ref64_X)≤5e-4*abs(delta_ref64_X)`；不给判据再加 `B_delta_X`、ULP 或 `1e-9`。同输入公式门也必须通过。0.25 的可辨裕量把“舒适可辨”与比较门分开：若可辨条件也用完整 5e-4 门，写入舍入误差本身可达门的 100%，`4×observed≤proposal` 的校准规则在数学上不可满足。两侧均可辨时另保留原始跨路径门 `abs(delta_measured_P-delta_ref64_I)≤5e-4*abs(delta_ref64_I)`；任一侧可辨而另一侧不可辨/增量为零时显式记单侧分歧，按 §6.4 分类，不当作通过。
 3. 每路径其余坐标标 `update_delta_observable_X=false`，记录 `parameter_delta_precision_gap` 及坐标/原始值/界。误差界只判断“能否证明”，不能把不满足更新量门的差异变成通过。任一路径存在该必测 gap，F 最终为 `audit_incomplete`，即使其他层完整；同输入公式等已测失败仍保留，不把精度不足宣称为 AdamW 实现错误。固定矩阵若因此无法完成覆盖，保留该结果，不能更换权重、窗口、lr、dtype 或阈值求通过。
 
-v0.4 纯合成全链（264 个参数 tensor、d_model 240、四窗、两步）在 step 1 出现 **660** 个 `parameter_delta_precision_gap`（first-step `m/√v≈0.1`，更新约 `1e-5`，而 float32 参数写入分辨率对 |theta|~0.1–1 为 `1e-8–6e-8`），另有 **340** 个 `cross_path_sensitivity_gap` 和 **2** 个 `cross_path_bound_unverifiable`。全部同输入公式/直接门通过，`failures=[]`、`problems=[]`；这是冻结矩阵在 lr=`1e-4` 与 float32 写入门下的真实精度/相消限制，不是 AdamW 实现错误，也不能通过换权重/窗口/lr/threshold 求通过。
+v0.5 纯合成全链（264 个参数 tensor、d_model 240、四窗、两步）在 step 1 出现 **392** 个 `parameter_delta_precision_gap`（first-step `m/√v≈0.1`，更新约 `1e-5`，而 float32 参数写入分辨率对 |theta|~0.1–1 为 `1e-8–6e-8`），另有 **219** 个 `cross_path_sensitivity_gap` 和 **0** 个 `cross_path_bound_unverifiable`。全部同输入公式/直接门通过，`failures=[]`、`problems=[]`；这是冻结矩阵在 lr=`1e-4` 与 float32 写入门下的真实精度/相消限制，不是 AdamW 实现错误，也不能通过换权重/窗口/lr/threshold 求通过。v0.4 记录的 660/340/2 与 F 合计 1002 条为旧 F 将 I 行 gap 与 I 报告 gap 重复计数的统计；v0.5 按 I 行一次计为 611，原始旧工件保留不改写。
 
 校准必含审阅标量：前态 `1.0`、参考后态 `0.999997615814209`、被改后态 `0.9999980926513672`，存储更新量少20%。同输入有效公式应拒绝被改后态；即使更新量因可辨性不足进入 gap，也绝不能被整行或最终裁决接受为通过。C 同时提供可辨的大更新正例及正确但不可辨的小更新 gap 正例。
 
@@ -316,7 +318,7 @@ m/v 的零值门在范数、分组聚合和数值容差之前执行。分别用 
 
 布尔/计数/None、roster、形状、step 和配置精确比较；原生 AdamW step tensor 要求 0 维、有限非布尔数值，值精确等于该参数的非 None 更新次数（连续参与时为1/2），另存 JSON 整数 step。None 不初始化/不递增；拒绝1.9、字符串或广播数组。
 
-F-P 的输入、prediction、梯度、参数和 AdamW 状态与 P **逐位**重放；F-I 相同浮点路径也须逐位重放，独立 float64 公式的跨后端比较才使用对应数值门。deterministic_algorithms=false 下若无法满足，登记 replay mismatch，不临时改成近似门。
+F-P 的输入、prediction、梯度、参数和 AdamW 状态与 P **逐位**重放；F-I 相同浮点路径也须逐位重放，独立 float64 公式的跨后端比较才使用对应数值门。deterministic_algorithms=false 下若无法满足，登记 replay mismatch，不临时改成近似门。**F 另须逐字段对账保存的 P/I 报告**（micro loss/parts、gnorm、clip_coef/triggered、RNG before/after digest、prediction/memory/arrays hash、state_presence/step_facts、report 内嵌 rows 与 rows 文件），并将保存行与重放行按 `(key, 全行 canonical hash)` **多重集**比较；重复/缺失/额外/漂移行均拒绝，不能先用 key→row 字典去重。报告或 RNG 被改写而 NPZ 未变时，F 必须报 `report_micro_drift`/`report_npz_sha` 等 verification problem，而不是只比 NPZ。
 
 全部数组先做容器/键集/dtype/精确 shape/非空/有限性校验；bool 与数值不能混比。新增/缺失/重复参数、改明细、全零替换、NaN/Inf、只保存范数均阻止通过。直接硬门的完整超容差结果是 mismatch；跨路径数值门按 §6.4 分类，不可计算/缺证据是 gap。
 
@@ -324,9 +326,13 @@ F-P 的输入、prediction、梯度、参数和 AdamW 状态与 P **逐位**重�
 
 同输入公式逐位正确，不代表两套不同梯度在相消附近会产生相近的 m 或更新量。§6.1 允许的上游梯度数值差异必须与更新器自身错误分开；最终参数写入是否可辨（§6.2）也不能代替这一敏感性检查。
 
-C 在 `adamw_fp32_contract.json` 中冻结传播规则。对 I 的有效 post-clip 梯度 `g_I`，先由 §6.1 已冻结门定义允许输入集合：逐坐标预算 `E_j=1e-8+2e-4*abs(g_I[j])`，再与该坐标所属 tensor/分组适用的小范数预算 `1e-30+2e-4*max_abs_ref` 取最小值；relative-L2/cosine、非全零、None 和裁剪门仍须单独满足。区间 `G_j=[g_I[j]-E_j,g_I[j]+E_j]∩finite_binary32` 只是这些门允许集合的保守外包，不替代原门，也不证明任何实现误差已获允许。
+C 在 `adamw_fp32_contract.json` 中冻结传播规则。对 I 的有效 post-clip 梯度 `g_I`，先由 §6.1 已冻结门定义允许输入集合：传播预算必须覆盖**梯度门实际允许的全部输入**，不能再用更紧的“tensor 小范数预算”把合法输入排除。逐坐标预算为：
+- deep cancellation band `||g_I||≤ZERO_GRADIENT_NOISE_SCALE=1e-10`：`E_j=ZERO_GRADIENT_ABS=1e-6`（零噪声门）；
+- `1e-10<||g_I||≤1e-6`：`E_j=2e-4*||g_I||`（分组 relative-L2 门）；
+- `||g_I||>1e-6`：`E_j=1e-8+2e-4*abs(g_I[j])`（逐元素与分组门）。
+relative-L2/cosine、非全零、None 和裁剪门仍须单独满足。区间 `G_j=[g_I[j]-E_j,g_I[j]+E_j]∩finite_binary32` 只是这些门允许集合的保守外包，不替代原门，也不证明任何实现误差已获允许。v0.4 的 `min(1e-30+2e-4*max_abs_ref, cell)` 会比梯度门的绝对项更紧，已撤销；撤销状态绝对豁免后，该收紧在同一合成矩阵造成 32 个 `cross_path_bound_unverifiable`（review_fix1 中间运行），v0.5 改为门允许集合后为 0。
 
-从已绑定的共同 theta/m/v/step 前态和 `G_j`，沿 §4.3.1 **唯一有效求值图**传播，生成逐坐标 `K_m/K_v/K_theta/K_delta`。`K_delta` 是可能的最终存储增量集合的外包；它与各路径的 `B_delta_X` 分开。区间向外取整，覆盖其中全部 binary32 输入及规定舍入，包含平方跨零、相消、符号/零值变化、分母和最终写入，不能只做中心点的一阶线性估计。传播预算仅由 I 的绑定输入、共同前态、固定阈值和求值图生成；禁止读取 P/I 实测后态、实测差异或按真实结果放宽区间。`B_m/B_v/B_theta` 的数学式舍入界也与这里的上游输入传播区间分开保存。
+从已绑定的共同 theta/m/v/step 前态和 `G_j`，沿 §4.3.1 **唯一有效求值图**传播，生成逐坐标 `K_m/K_v/K_theta/K_delta`。`K_delta` 是可能的最终存储增量集合的外包；它与各路径的 `B_delta_X` 分开。区间必须**逐节点**向外舍入到 binary32，至少覆盖 `z=R32(g-m)`、`m=R32(a*z+m)`、`g2=R32(g*g)`、`v=R32(c*g2+v_scaled)`、`s=sqrtf(v)`、`b=R32(s/bc2)`、`den=R32(b+eps)`、`ratio=R32(m/den)`、`theta_decay=R32(theta*d)`、`theta=R32(h*ratio+theta_decay)`；平方跨零、相消、符号/零值变化、分母和最终写入全部包括，不能只做中心点的一阶线性估计，也不能在 float64 中心值上直接加减半 ULP。传播预算仅由 I 的绑定输入、共同前态、固定阈值和求值图生成；禁止读取 P/I 实测后态、实测差异或按真实结果放宽区间。`B_m/B_v/B_theta` 的数学式舍入界也与这里的上游输入传播区间分开保存。合成端点反例必须对每个实际 binary32 输入（含 `g_I` 与相邻可接受值）重推有效图的 m/v/theta/delta，全部落在对应 `K` 内；当前 16×5 组随机尺度端点检查通过。
 
 按以下优先级裁决，保存原始跨路径 close/零值结果和分类，不能覆盖原始结果：
 
@@ -391,9 +397,9 @@ C 在 `adamw_fp32_contract.json` 中冻结传播规则。对 I 的有效 post-cl
 
 ### 7.3 资源与中断
 
-资源提案：单 GPU/单计算 worker，GPU peak≤22 GiB、host peak≤32 GiB，同 cohort 工件≤16 GiB，启动时磁盘 free≥20 GiB。C 根据 roster/schema 给出数组字节上界，R0 核验资源余额；这些是限制，尚无真实峰值实测。超限/OOM 诚实 incomplete，不减 micro、切半精度、追加重计算或并行。
+资源提案：单 GPU/单计算 worker，GPU peak≤22 GiB、host peak≤32 GiB，同 cohort 工件≤16 GiB，启动时磁盘 free≥20 GiB。C 按 schema **逐类**给出数组字节上界，不允许用固定“参数副本数”代替：P 每 attempt 为 33 份参数 tensor（theta_init 1 + 每 micro accum/contrib 16 + 8 个 update theta/state 副本）加前向数组/元数据；I 为每 update 17 份 float64 有效/传播/数学参考数组 + 10 份 float32 行/显式更新数组加 cotangent/FK 元素/元数据；F 为一次 P 重放加一次 I 重放；再计入 fixture、注册元数据和每阶段 2 次 attempt。按 full roster（264 tensor、7,567,220 元素）计算单链上界 **7.145 GiB**、cohort 上界 **14.236 GiB≤16 GiB**；v0.5 权威合成实际 6.895 GiB。R0 核验资源余额；这些是限制，尚无真实峰值实测。超限/OOM 诚实 incomplete，不减 micro、切半精度、追加重计算或并行。
 
-每个 unit 前持久化完整调用预留、身份和截止，在 backward/每个 FK 状态/更新/大文件 shard 前后重查工作截止。worker 在 finally 上报本表全部24类计数及零计数的完整快照，必须全覆盖且每项为非负 JSON 整数，不接受部分 delta 或 bool。父进程合并任一项失败，reservation 保持 consumed=null，历史 unknown；未结算额度不当作零返还。
+每个 unit 前持久化完整调用预留、身份和截止，在 backward/每个 FK 状态/更新/大文件 shard 前后重查工作截止。**F worker 继承父进程绝对 `perf_counter` 截止**，并在读取保存工件、构造 model/optimizer、每个 micro、每次 backward/VJP、clip 和 update 前重查父 running 登记（cohort/registration/状态）与截止；启动时父截止已过则不 spawn。worker 在 finally 上报本表全部24类计数及零计数的完整快照，必须全覆盖且每项为非负 JSON 整数，不接受部分 delta 或 bool。父进程**仅在完整快照核验并合并成功后** settle；任一失败/无快照（被杀/超时）保持 reservation `consumed=null`、历史 unknown，不以父 counter 差值结算为零。未结算额度不当作零返还。
 
 ## 8. 登记、成本封口与磁盘契约
 
@@ -402,8 +408,8 @@ C 在 `adamw_fp32_contract.json` 中冻结传播规则。对 I 的有效 post-cl
 1. 实质读取/计算前写 cohort、active running attempt 的盘×索引×台账；R0 前仅做授权/校准/历史和文件身份检查。来源、scope、注册 SHA、unit 目录必须匹配，子进程截止不晚于父。
 2. index/ledger 分半读取，先证归属再证完整：任何存活成员证据加另一半损坏为 unknown；完整外部 cohort 跳过不计数；有标记且半损坏无法排除成员时 unknown；无成员证据的 legacy 按既有规则跳过。
 3. 每个 attempt 精确对账有限非负成本、调用增量/累计快照、状态、report/array hashes 和目录枚举；缺失/未登记尝试、调用快照矛盾或 running/publishing 都停止消费。
-4. 终态先发布 publishing/complete=false。成本含自身持久化和尾部预留 `max(1s,2×观测最大写延迟)`；封口后至多4轮核验/刷新，撤回成本同属本 attempt、以旧成本为下限。未知覆盖保留 publishing，不发布低估的 incomplete 历史。
-5. 预算/调用/封口否决必须在 F terminal 前撤回磁盘 complete/pass 声明、更新绑定哈希；撤回不确定时返回 audit_incomplete。保留已测 mismatch，不沿用旧 terminal 标志以成功退出。
+4. 终态先发布 publishing/complete=false。成本含自身持久化和尾部预留 `max(1s,2×观测最大写延迟)`；封口后至多4轮核验/刷新，撤回成本同属本 attempt、以旧成本为下限（`cost_floor`），不得把旧成本改小。未知覆盖保留 publishing，不发布低估的 incomplete 历史。
+5. 预算/调用/全链矩阵/消费者否决必须在 F terminal 前撤回磁盘 complete/pass 声明、重写报告并重绑哈希；pre-seal 否决直接以 incomplete 封口，post-seal 否决重新走 publishing→terminal 并保留旧成本下限。撤回不确认时返回 audit_incomplete、保留 publishing 非可消费行。区分证据完整性与数值通过：I 的完整数值 mismatch 仍须以 `complete_evidence=true` 进入 F，F 独立重放并保留已测 failures；只有预算撤销/未知封口/证据缺失阻止 F。不得沿用旧 terminal 标志以成功退出。
 
 不能消除的任意终止/文件系统边界须按现有协议暴露，不新增“固有时钟边界”豁免。父产物与旧授权字节不改；本方案的真实授权与登记另存新目录。
 
@@ -450,7 +456,7 @@ v0.4 已新增 `src/ireset/eval/w1_real_training_update_audit.py`、`scripts/aud
 
 C 只用合成解析数据、随机初始化 full-architecture 模块与合成 FK；静态 roster 不加载真实权重。真实 G1 测试/真实 checkpoint 前向、真实训练更新不得混入授权前校准。保存合成证据、精确测试范围、保护清单、有效运算/传播分类契约、容差/roster/schema/calibration evidence SHA；固定正例/反例/应有gap的语义，独立复核从原始量重新分类，不信任自报预期原因。普通稳定正例仍须通过全部原始门，跨路径敏感性gap正例单列，不能用其差异放宽阈值。不拿历史全项目计数当作新验收。
 
-**v0.4 I/C 交付事实（纯合成）**：`tests/test_w1_real_training_update_audit.py` **25 passed**；校准 contract/evidence/fp32 文件写入 `derived/audit/w1_real_training_update_audit/`；完整 R0→P→I→F 合成链（full 配置、264 参数 tensor、四窗、两步、F 新进程）**exit 0**，四 stage 全部 done/sealed，调用矩阵精确等于 §7.2 全链名义值（8 loads、64/64 conditioner/backbone forwards、48 draw units、32/32 output/total VJP、16/16 native+explicit updates、15840/115200 reference FK、64 micro），`training_updates=16`、全部零计数 0；结论 **`audit_incomplete`**（complete_evidence=true、covered=false、failures/problems 空、F 与 I 合计 1002 个必测 gap），F 新进程 pid≠父、ppid=父、重读磁盘并逐位重放 P/I、行多重集与原始量分类复核。准入包为只读元数据包（`authorized=false/registered=false/run=not_run/section_10_2_checked=false`），真实 provider/checkpoint/数据/资产仍未读取。
+**v0.5 I/C 交付事实（纯合成）**：第三轮审阅 8 P1+4 P2 全部修复并加重反例：零噪声门限制到 `1e-10` 深带且拒绝非零擦除；状态跨路径保留相对门并显式记录零/符号/单侧更新分歧；F 对账保存报告/RNG/两侧行多重集；worker 继承截止与逐单元准入、仅完整快照结算；pre/post-seal 否决撤回磁盘声明并保留成本下限；I 的完整数值 mismatch 可进入 F；区间逐节点向外 R32 舍入且输入预算覆盖梯度门；clip 边界与原生一致；校准状态比值归一化并取最大；工件上界逐类计算。`tests/test_w1_real_training_update_audit.py` **39 passed**，相关回归 **263 passed**（全项目套件未重跑）。校准 contract SHA `9a9643728efecd32394a25df8b58923ef3bc9ff50d91e4a53423e554f422dc05`、evidence `85246d758590a921947bc64e9f862c08d17b0af7410489a435e4bb79318cef6a`、fp32 canonical `6d7a24d0cd077454120dfbaaad37fcc378b10572e4a33a26df8ca09f7e0003e1`。**最终全链** `derived/audit/w1_real_training_update_audit/synthetic/v0.5_final/`（full d240/4 layers、264 tensor、3864 行、四窗、两步）：四 stage done/sealed，调用矩阵精确（8 loads、64/64 forwards、48 draw units、32/32 VJP、64 production FK、16/16 updates、15840/115200 reference FK、64 micro），`training_updates=16`、零计数 0；结论 **`audit_incomplete`**（complete_evidence=true、covered=false、failures/problems 空、I/F 各 **611** gap：392 `parameter_delta_precision_gap` + 219 `cross_path_sensitivity_gap` + **0** bound-unverifiable）；F 新进程 pid≠父、ppid=父、exit 0、报告/RNG/行多重集复核通过；成本约 160s（R0/P/I/F 各 1/2 次，精确值见验证记录）；工件 6.895 GiB、单链上界 7.145、cohort 14.236≤16。只读准入包在文档冻结后重新生成（`authorized=false/registered=false/run=not_run/section_10_2_checked=false`）；真实 provider/checkpoint/数据/资产仍未读取。
 
 ### 10.2 新的明确授权记录
 
@@ -471,9 +477,9 @@ C 只用合成解析数据、随机初始化 full-architecture 模块与合成 F
 
 ### 10.3 当前交付与下一步
 
-v0.4 已完成 I/C 实施、纯合成验收、冻结校准/有效 float32 契约、F 新进程重放和只读准入包；共享 update unit 与原生 Trainer 的 observer=None 路径逐位等价。真实 provider、真实 checkpoint/数据/资产读取、真实 R0→P→I→F、授权/注册均未实施；本轮真实新增调用及参数更新为 0。合成全链是完整的负/不完整结果（`audit_incomplete`），不冒充覆盖通过。
+v0.5 已完成 I/C 实施、第三轮 8 P1+4 P2 修复、纯合成验收、冻结校准/有效 float32 契约、F 新进程重放和只读准入包重发；共享 update unit 与原生 Trainer 的 observer=None 路径逐位等价。真实 provider、真实 checkpoint/数据/资产读取、真实 R0→P→I→F、授权/注册均未实施；本轮真实新增调用及参数更新为 0。合成全链是完整的负/不完整结果（`audit_incomplete`、611 个必测 gap），不冒充覆盖通过。
 
-下一步复阅 v0.4 的校准/准入包、有效 float32 dispatch 绑定、1e-6 零噪声门、step-1 精度 gap 语义和真实 provider 计划；随后另行实施真实 provider 与 R0→P→I→F 的前置材料。收到本方案新的明确真实授权后，才执行真实 stage。U0 incomplete、UR no_quality_gain、原F not_ready、旧预测r6不可验收与旋转融合不接入全部保留。
+下一步复阅 v0.5 的校准/准入包、有效 float32 dispatch 绑定、1e-6 深带零噪声门、25% 更新可辨裕量、step-1 精度 gap 语义和真实 provider 计划；随后另行实施真实 provider 与 R0→P→I→F 的前置材料。收到本方案新的明确真实授权后，才执行真实 stage。U0 incomplete、UR no_quality_gain、原F not_ready、旧预测r6不可验收与旋转融合不接入全部保留。
 
 ## 11. 修订记录
 
@@ -484,5 +490,7 @@ v0.4 已完成 I/C 实施、纯合成验收、冻结校准/有效 float32 契约
 | v0.2 / P2 状态部分清零 | 撤销固定状态atol，逐元素零值/符号/有效后态核验先于聚合；由原始量重建掩码 | `g=1e-17` 的正常非零v被局部清零须拒；合法真零/下溢/相消零不误报 |
 | v0.3 / P2 跨路径相消误判 | 两侧自身增量/公式与原始跨路径门分开；从I梯度、共同前态及冻结上游误差预算传播有效区间，硬门错误仍failure，无法证明跨路径一致为必测gap，不能转为通过 | 1 ULP梯度差、m/可辨更新约62.9%差异的合法算子为sensitivity gap；稳定正例通过；上游超限/后态篡改仍拒；F独立重推预算/区间/分类 |
 | v0.4 / I/C 实施与校准 | 共享 update unit；审计器/CLI/测试；有效 float32 契约在默认 CUDA foreach 上逐位验证；独立 x_t 用生产 binary32 alpha；1e-30 极小门改为经校准的 1e-6 零噪声门；合成全链诚实记录 step-1 精度/相消 gap | 25 tests；calibration evidence/fp32 contract；20%更新/局部清零/1ULP/区间篡改反例；F 新进程逐位重放；准入包 |
+| v0.5 / 8 P1 数值门与协议缺口 | 零噪声门限制到 1e-10 深带并拒绝非零擦除；状态跨路径撤销绝对豁免、保留相对门和零/符号/单侧更新分歧；F 对账保存报告/RNG/行多重集；仅完整 worker 快照结算；worker 继承截止+逐单元准入；否决在 terminal 前撤回磁盘声明；撤回纳入 publishing/成本下限；完整数值 mismatch 进入 F；区间逐节点向外 R32 舍入且输入预算覆盖梯度门 | 100×1e-9 全清零/深带全擦除/真实相消三反例；m=0 vs 1e-9、50% 状态差、单侧零增量反例；报告 loss/RNG 篡改与重复行被 F 拒；无快照 reservation 保持 null；过期 F 不 spawn；矩阵否决后磁盘 audit_incomplete；撤回成本≥实测；I failures 完整进入 F；端点包含检查；`norm==clip` 缩放到 0.999999046 |
+| v0.5 / 4 P2 计算与资源缺口 | 区间舍入补齐 z/square/sqrt/ratio/write 节点；输入预算改为梯度门允许集合；clip 无条件 `min(1,clip/(norm+1e-6))`；状态比值按 rtol 归一化并取全链+标量最大；25% 可辨裕量使 4× 可满足；工件上界逐类计算 P/I/F/float64/重放/重试 | 4× 全键通过（最大 delta_same_input 0.147）；0 bound-unverifiable；6.895 GiB 实际 ≤7.145 单链/14.236 cohort 上界 |
 
 该表记录方案要求，不能当作实现/测试完成声明。v0.2 做过源码静态核对；本轮只做文档公式的合成标量算术及链接/一致性检查，未运行 pytest 或真实阶段。§7 预算、调用矩阵、尝试次数与16/32次更新额度保持原值，未建立 cohort、预算或执行注册。

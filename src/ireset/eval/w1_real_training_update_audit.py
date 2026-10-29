@@ -43,7 +43,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal, getcontext
 from fractions import Fraction
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Protocol, Sequence
+from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
 import numpy as np
 import torch
@@ -269,6 +269,11 @@ COTANGENT_WEIGHTS = {
 #: gradient (float32 autograd leaves cancellation noise ~1e-9).  The draft's
 #: 1e-30 proposal was not viable; this is proof-tested in the calibration.
 ZERO_GRADIENT_ABS = 1e-6
+#: Only tensors whose both norms sit inside this deep-noise band may use the
+#: absolute floor.  Observed cancellation noise is ~1e-12, so a 1e-8 tensor
+#: is a nonzero comparison and must pass relative-L2/cosine (or report a
+#: failure); the floor may not erase it.
+ZERO_GRADIENT_NOISE_SCALE = 1e-10
 ZERO_STATE_ABS = 1e-6
 COTANGENT_ORDER = ("pos", "rot6d", "joint", "geodesic_rad2", "fk_m2", "vel")
 COTANGENT_ORDER_INDEX = {k: i for i, k in enumerate(COTANGENT_ORDER)}
@@ -292,6 +297,10 @@ TOLERANCE_RULES = {
               "tolerance"],
     "scalar_formula": "abs(prod-ref) <= atol + rtol*abs(ref)",
     "calibration_rule": "4 * observed_max_ratio <= 1.0",
+    # A delta is only compared when its half-ULP write bound is at most a
+    # quarter of the gate; otherwise it is a precision gap.  Using the gate
+    # itself as the observability bound makes 4x calibration impossible.
+    "delta_observability_fraction": 0.25,
     "bitwise_gates": [
         "t_epsilon", "x_t_replay", "memory_replay", "prediction_replay",
         "same_input_adamw_state", "step_continuity", "f_replay",
@@ -300,6 +309,9 @@ TOLERANCE_RULES = {
     "counts_are_integers": True,
     "thresholds_are_proposals": True,
 }
+#: Fraction of the delta gate below which a float32 write is comfortably
+#: observable.  See TOLERANCE_RULES["delta_observability_fraction"].
+DELTA_OBSERVABILITY_FRACTION = 0.25
 
 BOUNDARIES = {
     "objective_coverage": "partial",
@@ -800,6 +812,22 @@ def _restore_rng(state: Mapping[str, Any]) -> None:
     torch.set_rng_state(state["torch_cpu"])
     if state.get("torch_cuda") is not None:
         torch.cuda.set_rng_state_all(state["torch_cuda"])
+
+
+def _seed_stage_rng(seed: int = ROSTER_SEED) -> None:
+    """Give each P/I invocation the same ambient RNG origin.
+
+    No production draw depends on the ambient RNG (noise comes from explicit
+    CPU generators and batches are fixed), but the RNG digests recorded per
+    micro are otherwise process-path dependent and cannot be replayed.
+    """
+    import random
+
+    random.seed(int(seed))
+    np.random.seed(int(seed))
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_initialized():
+        torch.cuda.manual_seed_all(int(seed))
 
 
 def _rng_digest(state: Mapping[str, Any]) -> dict:
@@ -1453,16 +1481,24 @@ def adamw_effective_fp32(theta: Any, m: Any, v: Any, g: Any, step: int,
 
 # --- interval propagation (plan section 6.4) -------------------------------
 
-def _iv_add(lo1, hi1, lo2, hi2):
-    lo = np.nextafter(lo1 + lo2, -np.inf)
-    hi = np.nextafter(hi1 + hi2, np.inf)
-    return lo, hi
+def _r32_down(value: Any) -> np.ndarray:
+    """Largest binary32 not greater than each real value (as float64)."""
+    v = np.asarray(value, dtype=np.float64)
+    with np.errstate(invalid="ignore", over="ignore"):
+        f = v.astype(np.float32)
+        f64 = f.astype(np.float64)
+        out = np.where(f64 > v, np.nextafter(f, np.float32(-np.inf)), f)
+    return out.astype(np.float64)
 
 
-def _iv_mul_scalar(lo, hi, c):
-    if c >= 0:
-        return (np.nextafter(lo * c, -np.inf), np.nextafter(hi * c, np.inf))
-    return (np.nextafter(hi * c, -np.inf), np.nextafter(lo * c, np.inf))
+def _r32_up(value: Any) -> np.ndarray:
+    """Smallest binary32 not less than each real value (as float64)."""
+    v = np.asarray(value, dtype=np.float64)
+    with np.errstate(invalid="ignore", over="ignore"):
+        f = v.astype(np.float32)
+        f64 = f.astype(np.float64)
+        out = np.where(f64 < v, np.nextafter(f, np.float32(np.inf)), f)
+    return out.astype(np.float64)
 
 
 def _iv_square(lo, hi):
@@ -1471,43 +1507,55 @@ def _iv_square(lo, hi):
     cross = (lo <= 0) & (hi >= 0)
     lower = np.where(cross, 0.0, np.minimum(lo2, hi2))
     upper = np.maximum(lo2, hi2)
-    return (np.nextafter(lower, -np.inf), np.nextafter(upper, np.inf))
+    return lower, upper
 
 
 def _iv_div_positive(lo1, hi1, lo2, hi2):
-    """Interval division with a strictly positive denominator interval."""
+    """Real corner bounds of an interval quotient (rounding applied later)."""
     q1 = lo1 / lo2
     q2 = lo1 / hi2
     q3 = hi1 / lo2
     q4 = hi1 / hi2
     lo = np.minimum(np.minimum(q1, q2), np.minimum(q3, q4))
     hi = np.maximum(np.maximum(q1, q2), np.maximum(q3, q4))
-    return (np.nextafter(lo, -np.inf), np.nextafter(hi, np.inf))
+    return lo, hi
 
 
-def _expand(lo, hi, half):
-    return (np.nextafter(lo - half, -np.inf), np.nextafter(hi + half, np.inf))
+def effective_input_budget(g_i: np.ndarray) -> np.ndarray:
+    """Per-coordinate input set admitted by the gradient gate itself.
 
-
-def effective_input_budget(g_i: np.ndarray, tensor_max_abs: float) -> np.ndarray:
-    """Plan section 6.4: coordinate budget = min(cell, tensor tiny budget)."""
-    g_i = np.asarray(g_i, dtype=np.float64)
-    cell = 1e-8 + 2e-4 * np.abs(g_i)
-    tiny = 1e-30 + 2e-4 * float(tensor_max_abs)
-    return np.minimum(cell, tiny)
+    The interval must cover every gradient that ``compare_gradient`` can
+    accept.  A tensor in the deep cancellation band is admitted by the
+    calibrated absolute floor; a small non-deep tensor by the group gate
+    (relative-L2 <= 2e-4 of its norm); otherwise by the elementwise gate.
+    Using a tighter invented tensor budget would declare legal inputs
+    unverifiable.
+    """
+    g = np.asarray(g_i, dtype=np.float64)
+    norm = float(np.linalg.norm(g))
+    if norm <= ZERO_GRADIENT_NOISE_SCALE:
+        return np.full_like(g, ZERO_GRADIENT_ABS)
+    if norm <= ZERO_GRADIENT_ABS:
+        return np.full_like(g, float(GROUP_GATE["relative_l2"]) * norm)
+    return float(TOLERANCE_PROPOSALS["parameter_gradient"]["atol"]) + float(
+        TOLERANCE_PROPOSALS["parameter_gradient"]["rtol"]) * np.abs(g)
 
 
 def propagate_intervals(g_i: np.ndarray, theta: Any, m: Any, v: Any,
                         step: int, *, m_none: bool = False,
                         v_none: bool = False,
-                        tensor_max_abs: float | None = None,
                         host: Mapping[str, Any] | None = None) -> dict:
-    """Outer enclosure of the effective graph over the allowed input set."""
+    """Outer enclosure of the effective graph over the allowed input set.
+
+    Every prescribed binary32 node is applied monotone-wise, then rounded
+    outwards to binary32: z=R32(g-m), m=R32(a*z+m), g2=R32(g*g),
+    v=R32(c*g2+v_scaled), s=sqrtf(v), b=R32(s/bc2), den=R32(b+eps),
+    ratio=R32(m/den), theta=R32(h*ratio+theta_decay).  Clipping an interval at
+    the central float64 value is not an enclosure.
+    """
     host = dict(host_constants(step) if host is None else host)
     g64 = np.asarray(g_i, dtype=np.float64)
-    budget = effective_input_budget(
-        g64, float(np.max(np.abs(g64))) if tensor_max_abs is None
-        else tensor_max_abs)
+    budget = effective_input_budget(g64)
     g_lo = g64 - budget
     g_hi = g64 + budget
     g_lo = np.maximum(g_lo, -_F32_INF)
@@ -1515,47 +1563,54 @@ def propagate_intervals(g_i: np.ndarray, theta: Any, m: Any, v: Any,
     theta32 = _f32_array(theta)
     theta_before = theta32.astype(np.float64)
     m_old = (np.zeros_like(theta32) if m_none else _f32_array(m)).astype(np.float64)
-    v_old = (np.zeros_like(theta32) if v_none else _f32_array(v)).astype(np.float64)
+    v_old32 = (np.zeros_like(theta32) if v_none else _f32_array(v))
+    # z = R32(g - m_old)
+    z_lo = _r32_down(g_lo - m_old)
+    z_hi = _r32_up(g_hi - m_old)
+    a = np.float64(host["a_32"])
+    # m = R32(a * z + m_old), a > 0 -> monotone in z
+    m_lo = _r32_down(a * z_lo + m_old)
+    m_hi = _r32_up(a * z_hi + m_old)
+    # v_scaled = R32(beta2 * v_old): one fixed binary32 value
+    v_scaled = (np.float32(host["b2_32"]) * v_old32).astype(np.float32)
+    v_scaled64 = v_scaled.astype(np.float64)
+    # g2 = R32(g * g); square crosses zero -> include 0
+    g2_real_lo, g2_real_hi = _iv_square(g_lo, g_hi)
+    g2_lo = _r32_down(g2_real_lo)
+    g2_hi = _r32_up(g2_real_hi)
+    b2 = np.float64(host["one_minus_b2_32"])
+    # v = R32(c * g2 + v_scaled), c > 0 -> monotone in g2
+    v_lo = _r32_down(b2 * g2_lo + v_scaled64)
+    v_hi = _r32_up(b2 * g2_hi + v_scaled64)
+    v_lo = np.maximum(v_lo, 0.0)
+    # s = sqrtf(v), b = R32(s / bc2), den = R32(b + eps)
+    s_lo = _r32_down(np.sqrt(v_lo))
+    s_hi = _r32_up(np.sqrt(v_hi))
+    bc2 = np.float64(host["bc2_sqrt_32"])
+    b_lo = _r32_down(s_lo / bc2)
+    b_hi = _r32_up(s_hi / bc2)
+    den_lo = _r32_down(b_lo + host["eps_32"])
+    den_hi = _r32_up(b_hi + host["eps_32"])
+    den_lo = np.maximum(den_lo, np.finfo(np.float64).tiny)
+    # ratio = R32(m / den), den > 0: real extrema at rectangle corners
+    r_real_lo, r_real_hi = _iv_div_positive(m_lo, m_hi, den_lo, den_hi)
+    r_lo = _r32_down(r_real_lo)
+    r_hi = _r32_up(r_real_hi)
+    # theta_decay = R32(theta * d)
     theta_decay = (theta32 * np.float32(host["d_32"])).astype(np.float32)
     theta_decay64 = theta_decay.astype(np.float64)
-    # m interval: a > 0, monotone in g
-    z_lo, z_hi = g_lo - m_old, g_hi - m_old
-    a = np.float64(host["a_32"])
-    m_lo, m_hi = a * z_lo + m_old, a * z_hi + m_old
-    m_lo, m_hi = _expand(m_lo, m_hi, _half_ulp32(
-        np.float32(np.clip((m_lo + m_hi) / 2, -_F32_INF, _F32_INF))))
-    # v interval: square crosses zero -> include 0
-    g2_lo, g2_hi = _iv_square(g_lo, g_hi)
-    b2 = np.float64(host["one_minus_b2_32"])
-    v_scaled = (np.float32(host["b2_32"]) * _f32_array(
-        np.zeros_like(theta32) if v_none else v)).astype(np.float32)
-    v_scaled64 = v_scaled.astype(np.float64)
-    v_lo, v_hi = b2 * g2_lo + v_scaled64, b2 * g2_hi + v_scaled64
-    v_lo, v_hi = _expand(v_lo, v_hi, _half_ulp32(
-        np.float32(np.clip((v_lo + v_hi) / 2, 0.0, _F32_INF))))
-    v_lo = np.maximum(v_lo, 0.0)
-    s_lo = np.sqrt(v_lo)
-    s_hi = np.sqrt(v_hi)
-    bc2 = np.float64(host["bc2_sqrt_32"])
-    b_lo, b_hi = s_lo / bc2, s_hi / bc2
-    b_lo, b_hi = _expand(b_lo, b_hi, _half_ulp32(
-        np.float32(np.clip((b_lo + b_hi) / 2, 0.0, _F32_INF))))
-    den_lo, den_hi = b_lo + host["eps_32"], b_hi + host["eps_32"]
-    den_lo, den_hi = _expand(den_lo, den_hi,
-                             _half_ulp32(np.float32(host["eps_32"])))
-    den_lo = np.maximum(den_lo, np.finfo(np.float64).tiny)
-    r_lo, r_hi = _iv_div_positive(m_lo, m_hi, den_lo, den_hi)
+    # theta = R32(h * ratio + theta_decay), h < 0 -> decreasing in ratio
     h32 = np.float64(host["h_32"])
-    t_lo, t_hi = _iv_mul_scalar(r_lo, r_hi, h32)
-    t_lo, t_hi = _iv_add(t_lo, t_hi, theta_decay64, theta_decay64)
-    t_lo, t_hi = _expand(t_lo, t_hi, _half_ulp32(
-        np.float32(np.clip((t_lo + t_hi) / 2, -_F32_INF, _F32_INF))))
+    t_lo = _r32_down(h32 * r_hi + theta_decay64)
+    t_hi = _r32_up(h32 * r_lo + theta_decay64)
+    d_lo = np.nextafter(t_lo - theta_before, -np.inf)
+    d_hi = np.nextafter(t_hi - theta_before, np.inf)
     return {
         "budget": budget,
         "g_lo": g_lo, "g_hi": g_hi,
         "K_m": (m_lo, m_hi), "K_v": (v_lo, v_hi),
         "K_theta": (t_lo, t_hi),
-        "K_delta": (t_lo - theta_before, t_hi - theta_before),
+        "K_delta": (d_lo, d_hi),
         "theta_before": theta_before,
         "host": host,
     }
@@ -1623,10 +1678,17 @@ def run_p_stage(root: Path, stage: str, attempt: str, t0: float,
                 budget: Mapping[str, Any], provider: SyntheticTrainingProvider,
                 counter: CallCounter, roster: Mapping[str, Any],
                 *, out_dir: Path | None = None,
-                fixture_error: str | None = None) -> dict:
+                fixture_error: str | None = None,
+                guard: Callable[[str], None] | None = None) -> dict:
     base = Path(out_dir or (stage_dir(root, stage) / attempt))
     base.mkdir(parents=True, exist_ok=True)
+    _seed_stage_rng()
     deadline = t0 + float(budget["remaining_s"]) - float(budget["reserve_s"])
+
+    def check(unit: str) -> None:
+        if guard is not None:
+            guard(unit)
+
     results: dict[str, dict] = {}
     rows: list[dict] = []
     failures: list[str] = []
@@ -1641,6 +1703,7 @@ def run_p_stage(root: Path, stage: str, attempt: str, t0: float,
                      n_parameters=roster["n_diff"], status="synthetic_verified"))
     for model_type in MODELS:
         _ensure_deadline(deadline, 0.0, "p_model")
+        check("p_model")
         model_arrays: dict[str, Any] = {}
         presence: dict[str, str] = {}
         state_presence: dict[str, dict] = {}
@@ -1671,11 +1734,13 @@ def run_p_stage(root: Path, stage: str, attempt: str, t0: float,
             prev_state: dict[str, Any] | None = None
             for u in UPDATES:
                 _ensure_deadline(deadline, 0.0, f"p_update_{u}")
+                check(f"p_update_{u}")
                 step_obs: dict = {}
                 micro_records: list[dict] = []
                 trainer.begin_update()
                 for m in range(MICRO_COUNT):
                     _ensure_deadline(deadline, 0.0, f"p_u{u}_m{m}")
+                    check(f"p_u{u}_m{m}")
                     unit_i = unit_index[(u, m)]
                     unit = noise[unit_i]
                     gen = None
@@ -1689,6 +1754,7 @@ def run_p_stage(root: Path, stage: str, attempt: str, t0: float,
                     loss, parts = trainer.accumulate_micro(
                         batch=provider.micro_batch(u, m),
                         noise_generator=gen, observer=obs,
+                        pre_backward=lambda: check(f"p_backward_{u}_{m}"),
                         post_backward=lambda: counter.add(
                             "production_parameter_backward"))
                     rng_after = _rng_state()
@@ -1779,8 +1845,10 @@ def run_p_stage(root: Path, stage: str, attempt: str, t0: float,
                                 failures.append(
                                     f"p_leaf_hook_count:{name}:{fired}")
                     micro_records.append(record)
+                check(f"p_clip_{u}")
                 gnorm = trainer.clip_gradients(observer=step_obs)
                 counter.add("native_global_clip")
+                check(f"p_step_{u}")
                 trainer.step_optimizer(observer=step_obs)
                 counter.add("native_adamw_steps")
                 counter.add("diagnostic_parameter_update_events")
@@ -1868,6 +1936,11 @@ def run_p_stage(root: Path, stage: str, attempt: str, t0: float,
                     memory_sha256=rec["memory_sha256"],
                     prediction_hook_fires=rec["prediction_hook_fires"],
                     status="synthetic_verified"))
+    catalog = row_catalog(roster)
+    row_problems = _stage_row_problems(rows, catalog, "P")
+    complete_evidence = (
+        not row_problems
+        and all(results[model].get("arrays_path") for model in MODELS))
     report = {
         "schema": "w1_real_training_update_p_stage_v1",
         "mode": "synthetic",
@@ -1876,13 +1949,20 @@ def run_p_stage(root: Path, stage: str, attempt: str, t0: float,
         "rows": rows,
         "failures": failures,
         "gaps": gaps,
+        "evidence_problems": row_problems,
+        "complete_evidence": bool(complete_evidence),
+        "numeric_passed": not failures,
         "call_delta": None,
         "passed": not failures and not gaps,
     }
     write_json(base / "p_rows.json", rows)
     write_json(base / "p_report.json", report)
     return {"passed": not failures and not gaps, "failures": failures,
-            "gaps": gaps, "rows": rows, "paths": {
+            "gaps": gaps, "rows": rows,
+            "complete_evidence": bool(complete_evidence),
+            "evidence_problems": row_problems,
+            "numeric_passed": not failures,
+            "paths": {
                 model: results[model]["arrays_path"] for model in MODELS},
             "report": path_for_record(base / "p_report.json"),
             "arrays_sha256": {model: results[model]["arrays_sha256"]
@@ -1969,12 +2049,45 @@ def compare_numeric(got: Any, ref: Any, spec: Mapping[str, Any],
                 "max_ratio": None, "ok": False}
     diff = np.abs(g - r)
     bound = float(spec["atol"]) + float(spec["rtol"]) * np.abs(r)
-    ratio = float((diff / bound).max())
-    ok = ratio <= 1.0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio_array = np.where(bound > 0.0, diff / bound,
+                               np.where(diff == 0.0, 0.0, np.inf))
+    ratio = float(ratio_array.max())
+    ok = math.isfinite(ratio) and ratio <= 1.0
     if not ok:
         problems.append(f"{name}:tolerance")
     return {"problems": problems, "max_abs": float(diff.max()),
-            "max_ratio": ratio, "ok": ok}
+            "max_ratio": ratio if math.isfinite(ratio) else None,
+            "ok": ok}
+
+
+def _zero_noise_equivalence(g: np.ndarray, r: np.ndarray, *,
+                            max_abs_diff: float, zero_abs: float,
+                            noise_scale: float) -> dict:
+    """Absolute zero-floor equivalence, restricted to genuine cancellation.
+
+    The calibrated floor only excuses float32 cancellation noise around a
+    mathematically zero tensor.  It must not excuse erasing a nonzero
+    reference (fully or in a tensor whose scale exceeds the observed noise
+    band); those remain nonzero comparisons for the relative-L2/cosine gate.
+    """
+    rn = float(np.linalg.norm(r))
+    gn = float(np.linalg.norm(g))
+    erased = (r != 0.0) & (g == 0.0)
+    full_erasure = rn > 0.0 and gn == 0.0
+    record = {
+        "zero_abs": zero_abs,
+        "noise_scale": noise_scale,
+        "nonzero_erased": int(np.count_nonzero(erased)),
+        "full_erasure": bool(full_erasure),
+        "max_abs_diff": float(max_abs_diff),
+    }
+    ok = (max_abs_diff <= zero_abs
+          and max(rn, gn) <= noise_scale
+          and not full_erasure)
+    if ok:
+        record["zero_noise_floor"] = zero_abs
+    return {"ok": ok, "record": record}
 
 
 def compare_gradient(got: Any, ref: Any, spec: Mapping[str, Any],
@@ -1998,28 +2111,33 @@ def compare_gradient(got: Any, ref: Any, spec: Mapping[str, Any],
     }
     problems = list(base["problems"])
     zero_abs = float(ZERO_GRADIENT_ABS)
+    noise_scale = float(ZERO_GRADIENT_NOISE_SCALE)
+    tiny_abs = float(GROUP_GATE["tiny_abs"])
     if (rn <= zero_abs and gn <= zero_abs
-            and record["max_abs_diff"] <= zero_abs):
-        # Mathematically-zero gradient at the float32 cancellation floor;
-        # the calibrated absolute equivalence supersedes relative/noise gates.
-        record["zero_noise_floor"] = zero_abs
+            and max(rn, gn) <= noise_scale):
+        zero = _zero_noise_equivalence(
+            g, r, max_abs_diff=record["max_abs_diff"], zero_abs=zero_abs,
+            noise_scale=noise_scale)
+        record.update(zero["record"])
+        if zero["ok"]:
+            # Mathematically-zero cancellation noise only; no nonzero
+            # coordinate was erased and both sides are inside the deep band.
+            record["zero_noise_floor"] = zero_abs
+        else:
+            record["zero_structure_mismatch"] = True
+            problems.append(f"{name}:zero_erased")
     elif rn >= 1e-10:
         if not (record["relative_l2"] <= GROUP_GATE["relative_l2"]
                 and record["cosine"] >= GROUP_GATE["cosine_min"] and gn > 0):
             problems.append(f"{name}:group")
     else:
-        # Mathematically-zero gradients (e.g. attention key bias) leave
-        # float32/float64 rounding noise on both paths.  The draft's 1e-30
-        # proposal was not viable; the calibrated equivalence is the audited
-        # ``tiny_abs`` threshold, and it is recorded in the contract.
-        tiny_abs = float(GROUP_GATE["tiny_abs"])
-        zero_abs = float(ZERO_GRADIENT_ABS)
-        if (rn <= tiny_abs and gn <= zero_abs
-                and record["max_abs_diff"] <= zero_abs):
-            record["zero_reference_absolute"] = zero_abs
-        elif max(gn, rn) > tiny_abs or record["max_abs_diff"] > tiny_abs:
-            problems.append(f"{name}:tiny")
+        # Reference below the nonzero band.  A production tensor outside the
+        # deep-noise band is not excused by the absolute floor.
         record["tiny_equivalence_abs"] = tiny_abs
+        if max(gn, rn) > tiny_abs or record["max_abs_diff"] > tiny_abs:
+            problems.append(f"{name}:tiny")
+    return {**base, "problems": problems, "groups": record,
+            "ok": not problems}
     return {**base, "problems": problems, "groups": record,
             "ok": not problems}
 
@@ -2144,13 +2262,15 @@ def _clip_independent(grads: Mapping[str, np.ndarray | None],
         total += float(np.sum(a * a))
         elems += int(a.size)
     norm = math.sqrt(total) if elems else 0.0
-    coef = min(1.0, float(grad_clip) / (norm + 1e-6)) if norm > float(grad_clip) else 1.0
+    # Native clip_grad_norm_ computes clip/(norm+1e-6) and scales whenever the
+    # coefficient is below one; norm == clip still shrinks the gradient.
+    coef = min(1.0, float(grad_clip) / (norm + 1e-6))
     post = {name: (None if value is None else
                    (np.asarray(value, np.float32)
                     * np.float32(coef)).astype(np.float32))
             for name, value in grads.items()}
     return {"norm": norm, "coef": coef, "postclip": post,
-            "triggered": bool(norm > float(grad_clip))}
+            "triggered": bool(coef < 1.0)}
 
 
 def _step_json(value: Any) -> Any:
@@ -2254,20 +2374,23 @@ def _zero_state_problems(ref_m: Any, ref_v: Any, got_m: Any, got_v: Any,
 
 
 def _delta_observability(delta_ref64: Any, delta_measured: Any,
-                         bound: Any, theta_new: Any, theta_before: Any
-                         ) -> tuple[np.ndarray, np.ndarray]:
+                         bound: Any, theta_new: Any, theta_before: Any,
+                         *, gate_rtol: float) -> tuple[np.ndarray, np.ndarray]:
     ref = np.asarray(delta_ref64, dtype=np.float64)
     measured = np.asarray(delta_measured, dtype=np.float64)
     delta_bound = np.asarray(bound, dtype=np.float64)
     changed = np.asarray(theta_new, np.float32) != np.asarray(theta_before,
                                                               np.float32)
     observable = ((ref != 0.0)
-                  & (delta_bound <= 5e-4 * np.abs(ref))
+                  & (delta_bound
+                     <= DELTA_OBSERVABILITY_FRACTION * float(gate_rtol)
+                     * np.abs(ref))
                   & changed)
     ok = np.where(
         ref == 0.0, measured == 0.0,
         np.where(observable,
-                 np.abs(measured - ref) <= 5e-4 * np.abs(ref), False))
+                 np.abs(measured - ref) <= float(gate_rtol) * np.abs(ref),
+                 False))
     return observable, ok
 
 
@@ -2275,7 +2398,8 @@ def _cross_path_flags(p_m: Any, i_m: Any, p_v: Any, i_v: Any,
                       p_theta: Any, i_theta: Any,
                       p_delta: Any, i_delta: Any,
                       p_obs: Any, i_obs: Any,
-                      spec: Mapping[str, Any]) -> dict:
+                      spec: Mapping[str, Any], *,
+                      delta_rtol: float = 5e-4) -> dict:
     """Raw cross-path gates; do not apply the interval classification here."""
     out: dict[str, Any] = {}
     for tag, a, b in (("m", p_m, i_m), ("v", p_v, i_v),
@@ -2290,23 +2414,35 @@ def _cross_path_flags(p_m: Any, i_m: Any, p_v: Any, i_v: Any,
             out[f"{tag}_ok"] = False
             continue
         tiny_abs = float(ZERO_STATE_ABS)
-        zero_disagree = (((aa == 0.0) != (bb == 0.0))
-                         & (np.abs(aa) > tiny_abs) & (np.abs(bb) > tiny_abs))
+        # The raw cross-path gate stays a relative comparison: an absolute
+        # "both tiny" exemption would hide a 50% difference or a one-sided
+        # zero.  Zero/sign divergence is recorded for classification and the
+        # interval (not the floor) decides whether a failure is a gap.
+        zero_disagree = ((aa == 0.0) != (bb == 0.0))
         sign_disagree = ((np.sign(aa) != np.sign(bb))
-                         & (np.abs(aa) > tiny_abs) & (np.abs(bb) > tiny_abs))
+                         & (aa != 0.0) & (bb != 0.0))
         close = ((np.abs(aa - bb)
                   <= float(spec["atol"]) + float(spec["rtol"]) * np.abs(bb))
-                 | ((np.abs(aa) <= tiny_abs) & (np.abs(bb) <= tiny_abs)))
+                 | ((aa == 0.0) & (bb == 0.0)))
+        out[f"{tag}_tiny_zero_floor"] = tiny_abs
         out[f"{tag}_zero_disagreement"] = bool(zero_disagree.any())
         out[f"{tag}_sign_disagreement"] = bool(sign_disagree.any())
         out[f"{tag}_close"] = bool(close.all())
-        out[f"{tag}_ok"] = bool(close.all() and not zero_disagree.any()
-                                and not sign_disagree.any())
+        out[f"{tag}_ok"] = bool(close.all())
+    p_delta_nz = np.asarray(p_delta, np.float64) != 0.0
+    i_delta_nz = np.asarray(i_delta, np.float64) != 0.0
+    out["delta_presence_mismatch"] = bool(
+        (p_delta_nz != i_delta_nz).any())
     mask = np.asarray(p_obs, bool) & np.asarray(i_obs, bool)
-    if mask.any():
+    one_sided = np.asarray(p_obs, bool) != np.asarray(i_obs, bool)
+    out["delta_one_sided_observable"] = bool(one_sided.any())
+    if out["delta_presence_mismatch"] or out["delta_one_sided_observable"]:
+        out["delta_close"] = False
+        out["delta_ok"] = False
+    elif mask.any():
         a = np.asarray(p_delta, np.float64)[mask]
         b = np.asarray(i_delta, np.float64)[mask]
-        close = np.abs(a - b) <= 5e-4 * np.abs(b)
+        close = np.abs(a - b) <= float(delta_rtol) * np.abs(b)
         out["delta_close"] = bool(close.all())
         out["delta_ok"] = bool(close.all())
     else:
@@ -2399,14 +2535,17 @@ def _adamw_param_row(key: str, *, name: str, model: str, u: int,
     delta_i_measured = i_theta.astype(np.float64) - theta_pre.astype(np.float64)
     b_p = _delta_write_bound(pe["theta"])
     b_i = _delta_write_bound(ie["theta"])
+    gate_same = float(tolerance["delta_same_input"]["rtol"])
+    gate_cross = float(tolerance["delta_cross_path"]["rtol"])
     p_obs, p_ok = _delta_observability(pe["delta_ref64"], delta_p_measured,
-                                       b_p, pe["theta"], theta_pre)
+                                       b_p, pe["theta"], theta_pre,
+                                       gate_rtol=gate_same)
     i_obs, i_ok = _delta_observability(ie["delta_ref64"], delta_i_measured,
-                                       b_i, ie["theta"], theta_pre)
+                                       b_i, ie["theta"], theta_pre,
+                                       gate_rtol=gate_same)
     iv = propagate_intervals(i_g, theta_pre, m_old if m_old is not None else 0.0,
                              v_old if v_old is not None else 0.0,
-                             int(i_step), m_none=m_none, v_none=v_none,
-                             tensor_max_abs=float(np.max(np.abs(i_g))))
+                             int(i_step), m_none=m_none, v_none=v_none)
     p_m64 = None if p_m is None else p_m.astype(np.float64)
     p_v64 = None if p_v is None else p_v.astype(np.float64)
     i_m64 = None if i_m is None else i_m.astype(np.float64)
@@ -2416,25 +2555,20 @@ def _adamw_param_row(key: str, *, name: str, model: str, u: int,
         p_m64, i_m64, p_v64, i_v64,
         p_theta.astype(np.float64), i_theta.astype(np.float64),
         delta_p_measured, delta_i_measured, p_obs, i_obs,
-        tolerance["state_cross_path"])
+        tolerance["state_cross_path"], delta_rtol=gate_cross)
     theta_close = ((np.abs(p_theta.astype(np.float64)
                            - i_theta.astype(np.float64))
                     <= float(theta_spec["atol"])
                     + float(theta_spec["rtol"])
                     * np.abs(i_theta.astype(np.float64)))
-                   | ((np.abs(p_theta) <= float(ZERO_STATE_ABS))
-                      & (np.abs(i_theta) <= float(ZERO_STATE_ABS))))
-    theta_zero = (((p_theta == 0.0) != (i_theta == 0.0))
-                  & (np.abs(p_theta) > float(ZERO_STATE_ABS))
-                  & (np.abs(i_theta) > float(ZERO_STATE_ABS)))
+                   | ((p_theta == 0.0) & (i_theta == 0.0)))
+    theta_zero = (p_theta == 0.0) != (i_theta == 0.0)
     theta_sign = ((np.sign(p_theta) != np.sign(i_theta))
-                  & (np.abs(p_theta) > float(ZERO_STATE_ABS))
-                  & (np.abs(i_theta) > float(ZERO_STATE_ABS)))
+                  & (p_theta != 0.0) & (i_theta != 0.0))
     flags["theta_close"] = bool(theta_close.all())
     flags["theta_zero_disagreement"] = bool(theta_zero.any())
     flags["theta_sign_disagreement"] = bool(theta_sign.any())
-    flags["theta_ok"] = bool(theta_close.all() and not theta_zero.any()
-                             and not theta_sign.any())
+    flags["theta_ok"] = bool(theta_close.all())
     m_mask = np.ones_like(i_g, dtype=bool) if not m_none else np.zeros_like(
         i_g, dtype=bool)
     v_mask = np.ones_like(i_g, dtype=bool) if not v_none else np.zeros_like(
@@ -2512,6 +2646,7 @@ def _adamw_param_row(key: str, *, name: str, model: str, u: int,
     max_theta_ratio = float(np.max(np.abs(
         p_theta.astype(np.float64) - i_theta.astype(np.float64)) / theta_bound))
     state_ratios = []
+    state_rtol = float(tolerance["state_cross_path"]["rtol"])
     for a, b in ((p_m, i_m), (p_v, i_v)):
         if a is None or b is None:
             continue
@@ -2521,14 +2656,16 @@ def _adamw_param_row(key: str, *, name: str, model: str, u: int,
         if mask.any():
             state_ratios.append(float(np.max(
                 np.abs(aa[mask] - bb[mask])
-                / np.maximum(np.abs(aa[mask]), np.abs(bb[mask])))))
+                / (state_rtol * np.maximum(np.abs(aa[mask]),
+                                           np.abs(bb[mask]))))))
     max_state_ratio = max(state_ratios, default=0.0)
     delta_mask = np.asarray(p_obs, bool) & np.asarray(i_obs, bool)
     if delta_mask.any():
         max_delta_ratio = float(np.max(
             np.abs(np.asarray(delta_p_measured)[delta_mask]
                    - np.asarray(delta_i_measured)[delta_mask])
-            / (5e-4 * np.abs(np.asarray(delta_i_measured)[delta_mask]))))
+            / (gate_cross
+               * np.abs(np.asarray(delta_i_measured)[delta_mask]))))
     else:
         max_delta_ratio = 0.0
     same_delta = []
@@ -2540,7 +2677,7 @@ def _adamw_param_row(key: str, *, name: str, model: str, u: int,
         if mask.any():
             same_delta.append(float(np.max(
                 np.abs(np.asarray(measured)[mask] - np.asarray(ref)[mask])
-                / (5e-4 * np.abs(np.asarray(ref)[mask])))))
+                / (gate_same * np.abs(np.asarray(ref)[mask])))))
     max_same_delta_ratio = max(same_delta, default=0.0)
     return _row(
         key, model=model, update=u, parameter=name,
@@ -2571,6 +2708,47 @@ def _adamw_param_row(key: str, *, name: str, model: str, u: int,
 
 # --- I stage ---------------------------------------------------------------
 
+EVIDENCE_FAILURE_PREFIXES = {
+    "i_memory_replay", "i_prediction_replay", "i_noise_t", "i_noise_epsilon",
+    "i_x_t_replay", "i_alpha_x_t", "i_roster",
+    "i_unexpected_none_gradient", "i_step_tensor_missing", "i_step_tensor",
+    "i_output_cotangent_missing", "i_objective_missing", "i_stage_aborted",
+}
+
+
+def _expected_stage_rows(catalog: Mapping[str, Any], stage: str) -> list[str]:
+    if stage == "P":
+        return [key for key in catalog["rows"]
+                if key.startswith(("model_setup:", "input:"))]
+    return [key for key in catalog["rows"]
+            if not key.startswith(("model_setup:", "input:"))]
+
+
+def _stage_row_problems(rows: Sequence[Mapping[str, Any]],
+                        catalog: Mapping[str, Any], stage: str) -> list[str]:
+    want = Counter(_expected_stage_rows(catalog, stage))
+    got = Counter(str(r.get("key")) for r in rows)
+    problems: list[str] = []
+    if got != want:
+        missing = want - got
+        extra = got - want
+        if missing:
+            problems.append(f"{stage.lower()}_rows_missing:{len(missing)}")
+        if extra:
+            problems.append(f"{stage.lower()}_rows_extra:{len(extra)}")
+        if any(v > 1 for v in got.values()):
+            problems.append(f"{stage.lower()}_rows_duplicate")
+    for row in rows:
+        if row.get("status") == "missing":
+            problems.append(f"{stage.lower()}_row_evidence:{row.get('key')}")
+            break
+    return problems
+
+
+def _i_evidence_failures(failures: Sequence[str]) -> list[str]:
+    return [f for f in failures
+            if f.split(":", 1)[0] in EVIDENCE_FAILURE_PREFIXES]
+
 
 def _declared_tolerance(tolerance: Mapping[str, Any]) -> dict:
     return dict(tolerance.get("tolerances") or TOLERANCE_PROPOSALS)
@@ -2580,10 +2758,17 @@ def run_i_stage(root: Path, stage: str, attempt: str, t0: float,
                 budget: Mapping[str, Any], provider: SyntheticTrainingProvider,
                 counter: CallCounter, roster: Mapping[str, Any],
                 p_dir: Path, *, tolerance: Mapping[str, Any],
-                out_dir: Path | None = None) -> dict:
+                out_dir: Path | None = None,
+                guard: Callable[[str], None] | None = None) -> dict:
     base = Path(out_dir or (stage_dir(root, stage) / attempt))
     base.mkdir(parents=True, exist_ok=True)
+    _seed_stage_rng()
     deadline = t0 + float(budget["remaining_s"]) - float(budget["reserve_s"])
+
+    def check(unit: str) -> None:
+        if guard is not None:
+            guard(unit)
+
     tol = _declared_tolerance(tolerance)
     p_reports = {model: _p_sidecar(p_dir, model) for model in MODELS}
     ref_ctx = ReferenceContext(provider, counter)
@@ -2597,6 +2782,7 @@ def run_i_stage(root: Path, stage: str, attempt: str, t0: float,
 
     for model_type in MODELS:
         _ensure_deadline(deadline, 0.0, f"i_model_{model_type}")
+        check(f"i_model_{model_type}")
         p_rec = p_reports[model_type]
         trainer = provider.build_trainer(model_type, with_optimizer=False,
                                          counter=counter,
@@ -2616,6 +2802,7 @@ def run_i_stage(root: Path, stage: str, attempt: str, t0: float,
                           for name in names}
             for u in UPDATES:
                 _ensure_deadline(deadline, 0.0, f"i_u{u}")
+                check(f"i_u{u}")
                 pre_theta = {name: np.asarray(
                     p_rec["arrays"][f"theta_before/u{u}/{name}"], np.float32)
                     for name in names}
@@ -2643,6 +2830,7 @@ def run_i_stage(root: Path, stage: str, attempt: str, t0: float,
                 unit_index = _noise_unit_index()
                 for m in range(MICRO_COUNT):
                     _ensure_deadline(deadline, 0.0, f"i_u{u}_m{m}")
+                    check(f"i_u{u}_m{m}")
                     unit = provider.noise[unit_index[(u, m)]]
                     gen = None
                     if model_type == "diffusion":
@@ -2737,7 +2925,10 @@ def run_i_stage(root: Path, stage: str, attempt: str, t0: float,
                     cot_cmp = compare_gradient(
                         p_grad, cot, tol["output_cotangent"],
                         name=f"cotangent:{model_type}:u{u}:m{m}")
-                    if p_grad is None or not cot_cmp["ok"]:
+                    if p_grad is None:
+                        failures.append(
+                            f"i_output_cotangent_missing:{model_type}:u{u}:m{m}")
+                    elif not cot_cmp["ok"]:
                         failures.append(
                             f"i_output_cotangent:{model_type}:u{u}:m{m}")
                     cotangent_facts[m] = {
@@ -2765,6 +2956,7 @@ def run_i_stage(root: Path, stage: str, attempt: str, t0: float,
                     params = [p for _, p in trainer._named_parameters()]
                     cot32 = (total_cot / 4.0).to(dtype=torch.float32,
                                                  device=pred.device)
+                    check(f"i_vjp_{u}_{m}")
                     grads = torch.autograd.grad(
                         pred, params, grad_outputs=cot32,
                         allow_unused=True, retain_graph=False)
@@ -2881,6 +3073,7 @@ def run_i_stage(root: Path, stage: str, attempt: str, t0: float,
                 counter.add("explicit_reference_updates")
                 counter.add("diagnostic_parameter_update_events")
                 counter.add("optimizer_formula_checks")
+                check(f"i_update_{u}")
                 # final accumulated/clipped and AdamW state rows
                 for name in names:
                     p_accum = p_rec["arrays"].get(f"accum/u{u}/m3/{name}")
@@ -3070,6 +3263,12 @@ def run_i_stage(root: Path, stage: str, attempt: str, t0: float,
         report["arrays_path"] = path_for_record(npz_path)
         report["arrays_sha256"] = arrays_sha
         results[model_type] = report
+    catalog = row_catalog(roster)
+    evidence_failures = _i_evidence_failures(failures) + list(ref_ctx.problems)
+    row_problems = _stage_row_problems(rows, catalog, "I")
+    complete_evidence = (
+        not evidence_failures and not row_problems
+        and all(results[model].get("arrays_path") for model in MODELS))
     report = {
         "schema": "w1_real_training_update_i_stage_v1",
         "mode": "synthetic",
@@ -3078,13 +3277,22 @@ def run_i_stage(root: Path, stage: str, attempt: str, t0: float,
         "rows": rows,
         "failures": failures,
         "gaps": gaps,
-        # Gaps do not block F: F independently re-derives and preserves them.
+        "evidence_failures": evidence_failures,
+        "evidence_problems": row_problems,
+        "complete_evidence": bool(complete_evidence),
+        "numeric_passed": not failures,
+        # Numeric mismatches are complete evidence and must reach F, which
+        # replays and preserves them.  Gaps do not block F either.
         "passed": not failures,
     }
     write_json(base / "i_rows.json", rows)
     write_json(base / "i_report.json", report)
     return {"passed": not failures, "failures": failures,
             "gaps": gaps, "rows": rows,
+            "complete_evidence": bool(complete_evidence),
+            "evidence_failures": evidence_failures,
+            "evidence_problems": row_problems,
+            "numeric_passed": not failures,
             "paths": {model: results[model]["arrays_path"]
                       for model in MODELS},
             "report": path_for_record(base / "i_report.json"),
@@ -3124,16 +3332,17 @@ def _npz_compare_problems(saved_dir: Path, replay_dir: Path,
     return problems
 
 
-def _row_map(rows: Sequence[Mapping[str, Any]]) -> dict[str, str]:
-    return {str(r.get("key")): _canonical_sha256(r) for r in rows}
+def _row_key_counts(rows: Sequence[Mapping[str, Any]]) -> Counter:
+    return Counter(str(r.get("key")) for r in rows)
 
 
 def _row_compare_problems(saved: Sequence[Mapping[str, Any]],
                           fresh: Sequence[Mapping[str, Any]],
                           expected: Sequence[str]) -> list[str]:
+    """Compare saved and fresh rows as multisets, never via a key->row dict."""
     problems: list[str] = []
     want = Counter(expected)
-    got = Counter(str(r.get("key")) for r in fresh)
+    got = _row_key_counts(fresh)
     if got != want:
         missing = want - got
         extra = got - want
@@ -3143,102 +3352,300 @@ def _row_compare_problems(saved: Sequence[Mapping[str, Any]],
             problems.append(f"rows_extra:{len(extra)}")
         if any(v > 1 for v in got.values()):
             problems.append("rows_duplicate")
-    saved_map = _row_map(saved)
-    fresh_map = _row_map(fresh)
-    if set(saved_map) != set(fresh_map):
-        problems.append("saved_row_keys")
+    saved_keys = _row_key_counts(saved)
+    if saved_keys != got:
+        if saved_keys - got:
+            problems.append(f"saved_rows_missing:{len(saved_keys - got)}")
+        if got - saved_keys:
+            problems.append(f"saved_rows_extra:{len(got - saved_keys)}")
+        if any(v > 1 for v in saved_keys.values()):
+            problems.append("saved_rows_duplicate")
+    saved_by: dict[str, list[str]] = {}
+    fresh_by: dict[str, list[str]] = {}
+    for row in saved:
+        saved_by.setdefault(str(row.get("key")), []).append(
+            _canonical_sha256(row))
+    for row in fresh:
+        fresh_by.setdefault(str(row.get("key")), []).append(
+            _canonical_sha256(row))
+    for key in sorted(set(saved_by) & set(fresh_by)):
+        if Counter(saved_by[key]) != Counter(fresh_by[key]):
+            problems.append(f"row_drift:{key}")
+    return problems
+
+
+ROW_EVIDENCE_STATUSES = {"synthetic_verified", "none", "none_parameter",
+                         "mismatch", "presence_mismatch"}
+
+
+def _row_evidence_problems(rows: Sequence[Mapping[str, Any]]) -> list[str]:
+    problems: list[str] = []
+    for row in rows:
+        if row.get("status") not in ROW_EVIDENCE_STATUSES:
+            problems.append(f"row_evidence:{row.get('key')}:"
+                            f"{row.get('status')}")
+    return problems
+
+
+def _report_binding_problems(saved_dir: Path, replay_dir: Path, *,
+                             stage: str) -> list[str]:
+    """Bind saved reports, RNG facts and rows to the fresh replay.
+
+    F must not trust the saved summary: a doctored total, an all-zero RNG
+    digest or a duplicated row is only visible by reconciling the report and
+    both row multisets with the independently replayed run.
+    """
+    prefix = "p" if stage == "P" else "i"
+    problems: list[str] = []
+    try:
+        saved = read_json(Path(saved_dir) / f"{prefix}_report.json")
+        fresh = read_json(Path(replay_dir) / f"{prefix}_report.json")
+    except (OSError, ValueError, TypeError) as exc:
+        return [f"report_unreadable:{stage}:{type(exc).__name__}"]
+    if not isinstance(saved, Mapping) or not isinstance(fresh, Mapping):
+        return [f"report_not_mapping:{stage}"]
+    if saved.get("schema") != fresh.get("schema"):
+        problems.append(f"report_schema:{stage}")
+    if stage == "P":
+        keys = ("none_parameters", "leaf_presence", "state_presence",
+                "step_facts", "roster_problems", "optimizer_problems",
+                "failures", "gaps")
+        micro_keys = ("update", "micro", "windows", "loss", "parts",
+                      "prediction_hook_fires", "rng_before", "rng_after",
+                      "prediction_sha256", "prediction_grad_sha256",
+                      "prediction_grad_norm", "memory_sha256", "L5",
+                      "x_t_max_ratio", "alpha_t_hash")
     else:
-        for key, sha in fresh_map.items():
-            if saved_map.get(key) != sha:
-                problems.append(f"row_drift:{key}")
+        keys = ("failures", "gaps", "evidence_failures",
+                "evidence_problems", "complete_evidence", "numeric_passed")
+        micro_keys = ()
+    for model in MODELS:
+        a = (saved.get("models") or {}).get(model)
+        b = (fresh.get("models") or {}).get(model)
+        if not isinstance(a, Mapping) or not isinstance(b, Mapping):
+            problems.append(f"report_model_missing:{stage}:{model}")
+            continue
+        for key in keys:
+            if _canonical_sha256(a.get(key)) != _canonical_sha256(b.get(key)):
+                problems.append(f"report_drift:{stage}:{model}:{key}")
+        if a.get("arrays_sha256") != b.get("arrays_sha256"):
+            problems.append(f"report_arrays_sha:{stage}:{model}")
+        npz_path = Path(saved_dir) / f"{prefix}_{model}.npz"
+        if not npz_path.is_file():
+            problems.append(f"report_npz_missing:{stage}:{model}")
+        elif a.get("arrays_sha256") != sha256_file(npz_path):
+            problems.append(f"report_npz_sha:{stage}:{model}")
+        au = a.get("updates") or {}
+        bu = b.get("updates") or {}
+        if set(au) != set(bu):
+            problems.append(f"report_updates:{stage}:{model}")
+            continue
+        for u in UPDATES:
+            ua = au.get(f"u{u}") or {}
+            ub = bu.get(f"u{u}") or {}
+            for key in ("gnorm", "clip_coef", "clip_triggered",
+                        "independent_gnorm", "independent_coef",
+                        "objective", "coef", "continuity_problems"):
+                if key in ua or key in ub:
+                    if _canonical_sha256(ua.get(key)) != _canonical_sha256(
+                            ub.get(key)):
+                        problems.append(
+                            f"report_update_drift:{stage}:{model}:u{u}:{key}")
+            if not micro_keys:
+                continue
+            ma = ua.get("micros") or []
+            mb = ub.get("micros") or []
+            if len(ma) != MICRO_COUNT or len(mb) != MICRO_COUNT:
+                problems.append(f"report_micros:{stage}:{model}:u{u}")
+                continue
+            for m, (x, y) in enumerate(zip(ma, mb)):
+                for key in micro_keys:
+                    if key in x or key in y:
+                        if _canonical_sha256(x.get(key)) != _canonical_sha256(
+                                y.get(key)):
+                            problems.append(
+                                f"report_micro_drift:{stage}:{model}:u{u}"
+                                f":m{m}:{key}")
+    rows_path = Path(saved_dir) / f"{prefix}_rows.json"
+    try:
+        rows = read_json(rows_path)
+    except (OSError, ValueError, TypeError):
+        problems.append(f"rows_unreadable:{stage}")
+    else:
+        if _canonical_sha256(rows) != _canonical_sha256(saved.get("rows")):
+            problems.append(f"report_rows_file_disagree:{stage}")
     return problems
 
 
 def _worker_main(spec_path: str, out_dir: str) -> int:
-    """Spawned F worker: fresh models, disk re-read, full re-verification."""
+    """Spawned F worker: fresh models, disk re-read, full re-verification.
+
+    The worker inherits the parent's absolute deadline and re-checks the
+    running parent registration before every read, factory, micro, backward
+    and update.  A result snapshot is written in ``finally`` so the parent can
+    settle only calls that were actually made; a killed worker leaves no
+    snapshot and therefore no invented zero.
+    """
     spec = read_json(Path(spec_path))
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    runtime = configure_production_runtime()
-    problems: list[str] = []
-    if runtime["problems"]:
-        problems += [f"worker_runtime:{p}" for p in runtime["problems"]]
-    provider = SyntheticTrainingProvider(spec["config"],
-                                         device=spec.get("device", "cuda"))
-    provider.fixture_dir = Path(spec["fixture_dir"])
-    provider.load_fixture()
-    roster = read_json(provider.fixture_dir / "roster.json")
     counter = CallCounter(spec["remaining_caps"])
-    # Rebuild the R0 schedule once (counted) and compare with the fixture.
-    schedule = draw_noise_path(NOISE_SEED)
-    counter.add("cpu_draw_units", DRAW_UNITS_PER_PATH)
-    fixture_noise = provider.noise
-    schedule_ok = True
-    for a, b in zip(schedule, fixture_noise):
-        if (not torch.equal(a["t"], b["t"])
-                or not torch.equal(a["epsilon"], b["epsilon"])):
-            schedule_ok = False
-    if not schedule_ok:
-        problems.append("schedule_rebuild_mismatch")
-    p_dir = out / "production_replay"
-    i_dir = out / "independent_replay"
-    p_replay = run_p_stage(
-        out, "P", "F-P", _now(),
-        {"remaining_s": 10 ** 6, "reserve_s": 0.0}, provider, counter, roster,
-        out_dir=p_dir)
-    p_problems = _npz_compare_problems(Path(spec["p_dir"]), p_dir, MODELS,
-                                       prefix="p")
-    problems += p_problems
-    i_replay = run_i_stage(
-        out, "I", "F-I", _now(),
-        {"remaining_s": 10 ** 6, "reserve_s": 0.0}, provider, counter, roster,
-        p_dir, tolerance=spec["tolerance"], out_dir=i_dir)
-    i_problems = _npz_compare_problems(Path(spec["i_dir"]), i_dir, MODELS,
-                                       prefix="i")
-    problems += i_problems
-    saved_rows = read_json(Path(spec["i_dir"]) / "i_rows.json")
-    fresh_rows = i_replay["rows"]
-    catalog = row_catalog(roster)
-    saved_p_rows = read_json(Path(spec["p_dir"]) / "p_rows.json")
-    all_fresh = list(p_replay["rows"]) + list(fresh_rows)
-    row_problems = _row_compare_problems(
-        list(saved_rows) + list(saved_p_rows), all_fresh, catalog["rows"])
-    problems += row_problems
-    if not p_replay["passed"]:
-        problems += [f"p_replay:{f}" for f in p_replay["failures"]]
-    if not i_replay["passed"]:
-        problems += [f"i_replay:{f}" for f in i_replay["failures"]]
-    expected_f = dict(STAGE_NOMINAL["F"])
-    expected_f["scene_setup_mj_forward"] = 0
-    counts = counter.snapshot()["counts"]
-    call_problems = [
-        f"f_call_matrix:{kind}:{counts[kind]}!={expected_f[kind]}"
-        for kind in CALL_KINDS if counts[kind] != expected_f[kind]]
-    problems += call_problems
-    result = {
-        "schema": "w1_real_training_update_f_worker_v1",
-        "pid": os.getpid(),
-        "ppid": os.getppid(),
-        "python": sys.version.split()[0],
-        "runtime": runtime,
-        "fixture_dir": path_for_record(provider.fixture_dir),
-        "p_replay": p_replay,
-        "i_replay_rows": len(fresh_rows),
-        "schedule_rebuild_ok": schedule_ok,
-        "npz_problems": p_problems + i_problems,
-        "row_problems": row_problems,
-        "call_matrix_problems": call_problems,
-        "problems": problems,
-        "counts": counter.snapshot(),
-        "complete_evidence": not problems,
-        "failures": (p_replay["failures"] + i_replay["failures"]
-                     + [r["failure"] for r in fresh_rows if r.get("failure")]),
-        "gaps": (p_replay["gaps"] + i_replay["gaps"]
-                 + [g for r in fresh_rows for g in (r.get("gaps") or [])]),
-        "advisory": read_json(provider.fixture_dir / "fixture.json"),
-        "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-    }
-    write_json(out / "worker_result.json", result)
+    deadline = float(spec["deadline_perf_counter"])
+    reserve = float(spec.get("reserve_s", 0.0))
+    root = Path(spec["run_root"])
+    attempt = str(spec["attempt"])
+    parent_record = {"registration_sha256": spec.get("registration_sha256"),
+                     "reserve_s": reserve}
+    problems: list[str] = []
+    failures: list[str] = []
+    gaps: list[str] = []
+    runtime: dict = {}
+    provider = None
+    p_replay = None
+    i_replay = None
+    saved_rows: list = []
+    saved_p_rows: list = []
+    fresh_rows: list = []
+    schedule_ok = False
+    p_problems: list[str] = []
+    i_problems: list[str] = []
+    row_problems: list[str] = []
+    report_problems: list[str] = []
+    call_problems: list[str] = []
+    aborted = False
+
+    def guard(unit: str) -> None:
+        _ensure_deadline(deadline, reserve, unit)
+        admission = unit_admission(root, "F", attempt, parent_record,
+                                   deadline=deadline)
+        if admission:
+            raise TimeoutError(f"unit_admission:{unit}:{','.join(admission)}")
+
+    try:
+        guard("worker_start")
+        runtime = configure_production_runtime()
+        if runtime["problems"]:
+            problems += [f"worker_runtime:{p}" for p in runtime["problems"]]
+        guard("fixture_load")
+        provider = SyntheticTrainingProvider(spec["config"],
+                                             device=spec.get("device", "cuda"))
+        provider.fixture_dir = Path(spec["fixture_dir"])
+        provider.load_fixture()
+        roster = read_json(provider.fixture_dir / "roster.json")
+        # Rebuild the R0 schedule once (counted) and compare with the fixture.
+        guard("schedule_rebuild")
+        schedule = draw_noise_path(NOISE_SEED)
+        counter.add("cpu_draw_units", DRAW_UNITS_PER_PATH)
+        fixture_noise = provider.noise
+        schedule_ok = True
+        for a, b in zip(schedule, fixture_noise):
+            if (not torch.equal(a["t"], b["t"])
+                    or not torch.equal(a["epsilon"], b["epsilon"])):
+                schedule_ok = False
+        if not schedule_ok:
+            problems.append("schedule_rebuild_mismatch")
+        p_dir = out / "production_replay"
+        i_dir = out / "independent_replay"
+        guard("p_replay_start")
+        p_replay = run_p_stage(
+            out, "P", "F-P", _now(),
+            {"remaining_s": max(0.0, deadline - _now() + reserve),
+             "reserve_s": reserve}, provider, counter, roster,
+            out_dir=p_dir, guard=guard)
+        guard("p_replay_compare")
+        p_problems = _npz_compare_problems(Path(spec["p_dir"]), p_dir, MODELS,
+                                           prefix="p")
+        problems += p_problems
+        guard("i_replay_start")
+        i_replay = run_i_stage(
+            out, "I", "F-I", _now(),
+            {"remaining_s": max(0.0, deadline - _now() + reserve),
+             "reserve_s": reserve}, provider, counter, roster,
+            p_dir, tolerance=spec["tolerance"], out_dir=i_dir, guard=guard)
+        guard("i_replay_compare")
+        i_problems = _npz_compare_problems(Path(spec["i_dir"]), i_dir, MODELS,
+                                           prefix="i")
+        problems += i_problems
+        guard("row_binding")
+        try:
+            saved_rows = read_json(Path(spec["i_dir"]) / "i_rows.json")
+            saved_p_rows = read_json(Path(spec["p_dir"]) / "p_rows.json")
+        except (OSError, ValueError, TypeError) as exc:
+            problems.append(f"saved_rows_unreadable:{type(exc).__name__}")
+            saved_rows, saved_p_rows = [], []
+        fresh_rows = list(i_replay["rows"])
+        catalog = row_catalog(roster)
+        all_fresh = list(p_replay["rows"]) + list(fresh_rows)
+        row_problems = _row_compare_problems(
+            list(saved_rows) + list(saved_p_rows), all_fresh, catalog["rows"])
+        row_problems += _row_evidence_problems(all_fresh)
+        expected_p = _expected_stage_rows(catalog, "P")
+        expected_i = _expected_stage_rows(catalog, "I")
+        if _row_key_counts(saved_p_rows) != Counter(expected_p):
+            row_problems.append("saved_p_rows_scope")
+        if _row_key_counts(saved_rows) != Counter(expected_i):
+            row_problems.append("saved_i_rows_scope")
+        problems += row_problems
+        report_problems = (
+            _report_binding_problems(Path(spec["p_dir"]), p_dir, stage="P")
+            + _report_binding_problems(Path(spec["i_dir"]), i_dir, stage="I"))
+        problems += report_problems
+        # Replay failures are measured numeric evidence, not evidence loss:
+        # they are preserved in ``failures`` so F can conclude a mismatch.
+        failures += list(p_replay["failures"]) + list(i_replay["failures"])
+        gaps += list(p_replay["gaps"]) + list(i_replay["gaps"])
+        if not p_replay.get("complete_evidence", False):
+            problems.append("p_replay_incomplete_evidence")
+        if not i_replay.get("complete_evidence", False):
+            problems.append("i_replay_incomplete_evidence")
+        expected_f = dict(STAGE_NOMINAL["F"])
+        expected_f["scene_setup_mj_forward"] = 0
+        counts = counter.snapshot()["counts"]
+        call_problems = [
+            f"f_call_matrix:{kind}:{counts[kind]}!={expected_f[kind]}"
+            for kind in CALL_KINDS if counts[kind] != expected_f[kind]]
+        problems += call_problems
+    except TimeoutError as exc:
+        aborted = True
+        problems.append(f"f_worker_aborted:{exc}")
+    except Exception as exc:  # noqa: BLE001 -- a broken worker is evidence
+        aborted = True
+        problems.append(f"f_worker_exception:{type(exc).__name__}:{exc}")
+    finally:
+        snapshot = counter.snapshot()
+        result = {
+            "schema": "w1_real_training_update_f_worker_v1",
+            "pid": os.getpid(),
+            "ppid": os.getppid(),
+            "python": sys.version.split()[0],
+            "runtime": runtime,
+            "fixture_dir": (path_for_record(provider.fixture_dir)
+                            if provider is not None else None),
+            "p_replay": p_replay,
+            "i_replay": None if i_replay is None else {
+                "complete_evidence": i_replay.get("complete_evidence"),
+                "numeric_passed": i_replay.get("numeric_passed"),
+                "rows": len(i_replay.get("rows") or []),
+                "report": i_replay.get("report"),
+            },
+            "i_replay_rows": len(fresh_rows),
+            "schedule_rebuild_ok": schedule_ok,
+            "npz_problems": p_problems + i_problems,
+            "row_problems": row_problems,
+            "report_problems": report_problems,
+            "call_matrix_problems": call_problems,
+            "problems": problems,
+            "aborted": aborted,
+            "counts": snapshot,
+            "complete_evidence": not problems,
+            "failures": failures,
+            "gaps": gaps,
+            "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        }
+        try:
+            write_json(out / "worker_result.json", result)
+        except (OSError, ValueError, TypeError):
+            return 3
     return 0 if not problems else 2
 
 
@@ -3250,6 +3657,7 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float,
                 project_root: Path = PROJECT_ROOT) -> dict:
     base = Path(out_dir or (stage_dir(root, stage) / attempt))
     base.mkdir(parents=True, exist_ok=True)
+    deadline = t0 + float(budget["remaining_s"]) - float(budget["reserve_s"])
     base_counts = counter.snapshot()["counts"]
     remaining = {kind: int(CALL_CAPS[kind]) - int(base_counts[kind])
                  for kind in CALL_KINDS}
@@ -3261,7 +3669,21 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float,
         "device": provider.device,
         "tolerance": dict(tolerance),
         "remaining_caps": remaining,
+        "deadline_perf_counter": deadline,
+        "reserve_s": float(budget["reserve_s"]),
+        "run_root": path_for_record(Path(root)),
+        "stage": stage,
+        "attempt": attempt,
+        "registration_sha256": None,
     }
+    try:
+        rows = [r for r in load_index(root)
+                if r.get("stage") == stage and r.get("attempt") == attempt]
+    except (OSError, ValueError, TypeError):
+        rows = []
+    if len(rows) == 1:
+        spec["registration_sha256"] = rows[0].get(
+            "execution_registration_sha256")
     spec_path = base / "worker_spec.json"
     write_json(spec_path, spec)
     worker_dir = base / "worker"
@@ -3273,20 +3695,32 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float,
     env = dict(os.environ)
     env["PYTHONPATH"] = str(Path(project_root) / "src") + os.pathsep + env.get(
         "PYTHONPATH", "")
-    started = _now()
-    try:
-        proc = subprocess.run(
-            [sys.executable, "-c", entry, str(spec_path), str(worker_dir)],
-            cwd=str(project_root), env=env, capture_output=True, text=True,
-            timeout=float(budget["remaining_s"]))
-        returncode, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
-    except subprocess.TimeoutExpired as exc:
-        returncode = -9
-        stdout = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
-        stderr = (exc.stderr or "") if isinstance(exc.stderr, str) else ""
-    wall = _now() - started
-    result_path = worker_dir / "worker_result.json"
-    result = read_json(result_path) if result_path.is_file() else None
+    problems: list[str] = []
+    result: dict | None = None
+    returncode = -1
+    stdout = stderr = ""
+    wall = 0.0
+    if time.perf_counter() + float(budget["reserve_s"]) >= deadline:
+        problems.append("f_stage_deadline_before_worker")
+        result = {"problems": list(problems), "counts": None,
+                  "failures": [], "gaps": [], "aborted": True}
+    else:
+        timeout = max(0.1, min(float(budget["remaining_s"]),
+                               deadline - time.perf_counter()))
+        started = _now()
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-c", entry, str(spec_path), str(worker_dir)],
+                cwd=str(project_root), env=env, capture_output=True, text=True,
+                timeout=timeout)
+            returncode, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
+        except subprocess.TimeoutExpired as exc:
+            returncode = -9
+            stdout = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
+            stderr = (exc.stderr or "") if isinstance(exc.stderr, str) else ""
+        wall = _now() - started
+        result_path = worker_dir / "worker_result.json"
+        result = read_json(result_path) if result_path.is_file() else None
     process = {
         "pid": None if result is None else result.get("pid"),
         "ppid": None if result is None else result.get("ppid"),
@@ -3297,20 +3731,23 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float,
         "stdout_tail": stdout[-2000:],
         "stderr_tail": stderr[-2000:],
         "exit_reason": ("ok" if returncode == 0 else
-                        "timeout" if returncode == -9 else "nonzero_exit"),
+                        "timeout" if returncode == -9 else
+                        "not_spawned" if returncode == -1 else "nonzero_exit"),
     }
-    problems: list[str] = []
     if result is None:
         problems.append("f_worker_result_missing")
-        result = {"problems": problems, "counts": {"schema": None}}
-    if returncode != 0:
+        result = {"problems": [], "counts": None, "failures": [], "gaps": [],
+                  "aborted": True}
+    problems += list(result.get("problems") or [])
+    if returncode != 0 and "f_stage_deadline_before_worker" not in problems:
         problems.append(f"f_worker_exit:{returncode}")
     if (process["pid"] is not None
             and process["pid"] == process["parent_pid"]):
         problems.append("f_worker_not_a_fresh_process")
     if process["ppid"] is not None and process["ppid"] != os.getpid():
         problems.append("f_worker_ppid")
-    counts = (result.get("counts") or {}).get("counts")
+    counts = (result.get("counts") or {}).get("counts") \
+        if isinstance(result.get("counts"), Mapping) else None
     merged = True
     if not isinstance(counts, Mapping):
         problems.append("f_worker_counts_missing")
@@ -3319,7 +3756,7 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float,
         try:
             for kind in CALL_KINDS:
                 value = counts.get(kind)
-                if not _json_int(value):
+                if not _json_int(value) or int(value) < 0:
                     raise ValueError(kind)
                 counter.add(kind, int(value))
         except (KeyError, ValueError, UpdateCallBudgetExceeded) as exc:
@@ -3353,7 +3790,9 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float,
         "gap_kinds": dict(Counter(g.split(":")[-1] for g in gaps)),
         "worker": process,
         "worker_result": result,
-        "call_delta": counts if isinstance(counts, Mapping) else None,
+        "worker_snapshot_ok": bool(merged),
+        "deadline_perf_counter": deadline,
+        "call_delta": dict(counts) if merged else None,
         "call_balance": counter.snapshot(),
         "training_updates": int(counter.counts["native_adamw_steps"]
                                 + counter.counts["explicit_reference_updates"]),
@@ -3384,7 +3823,7 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float,
         "final": final,
         "report": path_for_record(final_path),
         "summary": final,
-        "call_delta": counts if isinstance(counts, Mapping) else {},
+        "call_delta": dict(counts) if merged else None,
         "units": [],
     }
 
@@ -3910,9 +4349,17 @@ def _report_hashes(row: dict) -> dict:
 
 def finish_attempt(root: Path, stage: str, attempt: str, t0: float,
                    budget: dict, row: dict, *, status: str = "done",
-                   extra: dict | None = None) -> SealResult:
-    """running -> publishing -> seal; non-consumable on unproven coverage."""
+                   extra: dict | None = None,
+                   cost_floor: float | None = None) -> SealResult:
+    """running -> publishing -> seal; non-consumable on unproven coverage.
+
+    ``cost_floor`` preserves a previously published cost when an attempt is
+    later withdrawn; withdrawal must never reduce the billed wall time.
+    """
     extra = dict(extra or {})
+    floor = 0.0 if cost_floor is None else float(cost_floor)
+    if not _nonneg(floor):
+        raise ValueError("cost floor must be finite and non-negative")
     (stage_dir(root, stage) / attempt).mkdir(parents=True, exist_ok=True)
     row = {**row, "stage": stage, "attempt": attempt,
            "accounting_schema": ACCOUNTING_SCHEMA, "cohort_id": COHORT_ID}
@@ -3931,8 +4378,11 @@ def finish_attempt(root: Path, stage: str, attempt: str, t0: float,
     def reserve() -> float:
         return max(SEAL_TAIL_RESERVE_S, 2.0 * max(writes, default=0.0))
 
+    def elapsed() -> float:
+        return max(floor, time.perf_counter() - t0)
+
     def publish(rw: dict) -> dict:
-        sampled = max(0.0, time.perf_counter() - t0)
+        sampled = elapsed()
         rw = {**rw, "status": "publishing", "measured_wall_s": sampled,
               "sampled_wall_s": sampled}
         timed(upsert_index, root, stage, attempt, rw)
@@ -3943,13 +4393,13 @@ def finish_attempt(root: Path, stage: str, attempt: str, t0: float,
         return rw
 
     remaining = float(budget["remaining_s"])
-    overrun = (time.perf_counter() - t0) >= remaining
+    overrun = elapsed() >= remaining
     if overrun:
         row.update(complete=False,
                    incomplete_reason="budget_exceeded_after_registration")
         status = "incomplete"
     row = publish(row)
-    if not overrun and (time.perf_counter() - t0) >= remaining:
+    if not overrun and elapsed() >= remaining:
         overrun = True
         row.update(complete=False,
                    incomplete_reason="budget_exceeded_after_publication")
@@ -3957,7 +4407,7 @@ def finish_attempt(root: Path, stage: str, attempt: str, t0: float,
         row = publish(row)
 
     def terminal(rw: dict, st: str, cost: float, tail: float) -> dict:
-        sampled = max(0.0, time.perf_counter() - t0)
+        sampled = elapsed()
         rw = {**rw, "status": st, "measured_wall_s": cost,
               "sampled_wall_s": sampled, "seal_tail_reserve_s": tail}
         timed(upsert_index, root, stage, attempt, rw)
@@ -3968,14 +4418,14 @@ def finish_attempt(root: Path, stage: str, attempt: str, t0: float,
         return rw
 
     tail = reserve()
-    if not overrun and (time.perf_counter() - t0) + tail >= remaining:
+    if not overrun and elapsed() + tail >= remaining:
         overrun = True
         row.update(complete=False,
                    incomplete_reason="budget_exceeded_before_seal")
         status = "incomplete"
         row = publish(row)
     try:
-        row = terminal(row, status, time.perf_counter() - t0 + tail, tail)
+        row = terminal(row, status, elapsed() + tail, tail)
     except (OSError, ValueError, TypeError):
         row.update(status="publishing", complete=False,
                    incomplete_reason="seal_write_failed")
@@ -3986,7 +4436,7 @@ def finish_attempt(root: Path, stage: str, attempt: str, t0: float,
         problems.append("seal_write_failed")
         return SealResult(False, row, problems)
     for _ in range(SEAL_VERIFY_ROUNDS):
-        post = time.perf_counter() - t0
+        post = elapsed()
         if not overrun and post >= remaining:
             overrun = True
             row.update(complete=False,
@@ -4115,43 +4565,138 @@ def settle_stage_calls(root: Path, stage: str, attempt: str,
     return path
 
 
+def _report_claims_complete(report_path: Path | None) -> bool:
+    if report_path is None or not Path(report_path).is_file():
+        return False
+    try:
+        data = read_json(Path(report_path))
+    except (OSError, ValueError, TypeError):
+        return True  # unreadable report cannot be proven non-claiming
+    if not isinstance(data, Mapping):
+        return True
+    return bool(data.get("complete_evidence")
+                or data.get("covered_contract_passed")
+                or data.get("passed"))
+
+
+def _attempt_row(root: Path, stage: str, attempt: str) -> dict:
+    try:
+        rows = [r for r in load_index(root)
+                if r.get("stage") == stage and r.get("attempt") == attempt]
+    except (OSError, ValueError, TypeError):
+        return {"attempt": attempt}
+    return dict(rows[0]) if len(rows) == 1 else {"attempt": attempt}
+
+
+def _amend_final_report(report_path: Path | None,
+                        problems: Sequence[str]) -> bool:
+    """Make a disk summary retract its completion claim before resealing."""
+    if report_path is None or not Path(report_path).is_file():
+        return False
+    try:
+        data = read_json(Path(report_path))
+        if not isinstance(data, dict):
+            return False
+        current = data.get("verification_problems")
+        merged = list(current) if isinstance(current, list) else []
+        for item in problems:
+            if item not in merged:
+                merged.append(item)
+        data.update(conclusion="audit_incomplete", complete_evidence=False,
+                    covered_contract_passed=False,
+                    verification_problems=merged)
+        write_json(Path(report_path), data)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _valid_call_snapshot(snapshot: Any) -> bool:
+    if not isinstance(snapshot, Mapping) or set(snapshot) != set(CALL_KINDS):
+        return False
+    return all(_json_int(snapshot[kind]) and int(snapshot[kind]) >= 0
+               for kind in CALL_KINDS)
+
+
+def _settle_f_calls(root: Path, stage: str, attempt: str,
+                    snapshot: Any) -> tuple[bool, list[str]]:
+    """Settle only a complete worker snapshot; otherwise leave it unknown."""
+    if not _valid_call_snapshot(snapshot):
+        return False, ["f_call_settlement_unknown"]
+    try:
+        settle_stage_calls(root, stage, attempt,
+                           {"counts": {kind: int(snapshot[kind])
+                                       for kind in CALL_KINDS}})
+        return True, []
+    except (OSError, ValueError, KeyError) as exc:
+        return False, [f"reservation_settle:{type(exc).__name__}"]
+
+
 def withdraw_attempt_claim(root: Path, stage: str, attempt: str,
                            report_path: Path | None, row: dict,
                            reasons: Sequence[str], *, reason: str,
                            t0: float, budget: dict) -> tuple[dict, list[str], bool]:
-    """Rewrite a published pass claim to incomplete and reseal honestly."""
+    """Rewrite a published pass claim to incomplete and reseal honestly.
+
+    The rewrite and reseal follow the same publishing -> terminal protocol as
+    ``finish_attempt`` and keep the previously billed wall time as a floor.
+    If report rewriting or seal-cost coverage cannot be proven, the row is
+    left ``publishing`` (non-consumable) and the third value is False.
+    """
     problems: list[str] = []
     row = dict(row)
+    old_cost = float(row.get("measured_wall_s", 0.0) or 0.0)
+    if not _nonneg(old_cost):
+        old_cost = 0.0
     row.update(complete=False, status="incomplete", incomplete_reason=reason,
                withdrawn_reasons=list(reasons))
-    if report_path is not None and Path(report_path).is_file():
+    rewritten = report_path is not None and Path(report_path).is_file()
+    if rewritten:
         try:
-            data = read_json(report_path)
-            if isinstance(data, dict):
-                data.update(conclusion="audit_incomplete",
-                            complete_evidence=False,
-                            covered_contract_passed=False,
-                            withdrawn_reasons=list(reasons))
-                write_json(report_path, data)
-                row["report"] = path_for_record(report_path)
-                row["summary"] = path_for_record(report_path)
+            data = read_json(Path(report_path))
+            if not isinstance(data, dict):
+                raise ValueError("report_not_mapping")
+            data.update(conclusion="audit_incomplete",
+                        complete_evidence=False,
+                        covered_contract_passed=False,
+                        withdrawn_reasons=list(reasons))
+            write_json(Path(report_path), data)
+            row["report"] = path_for_record(Path(report_path))
+            row["summary"] = path_for_record(Path(report_path))
         except (OSError, ValueError, TypeError) as exc:
             problems.append(f"withdraw_report:{type(exc).__name__}")
-    try:
-        upsert_index(root, stage, attempt, row)
-        upsert_cost(root, stage, attempt,
-                    max(float(row.get("measured_wall_s", 0.0)),
-                        time.perf_counter() - t0),
-                    {"complete": False, "incomplete_reason": reason,
-                     "withdrawn_reasons": list(reasons)}, "incomplete")
-    except (OSError, ValueError, TypeError) as exc:
-        problems.append(f"withdraw_persist:{type(exc).__name__}")
+            # The pass claim cannot be rewritten: at least publish a
+            # non-consumable publishing row so the old claim is not sealed as
+            # a successful terminal state.
+            try:
+                upsert_index(root, stage, attempt,
+                             {**row, "status": "publishing",
+                              "measured_wall_s": max(
+                                  old_cost, time.perf_counter() - t0),
+                              "incomplete_reason": "withdraw_report_failed"})
+                upsert_cost(root, stage, attempt,
+                            max(old_cost, time.perf_counter() - t0),
+                            {"complete": False,
+                             "incomplete_reason": "withdraw_report_failed",
+                             "withdrawn_reasons": list(reasons)},
+                            "publishing")
+            except (OSError, ValueError, TypeError) as exc2:
+                problems.append(f"withdraw_publish:{type(exc2).__name__}")
+            return row, problems, False
+    sealed = finish_attempt(
+        root, stage, attempt, t0, budget, row, status="incomplete",
+        extra={"stage": stage, "withdrawn_reasons": list(reasons),
+               "withdrawn_reason": reason},
+        cost_floor=old_cost)
+    problems += list(sealed.problems)
     try:
         _row, state_problems = stage_state(root, stage)
     except (OSError, ValueError, TypeError):
         state_problems = ["stage_unreadable"]
-    unknown = [p for p in state_problems]
-    return row, problems, unknown == []
+    unknown = [p for p in state_problems
+               if p not in ("attempt_not_complete", "attempt_status_not_done")]
+    proven = bool(sealed.terminal and not unknown and not sealed.problems)
+    return sealed.row, problems, proven
 
 # ---------------------------------------------------------------------------
 # parent anchors, implementation identity and R0
@@ -4306,21 +4851,69 @@ def _fixture_schema_problems(provider: SyntheticTrainingProvider) -> list[str]:
     return problems
 
 
-def _resource_bound(roster: Mapping[str, Any]) -> dict:
-    element_bytes = 4
-    param_bytes = sum(int(e["numel"]) for model in MODELS
-                      for e in roster["models"][model]["parameters"]) * element_bytes
-    # contribution/accum/pre/post/theta/state copies across P, I and F.
-    per_param_copies = 64
-    parameter_arrays = param_bytes * per_param_copies
-    pred_bytes = 4 * WINDOW * 38 * 4
-    small_arrays = pred_bytes * 256
-    total = parameter_arrays + small_arrays + 64 * 1024 * 1024
-    return {
+def _artifact_classes(roster: Mapping[str, Any]) -> dict:
+    """Byte upper bound per artifact class for both attempt slots.
+
+    Counts come from the actual save sites, not a fixed copy multiplier:
+    P stores theta_init + 2 per micro (accum, contrib) + 8 update states;
+    I stores 17 float64 AdamW/propagation buffers, 7 float32 row buffers and
+    3 float32 explicit-update arrays per update; F stores a P replay plus an
+    I replay.  Two attempts per stage are retained under the cohort cap.
+    """
+    numel = sum(int(e["numel"]) for model in MODELS
+                for e in roster["models"][model]["parameters"])
+    param_bytes = numel * 4
+    p_copies = (1                                    # theta_init
+                + 2 * MICRO_COUNT * len(UPDATES)     # accum + contrib
+                + 8 * len(UPDATES))                  # theta/pre/post/state
+    i_f64_copies = 17 * len(UPDATES)                 # AdamW + intervals
+    i_f32_copies = (7 + 3) * len(UPDATES)            # row + explicit update
+    forward_bytes = (MICRO_COUNT * len(UPDATES) * len(MODELS)
+                     * 5 * int(MODEL_CONFIG["micro_batch"]) * WINDOW * 38 * 4)
+    p_json = 32 * 2 ** 20
+    i_json = 64 * 2 ** 20
+    f_json = 64 * 2 ** 20
+    p_bytes = int(param_bytes * p_copies + forward_bytes + p_json)
+    i_bytes = int(param_bytes * (i_f64_copies * 2 + i_f32_copies)
+                  + forward_bytes + i_json)
+    f_bytes = int(p_bytes + i_bytes + f_json)
+    fixture_bytes = 64 * 2 ** 20
+    registration_bytes = 8 * 2 ** 20
+    attempts = 2
+    cohort_bytes = int(attempts * (p_bytes + i_bytes + f_bytes)
+                       + fixture_bytes + registration_bytes)
+    classes = {
         "parameter_bytes": param_bytes,
-        "parameter_array_copies": per_param_copies,
-        "estimated_artifacts_bytes": int(total),
+        "p_parameter_array_bytes": int(param_bytes * p_copies),
+        "i_float64_propagation_bytes": int(param_bytes * i_f64_copies * 2),
+        "i_float32_array_bytes": int(param_bytes * i_f32_copies),
+        "forward_array_bytes_per_attempt": int(forward_bytes),
+        "p_json_bytes": p_json,
+        "i_json_bytes": i_json,
+        "f_json_bytes": f_json,
+        "fixture_bytes": fixture_bytes,
+        "registration_bytes": registration_bytes,
+        "p_attempt_bytes": p_bytes,
+        "i_attempt_bytes": i_bytes,
+        "f_attempt_bytes": f_bytes,
+        "attempts_per_stage": attempts,
+    }
+    return {"classes": classes, "cohort_bytes": cohort_bytes,
+            "one_chain_bytes": int(p_bytes + i_bytes + f_bytes
+                                   + fixture_bytes)}
+
+
+def _resource_bound(roster: Mapping[str, Any]) -> dict:
+    artifacts = _artifact_classes(roster)
+    total = int(artifacts["cohort_bytes"])
+    classes = dict(artifacts["classes"])
+    classes["one_chain_bytes"] = int(artifacts["one_chain_bytes"])
+    classes["cohort_bytes"] = total
+    return {
+        **classes,
+        "estimated_artifacts_bytes": total,
         "estimated_artifacts_gib": round(total / 2 ** 30, 3),
+        "one_chain_gib": round(artifacts["one_chain_bytes"] / 2 ** 30, 3),
         "artifact_cap_gib": 16,
         "host_peak_cap_gib": 32,
         "gpu_peak_cap_gib": 22,
@@ -4447,6 +5040,7 @@ def run_r0(root: Path, stage: str, attempt: str, t0: float,
         "call_nominal": {k: dict(v) for k, v in STAGE_NOMINAL.items()},
         "tolerances": tolerance.get("tolerances"),
         "tiny_zero_floors": {"gradient_abs": ZERO_GRADIENT_ABS,
+                             "gradient_noise_scale": ZERO_GRADIENT_NOISE_SCALE,
                              "state_abs": ZERO_STATE_ABS},
         "parents": parents,
         "checkpoints": checkpoints,
@@ -4711,6 +5305,18 @@ def _ratio_record(ratio: float, *, source: str) -> dict:
             "max_ratio_of_proposal": float(ratio), "source": source}
 
 
+def _merge_ratio_records(records: Sequence[Mapping[str, Any]]) -> dict:
+    """Keep the largest normalized error over every applicable positive case."""
+    usable = [r for r in records if r is not None]
+    if not usable:
+        return _ratio_record(0.0, source="none")
+    best = max(usable, key=lambda r: float(
+        r.get("max_ratio_of_proposal", -math.inf)))
+    sources = [str(r.get("source")) for r in usable if r.get("source")]
+    return {**dict(best), "source": "+".join(dict.fromkeys(sources)),
+            "sources": sources}
+
+
 def _scalar_case(theta: float, m: float, v: float, step: int,
                  g_p: float, g_i: float, *, m_none: bool,
                  post_p: float | None = None,
@@ -4732,10 +5338,14 @@ def _scalar_case(theta: float, m: float, v: float, step: int,
     d_i = ti.astype(np.float64) - np.float64(theta)
     b_p = _delta_write_bound(rp["theta"])
     b_i = _delta_write_bound(ri["theta"])
+    gate_same = float(TOLERANCE_PROPOSALS["delta_same_input"]["rtol"])
+    gate_cross = float(TOLERANCE_PROPOSALS["delta_cross_path"]["rtol"])
     obs_p, ok_p = _delta_observability(rp["delta_ref64"], d_p, b_p,
-                                       rp["theta"], np.array([theta], np.float32))
+                                       rp["theta"], np.array([theta], np.float32),
+                                       gate_rtol=gate_same)
     obs_i, ok_i = _delta_observability(ri["delta_ref64"], d_i, b_i,
-                                       ri["theta"], np.array([theta], np.float32))
+                                       ri["theta"], np.array([theta], np.float32),
+                                       gate_rtol=gate_same)
     p_formula = _formula_state_problems(
         rp, tp, mp, vp, step, m_none=m_none, v_none=m_none,
         expected_step=step)
@@ -4748,7 +5358,8 @@ def _scalar_case(theta: float, m: float, v: float, step: int,
         rp["m"].astype(np.float64), ri["m"].astype(np.float64),
         rp["v"].astype(np.float64), ri["v"].astype(np.float64),
         rp["theta"].astype(np.float64), ri["theta"].astype(np.float64),
-        d_p, d_i, obs_p, obs_i, TOLERANCE_PROPOSALS["state_cross_path"])
+        d_p, d_i, obs_p, obs_i, TOLERANCE_PROPOSALS["state_cross_path"],
+        delta_rtol=gate_cross)
     theta_spec = TOLERANCE_PROPOSALS["theta_cross_path"]
     tclose = (abs(float(rp["theta"][0]) - float(ri["theta"][0]))
               <= theta_spec["atol"] + theta_spec["rtol"]
@@ -4784,20 +5395,22 @@ def _scalar_case(theta: float, m: float, v: float, step: int,
     max_theta_ratio = abs(float(rp["theta"][0]) - float(ri["theta"][0])) \
         / theta_bound
     state_ratios = []
+    state_rtol = float(TOLERANCE_PROPOSALS["state_cross_path"]["rtol"])
     for a, b in ((rp["m"], ri["m"]), (rp["v"], ri["v"])):
         aa, bb = float(a[0]), float(b[0])
         if abs(aa) > ZERO_STATE_ABS and abs(bb) > ZERO_STATE_ABS:
-            state_ratios.append(abs(aa - bb) / max(abs(aa), abs(bb)))
+            state_ratios.append(abs(aa - bb)
+                                / (state_rtol * max(abs(aa), abs(bb))))
     max_state_ratio = max(state_ratios, default=0.0)
     mask = bool(obs_p[0]) and bool(obs_i[0])
     max_delta_ratio = (abs(float(d_p[0]) - float(d_i[0]))
-                       / (5e-4 * abs(float(d_i[0])))) if mask else 0.0
+                       / (gate_cross * abs(float(d_i[0])))) if mask else 0.0
     same_ratios = []
     for obs, ref, measured in ((obs_p, rp["delta_ref64"], d_p),
                                (obs_i, ri["delta_ref64"], d_i)):
         if bool(obs[0]):
             same_ratios.append(abs(float(measured[0]) - float(ref[0]))
-                               / (5e-4 * abs(float(ref[0]))))
+                               / (gate_same * abs(float(ref[0]))))
     max_same_delta_ratio = max(same_ratios, default=0.0)
     return {
         "classification": verdict["classification"],
@@ -4808,6 +5421,7 @@ def _scalar_case(theta: float, m: float, v: float, step: int,
         "max_delta_ratio": max_delta_ratio,
         "max_same_delta_ratio": max_same_delta_ratio,
         "m_p": float(rp["m"][0]), "m_i": float(ri["m"][0]),
+        "v_p": float(vp[0]), "v_i": float(vi[0]),
         "theta_p": float(rp["theta"][0]), "theta_i": float(ri["theta"][0]),
         "delta_ref_p": float(rp["delta_ref64"][0]),
         "delta_ref_i": float(ri["delta_ref64"][0]),
@@ -4928,7 +5542,7 @@ def synthetic_calibration(*, seed: int = 20261029,
     scalar_plan = _scalar_case(0.0, 0.001, 1.0000000116860974e-7, 2,
                                -0.008999999612569809,
                                -0.008999998681247234, m_none=False)
-    scalar_stable = _scalar_case(0.3, 0.002, 3.3e-7, 2, 0.5, 0.5,
+    scalar_stable = _scalar_case(0.0, 0.002, 3.3e-7, 2, 0.5, 0.5,
                                  m_none=False)
     scalar_near = _scalar_case(0.0, 0.002, 3.3e-7, 2, 0.5,
                                0.5 * (1 + 1e-5), m_none=False)
@@ -4936,8 +5550,10 @@ def synthetic_calibration(*, seed: int = 20261029,
                      ("state_cross_path", "max_state_ratio"),
                      ("delta_cross_path", "max_delta_ratio"),
                      ("delta_same_input", "max_same_delta_ratio")):
-        observed[key] = _ratio_record(
-            float(scalar_near[tag]), source="scalar_near_1e-7")
+        observed[key] = _merge_ratio_records([
+            observed.get(key),
+            _ratio_record(float(scalar_near[tag]), source="scalar_near_1e-7"),
+        ])
     for key, rec in observed.items():
         ratio = float(rec["max_ratio_of_proposal"])
         if not math.isfinite(ratio) or ratio < 0.0 or 4.0 * ratio > 1.0:
@@ -4999,6 +5615,7 @@ def synthetic_calibration(*, seed: int = 20261029,
             "interval_tamper_rejected": bool(interval_tamper_problems),
         },
         "tiny_zero_floors": {"gradient_abs": ZERO_GRADIENT_ABS,
+                             "gradient_noise_scale": ZERO_GRADIENT_NOISE_SCALE,
                              "state_abs": ZERO_STATE_ABS},
         "real_dataset_loaded": False,
         "real_checkpoint_loaded": False,
@@ -5061,6 +5678,7 @@ def build_tolerance_contract(*, observed: Mapping[str, Any] | None = None,
         "tolerances": tolerances,
         "rules": dict(TOLERANCE_RULES),
         "tiny_zero_floors": {"gradient_abs": ZERO_GRADIENT_ABS,
+                             "gradient_noise_scale": ZERO_GRADIENT_NOISE_SCALE,
                              "state_abs": ZERO_STATE_ABS},
         "calibration": dict(calibration) if calibration is not None else None,
         "calibration_sha256": evidence_sha256,
@@ -5102,7 +5720,9 @@ def tolerance_contract_problems(contract: Mapping[str, Any] | None,
     if _jsonable(contract.get("rules")) != _jsonable(TOLERANCE_RULES):
         problems.append("tolerance_rules_changed")
     if _jsonable(contract.get("tiny_zero_floors")) != _jsonable(
-            {"gradient_abs": ZERO_GRADIENT_ABS, "state_abs": ZERO_STATE_ABS}):
+            {"gradient_abs": ZERO_GRADIENT_ABS,
+             "gradient_noise_scale": ZERO_GRADIENT_NOISE_SCALE,
+             "state_abs": ZERO_STATE_ABS}):
         problems.append("tolerance_tiny_floors_changed")
     if problems:
         return problems
@@ -5826,26 +6446,30 @@ def run_registered_audit(run_root: Path, provider: SyntheticTrainingProvider,
     except (TimeoutError, UpdateCallBudgetExceeded) as exc:
         p = {"passed": False, "failures": [type(exc).__name__],
              "gaps": [f"p_stage_aborted:{exc}"], "rows": [], "paths": {},
-             "report": None, "arrays_sha256": {}}
+             "report": None, "arrays_sha256": {},
+             "complete_evidence": False, "numeric_passed": False}
     p_delta = _stage_delta(counter, base_counts)
     try:
         settle_stage_calls(run_root, "P", attempt, p_delta)
     except (OSError, ValueError) as exc:
         p["passed"] = False
+        p["complete_evidence"] = False
         p["failures"] = list(p.get("failures") or []) + [
             f"reservation_settle:{type(exc).__name__}"]
     results["P"] = p
+    p_complete = bool(p.get("complete_evidence"))
     p_report = Path(p["report"]) if p.get("report") else None
     seal = finish_attempt(
         run_root, "P", attempt, t0, budget,
-        {"complete": bool(p["passed"]),
+        {"complete": p_complete,
          "report": path_for_record(p_report) if p_report else None,
          "summary": path_for_record(p_report) if p_report else None,
          "registration_sha256": registration_sha,
          "artifacts": _artifact_hashes(
              Path(path) for path in (p.get("paths") or {}).values())},
-        status="done" if p["passed"] else "incomplete",
+        status="done" if p_complete else "incomplete",
         extra={"stage": "P", "scope": scope,
+               "numeric_passed": bool(p.get("numeric_passed")),
                "call_balance": counter.snapshot()})
     seals["P"] = {"sealed": seal.sealed, "terminal": seal.terminal,
                   "problems": seal.problems, "row": seal.row}
@@ -5856,7 +6480,8 @@ def run_registered_audit(run_root: Path, provider: SyntheticTrainingProvider,
         blockers = seal.problems + p_consumer
         if not p.get("paths"):
             blockers.append("p_artifacts_missing")
-        return stop(p["failures"] + blockers, p["gaps"] + blockers)
+        return stop(blockers, p["gaps"] + blockers,
+                    failures=p["failures"])
     p_dir = stage_dir(run_root, "P") / attempt
 
     # --- I ------------------------------------------------------------------
@@ -5878,26 +6503,30 @@ def run_registered_audit(run_root: Path, provider: SyntheticTrainingProvider,
     except (TimeoutError, UpdateCallBudgetExceeded) as exc:
         i = {"passed": False, "failures": [type(exc).__name__],
              "gaps": [f"i_stage_aborted:{exc}"], "rows": [], "paths": {},
-             "report": None, "arrays_sha256": {}}
+             "report": None, "arrays_sha256": {},
+             "complete_evidence": False, "numeric_passed": False}
     i_delta = _stage_delta(counter, base_counts)
     try:
         settle_stage_calls(run_root, "I", attempt, i_delta)
     except (OSError, ValueError) as exc:
         i["passed"] = False
+        i["complete_evidence"] = False
         i["failures"] = list(i.get("failures") or []) + [
             f"reservation_settle:{type(exc).__name__}"]
     results["I"] = i
+    i_complete = bool(i.get("complete_evidence"))
     i_report = Path(i["report"]) if i.get("report") else None
     seal = finish_attempt(
         run_root, "I", attempt, t0, budget,
-        {"complete": bool(i["passed"]),
+        {"complete": i_complete,
          "report": path_for_record(i_report) if i_report else None,
          "summary": path_for_record(i_report) if i_report else None,
          "registration_sha256": registration_sha,
          "artifacts": _artifact_hashes(
              Path(path) for path in (i.get("paths") or {}).values())},
-        status="done" if i["passed"] else "incomplete",
+        status="done" if i_complete else "incomplete",
         extra={"stage": "I", "scope": scope,
+               "numeric_passed": bool(i.get("numeric_passed")),
                "call_balance": counter.snapshot()})
     seals["I"] = {"sealed": seal.sealed, "terminal": seal.terminal,
                   "problems": seal.problems, "row": seal.row}
@@ -5908,7 +6537,8 @@ def run_registered_audit(run_root: Path, provider: SyntheticTrainingProvider,
         blockers = seal.problems + i_consumer
         if not i.get("paths"):
             blockers.append("i_artifacts_missing")
-        return stop(i["failures"] + blockers, i["gaps"] + blockers)
+        return stop(blockers, i["gaps"] + blockers,
+                    failures=i["failures"])
     i_dir = stage_dir(run_root, "I") / attempt
 
     # --- F ------------------------------------------------------------------
@@ -5918,7 +6548,6 @@ def run_registered_audit(run_root: Path, provider: SyntheticTrainingProvider,
     except SystemExit as exc:
         return stop([str(exc)], [str(exc)])
     attempt = allocate_attempt(run_root, "F")
-    base_counts = dict(counter.counts)
     pre_register_attempt(run_root, "F", attempt, t0, scope=scope,
                          budget=budget, registration_sha=registration_sha,
                          call_balance=counter.snapshot())
@@ -5935,14 +6564,15 @@ def run_registered_audit(run_root: Path, provider: SyntheticTrainingProvider,
              "failures": [], "gaps": [f"f_stage_aborted:{exc}"],
              "report": None, "summary": {}, "worker": {},
              "call_delta": {}}
-    f_delta = _stage_delta(counter, base_counts)
-    try:
-        settle_stage_calls(run_root, "F", attempt, f_delta)
-    except (OSError, ValueError) as exc:
+    snapshot = f.get("call_delta")
+    settled, settle_problems = _settle_f_calls(run_root, "F", attempt,
+                                               snapshot)
+    if settle_problems:
+        f.setdefault("verification_problems", []).extend(settle_problems)
+    if not settled:
         f["complete_evidence"] = False
+        f["covered_contract_passed"] = False
         f["conclusion"] = "audit_incomplete"
-        f.setdefault("verification_problems", []).append(
-            f"reservation_settle:{type(exc).__name__}")
     results["F"] = f
     expected_full = dict(CHAIN_NOMINAL)
     if mode == "synthetic":
@@ -5958,18 +6588,33 @@ def run_registered_audit(run_root: Path, provider: SyntheticTrainingProvider,
         f["conclusion"] = "audit_incomplete"
         f.setdefault("verification_problems", []).extend(matrix_problems)
     f_report = Path(f["report"]) if f.get("report") else None
-    seal = finish_attempt(
-        run_root, "F", attempt, t0, budget,
-        {"complete": bool(f["complete_evidence"]),
-         "report": path_for_record(f_report) if f_report else None,
-         "summary": path_for_record(f_report) if f_report else None,
-         "registration_sha256": registration_sha,
-         "artifacts": _artifact_hashes([f_report])},
-        status="done" if f["complete_evidence"] else "incomplete",
-        extra={"stage": "F", "scope": scope,
-               "call_balance": counter.snapshot()})
-    seals["F"] = {"sealed": seal.sealed, "terminal": seal.terminal,
-                  "problems": seal.problems, "row": seal.row}
+    pre_seal_veto = list(matrix_problems)
+    if not settled:
+        pre_seal_veto.append("f_call_settlement_unknown")
+    if pre_seal_veto:
+        # Retract the just-written pass claim before the terminal seal and
+        # rebind the report hash through the same publishing protocol.
+        _amend_final_report(f_report, pre_seal_veto)
+        wrow, wprobs, proven = withdraw_attempt_claim(
+            run_root, "F", attempt, f_report,
+            _attempt_row(run_root, "F", attempt),
+            pre_seal_veto, reason="pre_seal_veto", t0=t0, budget=budget)
+        seals["F"] = {"sealed": False, "terminal": bool(proven),
+                      "problems": wprobs, "row": wrow, "withdrawn": True}
+        seal = SealResult(False, wrow, wprobs, bool(proven))
+    else:
+        seal = finish_attempt(
+            run_root, "F", attempt, t0, budget,
+            {"complete": bool(f["complete_evidence"]),
+             "report": path_for_record(f_report) if f_report else None,
+             "summary": path_for_record(f_report) if f_report else None,
+             "registration_sha256": registration_sha,
+             "artifacts": _artifact_hashes([f_report])},
+            status="done" if f["complete_evidence"] else "incomplete",
+            extra={"stage": "F", "scope": scope,
+                   "call_balance": counter.snapshot()})
+        seals["F"] = {"sealed": seal.sealed, "terminal": seal.terminal,
+                      "problems": seal.problems, "row": seal.row}
     consumer_row, consumer_problems = stage_state(run_root, "F")
     prerequisite = {}
     prerequisite_problems = []
@@ -5981,22 +6626,51 @@ def run_registered_audit(run_root: Path, provider: SyntheticTrainingProvider,
             for p in state_problems if p != "attempt_not_complete"]
     seals["F"]["consumer_problems"] = consumer_problems
     seals["F"]["prerequisite_consumer_problems"] = prerequisite
+    revoke = (list(seal.problems)
+              + [p for p in consumer_problems if p != "attempt_not_complete"]
+              + prerequisite_problems + matrix_problems)
+    if not settled:
+        revoke.append("f_call_settlement_unknown")
+    if revoke and _report_claims_complete(f_report):
+        # A completed claim survived a post-seal veto (or the seal failed):
+        # rewrite the report and reseal incomplete with the old cost floor.
+        _amend_final_report(f_report, revoke)
+        wrow, wprobs, proven = withdraw_attempt_claim(
+            run_root, "F", attempt, f_report,
+            seals["F"].get("row") or _attempt_row(run_root, "F", attempt),
+            revoke, reason="post_seal_veto", t0=t0, budget=budget)
+        seals["F"]["post_seal_withdrawal"] = {
+            "row": wrow, "problems": wprobs, "proven": bool(proven)}
+        seal = SealResult(False, wrow, list(seal.problems) + wprobs,
+                          bool(proven))
+        seals["F"].update({"sealed": False, "terminal": bool(proven),
+                           "problems": seal.problems, "row": wrow})
+        if not proven:
+            revoke.append("f_withdraw_unproven")
+    if f_report is not None and f_report.is_file():
+        try:
+            f["summary"] = read_json(f_report)
+        except (OSError, ValueError, TypeError):
+            revoke.append("f_summary_unreadable")
     conclusion = f["conclusion"]
     complete = bool(f["complete_evidence"])
     covered = bool(f["covered_contract_passed"])
-    revoke = (seal.problems
-              + [p for p in consumer_problems if p != "attempt_not_complete"]
-              + prerequisite_problems + matrix_problems)
-    if revoke or not seal.terminal:
+    if revoke or not seal.terminal or not seal.sealed and not complete:
         conclusion = "audit_incomplete"
         complete = False
         covered = False
+    if not seal.sealed and not complete:
+        conclusion = "audit_incomplete"
+    disk_problems = []
+    if isinstance(f.get("summary"), Mapping):
+        disk_problems = list(f["summary"].get("verification_problems") or [])
     return {
         "mode": mode,
         "conclusion": conclusion,
         "complete_evidence": complete,
         "covered_contract_passed": covered,
-        "problems": list(f.get("verification_problems", [])) + revoke,
+        "problems": disk_problems + [p for p in revoke
+                                     if p not in disk_problems],
         "failures": f.get("failures", []),
         "gaps": f.get("gaps", []) + revoke,
         "stages": results,

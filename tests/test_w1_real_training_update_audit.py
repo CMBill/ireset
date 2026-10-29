@@ -286,6 +286,17 @@ def test_fp32_contract_matches_cuda_and_rejects_tamper():
 # ---------------------------------------------------------------------------
 
 
+def _register_f_parent(root, attempt="attempt_001"):
+    A.write_cohort(root, mode="synthetic")
+    budget = {"remaining_s": 10 ** 6, "reserve_s": 0.0,
+              "attempts": 2, "attempts_used": 0}
+    A.pre_register_attempt(root, "F", attempt, A._now(), scope={},
+                           budget=budget)
+    A.reserve_stage_calls(root, "F", attempt,
+                          {"counts": A.STAGE_NOMINAL["F"]})
+    return budget
+
+
 def test_chain_rows_and_call_matrix(chain):
     i_rows = chain["i"]["rows"]
     counts = chain["counter"].snapshot()["counts"]
@@ -308,13 +319,15 @@ def test_adamw_classification_is_visible(chain):
     rows = [r for r in chain["i"]["rows"] if r["key"].startswith("adamw:")]
     classes = {r["classification"] for r in rows}
     assert classes <= {"passed", "audit_incomplete",
-                       "cross_path_sensitivity_gap", "direct_failure"}
+                       "cross_path_sensitivity_gap", "direct_failure",
+                       "cross_path_bound_unverifiable"}
     assert "direct_failure" not in classes
     assert any(r["classification"] == "passed" for r in rows)
 
 
 def test_f_worker_replays_bitwise_and_verifies_rows(chain, tmp_path):
     provider = chain["provider"]
+    _register_f_parent(tmp_path)
     counter = A.CallCounter(A.CALL_CAPS)
     result = A.run_f_stage(
         tmp_path, "F", "attempt_001", A._now(),
@@ -418,6 +431,7 @@ def test_f_worker_detects_tampered_arrays_and_rows(chain, tmp_path):
     arrays[key] = arrays[key].copy()
     arrays[key] = arrays[key] + np.float32(1e-3)
     np.savez(path, **arrays)
+    _register_f_parent(tmp_path)
     counter = A.CallCounter(A.CALL_CAPS)
     result = A.run_f_stage(
         tmp_path, "F", "attempt_001", A._now(),
@@ -493,3 +507,346 @@ def test_withdraw_rewrites_pass_claim(tmp_path):
     assert data["complete_evidence"] is False
     assert row["complete"] is False
     assert problems == []
+
+
+# ---------------------------------------------------------------------------
+# review-round counterexamples: numeric gates, F binding, accounting
+# ---------------------------------------------------------------------------
+
+
+def test_zero_floor_cannot_erase_a_nonzero_reference():
+    spec = A.TOLERANCE_PROPOSALS["parameter_gradient"]
+    ref = np.full(100, 1e-9)
+    got = np.zeros(100)
+    rec = A.compare_gradient(got, ref, spec, name="erased")
+    assert rec["ok"] is False
+    assert rec["problems"]
+    partial = ref.copy()
+    partial[:50] = 0.0
+    rec = A.compare_gradient(partial, ref, spec, name="partial")
+    assert rec["ok"] is False
+    deep = np.full(8, 4e-12)
+    rec = A.compare_gradient(np.zeros(8), deep, spec, name="deep")
+    assert rec["ok"] is False
+    assert rec["groups"]["full_erasure"] is True
+    assert any(p.endswith("zero_erased") for p in rec["problems"])
+
+
+def test_genuine_cancellation_noise_still_passes():
+    rng = np.random.default_rng(5)
+    ref = rng.normal(0.0, 4e-12, size=8)
+    ref[0] = 0.0
+    got = ref + rng.normal(0.0, 2e-12, size=8)
+    rec = A.compare_gradient(got, ref,
+                             A.TOLERANCE_PROPOSALS["parameter_gradient"],
+                             name="noise")
+    assert rec["ok"] is True
+    assert rec["groups"]["zero_noise_floor"] == A.ZERO_GRADIENT_ABS
+
+
+def test_state_cross_path_floor_does_not_hide_divergence():
+    spec = A.TOLERANCE_PROPOSALS["state_cross_path"]
+    flags = A._cross_path_flags(
+        np.array([0.0]), np.array([1e-9]),
+        np.array([0.0]), np.array([1e-9]),
+        np.array([0.0]), np.array([0.0]),
+        np.array([0.0]), np.array([1e-9]),
+        np.array([True]), np.array([True]), spec)
+    assert flags["m_ok"] is False
+    assert flags["m_zero_disagreement"] is True
+    assert flags["delta_ok"] is False
+    assert flags["delta_presence_mismatch"] is True
+    flags = A._cross_path_flags(
+        np.array([1e-8]), np.array([2e-8]),
+        np.array([1e-8]), np.array([2e-8]),
+        np.array([0.0]), np.array([0.0]),
+        np.array([0.0]), np.array([0.0]),
+        np.array([False]), np.array([False]), spec)
+    assert flags["m_ok"] is False and flags["v_ok"] is False
+    flags = A._cross_path_flags(
+        np.zeros(1), np.zeros(1), np.zeros(1), np.zeros(1),
+        np.zeros(1), np.zeros(1), np.zeros(1), np.zeros(1),
+        np.array([False]), np.array([False]), spec)
+    assert flags["m_ok"] and flags["v_ok"] and flags["theta_ok"]
+    assert flags["delta_ok"] and not flags["delta_presence_mismatch"]
+
+
+def test_interval_rounding_contains_actual_binary32_nodes():
+    rng = np.random.default_rng(11)
+    for scale in (1e-12, 1e-9, 1e-4, 1e-1, 1.0):
+        g = (rng.normal(size=16) * scale).astype(np.float32)
+        theta = (rng.normal(size=16) * 0.4).astype(np.float32)
+        state = scale >= 1e-9
+        m = (rng.normal(size=16) * max(scale, 1e-9)).astype(np.float32)
+        v = (np.abs(rng.normal(size=16)) * max(scale, 1e-9) ** 2
+             ).astype(np.float32)
+        iv = A.propagate_intervals(g, theta, m, v, 2,
+                                    m_none=not state, v_none=not state)
+        candidates = [g.astype(np.float64)]
+        for direction in (np.float32(-np.inf), np.float32(np.inf)):
+            neighbour = np.nextafter(g, direction).astype(np.float64)
+            inside = ((neighbour >= iv["g_lo"])
+                      & (neighbour <= iv["g_hi"]))
+            candidates.append(np.where(inside, neighbour,
+                                       g.astype(np.float64)))
+        for candidate in candidates:
+            eff = A.adamw_effective_fp32(
+                theta, m, v, candidate.astype(np.float32), 2,
+                m_none=not state, v_none=not state)
+            assert A._inside(iv["K_m"], eff["m"])
+            assert A._inside(iv["K_v"], eff["v"])
+            assert A._inside(iv["K_theta"], eff["theta"])
+            assert A._inside(iv["K_delta"], eff["delta_ref64"])
+    real = rng.normal(size=512) * 10.0 ** rng.uniform(-14, 2, size=512)
+    assert np.all(A._r32_down(real) <= real)
+    assert np.all(A._r32_up(real) >= real)
+
+
+def test_clip_coefficient_scales_at_the_equality_boundary():
+    from ireset.train.trainer import clip_coefficient
+
+    grad = np.array([1.0, -1.0], np.float32)
+    norm = float(np.sqrt(2.0))
+    out = A._clip_independent({"g": grad}, norm)
+    expected = min(1.0, norm / (norm + 1e-6))
+    assert out["triggered"] is True
+    assert out["coef"] == pytest.approx(expected, rel=1e-12)
+    assert clip_coefficient(norm, norm) == out["coef"]
+    assert clip_coefficient(1.0, 0.5) == 1.0
+    assert np.array_equal(out["postclip"]["g"],
+                          (grad * np.float32(out["coef"])).astype(np.float32))
+
+
+def test_calibration_state_ratio_is_normalized_and_maxed():
+    case = A._scalar_case(0.3, 0.002, 3.3e-7, 2, 0.5, 0.505, m_none=False)
+    rtol = A.TOLERANCE_PROPOSALS["state_cross_path"]["rtol"]
+    m_ratio = (abs(case["m_p"] - case["m_i"])
+               / (rtol * max(abs(case["m_p"]), abs(case["m_i"]))))
+    v_ratio = (abs(case["v_p"] - case["v_i"])
+               / (rtol * max(abs(case["v_p"]), abs(case["v_i"]))))
+    assert case["max_state_ratio"] == pytest.approx(max(m_ratio, v_ratio),
+                                                     rel=1e-12)
+    merged = A._merge_ratio_records([
+        A._ratio_record(0.1, source="chain"),
+        A._ratio_record(0.4, source="scalar")])
+    assert merged["max_ratio_of_proposal"] == 0.4
+    assert merged["sources"] == ["chain", "scalar"]
+
+
+def test_artifact_bound_is_per_class_and_covers_the_chain(tiny_provider,
+                                                          chain):
+    bound = A._resource_bound(tiny_provider.roster)
+    assert bound["cohort_bytes"] == (
+        2 * (bound["p_attempt_bytes"] + bound["i_attempt_bytes"]
+             + bound["f_attempt_bytes"])
+        + bound["fixture_bytes"] + bound["registration_bytes"])
+    assert bound["one_chain_bytes"] >= (bound["p_attempt_bytes"]
+                                        + bound["i_attempt_bytes"])
+    actual = sum(path.stat().st_size for path in chain["root"].rglob("*")
+                 if path.is_file())
+    assert actual <= bound["one_chain_bytes"]
+    assert bound["within_cap"] is True
+
+
+def test_f_settlement_requires_a_complete_worker_snapshot(tmp_path):
+    root = tmp_path / "run"
+    A.write_cohort(root, mode="synthetic")
+    budget = {"remaining_s": 10.0, "reserve_s": 1.0,
+              "attempts": 2, "attempts_used": 0}
+    A.pre_register_attempt(root, "F", "attempt_001", A._now(), scope={},
+                           budget=budget)
+    A.reserve_stage_calls(root, "F", "attempt_001",
+                          {"counts": A.STAGE_NOMINAL["F"]})
+    ok, problems = A._settle_f_calls(root, "F", "attempt_001", None)
+    assert not ok and problems == ["f_call_settlement_unknown"]
+    path = A.stage_dir(root, "F") / "attempt_001" / "call_reservations.json"
+    assert A.read_json(path)["consumed"] is None
+    partial = {kind: 0 for kind in A.CALL_KINDS}
+    partial.pop(next(iter(partial)))
+    assert not A._settle_f_calls(root, "F", "attempt_001", partial)[0]
+    boolean = {kind: 0 for kind in A.CALL_KINDS}
+    boolean[next(iter(boolean))] = True
+    assert not A._settle_f_calls(root, "F", "attempt_001", boolean)[0]
+    negative = {kind: 0 for kind in A.CALL_KINDS}
+    negative[next(iter(negative))] = -1
+    assert not A._settle_f_calls(root, "F", "attempt_001", negative)[0]
+    assert A.read_json(path)["consumed"] is None
+    good = {kind: 0 for kind in A.CALL_KINDS}
+    ok, problems = A._settle_f_calls(root, "F", "attempt_001", good)
+    assert ok and problems == []
+    assert A.read_json(path)["consumed"] == good
+
+
+def test_worker_inherits_deadline_and_parent_admission(tmp_path):
+    root = tmp_path / "run"
+    A.write_cohort(root, mode="synthetic")
+    budget = {"remaining_s": 10.0, "reserve_s": 1.0,
+              "attempts": 2, "attempts_used": 0}
+    A.pre_register_attempt(root, "F", "attempt_001", A._now(), scope={},
+                           budget=budget)
+    A.reserve_stage_calls(root, "F", "attempt_001",
+                          {"counts": A.STAGE_NOMINAL["F"]})
+    spec = {
+        "fixture_dir": str(tmp_path / "missing_fixture"),
+        "p_dir": str(tmp_path / "P"), "i_dir": str(tmp_path / "I"),
+        "config": TINY_CONFIG, "device": "cuda",
+        "tolerance": {"tolerances": A.TOLERANCE_PROPOSALS},
+        "remaining_caps": dict(A.STAGE_NOMINAL["F"]),
+        "deadline_perf_counter": A._now() - 10.0,
+        "reserve_s": 0.0, "run_root": str(root), "stage": "F",
+        "attempt": "attempt_001", "registration_sha256": None,
+    }
+    spec_path = tmp_path / "spec.json"
+    A.write_json(spec_path, spec)
+    out = tmp_path / "worker"
+    assert A._worker_main(str(spec_path), str(out)) == 2
+    result = A.read_json(out / "worker_result.json")
+    assert result["aborted"] is True
+    assert any("f_worker_aborted" in p and "budget_deadline" in p
+               for p in result["problems"])
+    assert set(result["counts"]["counts"]) == set(A.CALL_KINDS)
+    problems = A.unit_admission(root, "F", "attempt_001",
+                                {"registration_sha256": "wrong"},
+                                deadline=A._now() + 10.0)
+    assert "unit_parent_registration" in problems
+
+
+def test_f_rejects_expired_spawn_without_a_worker(chain, tmp_path):
+    _register_f_parent(tmp_path)
+    result = A.run_f_stage(
+        tmp_path, "F", "attempt_001", A._now(),
+        {"remaining_s": 0.0, "reserve_s": 0.0}, chain["provider"],
+        A.CallCounter(A.CALL_CAPS), chain["provider"].roster,
+        chain["root"] / "P", chain["root"] / "I",
+        tolerance=chain["tolerance"], out_dir=tmp_path / "F")
+    assert result["complete_evidence"] is False
+    assert result["call_delta"] is None
+    assert result["worker"]["exit_reason"] == "not_spawned"
+    assert any("f_stage_deadline_before_worker" in p
+               for p in result["verification_problems"])
+
+
+def test_f_detects_report_rng_and_duplicate_row_tamper(chain, tmp_path):
+    import shutil
+
+    saved_p = tmp_path / "P_tampered"
+    shutil.copytree(chain["root"] / "P", saved_p)
+    report = A.read_json(saved_p / "p_report.json")
+    micro = report["models"]["deterministic"]["updates"]["u1"]["micros"][0]
+    micro["loss"] = 123.0
+    micro["rng_before"] = {
+        key: ("0" * 64 if isinstance(value, str) else value)
+        for key, value in micro["rng_before"].items()}
+    A.write_json(saved_p / "p_report.json", report)
+    saved_i = tmp_path / "I_tampered"
+    shutil.copytree(chain["root"] / "I", saved_i)
+    rows = A.read_json(saved_i / "i_rows.json")
+    rows.append(dict(rows[0]))
+    A.write_json(saved_i / "i_rows.json", rows)
+    _register_f_parent(tmp_path)
+    result = A.run_f_stage(
+        tmp_path, "F", "attempt_001", A._now(),
+        {"remaining_s": 10 ** 6, "reserve_s": 0.0}, chain["provider"],
+        A.CallCounter(A.CALL_CAPS), chain["provider"].roster,
+        saved_p, saved_i, tolerance=chain["tolerance"],
+        out_dir=tmp_path / "F")
+    problems = result["verification_problems"]
+    assert result["complete_evidence"] is False
+    assert any("report_micro_drift" in p and p.endswith(":loss")
+               for p in problems)
+    assert any("report_micro_drift" in p and p.endswith(":rng_before")
+               for p in problems)
+    assert any(("saved_rows_duplicate" in p) or ("saved_i_rows_scope" in p)
+               for p in problems)
+
+
+def test_complete_numeric_mismatch_reaches_f(chain, tmp_path):
+    tolerance = dict(A.TOLERANCE_PROPOSALS)
+    tolerance["parameter_gradient"] = {"atol": 1e-30, "rtol": 0.0}
+    counter = A.CallCounter(A.CALL_CAPS)
+    i = A.run_i_stage(
+        tmp_path / "chain", "I", "attempt_001", A._now(),
+        {"remaining_s": 10 ** 6, "reserve_s": 0.0}, chain["provider"],
+        counter, chain["provider"].roster, chain["root"] / "P",
+        tolerance={"tolerances": tolerance},
+        out_dir=tmp_path / "chain" / "I")
+    assert i["failures"]
+    assert i["complete_evidence"] is True
+    assert i["evidence_failures"] == []
+    _register_f_parent(tmp_path / "run")
+    f = A.run_f_stage(
+        tmp_path / "run", "F", "attempt_001", A._now(),
+        {"remaining_s": 10 ** 6, "reserve_s": 0.0}, chain["provider"],
+        A.CallCounter(A.CALL_CAPS), chain["provider"].roster,
+        chain["root"] / "P", tmp_path / "chain" / "I",
+        tolerance={"tolerances": tolerance},
+        out_dir=tmp_path / "run" / "F")
+    assert f["complete_evidence"] is True
+    assert f["failures"]
+    assert f["conclusion"] in ("audit_incomplete",
+                               "real_training_update_mismatch")
+
+
+def test_withdrawal_charges_the_cost_floor(tmp_path, monkeypatch):
+    root = tmp_path / "run"
+    A.write_cohort(root, mode="synthetic")
+    attempt = "attempt_001"
+    directory = A.stage_dir(root, "F") / attempt
+    directory.mkdir(parents=True)
+    report = directory / "final.json"
+    A.write_json(report, {"conclusion":
+                          "real_training_update_covered_contract_passed",
+                          "complete_evidence": True,
+                          "covered_contract_passed": True})
+    budget = {"remaining_s": 20.0, "reserve_s": 1.0,
+              "attempts": 2, "attempts_used": 0}
+    t0 = A._now()
+    A.pre_register_attempt(root, "F", attempt, t0, scope={}, budget=budget)
+    seal = A.finish_attempt(
+        root, "F", attempt, t0, budget,
+        {"complete": True, "report": A.path_for_record(report),
+         "summary": A.path_for_record(report)}, status="done")
+    assert seal.sealed
+    old_cost = seal.row["measured_wall_s"]
+    real_upsert = A.upsert_cost
+    calls = {"n": 0}
+
+    def slow_upsert(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            time.sleep(0.4)
+        return real_upsert(*args, **kwargs)
+
+    monkeypatch.setattr(A, "upsert_cost", slow_upsert)
+    start = A._now()
+    row, problems, proven = A.withdraw_attempt_claim(
+        root, "F", attempt, report, seal.row, ["post_veto"],
+        reason="post_seal_veto", t0=t0, budget=budget)
+    elapsed = A._now() - start
+    assert proven and problems == []
+    assert row["measured_wall_s"] >= old_cost
+    ledger = A.load_ledger(root)[0]
+    assert ledger["measured_wall_s"] >= elapsed
+    assert A.read_json(report)["complete_evidence"] is False
+    assert A.stage_state(root, "F")[0]["status"] == "incomplete"
+
+
+def test_matrix_veto_retracts_the_disk_claim(tmp_path, monkeypatch):
+    monkeypatch.setitem(
+        A.CHAIN_NOMINAL, "conditioner_forwards",
+        A.CHAIN_NOMINAL["conditioner_forwards"] + 1)
+    result = A.synthetic_self_test(tmp_path / "run", config=TINY_CONFIG,
+                                   device="cuda")
+    assert result["complete_evidence"] is False
+    assert result["conclusion"] == "audit_incomplete"
+    summary = A.read_json(Path(result["summary_path"]))
+    assert summary["complete_evidence"] is False
+    assert summary["conclusion"] == "audit_incomplete"
+    problems = summary.get("verification_problems") or []
+    assert any("full_chain_calls" in p for p in problems)
+    assert any("full_chain_calls" in r
+               for r in (summary.get("withdrawn_reasons") or []))
+    rows = [r for r in A.load_index(tmp_path / "run") if r["stage"] == "F"]
+    assert rows and rows[0]["status"] == "incomplete"
+    assert rows[0]["complete"] is False
+    assert rows[0]["incomplete_reason"] == "pre_seal_veto"
