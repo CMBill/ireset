@@ -619,13 +619,23 @@ def test_clip_coefficient_scales_at_the_equality_boundary():
 
 def test_calibration_state_ratio_is_normalized_and_maxed():
     case = A._scalar_case(0.3, 0.002, 3.3e-7, 2, 0.5, 0.505, m_none=False)
-    rtol = A.TOLERANCE_PROPOSALS["state_cross_path"]["rtol"]
+    spec = A.TOLERANCE_PROPOSALS["state_cross_path"]
     m_ratio = (abs(case["m_p"] - case["m_i"])
-               / (rtol * max(abs(case["m_p"]), abs(case["m_i"]))))
+               / (spec["atol"] + spec["rtol"] * abs(case["m_i"])))
     v_ratio = (abs(case["v_p"] - case["v_i"])
-               / (rtol * max(abs(case["v_p"]), abs(case["v_i"]))))
+               / (spec["atol"] + spec["rtol"] * abs(case["v_i"])))
     assert case["max_state_ratio"] == pytest.approx(max(m_ratio, v_ratio),
                                                      rel=1e-12)
+    # Small states are part of the gate domain; the old absolute mask hid
+    # them from the calibration statistic.
+    tiny = A._scalar_case(0.0, 1e-9, 1e-18, 1, 3e-7,
+                          3e-7 * (1 + 1e-4), m_none=False)
+    assert tiny["m_p"] < A.ZERO_STATE_ABS
+    assert tiny["max_state_ratio"] > 0.0
+    ratio, count = A._state_cross_path_ratio(
+        np.array([1e-9]), np.array([1e-9 * (1 + 1e-4)]), spec)
+    assert count == 1
+    assert ratio == pytest.approx(1e-4 / (1e-3 * (1 + 1e-4)), rel=1e-9)
     merged = A._merge_ratio_records([
         A._ratio_record(0.1, source="chain"),
         A._ratio_record(0.4, source="scalar")])
@@ -850,3 +860,223 @@ def test_matrix_veto_retracts_the_disk_claim(tmp_path, monkeypatch):
     assert rows and rows[0]["status"] == "incomplete"
     assert rows[0]["complete"] is False
     assert rows[0]["incomplete_reason"] == "pre_seal_veto"
+    final_calls = result["calls"]["counts"]
+    assert rows[0]["call_balance"]["counts"] == final_calls
+    ledger = [e for e in A.load_ledger(tmp_path / "run") if e["stage"] == "F"]
+    assert len(ledger) == 1
+    assert ledger[0]["call_balance"]["counts"] == final_calls
+    prior = A.prior_call_counts(tmp_path / "run", fixed_root=A.HISTORY_ROOT,
+                                mode="synthetic")
+    assert prior is not None
+    assert prior == final_calls
+    assert prior["native_adamw_steps"] == A.CHAIN_NOMINAL[
+        "native_adamw_steps"]
+    assert prior["backbone_forwards"] == A.CHAIN_NOMINAL["backbone_forwards"]
+    reservation = A.read_json(A.stage_dir(tmp_path / "run", "F")
+                              / "attempt_001" / "call_reservations.json")
+    assert reservation["consumed"] is not None
+
+
+# ---------------------------------------------------------------------------
+# second review-round counterexamples: full-domain calibration, withdrawal
+# snapshot, main-path deadlines, cotangent groups and the shared reserve
+# ---------------------------------------------------------------------------
+
+
+def test_state_calibration_covers_small_states_and_gate_denominator():
+    spec = A.TOLERANCE_PROPOSALS["state_cross_path"]
+    # m/v of 1e-17 are legitimate AdamW states; the old absolute mask skipped
+    # them while the raw gate still compared them.
+    ratio, count = A._state_cross_path_ratio(
+        np.array([8.772033343932125e-17]),
+        np.array([8.770656915392836e-17]), spec)
+    assert count == 1
+    assert ratio == pytest.approx(1.569e-4 / spec["rtol"], rel=1e-3)
+    # A zero reference with a non-zero production value is unbounded, not
+    # skipped: a passed row can never contain one.
+    ratio, count = A._state_cross_path_ratio(
+        np.array([1e-9]), np.array([0.0]), spec)
+    assert not np.isfinite(ratio) and count == 1
+    ratio, count = A._state_cross_path_ratio(
+        np.zeros(3), np.zeros(3), spec)
+    assert ratio == 0.0 and count == 0
+
+
+def test_withdrawal_stores_the_final_call_balance(tmp_path):
+    root = tmp_path / "run"
+    A.write_cohort(root, mode="synthetic")
+    budget = {"remaining_s": 10.0, "reserve_s": 1.0,
+              "attempts": 2, "attempts_used": 0}
+    t0 = A._now()
+    A.pre_register_attempt(root, "F", "attempt_001", t0, scope={},
+                           budget=budget,
+                           call_balance=A.CallCounter(A.CALL_CAPS).snapshot())
+    prior = A._attempt_row(root, "F", "attempt_001")["call_balance"]
+    counts = {kind: int(prior["counts"][kind]) for kind in A.CALL_KINDS}
+    counts["backbone_forwards"] += 32
+    counts["native_adamw_steps"] += 8
+    final = {"schema": "w1_real_training_update_call_budget_v1",
+             "counts": counts,
+             "within_caps": all(counts[k] <= A.CALL_CAPS[k]
+                                for k in A.CALL_KINDS)}
+    consumed = {kind: counts[kind] - int(prior["counts"][kind])
+                for kind in A.CALL_KINDS}
+    assert A._call_balance_delta_problems(prior, final, consumed) == []
+    bad = dict(consumed)
+    bad["backbone_forwards"] += 1
+    assert A._call_balance_delta_problems(prior, final, bad) == [
+        "call_balance_delta:backbone_forwards"]
+    # A running attempt withdrawal must publish the post-execution snapshot,
+    # not the pre-F balance copied from the running row.
+    row, _problems, _proven = A.withdraw_attempt_claim(
+        root, "F", "attempt_001", None,
+        A._attempt_row(root, "F", "attempt_001"), ["call_balance"],
+        reason="pre_seal_veto", t0=t0, budget=budget,
+        call_balance=final)
+    assert row["call_balance"]["counts"] == counts
+    index = [r for r in A.load_index(root) if r["stage"] == "F"]
+    ledger = [e for e in A.load_ledger(root) if e["stage"] == "F"]
+    assert len(index) == 1 and len(ledger) == 1
+    assert index[0]["call_balance"]["counts"] == counts
+    assert ledger[0]["call_balance"]["counts"] == counts
+
+
+def test_p_stage_checks_deadline_before_the_backward(tiny_provider, tmp_path,
+                                                     monkeypatch):
+    from ireset.train.trainer import Trainer
+
+    original = Trainer.accumulate_micro
+    seen = {"calls": 0}
+
+    def slow_accumulate(self, *args, **kwargs):
+        seen["calls"] += 1
+        if seen["calls"] == 1:
+            time.sleep(1.2)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Trainer, "accumulate_micro", slow_accumulate)
+    counter = A.CallCounter(A.CALL_CAPS)
+    with pytest.raises(TimeoutError) as caught:
+        A.run_p_stage(tmp_path, "P", "attempt_001", A._now(),
+                      {"remaining_s": 1.0, "reserve_s": 0.0},
+                      tiny_provider, counter, tiny_provider.roster,
+                      out_dir=tmp_path / "P")
+    assert "p_backward_1_0" in str(caught.value)
+    assert counter.counts["production_parameter_backward"] == 0
+    assert counter.counts["native_adamw_steps"] == 0
+
+
+def test_stage_unit_guard_admits_only_the_running_parent(tmp_path):
+    root = tmp_path / "run"
+    A.write_cohort(root, mode="synthetic")
+    budget = {"remaining_s": 10.0, "reserve_s": 0.0,
+              "attempts": 2, "attempts_used": 0}
+    A.pre_register_attempt(root, "P", "attempt_001", A._now(), scope={},
+                           budget=budget, registration_sha="reg")
+    deadline = A._now() + 10.0
+    guard = A._stage_unit_guard(root, "P", "attempt_001",
+                                registration_sha="reg", deadline=deadline)
+    guard("running_ok")
+    A.finish_attempt(root, "P", "attempt_001", A._now(), budget,
+                     {"complete": True}, status="done")
+    with pytest.raises(TimeoutError) as caught:
+        guard("after_seal")
+    assert "unit_parent_not_running" in str(caught.value)
+    unknown = A._stage_unit_guard(root, "P", "attempt_002",
+                                  registration_sha="reg",
+                                  deadline=deadline)
+    with pytest.raises(TimeoutError) as caught:
+        unknown("missing")
+    assert "unit_parent_not_registered" in str(caught.value)
+
+
+def test_i_stage_checks_deadline_before_reference_context(chain, tmp_path):
+    counter = A.CallCounter(A.CALL_CAPS)
+    with pytest.raises(TimeoutError) as caught:
+        A.run_i_stage(
+            tmp_path / "I", "I", "attempt_001", A._now() - 10.0,
+            {"remaining_s": 1.0, "reserve_s": 0.0}, chain["provider"],
+            counter, chain["provider"].roster, chain["root"] / "P",
+            tolerance={"tolerances": A.TOLERANCE_PROPOSALS},
+            out_dir=tmp_path / "I")
+    assert "i_reference_context" in str(caught.value)
+    assert counter.counts["reference_mj_forward"] == 0
+
+
+def test_cotangent_group_gate_rejects_a_zeroed_joint_group(chain):
+    ref = np.ones((4, 60, 38), np.float64)
+    ref[..., 9:] = 1e-9
+    got = ref.copy()
+    got[..., 9:] = 0.0
+    spec = A.TOLERANCE_PROPOSALS["output_cotangent"]
+    whole = A.compare_gradient(got, ref, spec, name="cot")
+    assert whole["ok"] is True
+    rec = A.compare_cotangent_gradient(got, ref, spec, name="cot")
+    assert rec["ok"] is False
+    assert "cot:group_joint" in rec["group_gate_problems"]
+    joint = rec["groups"]["group_gates"]["joint"]
+    assert joint["production_norm"] == 0.0
+    assert joint["reference_norm"] > 1e-10
+    assert joint["ok"] is False
+    missing = A.compare_cotangent_gradient(None, ref, spec, name="missing")
+    assert missing["ok"] is False
+    assert "missing:group_shape" in missing["group_gate_problems"]
+    # The I rows carry the three group gates and their verdict binds them.
+    rows = [r for r in chain["i"]["rows"]
+            if str(r["key"]).startswith("cotangent:")]
+    assert rows
+    for row in rows:
+        assert set(row["group_gates"]) == {"pos", "rot6d", "joint"}
+        assert row["status"] == "synthetic_verified"
+        assert row["group_gate_problems"] == []
+    tampered = [dict(r) for r in rows]
+    tampered[0] = dict(tampered[0])
+    gates = dict(tampered[0]["group_gates"])
+    gates["joint"] = {**gates["joint"], "relative_l2": 123.0}
+    tampered[0]["group_gates"] = gates
+    drift = A._row_compare_problems(rows, tampered,
+                                    [r["key"] for r in rows])
+    assert any(p.startswith("row_drift:cotangent") for p in drift)
+
+
+def test_f_stage_deducts_the_reserve_once(tmp_path, monkeypatch, chain):
+    _register_f_parent(tmp_path)
+    counts = {kind: 0 for kind in A.CALL_KINDS}
+    import os
+    import subprocess
+
+    def fake_run(cmd, **kwargs):
+        worker = Path(cmd[-1])
+        worker.mkdir(parents=True, exist_ok=True)
+        A.write_json(worker / "worker_result.json", {
+            "schema": "w1_real_training_update_f_worker_v1",
+            "pid": os.getpid() + 1, "ppid": os.getpid(),
+            "python": "fake", "runtime": {}, "fixture_dir": None,
+            "p_replay": None, "i_replay": None, "i_replay_rows": 0,
+            "schedule_rebuild_ok": False, "npz_problems": [],
+            "row_problems": [], "report_problems": [],
+            "call_matrix_problems": [], "problems": ["fake_worker"],
+            "aborted": True,
+            "counts": {"schema": A.CallCounter.schema, "counts": counts,
+                       "within_caps": True},
+            "complete_evidence": False, "failures": [], "gaps": [],
+            "created_wall": "fake",
+        })
+        return subprocess.CompletedProcess(cmd, 2, "", "")
+
+    monkeypatch.setattr(A.subprocess, "run", fake_run)
+    deadline_before = A._now()
+    result = A.run_f_stage(
+        tmp_path, "F", "attempt_001", A._now(),
+        {"remaining_s": 300.0, "reserve_s": 180.0}, chain["provider"],
+        A.CallCounter(A.CALL_CAPS), chain["provider"].roster,
+        chain["root"] / "P", chain["root"] / "I",
+        tolerance=chain["tolerance"], out_dir=tmp_path / "F")
+    problems = result["verification_problems"]
+    assert "f_stage_deadline_before_worker" not in problems
+    assert result["worker"]["exit_reason"] == "nonzero_exit"
+    assert result["worker"]["exit_reason"] != "not_spawned"
+    spec = A.read_json(tmp_path / "F" / "worker_spec.json")
+    remaining = spec["deadline_perf_counter"] - deadline_before
+    assert 110.0 < remaining <= 121.0
+    assert not any("reservation_settle" in p for p in problems)

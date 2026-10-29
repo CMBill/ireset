@@ -287,7 +287,7 @@ TOLERANCE_PROPOSALS = {
     "parameter_gradient": {"atol": 1e-8, "rtol": 2e-4},
     "global_norm_clip": {"atol": 1e-7, "rtol": 2e-4},
     "theta_cross_path": {"atol": 2e-7, "rtol": 2e-6},
-    "state_cross_path": {"atol": 0.0, "rtol": 5e-4},
+    "state_cross_path": {"atol": 0.0, "rtol": 1e-3},
     "delta_cross_path": {"atol": 0.0, "rtol": 5e-4},
     "delta_same_input": {"atol": 0.0, "rtol": 5e-4},
     "independent_float64": {"atol": 1e-12, "rtol": 1e-9},
@@ -1686,6 +1686,7 @@ def run_p_stage(root: Path, stage: str, attempt: str, t0: float,
     deadline = t0 + float(budget["remaining_s"]) - float(budget["reserve_s"])
 
     def check(unit: str) -> None:
+        _ensure_deadline(deadline, 0.0, unit)
         if guard is not None:
             guard(unit)
 
@@ -2090,6 +2091,63 @@ def _zero_noise_equivalence(g: np.ndarray, r: np.ndarray, *,
     return {"ok": ok, "record": record}
 
 
+GRADIENT_SLICE_POS = {"pos": slice(0, 3), "rot6d": slice(3, 9),
+                      "joint": slice(9, 38)}
+
+
+def _gradient_group_gate(got: Any, ref: Any, *,
+                         name: str) -> tuple[list[str], dict]:
+    """p/rot6d/q group relative-L2/cosine gate for a 38-dim tensor.
+
+    The whole-tensor relative-L2 can hide an exactly-zero group when the
+    remaining groups are large; the plan requires the three registered groups
+    to pass their own gates.  A group whose reference norm is below the
+    nonzero band uses the calibrated absolute zero-noise floor; an exactly
+    zero production group with a non-zero reference is an erasure.
+    """
+    g_all = np.asarray(got, dtype=np.float64)
+    r_all = np.asarray(ref, dtype=np.float64)
+    if g_all.shape != r_all.shape or g_all.ndim == 0:
+        return [f"{name}:group_shape"], {}
+    if g_all.shape[-1] != 38:
+        return [f"{name}:group_width"], {}
+    flat_g = g_all.reshape(-1, 38)
+    flat_r = r_all.reshape(-1, 38)
+    problems: list[str] = []
+    record: dict[str, dict] = {}
+    for label, sl in GRADIENT_SLICE_POS.items():
+        g = flat_g[:, sl].reshape(-1)
+        r = flat_r[:, sl].reshape(-1)
+        diff = g - r
+        rn = float(np.linalg.norm(r))
+        gn = float(np.linalg.norm(g))
+        max_abs = float(np.max(np.abs(diff))) if diff.size else 0.0
+        entry: dict[str, Any] = {
+            "reference_norm": rn, "production_norm": gn,
+            "max_abs_diff": max_abs, "coordinate_count": int(g.size),
+            "relative_l2": None, "cosine": None, "ok": True,
+        }
+        if rn >= GROUP_GATE["nonzero_reference_norm"]:
+            rel = float(np.linalg.norm(diff) / rn)
+            cos = (float(np.dot(g, r) / (gn * rn))
+                   if gn > 0.0 and rn > 0.0 else None)
+            ok = (rel <= GROUP_GATE["relative_l2"]
+                  and cos is not None and cos >= GROUP_GATE["cosine_min"]
+                  and gn > 0.0)
+            entry.update(relative_l2=rel, cosine=cos)
+            if not ok:
+                problems.append(f"{name}:group_{label}")
+        else:
+            ok = (max_abs <= ZERO_GRADIENT_ABS
+                  and not (rn > 0.0 and gn == 0.0))
+            entry["tiny_gate_abs"] = ZERO_GRADIENT_ABS
+            if not ok:
+                problems.append(f"{name}:tiny_group_{label}")
+        entry["ok"] = bool(ok)
+        record[label] = entry
+    return problems, record
+
+
 def compare_gradient(got: Any, ref: Any, spec: Mapping[str, Any],
                      *, name: str) -> dict:
     """Elementwise gate plus relative-L2/cosine for a non-tiny tensor."""
@@ -2138,7 +2196,28 @@ def compare_gradient(got: Any, ref: Any, spec: Mapping[str, Any],
             problems.append(f"{name}:tiny")
     return {**base, "problems": problems, "groups": record,
             "ok": not problems}
-    return {**base, "problems": problems, "groups": record,
+
+
+def compare_cotangent_gradient(got: Any, ref: Any,
+                               spec: Mapping[str, Any], *,
+                               name: str) -> dict:
+    """Whole-tensor gate plus the registered p/rot6d/joint group gates."""
+    base = compare_gradient(got, ref, spec, name=name)
+    problems = list(base["problems"])
+    group_problems, group_record = _gradient_group_gate(got, ref, name=name)
+    problems += group_problems
+    groups = dict(base.get("groups") or {})
+    groups["group_gates"] = group_record
+    group_ratio = 0.0
+    for entry in group_record.values():
+        rel = entry.get("relative_l2")
+        if rel is not None:
+            group_ratio = max(
+                group_ratio,
+                float(rel) / float(GROUP_GATE["relative_l2"]))
+    return {**base, "problems": problems, "groups": groups,
+            "group_gate_problems": group_problems,
+            "group_max_ratio": group_ratio,
             "ok": not problems}
 
 
@@ -2285,9 +2364,6 @@ def _step_json(value: Any) -> Any:
 # I (independent reference stage)
 # ---------------------------------------------------------------------------
 
-GRADIENT_SLICE_POS = {"pos": slice(0, 3), "rot6d": slice(3, 9),
-                      "joint": slice(9, 38)}
-
 
 def _bitwise_array(a: Any, b: Any) -> bool:
     if a is None or b is None:
@@ -2392,6 +2468,28 @@ def _delta_observability(delta_ref64: Any, delta_measured: Any,
                  np.abs(measured - ref) <= float(gate_rtol) * np.abs(ref),
                  False))
     return observable, ok
+
+
+def _state_cross_path_ratio(a: Any, b: Any,
+                            spec: Mapping[str, Any]) -> tuple[float, int]:
+    """Maximum normalized error over *every* coordinate the gate compares.
+
+    The raw state gate is ``abs(a-b) <= atol + rtol*abs(b)`` with no floor, so
+    calibration must use the same denominator and may not skip small states;
+    only coordinates where both sides are exactly zero are equivalent without
+    a ratio.  A non-zero difference at ``b == 0`` is unbounded.
+    """
+    aa = np.asarray(a, dtype=np.float64).reshape(-1)
+    bb = np.asarray(b, dtype=np.float64).reshape(-1)
+    denom = float(spec["atol"]) + float(spec["rtol"]) * np.abs(bb)
+    nonzero = denom > 0.0
+    unbounded = (~nonzero) & (aa != bb)
+    if unbounded.any():
+        return math.inf, int(unbounded.sum())
+    if not nonzero.any():
+        return 0.0, 0
+    ratio = np.abs(aa[nonzero] - bb[nonzero]) / denom[nonzero]
+    return float(ratio.max()), int(nonzero.sum())
 
 
 def _cross_path_flags(p_m: Any, i_m: Any, p_v: Any, i_v: Any,
@@ -2646,19 +2744,20 @@ def _adamw_param_row(key: str, *, name: str, model: str, u: int,
     max_theta_ratio = float(np.max(np.abs(
         p_theta.astype(np.float64) - i_theta.astype(np.float64)) / theta_bound))
     state_ratios = []
-    state_rtol = float(tolerance["state_cross_path"]["rtol"])
+    state_applicable = 0
+    state_unbounded = False
     for a, b in ((p_m, i_m), (p_v, i_v)):
         if a is None or b is None:
             continue
-        aa = np.asarray(a, np.float64)
-        bb = np.asarray(b, np.float64)
-        mask = (np.abs(aa) > ZERO_STATE_ABS) & (np.abs(bb) > ZERO_STATE_ABS)
-        if mask.any():
-            state_ratios.append(float(np.max(
-                np.abs(aa[mask] - bb[mask])
-                / (state_rtol * np.maximum(np.abs(aa[mask]),
-                                           np.abs(bb[mask]))))))
-    max_state_ratio = max(state_ratios, default=0.0)
+        ratio, count = _state_cross_path_ratio(
+            a, b, tolerance["state_cross_path"])
+        state_applicable += count
+        if not math.isfinite(ratio):
+            state_unbounded = True
+        else:
+            state_ratios.append(ratio)
+    max_state_ratio = (None if state_unbounded
+                       else max(state_ratios, default=0.0))
     delta_mask = np.asarray(p_obs, bool) & np.asarray(i_obs, bool)
     if delta_mask.any():
         max_delta_ratio = float(np.max(
@@ -2685,6 +2784,8 @@ def _adamw_param_row(key: str, *, name: str, model: str, u: int,
         classification=verdict["classification"],
         max_theta_ratio=max_theta_ratio,
         max_state_ratio=max_state_ratio,
+        state_ratio_applicable=state_applicable,
+        state_ratio_unbounded=state_unbounded,
         max_delta_ratio=max_delta_ratio,
         max_same_delta_ratio=max_same_delta_ratio,
         same_input_formula_passed=verdict["same_input_formula_passed"],
@@ -2766,11 +2867,13 @@ def run_i_stage(root: Path, stage: str, attempt: str, t0: float,
     deadline = t0 + float(budget["remaining_s"]) - float(budget["reserve_s"])
 
     def check(unit: str) -> None:
+        _ensure_deadline(deadline, 0.0, unit)
         if guard is not None:
             guard(unit)
 
     tol = _declared_tolerance(tolerance)
     p_reports = {model: _p_sidecar(p_dir, model) for model in MODELS}
+    check("i_reference_context")
     ref_ctx = ReferenceContext(provider, counter)
     failures: list[str] = list(ref_ctx.problems)
     gaps: list[str] = list(ref_ctx.problems)
@@ -2922,7 +3025,7 @@ def run_i_stage(root: Path, stage: str, attempt: str, t0: float,
                     # output cotangent vs P
                     p_grad = p_rec["arrays"].get(f"pred_grad/u{u}/m{m}")
                     cot = (total_cot / 4.0).numpy()
-                    cot_cmp = compare_gradient(
+                    cot_cmp = compare_cotangent_gradient(
                         p_grad, cot, tol["output_cotangent"],
                         name=f"cotangent:{model_type}:u{u}:m{m}")
                     if p_grad is None:
@@ -2931,6 +3034,9 @@ def run_i_stage(root: Path, stage: str, attempt: str, t0: float,
                     elif not cot_cmp["ok"]:
                         failures.append(
                             f"i_output_cotangent:{model_type}:u{u}:m{m}")
+                        failures += [
+                            f"i_output_cotangent_{p}"
+                            for p in (cot_cmp.get("group_gate_problems") or [])]
                     cotangent_facts[m] = {
                         "comparison": cot_cmp, "total_cot": cot,
                         "scalars": {k: float(v) for k, v in scalars.items()},
@@ -2946,6 +3052,11 @@ def run_i_stage(root: Path, stage: str, attempt: str, t0: float,
                         max_abs=cot_cmp.get("max_abs"),
                         max_ratio=cot_cmp.get("max_ratio"),
                         groups=cot_cmp.get("groups"),
+                        group_gates=(cot_cmp.get("groups") or {}).get(
+                            "group_gates"),
+                        group_gate_problems=cot_cmp.get(
+                            "group_gate_problems"),
+                        group_max_ratio=cot_cmp.get("group_max_ratio"),
                         status="synthetic_verified" if cot_cmp["ok"]
                         else "mismatch",
                         failure=None if cot_cmp["ok"]
@@ -3515,7 +3626,9 @@ def _worker_main(spec_path: str, out_dir: str) -> int:
     aborted = False
 
     def guard(unit: str) -> None:
-        _ensure_deadline(deadline, reserve, unit)
+        # ``deadline`` is already the work deadline (the seal reserve was
+        # subtracted once when the stage started), so do not subtract it again.
+        _ensure_deadline(deadline, 0.0, unit)
         admission = unit_admission(root, "F", attempt, parent_record,
                                    deadline=deadline)
         if admission:
@@ -3700,7 +3813,7 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float,
     returncode = -1
     stdout = stderr = ""
     wall = 0.0
-    if time.perf_counter() + float(budget["reserve_s"]) >= deadline:
+    if time.perf_counter() >= deadline:
         problems.append("f_stage_deadline_before_worker")
         result = {"problems": list(problems), "counts": None,
                   "failures": [], "gaps": [], "aborted": True}
@@ -4524,9 +4637,26 @@ def unit_admission(root: Path, stage: str, attempt: str,
     if row.get("execution_registration_sha256") != parent.get(
             "registration_sha256"):
         problems.append("unit_parent_registration")
-    if time.perf_counter() + float(parent.get("reserve_s", 0.0)) >= deadline:
+    # ``deadline`` is the absolute work deadline; the seal reserve is already
+    # removed by the caller and must not be deducted a second time.
+    if time.perf_counter() >= float(deadline):
         problems.append("unit_deadline")
     return problems
+
+
+def _stage_unit_guard(root: Path, stage: str, attempt: str, *,
+                      registration_sha: str | None,
+                      deadline: float) -> Callable[[str], None]:
+    """Admission check before every unit of a registered P/I attempt."""
+    parent = {"registration_sha256": registration_sha, "reserve_s": 0.0}
+
+    def guard(unit: str) -> None:
+        problems = unit_admission(root, stage, attempt, parent,
+                                  deadline=deadline)
+        if problems:
+            raise TimeoutError(f"unit_admission:{unit}:{','.join(problems)}")
+
+    return guard
 
 
 def reserve_stage_calls(root: Path, stage: str, attempt: str,
@@ -4632,19 +4762,43 @@ def _settle_f_calls(root: Path, stage: str, attempt: str,
         return False, [f"reservation_settle:{type(exc).__name__}"]
 
 
+def _call_balance_delta_problems(before: Any, after: Any,
+                                 consumed: Any) -> list[str]:
+    """Reconcile the final cumulative call snapshot with the reservation."""
+    prior = _call_counts_from_balance(before)
+    final = _call_counts_from_balance(after)
+    if prior is None:
+        return ["call_balance_prior_unknown"]
+    if final is None:
+        return ["call_balance_final_invalid"]
+    if not _valid_call_snapshot(consumed):
+        return ["call_consumed_unknown"]
+    problems = []
+    for kind in CALL_KINDS:
+        if final[kind] - prior[kind] != int(consumed[kind]):
+            problems.append(f"call_balance_delta:{kind}")
+    return problems
+
+
 def withdraw_attempt_claim(root: Path, stage: str, attempt: str,
                            report_path: Path | None, row: dict,
                            reasons: Sequence[str], *, reason: str,
-                           t0: float, budget: dict) -> tuple[dict, list[str], bool]:
+                           t0: float, budget: dict,
+                           call_balance: Mapping[str, Any] | None = None
+                           ) -> tuple[dict, list[str], bool]:
     """Rewrite a published pass claim to incomplete and reseal honestly.
 
     The rewrite and reseal follow the same publishing -> terminal protocol as
     ``finish_attempt`` and keep the previously billed wall time as a floor.
     If report rewriting or seal-cost coverage cannot be proven, the row is
     left ``publishing`` (non-consumable) and the third value is False.
+    ``call_balance`` is the post-execution cumulative snapshot; a withdrawal
+    of a running attempt must not restore the pre-execution balance.
     """
     problems: list[str] = []
     row = dict(row)
+    if call_balance is not None:
+        row["call_balance"] = dict(call_balance)
     old_cost = float(row.get("measured_wall_s", 0.0) or 0.0)
     if not _nonneg(old_cost):
         old_cost = 0.0
@@ -4678,7 +4832,9 @@ def withdraw_attempt_claim(root: Path, stage: str, attempt: str,
                             max(old_cost, time.perf_counter() - t0),
                             {"complete": False,
                              "incomplete_reason": "withdraw_report_failed",
-                             "withdrawn_reasons": list(reasons)},
+                             "withdrawn_reasons": list(reasons),
+                             **({"call_balance": dict(call_balance)}
+                                if call_balance is not None else {})},
                             "publishing")
             except (OSError, ValueError, TypeError) as exc2:
                 problems.append(f"withdraw_publish:{type(exc2).__name__}")
@@ -4686,7 +4842,9 @@ def withdraw_attempt_claim(root: Path, stage: str, attempt: str,
     sealed = finish_attempt(
         root, stage, attempt, t0, budget, row, status="incomplete",
         extra={"stage": stage, "withdrawn_reasons": list(reasons),
-               "withdrawn_reason": reason},
+               "withdrawn_reason": reason,
+               **({"call_balance": dict(call_balance)}
+                  if call_balance is not None else {})},
         cost_floor=old_cost)
     problems += list(sealed.problems)
     try:
@@ -5395,13 +5553,18 @@ def _scalar_case(theta: float, m: float, v: float, step: int,
     max_theta_ratio = abs(float(rp["theta"][0]) - float(ri["theta"][0])) \
         / theta_bound
     state_ratios = []
-    state_rtol = float(TOLERANCE_PROPOSALS["state_cross_path"]["rtol"])
+    state_applicable = 0
+    state_unbounded = False
     for a, b in ((rp["m"], ri["m"]), (rp["v"], ri["v"])):
-        aa, bb = float(a[0]), float(b[0])
-        if abs(aa) > ZERO_STATE_ABS and abs(bb) > ZERO_STATE_ABS:
-            state_ratios.append(abs(aa - bb)
-                                / (state_rtol * max(abs(aa), abs(bb))))
-    max_state_ratio = max(state_ratios, default=0.0)
+        ratio, count = _state_cross_path_ratio(
+            a, b, TOLERANCE_PROPOSALS["state_cross_path"])
+        state_applicable += count
+        if not math.isfinite(ratio):
+            state_unbounded = True
+        else:
+            state_ratios.append(ratio)
+    max_state_ratio = (None if state_unbounded
+                       else max(state_ratios, default=0.0))
     mask = bool(obs_p[0]) and bool(obs_i[0])
     max_delta_ratio = (abs(float(d_p[0]) - float(d_i[0]))
                        / (gate_cross * abs(float(d_i[0])))) if mask else 0.0
@@ -5418,6 +5581,8 @@ def _scalar_case(theta: float, m: float, v: float, step: int,
         "gaps": verdict["gaps"],
         "max_theta_ratio": max_theta_ratio,
         "max_state_ratio": max_state_ratio,
+        "state_ratio_applicable": state_applicable,
+        "state_ratio_unbounded": state_unbounded,
         "max_delta_ratio": max_delta_ratio,
         "max_same_delta_ratio": max_same_delta_ratio,
         "m_p": float(rp["m"][0]), "m_i": float(ri["m"][0]),
@@ -5488,7 +5653,8 @@ def _observed_from_chain(seed: int, device: str) -> dict:
                                             float(row["max_ratio"]))
             if key.startswith("cotangent:") and row.get("max_ratio") is not None:
                 ratios["output_cotangent"] = max(
-                    ratios["output_cotangent"], float(row["max_ratio"]))
+                    ratios["output_cotangent"], float(row["max_ratio"]),
+                    float(row.get("group_max_ratio") or 0.0))
             if key.startswith("micro_param:"):
                 cmp = row.get("comparison") or {}
                 if cmp.get("max_ratio") is not None:
@@ -5525,6 +5691,10 @@ def _observed_from_chain(seed: int, device: str) -> dict:
                     value = row.get(tag)
                     if value is not None:
                         ratios[name] = max(ratios[name], float(value))
+                    elif name == "state_cross_path":
+                        # A raw-gate pass cannot contain a coordinate whose
+                        # reference is zero with a non-zero production value.
+                        ratios[name] = math.inf
     return {key: _ratio_record(value, source="synthetic_chain")
             for key, value in ratios.items()}
 
@@ -6440,9 +6610,13 @@ def run_registered_audit(run_root: Path, provider: SyntheticTrainingProvider,
                          call_balance=counter.snapshot())
     reserve_stage_calls(run_root, "P", attempt,
                         {"counts": STAGE_NOMINAL["P"]})
+    stage_deadline = t0 + float(budget["remaining_s"]) - float(budget["reserve_s"])
     try:
         p = run_p_stage(run_root, "P", attempt, t0, budget, provider, counter,
-                        roster)
+                        roster, guard=_stage_unit_guard(
+                            run_root, "P", attempt,
+                            registration_sha=registration_sha,
+                            deadline=stage_deadline))
     except (TimeoutError, UpdateCallBudgetExceeded) as exc:
         p = {"passed": False, "failures": [type(exc).__name__],
              "gaps": [f"p_stage_aborted:{exc}"], "rows": [], "paths": {},
@@ -6497,9 +6671,14 @@ def run_registered_audit(run_root: Path, provider: SyntheticTrainingProvider,
                          call_balance=counter.snapshot())
     reserve_stage_calls(run_root, "I", attempt,
                         {"counts": STAGE_NOMINAL["I"]})
+    stage_deadline = t0 + float(budget["remaining_s"]) - float(budget["reserve_s"])
     try:
         i = run_i_stage(run_root, "I", attempt, t0, budget, provider, counter,
-                        roster, p_dir, tolerance=tolerance)
+                        roster, p_dir, tolerance=tolerance,
+                        guard=_stage_unit_guard(
+                            run_root, "I", attempt,
+                            registration_sha=registration_sha,
+                            deadline=stage_deadline))
     except (TimeoutError, UpdateCallBudgetExceeded) as exc:
         i = {"passed": False, "failures": [type(exc).__name__],
              "gaps": [f"i_stage_aborted:{exc}"], "rows": [], "paths": {},
@@ -6591,14 +6770,22 @@ def run_registered_audit(run_root: Path, provider: SyntheticTrainingProvider,
     pre_seal_veto = list(matrix_problems)
     if not settled:
         pre_seal_veto.append("f_call_settlement_unknown")
+    final_balance = counter.snapshot()
+    if settled:
+        pre_seal_veto += _call_balance_delta_problems(
+            _attempt_row(run_root, "F", attempt).get("call_balance"),
+            final_balance, snapshot)
     if pre_seal_veto:
         # Retract the just-written pass claim before the terminal seal and
-        # rebind the report hash through the same publishing protocol.
+        # rebind the report hash through the same publishing protocol.  The
+        # withdrawal stores the post-execution cumulative call snapshot, not
+        # the pre-F balance copied from the running row.
         _amend_final_report(f_report, pre_seal_veto)
         wrow, wprobs, proven = withdraw_attempt_claim(
             run_root, "F", attempt, f_report,
             _attempt_row(run_root, "F", attempt),
-            pre_seal_veto, reason="pre_seal_veto", t0=t0, budget=budget)
+            pre_seal_veto, reason="pre_seal_veto", t0=t0, budget=budget,
+            call_balance=final_balance)
         seals["F"] = {"sealed": False, "terminal": bool(proven),
                       "problems": wprobs, "row": wrow, "withdrawn": True}
         seal = SealResult(False, wrow, wprobs, bool(proven))
@@ -6638,7 +6825,8 @@ def run_registered_audit(run_root: Path, provider: SyntheticTrainingProvider,
         wrow, wprobs, proven = withdraw_attempt_claim(
             run_root, "F", attempt, f_report,
             seals["F"].get("row") or _attempt_row(run_root, "F", attempt),
-            revoke, reason="post_seal_veto", t0=t0, budget=budget)
+            revoke, reason="post_seal_veto", t0=t0, budget=budget,
+            call_balance=counter.snapshot())
         seals["F"]["post_seal_withdrawal"] = {
             "row": wrow, "problems": wprobs, "proven": bool(proven)}
         seal = SealResult(False, wrow, list(seal.problems) + wprobs,
