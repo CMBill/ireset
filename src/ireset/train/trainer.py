@@ -105,6 +105,20 @@ def _worker_thread_limits(worker_id: int) -> None:
     torch.set_num_threads(1)
 
 
+def _optimizer_state_snapshot(opt, param) -> dict | None:
+    """Read-only copy of one AdamW state entry (``None`` when uninitialized)."""
+    state = opt.state.get(param)
+    if not state:
+        return None
+    out: dict = {}
+    for key in ("step", "exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+        value = state.get(key)
+        if value is None:
+            continue
+        out[key] = value.detach().clone() if torch.is_tensor(value) else value
+    return out
+
+
 @dataclass
 class TrainConfig:
     model_type: str = "diffusion"
@@ -141,7 +155,8 @@ class Trainer:
     def __init__(self, cfg: TrainConfig, tokenizer, train_ds, val_ds, out_dir: Path,
                  identity: dict | None = None,
                  formal_eval=None, formal_eval_every: int | None = None,
-                 budget_deadline: float | None = None) -> None:
+                 budget_deadline: float | None = None,
+                 *, loss_fn=None, build_optimizer: bool = True) -> None:
         self.cfg, self.tokenizer = cfg, tokenizer
         self.train_ds, self.val_ds = train_ds, val_ds
         self.out_dir = Path(out_dir)
@@ -179,11 +194,15 @@ class Trainer:
         else:
             self.model = DeterministicG1(**cfg.backbone_kwargs()).to(cfg.device)
         self.conditioner = ConditionEncoder(cfg.d_model).to(cfg.device)
-        self.loss_fn = LossAssembler(tokenizer, cfg.loss, cfg.device)
-        self.opt = torch.optim.AdamW(
+        # ``loss_fn`` is an audit-only injection (pure-synthetic FK/geometry);
+        # ``build_optimizer=False`` lets the independent-reference stage reuse
+        # the shared forward without constructing a second native optimizer.
+        self.loss_fn = (loss_fn if loss_fn is not None
+                        else LossAssembler(tokenizer, cfg.loss, cfg.device))
+        self.opt = (torch.optim.AdamW(
             [*self.model.parameters(), *self.conditioner.parameters()],
             lr=cfg.lr, weight_decay=cfg.weight_decay,
-        )
+        ) if build_optimizer else None)
         g = torch.Generator().manual_seed(cfg.seed)
         self.train_loader = DataLoader(
             train_ds, batch_size=cfg.micro_batch, shuffle=True,
@@ -262,7 +281,14 @@ class Trainer:
             if not _finite_number(value):
                 raise TrainingNumericalError("nonfinite_loss_part", field=f"parts.{key}", value=repr(value))
 
-    def _forward(self, batch, noise_generator: torch.Generator | None = None):
+    def predict(self, batch, noise_generator: torch.Generator | None = None,
+                capture: dict | None = None):
+        """Conditioner/backbone prediction; no loss call.
+
+        This is the shared production forward.  ``_forward`` adds the loss
+        assembly; the update audit re-executes the same prediction for its
+        independent reference without invoking the production loss.
+        """
         self._check_batch(batch)
         B = batch["x0"].shape[0]
         memory = self.conditioner(batch)
@@ -289,9 +315,166 @@ class Trainer:
             raise TrainingNumericalError("nonfinite_prediction", field="x0_pred")
         if not _rotation6d_valid(x0_pred[..., 3:9]):
             raise TrainingNumericalError("degenerate_prediction_rotation6d", field="x0_pred[3:9]")
+        if capture is not None:
+            capture["batch"] = batch
+            capture["memory"] = memory
+            capture["x0_pred"] = x0_pred
+            if self.cfg.model_type == "diffusion":
+                capture["t"] = t
+                capture["noise"] = noise
+                capture["x_t"] = x_t
+        return memory, x0_pred
+
+    def _forward(self, batch, noise_generator: torch.Generator | None = None,
+                 capture: dict | None = None):
+        """Production forward; ``capture`` receives read-only live references.
+
+        ``capture`` is an audit-only sink.  Assigning references does not
+        alter the graph or the numeric path; with ``capture=None`` this is
+        bit-identical to the pre-refactor implementation.
+        """
+        memory, x0_pred = self.predict(batch, noise_generator=noise_generator,
+                                       capture=capture)
         loss, parts = self.loss_fn(x0_pred, batch)
         self._check_losses(loss, parts)
         return loss, parts
+
+    # --- shared production update unit -------------------------------------
+    # The native training loop and the real-update audit both call exactly
+    # these methods: zero_grad -> per-micro forward/scaled backward ->
+    # joint-global clip -> native AdamW step.  Loader sampling, history,
+    # validation and checkpointing stay with the native ``run``.
+
+    def begin_update(self) -> None:
+        self.opt.zero_grad(set_to_none=True)
+
+    def _named_parameters(self) -> list[tuple[str, torch.nn.Parameter]]:
+        return ([("model." + n, p) for n, p in self.model.named_parameters()]
+                + [("conditioner." + n, p)
+                   for n, p in self.conditioner.named_parameters()])
+
+    def accumulate_micro(self, batch: dict, *, grad_accum: int | None = None,
+                         noise_generator: torch.Generator | None = None,
+                         observer: dict | None = None,
+                         pre_backward=None, post_backward=None
+                         ) -> tuple[torch.Tensor, dict]:
+        """One micro: check -> forward -> (loss/N).backward -> finite check.
+
+        ``observer`` captures read-only evidence for the audit: prediction
+        input gradient, per-micro leaf contributions, accumulated ``.grad``
+        and the forward inputs.  Hooks never return a replacement gradient
+        and never write ``.grad``; ``observer=None`` is the native path.
+        """
+        accum = int(self.cfg.grad_accum if grad_accum is None else grad_accum)
+        if accum <= 0:
+            raise ValueError("grad_accum must be positive")
+        capture: dict | None = {} if observer is not None else None
+        handles: list = []
+        self._check_batch(batch)
+        try:
+            if capture is not None:
+                loss, parts = self._forward(batch, noise_generator=noise_generator,
+                                            capture=capture)
+            else:
+                loss, parts = self._forward(batch, noise_generator=noise_generator)
+            if observer is not None:
+                assert capture is not None
+                fired = {"prediction": 0}
+                named = self._named_parameters()
+
+                def prediction_hook(grad):
+                    fired["prediction"] += 1
+                    observer.setdefault("prediction_grads", []).append(
+                        grad.detach().clone())
+                    return None
+
+                capture["x0_pred"].register_hook(prediction_hook)
+                contributions: dict[str, torch.Tensor] = {}
+                counts: dict[str, int] = {}
+
+                for name, param in named:
+                    def leaf_hook(grad, _name=name):
+                        counts[_name] = counts.get(_name, 0) + 1
+                        contributions[_name] = grad.detach().clone()
+                        return None
+                    handles.append(param.register_hook(leaf_hook))
+                observer["_leaf_counts"] = counts
+                observer["_leaf_contributions"] = contributions
+                observer["forward_capture"] = capture
+                observer["loss"] = loss.detach().clone()
+                observer["parts"] = dict(parts)
+                observer["loss_scaled"] = (loss / accum).detach().clone()
+            if pre_backward is not None:
+                pre_backward()
+            (loss / accum).backward()
+            if observer is not None:
+                observer["prediction_hook_fires"] = int(fired["prediction"])
+                observer["accumulated"] = {
+                    name: (param.grad.detach().clone()
+                           if param.grad is not None else None)
+                    for name, param in named}
+                observer["leaf_counts"] = dict(observer["_leaf_counts"])
+                observer["leaf_contributions"] = dict(observer["_leaf_contributions"])
+            if post_backward is not None:
+                post_backward()
+            self._check_gradients()
+            return loss, parts
+        finally:
+            for handle in handles:
+                handle.remove()
+            if observer is not None:
+                observer.pop("_leaf_counts", None)
+                observer.pop("_leaf_contributions", None)
+
+    def clip_gradients(self, *, observer: dict | None = None) -> float:
+        """Joint model+conditioner global L2 clip with the frozen 1e-6 term."""
+        self._check_gradients()
+        if observer is not None:
+            observer["preclip"] = {
+                name: (param.grad.detach().clone()
+                       if param.grad is not None else None)
+                for name, param in self._named_parameters()}
+        gnorm = torch.nn.utils.clip_grad_norm_(
+            [*self.model.parameters(), *self.conditioner.parameters()],
+            self.cfg.grad_clip)
+        if not _finite_number(gnorm):
+            raise TrainingNumericalError("nonfinite_gradnorm", field="gnorm")
+        self._check_gradients()
+        self._check_params()
+        if observer is not None:
+            g = float(gnorm)
+            observer["gnorm"] = g
+            observer["clip_coef"] = (min(1.0, float(self.cfg.grad_clip) / (g + 1e-6))
+                                     if g > float(self.cfg.grad_clip) else 1.0)
+            observer["clip_triggered"] = bool(g > float(self.cfg.grad_clip))
+            observer["postclip"] = {
+                name: (param.grad.detach().clone()
+                       if param.grad is not None else None)
+                for name, param in self._named_parameters()}
+        return float(gnorm)
+
+    def step_optimizer(self, *, observer: dict | None = None) -> None:
+        """Native AdamW step; the pre/post parameters and state are optional evidence."""
+        if observer is not None:
+            observer["optimizer_param_groups"] = len(self.opt.param_groups)
+            observer["optimizer_defaults"] = {
+                k: (v if isinstance(v, (bool, int, float, str, type(None)))
+                    else repr(v))
+                for k, v in self.opt.defaults.items()}
+            observer["state_before"] = {
+                name: _optimizer_state_snapshot(self.opt, param)
+                for name, param in self._named_parameters()}
+            observer["theta_before"] = {
+                name: param.detach().clone()
+                for name, param in self._named_parameters()}
+        self.opt.step()
+        if observer is not None:
+            observer["theta_after"] = {
+                name: param.detach().clone()
+                for name, param in self._named_parameters()}
+            observer["state_after"] = {
+                name: _optimizer_state_snapshot(self.opt, param)
+                for name, param in self._named_parameters()}
 
     @contextmanager
     def _evaluation_state(self):
@@ -519,6 +702,11 @@ class Trainer:
         phase, n_micro, n_samples = "startup", 0, 0
         update_in_flight = False
         t_start = time.perf_counter()
+
+        def _count_backward() -> None:
+            nonlocal n_micro, backward_micro_batches
+            n_micro += 1
+            backward_micro_batches += 1
         self._checkpoint_records = {}
         self._failure = None
         self._last_validation_evidence = self._last_formal_evidence = None
@@ -533,7 +721,7 @@ class Trainer:
                 self._check_params()
                 self._synchronize()
                 opt_step_t0 = time.perf_counter()
-                self.opt.zero_grad(set_to_none=True)
+                self.begin_update()
                 parts_acc: dict[str, float] = {}
                 n_micro, n_samples = 0, 0
                 for micro in range(cfg.grad_accum):
@@ -553,31 +741,22 @@ class Trainer:
                         n_samples += consumed
                     self._check_deadline(f"step_{step + 1}_{phase}_loaded")
                     batch = self._to_device(batch)
-                    self._check_batch(batch)
-                    loss, parts = self._forward(batch)
-                    self._check_losses(loss, parts)
-                    self._check_deadline(f"step_{step + 1}_{phase}_forward")
-                    (loss / cfg.grad_accum).backward()
-                    n_micro += 1
-                    backward_micro_batches += 1
-                    self._check_gradients()
+                    loss, parts = self.accumulate_micro(
+                        batch,
+                        pre_backward=lambda: self._check_deadline(
+                            f"step_{step + 1}_{phase}_forward"),
+                        post_backward=_count_backward)
                     for k, v in parts.items():
                         parts_acc[k] = parts_acc.get(k, 0.0) + v / cfg.grad_accum
                         if not _finite_number(parts_acc[k]):
                             raise TrainingNumericalError("nonfinite_loss_aggregate", field=k)
                     self._check_deadline(f"step_{step + 1}_{phase}_backward")
                 phase = "gradient_clip"
-                self._check_gradients()
-                gnorm = torch.nn.utils.clip_grad_norm_(
-                    [*self.model.parameters(), *self.conditioner.parameters()], cfg.grad_clip)
-                if not _finite_number(gnorm):
-                    raise TrainingNumericalError("nonfinite_gradnorm", field="gnorm")
-                self._check_gradients()
-                self._check_params()
+                gnorm = self.clip_gradients()
                 self._check_deadline(f"optimizer_update_{step + 1}")
                 phase = "optimizer_update"
                 update_in_flight = True
-                self.opt.step()
+                self.step_optimizer()
                 update_in_flight = False
                 step += 1  # actual update returned; record its losses even if it poisoned parameters
                 self._synchronize()
