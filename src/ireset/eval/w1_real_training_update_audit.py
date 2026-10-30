@@ -2260,6 +2260,9 @@ class ReferenceContext:
                             dtype=np.float32).reshape(-1, 38)
             decoded = independent_decode(x0.astype(np.float64), self.mean,
                                          self.std, self.lo, self.hi)
+            # The decode itself can outlast the deadline; re-check before the
+            # charged target FK so no reference FK starts after expiry.
+            self._check(f"reference_target_{key}")
             kp = synthetic_fk_np(self.chain, decoded["pos"], decoded["R"],
                                  decoded["q"])
             self.target[key] = {"kp": kp.reshape(-1, len(SITE_NAMES), 3),

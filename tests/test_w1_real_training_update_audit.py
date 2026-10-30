@@ -1360,3 +1360,44 @@ def test_reference_context_jacobian_obeys_the_deadline(chain, tmp_path,
         for key in A.WINDOW_IDS)
     assert counter.counts["reference_mj_forward"] == 2 * target_states
     assert counter.counts["independent_output_vjp"] == 0
+
+
+def test_reference_context_target_fk_obeys_the_deadline(chain, tmp_path,
+                                                        monkeypatch):
+    clock = _install_fake_clock(monkeypatch)
+    calls = {"decode": 0, "fk": 0}
+    original_decode = A.independent_decode
+
+    def expire_during_decode(*args, **kwargs):
+        result = original_decode(*args, **kwargs)
+        calls["decode"] += 1
+        if calls["decode"] == 2:
+            clock["now"] = 200.0
+        return result
+
+    original_fk = A.synthetic_fk_np
+
+    def counted_fk(*args, **kwargs):
+        calls["fk"] += 1
+        return original_fk(*args, **kwargs)
+
+    monkeypatch.setattr(A, "independent_decode", expire_during_decode)
+    monkeypatch.setattr(A, "synthetic_fk_np", counted_fk)
+    counter = A.CallCounter(A.CALL_CAPS)
+    with pytest.raises(TimeoutError) as caught:
+        A.run_i_stage(
+            tmp_path / "I", "I", "attempt_001", 0.0,
+            {"remaining_s": 100.0, "reserve_s": 0.0}, chain["provider"],
+            counter, chain["provider"].roster, chain["root"] / "P",
+            tolerance={"tolerances": A.TOLERANCE_PROPOSALS},
+            out_dir=tmp_path / "I")
+    assert "reference_target_W1" in str(caught.value)
+    assert "budget_deadline" in str(caught.value)
+    # Only the first window (decoded before expiry) may run its target FK;
+    # the window whose decode crossed the deadline must not start one.
+    assert calls["fk"] == 1
+    first_states = int(np.asarray(
+        chain["provider"].window_arrays[A.WINDOW_IDS[0]]["x0"]).shape[0])
+    assert counter.counts["reference_mj_forward"] == first_states
+    assert counter.counts["reference_mj_jac_site"] == 0
+    assert counter.counts["independent_output_vjp"] == 0
