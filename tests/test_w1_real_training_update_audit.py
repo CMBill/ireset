@@ -551,7 +551,7 @@ def test_state_cross_path_floor_does_not_hide_divergence():
         np.array([0.0]), np.array([1e-9]),
         np.array([0.0]), np.array([1e-9]),
         np.array([0.0]), np.array([0.0]),
-        np.array([0.0]), np.array([1e-9]),
+        np.array([0.0]), np.array([0.0]), np.array([1e-9]),
         np.array([True]), np.array([True]), spec)
     assert flags["m_ok"] is False
     assert flags["m_zero_disagreement"] is True
@@ -561,13 +561,13 @@ def test_state_cross_path_floor_does_not_hide_divergence():
         np.array([1e-8]), np.array([2e-8]),
         np.array([1e-8]), np.array([2e-8]),
         np.array([0.0]), np.array([0.0]),
-        np.array([0.0]), np.array([0.0]),
+        np.array([0.0]), np.array([0.0]), np.array([0.0]),
         np.array([False]), np.array([False]), spec)
     assert flags["m_ok"] is False and flags["v_ok"] is False
     flags = A._cross_path_flags(
         np.zeros(1), np.zeros(1), np.zeros(1), np.zeros(1),
         np.zeros(1), np.zeros(1), np.zeros(1), np.zeros(1),
-        np.array([False]), np.array([False]), spec)
+        np.zeros(1), np.array([False]), np.array([False]), spec)
     assert flags["m_ok"] and flags["v_ok"] and flags["theta_ok"]
     assert flags["delta_ok"] and not flags["delta_presence_mismatch"]
 
@@ -1256,3 +1256,107 @@ def test_i_stage_checks_deadline_before_clip_and_counts_after_update(
     assert counter.counts["explicit_reference_updates"] == 3
     assert counter.counts["diagnostic_parameter_update_events"] == 3
     assert counter.counts["optimizer_formula_checks"] == 3
+
+
+# ---------------------------------------------------------------------------
+# sixth review-round counterexamples: unrounded cross-path delta reference
+# and the reference-FK deadline units
+# ---------------------------------------------------------------------------
+
+
+def test_cross_path_delta_uses_the_unrounded_i_reference():
+    case = A._scalar_case(
+        0.00043598099728114903, 0.001, 1e-7, 2,
+        -0.008899898268282413, -0.0089, m_none=False)
+    assert case["observable_p"] and case["observable_i"]
+    assert case["p_formula"] == [] and case["i_formula"] == []
+    assert case["failures"] == []
+    assert case["flags"]["delta_presence_mismatch"] is False
+    assert case["flags"]["delta_one_sided_observable"] is False
+    gate = A.TOLERANCE_PROPOSALS["delta_cross_path"]["rtol"]
+    # The review numbers are normalized by 1e-3: 1.001830 against the
+    # unrounded I reference and 0.994504 against the rounded measured I delta.
+    raw_correct = (abs(case["delta_measured_p"] - case["delta_ref_i"])
+                   / abs(case["delta_ref_i"]))
+    raw_rounded = (abs(case["delta_measured_p"] - case["delta_measured_i"])
+                   / abs(case["delta_measured_i"]))
+    assert raw_correct == pytest.approx(1.001830e-3, rel=1e-4)
+    assert raw_rounded == pytest.approx(0.994504e-3, rel=1e-3)
+    assert case["max_delta_ratio"] == pytest.approx(raw_correct / gate,
+                                                    rel=1e-4)
+    assert case["classification"] == "cross_path_sensitivity_gap"
+    assert case["flags"]["delta_ok"] is False
+
+
+def test_i_stage_checks_deadline_before_reference_fk(chain, tmp_path,
+                                                     monkeypatch):
+    from ireset.train.trainer import Trainer
+
+    clock = _install_fake_clock(monkeypatch)
+    original = Trainer.predict
+    calls = {"n": 0}
+
+    def expire_after_forward(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            clock["now"] = 200.0
+        return result
+
+    monkeypatch.setattr(Trainer, "predict", expire_after_forward)
+    counter = A.CallCounter(A.CALL_CAPS)
+    with pytest.raises(TimeoutError) as caught:
+        A.run_i_stage(
+            tmp_path / "I", "I", "attempt_001", 0.0,
+            {"remaining_s": 100.0, "reserve_s": 0.0}, chain["provider"],
+            counter, chain["provider"].roster, chain["root"] / "P",
+            tolerance={"tolerances": A.TOLERANCE_PROPOSALS},
+            out_dir=tmp_path / "I")
+    assert "i_ref_fk_1_0" in str(caught.value)
+    target_states = sum(
+        int(np.asarray(chain["provider"].window_arrays[key]["x0"]).shape[0])
+        for key in A.WINDOW_IDS)
+    assert counter.counts["reference_mj_forward"] == target_states
+    assert counter.counts["reference_mj_jac_site"] == 0
+    assert counter.counts["independent_output_vjp"] == 0
+    assert counter.counts["independent_total_vjp"] == 0
+
+
+def test_reference_context_jacobian_obeys_the_deadline(chain, tmp_path,
+                                                       monkeypatch):
+    clock = _install_fake_clock(monkeypatch)
+    calls = {"fk": 0, "jac": 0}
+    original_fk = A.synthetic_fk_np
+
+    def counted_fk(*args, **kwargs):
+        result = original_fk(*args, **kwargs)
+        calls["fk"] += 1
+        if calls["fk"] == len(A.WINDOW_IDS) + 1:
+            clock["now"] = 200.0
+        return result
+
+    original_jac = A.synthetic_fk_jac_np
+
+    def counted_jac(*args, **kwargs):
+        calls["jac"] += 1
+        return original_jac(*args, **kwargs)
+
+    monkeypatch.setattr(A, "synthetic_fk_np", counted_fk)
+    monkeypatch.setattr(A, "synthetic_fk_jac_np", counted_jac)
+    counter = A.CallCounter(A.CALL_CAPS)
+    with pytest.raises(TimeoutError) as caught:
+        A.run_i_stage(
+            tmp_path / "I", "I", "attempt_001", 0.0,
+            {"remaining_s": 100.0, "reserve_s": 0.0}, chain["provider"],
+            counter, chain["provider"].roster, chain["root"] / "P",
+            tolerance={"tolerances": A.TOLERANCE_PROPOSALS},
+            out_dir=tmp_path / "I")
+    assert "reference_jacobian" in str(caught.value)
+    assert "budget_deadline" in str(caught.value)
+    assert calls["jac"] == 0
+    assert counter.counts["reference_mj_jac_site"] == 0
+    target_states = sum(
+        int(np.asarray(chain["provider"].window_arrays[key]["x0"]).shape[0])
+        for key in A.WINDOW_IDS)
+    assert counter.counts["reference_mj_forward"] == 2 * target_states
+    assert counter.counts["independent_output_vjp"] == 0

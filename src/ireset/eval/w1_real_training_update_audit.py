@@ -288,7 +288,7 @@ TOLERANCE_PROPOSALS = {
     "global_norm_clip": {"atol": 1e-7, "rtol": 2e-4},
     "theta_cross_path": {"atol": 2e-7, "rtol": 2e-6},
     "state_cross_path": {"atol": 0.0, "rtol": 2e-3},
-    "delta_cross_path": {"atol": 0.0, "rtol": 1e-3},
+    "delta_cross_path": {"atol": 0.0, "rtol": 5e-4},
     "delta_same_input": {"atol": 0.0, "rtol": 5e-4},
     "independent_float64": {"atol": 1e-12, "rtol": 1e-9},
 }
@@ -2240,9 +2240,11 @@ class ReferenceContext:
     """One cache per I/F-I process: four target windows (240 states)."""
 
     def __init__(self, provider: SyntheticTrainingProvider,
-                 counter: CallCounter) -> None:
+                 counter: CallCounter, *,
+                 guard: Callable[[str], None] | None = None) -> None:
         self.provider = provider
         self.counter = counter
+        self._guard = guard
         tokenizer = provider.tokenizer
         constants = provider.constants
         self.const = constants
@@ -2253,6 +2255,7 @@ class ReferenceContext:
         self.chain = provider.chain
         self.target: dict[str, dict] = {}
         for key in WINDOW_IDS:
+            self._check(f"reference_target_{key}")
             x0 = np.asarray(provider.window_arrays[key]["x0"],
                             dtype=np.float32).reshape(-1, 38)
             decoded = independent_decode(x0.astype(np.float64), self.mean,
@@ -2267,16 +2270,26 @@ class ReferenceContext:
             f"target_domain:{key}"
             for key, rec in self.target.items() if not rec["ok"]]
 
+    def _check(self, unit: str,
+               guard: Callable[[str], None] | None = None) -> None:
+        active = guard if guard is not None else self._guard
+        if active is not None:
+            active(unit)
+
     def targets_for(self, slots: Sequence[str]) -> np.ndarray:
         return np.concatenate([self.target[w]["kp"] for w in slots], axis=0)
 
-    def evaluate(self, pred_np: np.ndarray, slots: Sequence[str]) -> dict:
+    def evaluate(self, pred_np: np.ndarray, slots: Sequence[str], *,
+                 guard: Callable[[str], None] | None = None) -> dict:
+        self._check("reference_evaluate", guard)
         x0 = np.asarray(pred_np, dtype=np.float32).reshape(-1, 38)
         decoded = independent_decode(x0.astype(np.float64), self.mean,
                                      self.std, self.lo, self.hi)
+        self._check("reference_fk", guard)
         kp = synthetic_fk_np(self.chain, decoded["pos"], decoded["R"],
                              decoded["q"])
         self.counter.add("reference_mj_forward", x0.shape[0])
+        self._check("reference_jacobian", guard)
         _, jac = synthetic_fk_jac_np(self.chain, decoded["pos"], decoded["R"],
                                      decoded["q"])
         self.counter.add("reference_mj_forward", x0.shape[0])
@@ -2500,11 +2513,18 @@ def _state_cross_path_ratio(a: Any, b: Any,
 
 def _cross_path_flags(p_m: Any, i_m: Any, p_v: Any, i_v: Any,
                       p_theta: Any, i_theta: Any,
-                      p_delta: Any, i_delta: Any,
-                      p_obs: Any, i_obs: Any,
+                      p_delta_measured: Any, p_delta_ref: Any,
+                      i_delta_ref: Any, p_obs: Any, i_obs: Any,
                       spec: Mapping[str, Any], *,
                       delta_rtol: float = 5e-4) -> dict:
-    """Raw cross-path gates; do not apply the interval classification here."""
+    """Raw cross-path gates; do not apply the interval classification here.
+
+    The delta close gate compares P's *measured* update with I's *unrounded*
+    reference delta (plan section 6.2); comparing two measured, rounded
+    updates lets the final float32 write hide a cross-path difference.  The
+    zero/non-zero presence check compares the two unrounded references, so an
+    unobservable but non-zero reference on both sides is not a divergence.
+    """
     out: dict[str, Any] = {}
     for tag, a, b in (("m", p_m, i_m), ("v", p_v, i_v),
                       ("theta", p_theta, i_theta)):
@@ -2533,8 +2553,8 @@ def _cross_path_flags(p_m: Any, i_m: Any, p_v: Any, i_v: Any,
         out[f"{tag}_sign_disagreement"] = bool(sign_disagree.any())
         out[f"{tag}_close"] = bool(close.all())
         out[f"{tag}_ok"] = bool(close.all())
-    p_delta_nz = np.asarray(p_delta, np.float64) != 0.0
-    i_delta_nz = np.asarray(i_delta, np.float64) != 0.0
+    p_delta_nz = np.asarray(p_delta_ref, np.float64) != 0.0
+    i_delta_nz = np.asarray(i_delta_ref, np.float64) != 0.0
     out["delta_presence_mismatch"] = bool(
         (p_delta_nz != i_delta_nz).any())
     mask = np.asarray(p_obs, bool) & np.asarray(i_obs, bool)
@@ -2544,8 +2564,8 @@ def _cross_path_flags(p_m: Any, i_m: Any, p_v: Any, i_v: Any,
         out["delta_close"] = False
         out["delta_ok"] = False
     elif mask.any():
-        a = np.asarray(p_delta, np.float64)[mask]
-        b = np.asarray(i_delta, np.float64)[mask]
+        a = np.asarray(p_delta_measured, np.float64)[mask]
+        b = np.asarray(i_delta_ref, np.float64)[mask]
         close = np.abs(a - b) <= float(delta_rtol) * np.abs(b)
         out["delta_close"] = bool(close.all())
         out["delta_ok"] = bool(close.all())
@@ -2658,8 +2678,8 @@ def _adamw_param_row(key: str, *, name: str, model: str, u: int,
     flags = _cross_path_flags(
         p_m64, i_m64, p_v64, i_v64,
         p_theta.astype(np.float64), i_theta.astype(np.float64),
-        delta_p_measured, delta_i_measured, p_obs, i_obs,
-        tolerance["state_cross_path"], delta_rtol=gate_cross)
+        delta_p_measured, pe["delta_ref64"], ie["delta_ref64"],
+        p_obs, i_obs, tolerance["state_cross_path"], delta_rtol=gate_cross)
     theta_close = ((np.abs(p_theta.astype(np.float64)
                            - i_theta.astype(np.float64))
                     <= float(theta_spec["atol"])
@@ -2766,11 +2786,11 @@ def _adamw_param_row(key: str, *, name: str, model: str, u: int,
                        else max(state_ratios, default=0.0))
     delta_mask = np.asarray(p_obs, bool) & np.asarray(i_obs, bool)
     if delta_mask.any():
+        delta_ref_i = np.asarray(ie["delta_ref64"], np.float64)
         max_delta_ratio = float(np.max(
             np.abs(np.asarray(delta_p_measured)[delta_mask]
-                   - np.asarray(delta_i_measured)[delta_mask])
-            / (gate_cross
-               * np.abs(np.asarray(delta_i_measured)[delta_mask]))))
+                   - delta_ref_i[delta_mask])
+            / (gate_cross * np.abs(delta_ref_i[delta_mask]))))
     else:
         max_delta_ratio = 0.0
     same_delta = []
@@ -2880,7 +2900,7 @@ def run_i_stage(root: Path, stage: str, attempt: str, t0: float,
     tol = _declared_tolerance(tolerance)
     p_reports = {model: _p_sidecar(p_dir, model) for model in MODELS}
     check("i_reference_context")
-    ref_ctx = ReferenceContext(provider, counter)
+    ref_ctx = ReferenceContext(provider, counter, guard=check)
     failures: list[str] = list(ref_ctx.problems)
     gaps: list[str] = list(ref_ctx.problems)
     rows: list[dict] = []
@@ -2992,7 +3012,9 @@ def run_i_stage(root: Path, stage: str, attempt: str, t0: float,
                     pred_det = pred.detach()
                     pred_np = pred_det.cpu().numpy().astype(np.float32).reshape(
                         -1, 38)
-                    ref = ref_ctx.evaluate(pred_np, MICRO_SCHEDULE[u][m])
+                    check(f"i_ref_fk_{u}_{m}")
+                    ref = ref_ctx.evaluate(pred_np, MICRO_SCHEDULE[u][m],
+                                           guard=check)
                     for gap in ref["problems"]:
                         gaps.append(f"i_fk_{gap}:{model_type}:u{u}:m{m}")
                     check(f"i_output_vjp_{u}_{m}")
@@ -5526,7 +5548,8 @@ def _scalar_case(theta: float, m: float, v: float, step: int,
         rp["m"].astype(np.float64), ri["m"].astype(np.float64),
         rp["v"].astype(np.float64), ri["v"].astype(np.float64),
         rp["theta"].astype(np.float64), ri["theta"].astype(np.float64),
-        d_p, d_i, obs_p, obs_i, TOLERANCE_PROPOSALS["state_cross_path"],
+        d_p, rp["delta_ref64"], ri["delta_ref64"], obs_p, obs_i,
+        TOLERANCE_PROPOSALS["state_cross_path"],
         delta_rtol=gate_cross)
     theta_spec = TOLERANCE_PROPOSALS["theta_cross_path"]
     tclose = (abs(float(rp["theta"][0]) - float(ri["theta"][0]))
@@ -5576,8 +5599,9 @@ def _scalar_case(theta: float, m: float, v: float, step: int,
     max_state_ratio = (None if state_unbounded
                        else max(state_ratios, default=0.0))
     mask = bool(obs_p[0]) and bool(obs_i[0])
-    max_delta_ratio = (abs(float(d_p[0]) - float(d_i[0]))
-                       / (gate_cross * abs(float(d_i[0])))) if mask else 0.0
+    max_delta_ratio = (abs(float(d_p[0]) - float(ri["delta_ref64"][0]))
+                       / (gate_cross
+                          * abs(float(ri["delta_ref64"][0])))) if mask else 0.0
     same_ratios = []
     for obs, ref, measured in ((obs_p, rp["delta_ref64"], d_p),
                                (obs_i, ri["delta_ref64"], d_i)):
