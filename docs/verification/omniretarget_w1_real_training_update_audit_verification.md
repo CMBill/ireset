@@ -239,3 +239,118 @@ v0.8 的第六轮 2 P1 修复与 54 项测试保留在历史（`synthetic/histor
   （成本 164.4234s）与 `synthetic/history/v0.9_final_plan_9ff3b1f1/`（成本 160.5867s），均为
   582 条 gap，不作准入依据；当前权威为方案 `e2ba8ef9…`、`synthetic/v0.9_final/` 与
   `admission/attempt_012/`（SHA `44e229f1…`）。
+
+## 10. Gate A/B 真实 provider 接入与执行计划实现（2026-10-31）
+
+执行计划：[W1 真实 provider 接入与执行计划](../plans/omniretarget_w1_real_training_update_provider_execution_plan.md)
+（v0.6，`gate_a_implemented / gate_b_acceptance_passed / gate_c_not_authorized /
+gate_d_e_not_run`）。本轮只实施并验收 Gate A/B；Gate C（新的 §10.2 明确授权）、Gate D（真实 R0）
+与 Gate E（真实 P→I→F）未执行。
+
+### 10.1 Gate A 实现
+
+- 新增 `src/ireset/eval/w1_real_training_update_provider.py`。`RealTrainingProvider.metadata()`
+  只读取父锚路径/字节 SHA、NPZ header（键/dtype/shape/order，不读 payload）、父 index/ledger
+  终态、checkpoint/config/资产引用文本、静态 roster 与 runtime；`read_scope` 记录
+  `npz_values_read=0`、`checkpoint_payload_read=0`、`torch_load_calls=0`、
+  `model_constructor_calls=0`、`muJoCo_compile_calls=0`。
+- `materialize()` 在已登记 P/I/F 阶段读取四窗数组、常数、R0 噪声与父数组，先做 dtype/shape/
+  有限性/旋转域/joint 域/关节限位/box quat/wfc 检查、独立 encode 与 tokenizer 复现、alpha
+  重推与 x_t 参考，P 写入 `input_admission.json`；I/F 重新读取并逐字段绑定该工件。失败时
+  P/I 在构造任何模型前以 `complete_evidence=false` 收口。
+- 真实参考后端 `RealReferenceBackend` 在每次 `positions/jacobians` 入口执行截止与父登记
+  守卫，并在每个 `mj_forward/mj_jacSite` 前检查绝对截止、成功返回后分别增加
+  `reference_mj_forward/reference_mj_jac_site`；部分失败保留已完成量，不按 batch 名义补足。
+  合成后端适配同一接口，`ReferenceContext` 不再直接要求 `SyntheticChain`。
+- 真实 `build_trainer` 使用 strict `load_state_dict`（缺键/额外键/dtype/shape/非有限/step/
+  config/root_stats/usable 均拒绝），P/F-P 构造一次生产 LossAssembler/FK/箱体静态场景，
+  I/F-I 禁止生产 loss 且不构造原生优化器；`Trainer` 只新增可选 `construction_observer`
+  计数钩子，默认 `None` 路径数值不变。
+
+### 10.2 续跑、选择与 F 时序
+
+- `stage_state(root, stage, attempt=None)` 支持显式 attempt；默认允许一个已结算失败 attempt
+  与唯一可消费 attempt 共存，多个可消费候选、未封口/撤回选择或未知历史均拒绝；
+  `verify_history` 要求盘 × index × ledger × reservation 一致、成本有限非负、`final-before
+  == consumed`。
+- `_cohort_chain` 按 R0→P→I→F 顺序重推每个 attempt 的调用增量；`selected_chain_counts`
+  （仅选中链，精确等于 mode 名义列）、`stage_call_counts`（同阶段全部历史）与
+  `cohort_call_counts`（全部 attempt）分开保存；选中链 16 次不因 cohort 17 次被否决，反
+  之亦然。`--resume --stage` 只追加一个新 attempt，上游复用不重复计费。
+- F worker 在 `running/consumed=null` 时以 `candidate_attempts` + 本地 `L_F` 计算
+  `provisional_chain_counts` 并检查阶段/cohort 上限；父进程仅在完整 24 类快照核验合并后
+  settle，再持久化 `call_balance_before/after`、从盘重读并终检父绑定/选中链/历史上限；
+  封口后按通常消费者规则确认四个终态 attempt，通过后才把完整 `selected_attempts/
+  selected_chain_counts` 写入报告并重封口；失败时按 publishing→terminal 撤回。
+- scene 计数按 mode 校验：synthetic 全 0，real P/F 各 1、全链 2；admission/full-chain/F
+  父子检查均按 mode 生成预期。
+
+### 10.3 Gate B 执行
+
+全部命令在最终实现字节上执行；校准/合成命令不设置 `OMP_NUM_THREADS`（与 v0.9 运行环境一致），
+仅 pytest 使用 `OMP_NUM_THREADS=1`。
+
+- 新 provider 测试 `tests/test_w1_real_training_update_provider.py`：**20 passed**
+  （临时文件、解析 fixture、fake MuJoCo/G1Spec、metadata/schema/stub；不读真实 checkpoint/
+  数组/资产）。
+- 既有 `tests/test_w1_real_training_update_audit.py`：**55 passed**。
+- 相关回归 6 文件（`test_omniretarget_w1.py`、`test_w1_de_numerics.py`、
+  `test_w1_training_objective_audit.py`、`test_w1_real_objective_audit.py`、
+  `test_w1_real_admission.py`、`test_w1_real_fk_audit.py`）：**263 passed**。
+- 最终字节合并运行（上述 2 + 6 文件）：**338 passed（392.20s）**；全项目套件未重跑。
+- 校准 `derived/audit/w1_real_training_update_audit/calibration/attempt_005/`：
+  `tolerance_contract.json` SHA `7e40a94dc960eae8a055e227ca9273adbc5047c5681027cc29bfc5698665a46d`、
+  evidence `f0050d6a8035c63fb1d1d35f4db7faa42b5901e9940bfe719d88c87c77b467f0`、
+  fp32 canonical `f281ab1fb625e9ff74adea689afbdd5a69b551542ba278076d630d53dabf9267`、
+  `calibration_verification.json` SHA `767c9d66a3db188ebecd398719fd09dd098a4e77ee32064bac2c8f68f15ac882`；
+  `recompute_problems=[]`、`four_x_ok=true`。`tolerances/rules/tiny_zero_floors` 与 v0.9
+  逐项相同；仅环境（内核版本/CPU 线程）使 fp32 canonical/evidence SHA 与 v0.9 不同，未改阈值。
+- 完整合成链 `derived/audit/w1_real_training_update_audit/synthetic/attempt_005/`：
+  `audit_result.json` SHA `897021226645c1c240e81bc0b78d03a042c9d077c61ad10c2e066f6f43d5e584`、
+  final `013f43a43a03122b6812c74a193a8be06f3df77984b61b2ee7b54b66cefca5e8`；
+  四 stage `done/sealed`、264 tensor/3864 行、调用矩阵精确（8 loads、64/64 forwards、
+  48 draw units、32/32 VJP、64 production FK、16/16 updates、15840/115200 reference FK、
+  64 micro）、`training_updates=16`；结论 **`audit_incomplete`**（`complete_evidence=true`、
+  `failures=[]`、`problems=[]`、**582** gap：392 `parameter_delta_precision_gap` +
+  190 `cross_path_sensitivity_gap` + 0 bound-unverifiable）。F 新进程 pid 204048/ppid 201457
+  （pid≠ppid、ppid=父）、exit 0、`verification_problems=[]`；成本 R0 1.1869/P 13.7560/
+  I 57.8924/F 96.3983 = **169.2336s**，各 1/2 次；工件 7,404,741,172 bytes（约 6.896 GiB）。
+  `synthetic_acceptance.json` SHA `706c0b4167294032aa3b165f0e7cc30d349403bf6f3e22e525d79efdaf54318e`，
+  `passed=true/problems=[]`，绑定重算报告、roster、所有阶段报告与实现/环境。
+- 真实 metadata-only admission `derived/audit/w1_real_training_update_audit/admission_real/attempt_005/`
+  SHA **`a0d55a92636dec1fc7eda60d2f8e42f87e0bfcb56ae11755bd5886170dde6978`**，
+  `passed=true/problems=[]`、`provider_mode=real/scope=metadata_only`、
+  `authorized=false/registered=false/run=not_run/section_10_2_checked=false`；
+  `read_scope` 的 `npz_values_read/checkpoint_payload_read/torch_load_calls/
+  model_constructor_calls/muJoCo_compile_calls/forward/VJP/optimizer` 全 0，
+  `asset_closure_verified=true`（37 引用、closure `46cb786a…`）；父锚 10/10、checkpoint 2/2、
+  训练配置、264 tensor/3864 行、真实全链 scene=2/16 updates 与校准验证
+  （canonical `245cb998…`）/接受报告 SHA 全部绑定；validator `[]`。
+- 被取代证据：首次中间运行使用 `OMP_NUM_THREADS=1`，在
+  `i_accumulated:diffusion:u1:model.net.root_out.weight` 出现 1 条近阈值 failure
+  （585 gap），不作为 Gate B 依据；`synthetic/attempt_001` 与 `attempt_002` 已在记录事实后
+  删除以释放磁盘（两者均非当前实现字节），`calibration/attempt_001–004`、
+  `synthetic/attempt_003–004` 与 `admission_real/attempt_001–004` 保留为历史；其中
+  attempt_003/004 因后续实现字节变化被取代，当前权威为 attempt_005。
+  阈值、窗口、lr、dtype、噪声/微批矩阵未调整。
+
+### 10.4 边界
+
+- 未读取真实 checkpoint payload、父 NPZ 数值、G1 mesh 或编译锁定资产；未构造真实模型/优化器、
+  未执行真实前向/反向/FK/AdamW；未创建真实 cohort/attempt/reservation；未取得新的 §10.2 授权。
+- Gate D/E 未运行；真实 R0→P→I→F 的数值行为、严格加载、input_admission、参考 FK 和
+  调用矩阵仍未验证。Gate B 通过只表示本模式的元数据准入与合成回归。
+- 合成 `audit_incomplete` 是冻结精度/相消门下的必测 gap，不是 AdamW/网络实现错误；不说明真实
+  链会通过或失败。`objective_coverage=partial`、`full_objective_contract_passed=null`、
+  `attribution=attribution_insufficient`、`factor_selected=false`、`auto_execute=false`、
+  `final_interaction_method=not_ready`、`production_integration=false`；U0 `incomplete`、
+  UR `no_quality_gain`、原 F `not_ready`、旧预测 r6 不可验收与旋转融合不接入全部保留。
+- v0.9 的 `tolerance_contract.json`、`adamw_fp32_contract.json`、`synthetic/v0.9_final/`、
+  `admission/attempt_012/` 与冻结方案字节未改写。全项目套件本轮未重跑。
+
+### 10.5 Gate B 后的下一步
+
+先由用户复阅本记录、执行计划 v0.6、`calibration/attempt_005`、`synthetic/attempt_005` 与
+`admission_real/attempt_005`；随后提供新的 §10.2 明确授权记录（10 项 checklist 全 true，
+并绑定执行计划/校准验证/接受报告/准入包/实现哈希）。未取得授权前不得运行
+`--real`/`--resume`，不得创建真实 cohort 或消耗真实调用额度。

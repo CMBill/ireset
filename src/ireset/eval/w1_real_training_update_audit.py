@@ -845,6 +845,34 @@ def _rng_digest(state: Mapping[str, Any]) -> dict:
 # ---------------------------------------------------------------------------
 
 
+class SyntheticReferenceBackend:
+    """Analytic 29-joint/15-site chain behind the common reference API."""
+
+    schema = "w1_real_training_update_reference_backend_v1"
+    mode = "synthetic"
+
+    def __init__(self, chain: SyntheticChain, counter: CallCounter) -> None:
+        self.chain = chain
+        self.counter = counter
+
+    def positions(self, pos: np.ndarray, R: np.ndarray,
+                  q: np.ndarray) -> np.ndarray:
+        out = synthetic_fk_np(self.chain, pos, R, q)
+        self.counter.add("reference_mj_forward", int(np.shape(pos)[0]))
+        return out
+
+    def jacobians(self, pos: np.ndarray, R: np.ndarray,
+                  q: np.ndarray) -> np.ndarray:
+        _, jac = synthetic_fk_jac_np(self.chain, pos, R, q)
+        Rt = np.swapaxes(np.asarray(R, np.float64), 1, 2)
+        J35 = np.array(jac, copy=True)
+        J35[..., 3:6] = np.einsum("nsck,nkj->nscj", jac[..., 3:6], Rt)
+        n = int(np.shape(pos)[0])
+        self.counter.add("reference_mj_forward", n)
+        self.counter.add("reference_mj_jac_site", n * len(SITE_NAMES))
+        return J35
+
+
 def _loss_assembler(tokenizer: StateTokenizer, chain: SyntheticChain,
                     counter: CallCounter | None, device: str) -> LossAssembler:
     """Production ``LossAssembler`` methods with the analytic FK stand-in.
@@ -903,11 +931,74 @@ class SyntheticTrainingProvider:
         self.tokenizer: StateTokenizer | None = None
         self.chain: SyntheticChain | None = None
         self.constants: dict | None = None
+        self.reference: SyntheticReferenceBackend | None = None
+        self._alpha: np.ndarray | None = None
         self.problems: list[str] = []
         self.fixture_seconds: float | None = None
 
     def bind_counter(self, counter: CallCounter) -> None:
         self.counter = counter
+        if self.chain is not None:
+            self.reference = SyntheticReferenceBackend(self.chain, counter)
+        if self.reference is not None:
+            self.reference.counter = counter
+
+    # --- provider identity ------------------------------------------------
+
+    def spec(self) -> dict:
+        return {
+            "schema": "w1_real_training_update_provider_v1",
+            "mode": "synthetic",
+            "fixture_dir": (path_for_record(self.fixture_dir)
+                            if self.fixture_dir is not None else None),
+            "config": dict(self.config),
+            "device": self.device,
+            "seed": self.seed,
+        }
+
+    def for_stage(self, stage: str) -> "SyntheticTrainingProvider":
+        return self
+
+    def materialize(self, *, stage: str, r0_noise: Any = None,
+                    counter: CallCounter | None = None,
+                    parent_input_admission: Any = None,
+                    guard: Any = None,
+                    deadline: float | None = None,
+                    registered: bool = False) -> dict:
+        return {
+            "schema": "w1_real_training_update_input_admission_v1",
+            "mode": "synthetic",
+            "stage": stage, "registered": bool(registered),
+            "passed": not self.problems,
+            "problems": list(self.problems),
+            "read_scope": {"npz_values_read": 0, "checkpoint_payload_read": 0,
+                           "forward_calls": 0},
+        }
+
+    def reference_positions(self, pos: np.ndarray, R: np.ndarray,
+                            q: np.ndarray) -> np.ndarray:
+        if self.reference is None:
+            self._refresh_reference()
+        return self.reference.positions(pos, R, q)
+
+    def reference_jacobians(self, pos: np.ndarray, R: np.ndarray,
+                            q: np.ndarray) -> np.ndarray:
+        if self.reference is None:
+            self._refresh_reference()
+        return self.reference.jacobians(pos, R, q)
+
+    def _refresh_reference(self) -> None:
+        if self.chain is None:
+            raise ValueError("synthetic provider has no chain")
+        counter = self.counter if self.counter is not None else CallCounter(
+            {})
+        self.reference = SyntheticReferenceBackend(self.chain, counter)
+
+    @property
+    def alpha_cumprod(self) -> np.ndarray:
+        if self._alpha is None:
+            self._alpha = alpha_cumprod_reference(self.config)
+        return self._alpha
 
     # --- fixture ---------------------------------------------------------
 
@@ -920,6 +1011,8 @@ class SyntheticTrainingProvider:
         self.constants = effective_constants(
             self.tokenizer.root_stats.mean, self.tokenizer.root_stats.std,
             self.tokenizer.lo, self.tokenizer.hi)
+        counter = self.counter if self.counter is not None else CallCounter({})
+        self.reference = SyntheticReferenceBackend(self.chain, counter)
         return self.tokenizer
 
     def _window_meta(self) -> list[dict]:
@@ -1675,11 +1768,16 @@ def _noise_unit_index() -> dict[tuple[int, int], int]:
 
 
 def run_p_stage(root: Path, stage: str, attempt: str, t0: float,
-                budget: Mapping[str, Any], provider: SyntheticTrainingProvider,
+                budget: Mapping[str, Any], provider: Any,
                 counter: CallCounter, roster: Mapping[str, Any],
                 *, out_dir: Path | None = None,
                 fixture_error: str | None = None,
-                guard: Callable[[str], None] | None = None) -> dict:
+                guard: Callable[[str], None] | None = None,
+                registered: bool = True,
+                r0_noise: Sequence[dict] | None = None,
+                parent_input_admission: Mapping[str, Any] | None = None,
+                write_input_admission: bool = False,
+                r0_registration_sha: str | None = None) -> dict:
     base = Path(out_dir or (stage_dir(root, stage) / attempt))
     base.mkdir(parents=True, exist_ok=True)
     _seed_stage_rng()
@@ -1690,10 +1788,53 @@ def run_p_stage(root: Path, stage: str, attempt: str, t0: float,
         if guard is not None:
             guard(unit)
 
+    binder = getattr(provider, "bind_counter", None)
+    if callable(binder):
+        binder(counter)
+    mode = str(getattr(provider, "mode", "synthetic"))
     results: dict[str, dict] = {}
     rows: list[dict] = []
     failures: list[str] = []
     gaps: list[str] = list([fixture_error] if fixture_error else [])
+    admission_path: Path | None = None
+    admission_sha: str | None = None
+    if mode == "real":
+        admission = provider.materialize(
+            stage="P", r0_noise=r0_noise, counter=counter, guard=check,
+            deadline=deadline, registered=registered,
+            parent_input_admission=parent_input_admission,
+            r0_registration_sha=r0_registration_sha)
+        if not admission.get("passed"):
+            failures += [f"p_input_admission:{p}"
+                         for p in admission.get("problems") or []]
+        admission_path = None
+        admission_sha = None
+        if write_input_admission:
+            admission_path = base / "input_admission.json"
+            write_json(admission_path, admission)
+            admission_sha = sha256_file(admission_path)
+        if not admission.get("passed"):
+            rows = []
+            report = {
+                "schema": "w1_real_training_update_p_stage_v1",
+                "mode": mode, "stage": stage, "attempt": attempt,
+                "models": {}, "rows": rows, "failures": failures,
+                "gaps": gaps, "evidence_problems": ["p_input_admission"],
+                "complete_evidence": False, "numeric_passed": False,
+                "call_delta": None, "passed": False,
+                "input_admission": (
+                    {"path": path_for_record(admission_path),
+                     "sha256": admission_sha}
+                    if admission_path is not None else None),
+            }
+            write_json(base / "p_rows.json", rows)
+            write_json(base / "p_report.json", report)
+            return {"passed": False, "failures": failures, "gaps": gaps,
+                    "rows": rows, "complete_evidence": False,
+                    "evidence_problems": ["p_input_admission"],
+                    "numeric_passed": False, "paths": {},
+                    "report": path_for_record(base / "p_report.json"),
+                    "arrays_sha256": {}, "call_delta": None}
     noise = provider.noise
     unit_index = _noise_unit_index()
     rows.append(_row("model_setup:deterministic",
@@ -1808,7 +1949,7 @@ def run_p_stage(root: Path, stage: str, attempt: str, t0: float,
                         slots = MICRO_SCHEDULE[u][m]
                         x0 = np.stack([provider.window_arrays[w]["x0"]
                                        for w in slots], axis=0)
-                        alpha = alpha_cumprod_reference(provider.config)
+                        alpha = provider.alpha_cumprod
                         x_t_ref = independent_x_t(
                             x0, unit["epsilon"].numpy(), unit["t"].numpy(),
                             effective_alpha(alpha))
@@ -1944,7 +2085,7 @@ def run_p_stage(root: Path, stage: str, attempt: str, t0: float,
         and all(results[model].get("arrays_path") for model in MODELS))
     report = {
         "schema": "w1_real_training_update_p_stage_v1",
-        "mode": "synthetic",
+        "mode": mode,
         "stage": stage, "attempt": attempt,
         "models": results,
         "rows": rows,
@@ -1955,6 +2096,10 @@ def run_p_stage(root: Path, stage: str, attempt: str, t0: float,
         "numeric_passed": not failures,
         "call_delta": None,
         "passed": not failures and not gaps,
+        "input_admission": (
+            {"path": path_for_record(admission_path),
+             "sha256": admission_sha}
+            if admission_path is not None else None),
     }
     write_json(base / "p_rows.json", rows)
     write_json(base / "p_report.json", report)
@@ -2252,7 +2397,6 @@ class ReferenceContext:
         self.std = constants["std32"].astype(np.float64)
         self.lo = constants["lo32"].astype(np.float64)
         self.hi = constants["hi32"].astype(np.float64)
-        self.chain = provider.chain
         self.target: dict[str, dict] = {}
         for key in WINDOW_IDS:
             self._check(f"reference_target_{key}")
@@ -2263,12 +2407,11 @@ class ReferenceContext:
             # The decode itself can outlast the deadline; re-check before the
             # charged target FK so no reference FK starts after expiry.
             self._check(f"reference_target_{key}")
-            kp = synthetic_fk_np(self.chain, decoded["pos"], decoded["R"],
-                                 decoded["q"])
+            kp = provider.reference_positions(decoded["pos"], decoded["R"],
+                                              decoded["q"])
             self.target[key] = {"kp": kp.reshape(-1, len(SITE_NAMES), 3),
                                 "ok": bool(decoded["ok"].all()),
                                 "boundary": bool(decoded["clamp_boundary"].any())}
-            self.counter.add("reference_mj_forward", x0.shape[0])
         self.problems = [
             f"target_domain:{key}"
             for key, rec in self.target.items() if not rec["ok"]]
@@ -2289,18 +2432,11 @@ class ReferenceContext:
         decoded = independent_decode(x0.astype(np.float64), self.mean,
                                      self.std, self.lo, self.hi)
         self._check("reference_fk", guard)
-        kp = synthetic_fk_np(self.chain, decoded["pos"], decoded["R"],
-                             decoded["q"])
-        self.counter.add("reference_mj_forward", x0.shape[0])
+        kp = self.provider.reference_positions(decoded["pos"], decoded["R"],
+                                               decoded["q"])
         self._check("reference_jacobian", guard)
-        _, jac = synthetic_fk_jac_np(self.chain, decoded["pos"], decoded["R"],
-                                     decoded["q"])
-        self.counter.add("reference_mj_forward", x0.shape[0])
-        self.counter.add("reference_mj_jac_site",
-                         x0.shape[0] * len(SITE_NAMES))
-        Rt = np.swapaxes(decoded["R"], 1, 2)
-        J35 = np.array(jac, copy=True)
-        J35[..., 3:6] = np.einsum("nsck,nkj->nscj", jac[..., 3:6], Rt)
+        J35 = self.provider.reference_jacobians(decoded["pos"], decoded["R"],
+                                                decoded["q"])
         D, ddom = decode_jacobian_np(x0, self.std, self.lo, self.hi)
         J38 = np.einsum("nsck,nkj->nscj", J35, D)
         kp_target = self.targets_for(slots)
@@ -2885,11 +3021,15 @@ def _declared_tolerance(tolerance: Mapping[str, Any]) -> dict:
 
 
 def run_i_stage(root: Path, stage: str, attempt: str, t0: float,
-                budget: Mapping[str, Any], provider: SyntheticTrainingProvider,
+                budget: Mapping[str, Any], provider: Any,
                 counter: CallCounter, roster: Mapping[str, Any],
                 p_dir: Path, *, tolerance: Mapping[str, Any],
                 out_dir: Path | None = None,
-                guard: Callable[[str], None] | None = None) -> dict:
+                guard: Callable[[str], None] | None = None,
+                registered: bool = True,
+                r0_noise: Sequence[dict] | None = None,
+                parent_input_admission: Mapping[str, Any] | None = None,
+                r0_registration_sha: str | None = None) -> dict:
     base = Path(out_dir or (stage_dir(root, stage) / attempt))
     base.mkdir(parents=True, exist_ok=True)
     _seed_stage_rng()
@@ -2900,12 +3040,47 @@ def run_i_stage(root: Path, stage: str, attempt: str, t0: float,
         if guard is not None:
             guard(unit)
 
+    binder = getattr(provider, "bind_counter", None)
+    if callable(binder):
+        binder(counter)
+    mode = str(getattr(provider, "mode", "synthetic"))
     tol = _declared_tolerance(tolerance)
+    failures: list[str] = []
+    gaps: list[str] = []
+    if mode == "real":
+        admission = provider.materialize(
+            stage="I", r0_noise=r0_noise, counter=counter, guard=check,
+            deadline=deadline, registered=registered,
+            parent_input_admission=parent_input_admission,
+            r0_registration_sha=r0_registration_sha)
+        if not admission.get("passed"):
+            failures += [f"i_input_admission:{p}"
+                         for p in admission.get("problems") or []]
+        if not admission.get("passed"):
+            rows: list[dict] = []
+            report = {
+                "schema": "w1_real_training_update_i_stage_v1",
+                "mode": mode, "stage": stage, "attempt": attempt,
+                "models": {}, "rows": rows, "failures": failures,
+                "gaps": gaps, "evidence_failures": ["i_input_admission"],
+                "evidence_problems": ["i_input_admission"],
+                "complete_evidence": False, "numeric_passed": False,
+                "passed": False,
+            }
+            write_json(base / "i_rows.json", rows)
+            write_json(base / "i_report.json", report)
+            return {"passed": False, "failures": failures, "gaps": gaps,
+                    "rows": rows, "complete_evidence": False,
+                    "evidence_failures": ["i_input_admission"],
+                    "evidence_problems": ["i_input_admission"],
+                    "numeric_passed": False, "paths": {},
+                    "report": path_for_record(base / "i_report.json"),
+                    "arrays_sha256": {}}
     p_reports = {model: _p_sidecar(p_dir, model) for model in MODELS}
     check("i_reference_context")
     ref_ctx = ReferenceContext(provider, counter, guard=check)
-    failures: list[str] = list(ref_ctx.problems)
-    gaps: list[str] = list(ref_ctx.problems)
+    failures += list(ref_ctx.problems)
+    gaps += list(ref_ctx.problems)
     rows: list[dict] = []
     results: dict[str, dict] = {}
     host_cache: dict[int, dict] = {u: host_constants(
@@ -3001,7 +3176,7 @@ def run_i_stage(root: Path, stage: str, attempt: str, t0: float,
                         slots = MICRO_SCHEDULE[u][m]
                         x0 = np.stack([provider.window_arrays[w]["x0"]
                                        for w in slots], axis=0)
-                        alpha = alpha_cumprod_reference(provider.config)
+                        alpha = provider.alpha_cumprod
                         x_t_ref = independent_x_t(
                             x0, unit["epsilon"].numpy(), unit["t"].numpy(),
                             effective_alpha(alpha))
@@ -3417,7 +3592,7 @@ def run_i_stage(root: Path, stage: str, attempt: str, t0: float,
         and all(results[model].get("arrays_path") for model in MODELS))
     report = {
         "schema": "w1_real_training_update_i_stage_v1",
-        "mode": "synthetic",
+        "mode": mode,
         "stage": stage, "attempt": attempt,
         "models": results,
         "rows": rows,
@@ -3631,6 +3806,11 @@ def _worker_main(spec_path: str, out_dir: str) -> int:
     and update.  A result snapshot is written in ``finally`` so the parent can
     settle only calls that were actually made; a killed worker leaves no
     snapshot and therefore no invented zero.
+
+    The current F attempt is deliberately still ``running/consumed=null``:
+    candidate checks use the settled R0/P/I deltas plus this worker's local
+    ``L_F`` (``provisional_chain_counts``); the parent settles and re-checks
+    from disk afterwards (plan section 2.2).
     """
     spec = read_json(Path(spec_path))
     out = Path(out_dir)
@@ -3640,6 +3820,7 @@ def _worker_main(spec_path: str, out_dir: str) -> int:
     reserve = float(spec.get("reserve_s", 0.0))
     root = Path(spec["run_root"])
     attempt = str(spec["attempt"])
+    mode = str(spec.get("mode", "synthetic"))
     parent_record = {"registration_sha256": spec.get("registration_sha256"),
                      "reserve_s": reserve}
     problems: list[str] = []
@@ -3659,6 +3840,14 @@ def _worker_main(spec_path: str, out_dir: str) -> int:
     report_problems: list[str] = []
     call_problems: list[str] = []
     aborted = False
+    precheck: dict = {}
+    candidate_attempts = dict(spec.get("candidate_attempts") or {})
+    candidate_checks = bool(spec.get("candidate_checks", True)) and bool(
+        candidate_attempts)
+    provisional: dict = {}
+    stage_totals: dict = {}
+    cohort_totals: dict = {}
+    local_counts = {kind: 0 for kind in CALL_KINDS}
 
     def guard(unit: str) -> None:
         # ``deadline`` is already the work deadline (the seal reserve was
@@ -3669,29 +3858,163 @@ def _worker_main(spec_path: str, out_dir: str) -> int:
         if admission:
             raise TimeoutError(f"unit_admission:{unit}:{','.join(admission)}")
 
+    def precheck_candidates() -> list[str]:
+        found: list[str] = []
+        history = verify_history(root, allow_current=("F", attempt))
+        found += [f"f_candidate_history:{p}" for p in history]
+        if set(candidate_attempts) != set(STAGE_BUDGETS):
+            found.append("f_candidate_keys")
+        for name in ("R0", "P", "I"):
+            selected = candidate_attempts.get(name)
+            if not isinstance(selected, str):
+                found.append(f"f_candidate_missing:{name}")
+                continue
+            row, state = stage_state(root, name, selected,
+                                     allow_current=("F", attempt))
+            precheck[name] = {"attempt": selected, "problems": state,
+                              "report": (row or {}).get("report")}
+            if state:
+                found += [f"f_candidate:{name}:{p}" for p in state]
+        current = _attempt_row(root, "F", attempt)
+        if current.get("status") != "running":
+            found.append("f_current_not_running")
+        if candidate_attempts.get("F") != attempt:
+            found.append("f_candidate_self")
+        if _reservation_consumed(root, "F", attempt) is not None:
+            found.append("f_current_already_settled")
+        precheck["current"] = {
+            "attempt": attempt, "status": current.get("status"),
+            "registration_sha256": current.get(
+                "execution_registration_sha256"),
+            "deadline_perf_counter": current.get("deadline_perf_counter"),
+        }
+        return found
+
+    def provisional_counts() -> list[str]:
+        found: list[str] = []
+        deltas: dict[str, dict] = {}
+        for name in ("R0", "P", "I"):
+            stage_deltas = stage_attempt_deltas(
+                root, name, current=("F", attempt))
+            if stage_deltas is None or candidate_attempts.get(name) not in \
+                    stage_deltas:
+                found.append(f"f_provisional_delta:{name}")
+                continue
+            deltas[name] = stage_deltas
+        if found:
+            return found
+        chain = {kind: int(deltas["R0"][candidate_attempts["R0"]]["counts"][kind])
+                 + int(deltas["P"][candidate_attempts["P"]]["counts"][kind])
+                 + int(deltas["I"][candidate_attempts["I"]]["counts"][kind])
+                 + int(local_counts[kind])
+                 for kind in CALL_KINDS}
+        provisional.update({
+            "selected_chain_counts": chain,
+            "training_updates": int(chain["native_adamw_steps"]
+                                    + chain["explicit_reference_updates"]),
+        })
+        expected_chain = chain_nominal_for_mode(mode)
+        for kind in CALL_KINDS:
+            if chain[kind] != expected_chain[kind]:
+                found.append(
+                    f"f_provisional_chain:{kind}:{chain[kind]}"
+                    f"!={expected_chain[kind]}")
+        for stage in STAGE_BUDGETS:
+            totals = {kind: 0 for kind in CALL_KINDS}
+            stage_deltas = stage_attempt_deltas(
+                root, stage, current=("F", attempt))
+            if stage_deltas is None:
+                found.append(f"f_stage_delta:{stage}")
+                continue
+            if stage == "F":
+                for kind in CALL_KINDS:
+                    totals[kind] = sum(
+                        int(rec["counts"][kind])
+                        for rec in stage_deltas.values()) + int(
+                        local_counts[kind])
+            else:
+                for rec in stage_deltas.values():
+                    for kind in CALL_KINDS:
+                        totals[kind] += int(rec["counts"][kind])
+            stage_totals[stage] = totals
+            nominal = stage_nominal_for_mode(mode, stage)
+            for kind in CALL_KINDS:
+                if totals[kind] > 2 * nominal[kind]:
+                    found.append(f"f_stage_cap:{stage}:{kind}")
+            if stage == "F":
+                used = len(stage_deltas) + 1
+                if used > STAGE_BUDGETS["F"]["attempts"]:
+                    found.append("f_attempt_cap")
+        cohort = {kind: 0 for kind in CALL_KINDS}
+        for stage in STAGE_BUDGETS:
+            for kind in CALL_KINDS:
+                cohort[kind] += int(stage_totals.get(stage, {}).get(kind, 0))
+        cohort_totals.update(cohort)
+        for kind in CALL_KINDS:
+            if cohort[kind] > int(CALL_CAPS[kind]):
+                found.append(f"f_cohort_cap:{kind}")
+        return found
+
     try:
         guard("worker_start")
         runtime = configure_production_runtime()
         if runtime["problems"]:
             problems += [f"worker_runtime:{p}" for p in runtime["problems"]]
+        candidates_problems = (precheck_candidates()
+                               if candidate_checks else [])
+        if candidates_problems:
+            problems += candidates_problems
+            raise TimeoutError("candidate_precheck_failed")
         guard("fixture_load")
-        provider = SyntheticTrainingProvider(spec["config"],
-                                             device=spec.get("device", "cuda"))
-        provider.fixture_dir = Path(spec["fixture_dir"])
-        provider.load_fixture()
-        roster = read_json(provider.fixture_dir / "roster.json")
-        # Rebuild the R0 schedule once (counted) and compare with the fixture.
+        if mode == "real":
+            from ireset.eval.w1_real_training_update_provider import (
+                RealTrainingProvider,
+            )
+            provider = RealTrainingProvider.from_spec(
+                spec["provider"], project_root=Path(spec["project_root"]))
+            provider.roster = spec["roster"]
+        else:
+            provider = SyntheticTrainingProvider(
+                spec["config"], device=spec.get("device", "cuda"))
+            provider.fixture_dir = Path(spec["fixture_dir"])
+            provider.load_fixture()
+            provider.roster = read_json(provider.fixture_dir / "roster.json")
+        roster = provider.roster
         guard("schedule_rebuild")
         schedule = draw_noise_path(NOISE_SEED)
         counter.add("cpu_draw_units", DRAW_UNITS_PER_PATH)
-        fixture_noise = provider.noise
         schedule_ok = True
-        for a, b in zip(schedule, fixture_noise):
-            if (not torch.equal(a["t"], b["t"])
-                    or not torch.equal(a["epsilon"], b["epsilon"])):
-                schedule_ok = False
+        if mode == "real":
+            stored = provider.load_noise_schedule(Path(spec["r0_noise_path"]))
+            if sha256_file(Path(spec["r0_noise_path"])) != spec.get(
+                    "r0_noise_sha256"):
+                problems.append("schedule_source_sha")
+            for a, b in zip(schedule, stored):
+                if (not torch.equal(a["t"], b["t"])
+                        or not torch.equal(a["epsilon"], b["epsilon"])
+                        or not torch.equal(a["generator_state_before"],
+                                           b["generator_state_before"])
+                        or not torch.equal(a["generator_state_after"],
+                                           b["generator_state_after"])):
+                    schedule_ok = False
+            provider.noise = schedule
+        else:
+            fixture_noise = provider.noise
+            for a, b in zip(schedule, fixture_noise):
+                if (not torch.equal(a["t"], b["t"])
+                        or not torch.equal(a["epsilon"], b["epsilon"])):
+                    schedule_ok = False
         if not schedule_ok:
             problems.append("schedule_rebuild_mismatch")
+        main_admission = None
+        if mode == "real":
+            admission_path = Path(spec["p_input_admission_path"])
+            if sha256_file(admission_path) != spec.get(
+                    "p_input_admission_sha256"):
+                problems.append("p_input_admission_sha")
+            main_admission = read_json(admission_path)
+            if main_admission.get("passed") is not True:
+                problems.append("p_input_admission_not_passed")
         p_dir = out / "production_replay"
         i_dir = out / "independent_replay"
         guard("p_replay_start")
@@ -3699,7 +4022,10 @@ def _worker_main(spec_path: str, out_dir: str) -> int:
             out, "P", "F-P", _now(),
             {"remaining_s": max(0.0, deadline - _now() + reserve),
              "reserve_s": reserve}, provider, counter, roster,
-            out_dir=p_dir, guard=guard)
+            out_dir=p_dir, guard=guard, registered=False,
+            r0_noise=(schedule if mode == "real" else None),
+            parent_input_admission=main_admission,
+            r0_registration_sha=spec.get("registration_sha256"))
         guard("p_replay_compare")
         p_problems = _npz_compare_problems(Path(spec["p_dir"]), p_dir, MODELS,
                                            prefix="p")
@@ -3709,7 +4035,11 @@ def _worker_main(spec_path: str, out_dir: str) -> int:
             out, "I", "F-I", _now(),
             {"remaining_s": max(0.0, deadline - _now() + reserve),
              "reserve_s": reserve}, provider, counter, roster,
-            p_dir, tolerance=spec["tolerance"], out_dir=i_dir, guard=guard)
+            p_dir, tolerance=spec["tolerance"], out_dir=i_dir, guard=guard,
+            registered=False,
+            r0_noise=(schedule if mode == "real" else None),
+            parent_input_admission=main_admission,
+            r0_registration_sha=spec.get("registration_sha256"))
         guard("i_replay_compare")
         i_problems = _npz_compare_problems(Path(spec["i_dir"]), i_dir, MODELS,
                                            prefix="i")
@@ -3738,21 +4068,23 @@ def _worker_main(spec_path: str, out_dir: str) -> int:
             _report_binding_problems(Path(spec["p_dir"]), p_dir, stage="P")
             + _report_binding_problems(Path(spec["i_dir"]), i_dir, stage="I"))
         problems += report_problems
-        # Replay failures are measured numeric evidence, not evidence loss:
-        # they are preserved in ``failures`` so F can conclude a mismatch.
         failures += list(p_replay["failures"]) + list(i_replay["failures"])
         gaps += list(p_replay["gaps"]) + list(i_replay["gaps"])
         if not p_replay.get("complete_evidence", False):
             problems.append("p_replay_incomplete_evidence")
         if not i_replay.get("complete_evidence", False):
             problems.append("i_replay_incomplete_evidence")
-        expected_f = dict(STAGE_NOMINAL["F"])
-        expected_f["scene_setup_mj_forward"] = 0
-        counts = counter.snapshot()["counts"]
+        local_counts = counter.snapshot()["counts"]
+        expected_f = stage_nominal_for_mode(mode, "F")
         call_problems = [
-            f"f_call_matrix:{kind}:{counts[kind]}!={expected_f[kind]}"
-            for kind in CALL_KINDS if counts[kind] != expected_f[kind]]
+            f"f_call_matrix:{kind}:{counts_now}!={expected_f[kind]}"
+            for kind, counts_now in local_counts.items()
+            if counts_now != expected_f[kind]]
         problems += call_problems
+        provisional_problems = (provisional_counts()
+                                if candidate_checks else [])
+        if provisional_problems:
+            problems += provisional_problems
     except TimeoutError as exc:
         aborted = True
         problems.append(f"f_worker_aborted:{exc}")
@@ -3761,14 +4093,21 @@ def _worker_main(spec_path: str, out_dir: str) -> int:
         problems.append(f"f_worker_exception:{type(exc).__name__}:{exc}")
     finally:
         snapshot = counter.snapshot()
+        local_counts = dict(snapshot["counts"])
         result = {
             "schema": "w1_real_training_update_f_worker_v1",
+            "mode": mode,
             "pid": os.getpid(),
             "ppid": os.getppid(),
             "python": sys.version.split()[0],
             "runtime": runtime,
-            "fixture_dir": (path_for_record(provider.fixture_dir)
-                            if provider is not None else None),
+            "provider": (path_for_record(provider.fixture_dir)
+                         if mode == "synthetic" and provider is not None
+                         and provider.fixture_dir is not None
+                         else (getattr(provider, "spec", lambda: None)()
+                               if provider is not None else None)),
+            "candidate_attempts": candidate_attempts,
+            "precheck": precheck,
             "p_replay": p_replay,
             "i_replay": None if i_replay is None else {
                 "complete_evidence": i_replay.get("complete_evidence"),
@@ -3782,6 +4121,12 @@ def _worker_main(spec_path: str, out_dir: str) -> int:
             "row_problems": row_problems,
             "report_problems": report_problems,
             "call_matrix_problems": call_problems,
+            "provisional_chain_counts": provisional.get(
+                "selected_chain_counts"),
+            "provisional_training_updates": provisional.get(
+                "training_updates"),
+            "stage_call_counts": stage_totals,
+            "cohort_call_counts": cohort_totals,
             "problems": problems,
             "aborted": aborted,
             "counts": snapshot,
@@ -3798,19 +4143,25 @@ def _worker_main(spec_path: str, out_dir: str) -> int:
 
 
 def run_f_stage(root: Path, stage: str, attempt: str, t0: float,
-                budget: Mapping[str, Any], provider: SyntheticTrainingProvider,
+                budget: Mapping[str, Any], provider: Any,
                 counter: CallCounter, roster: Mapping[str, Any],
                 p_dir: Path, i_dir: Path, *, tolerance: Mapping[str, Any],
                 out_dir: Path | None = None,
-                project_root: Path = PROJECT_ROOT) -> dict:
+                project_root: Path = PROJECT_ROOT,
+                candidate_attempts: Mapping[str, str] | None = None,
+                r0_noise_path: Path | None = None,
+                r0_noise_sha256: str | None = None,
+                p_input_admission_path: Path | None = None,
+                p_input_admission_sha256: str | None = None) -> dict:
     base = Path(out_dir or (stage_dir(root, stage) / attempt))
     base.mkdir(parents=True, exist_ok=True)
     deadline = t0 + float(budget["remaining_s"]) - float(budget["reserve_s"])
+    mode = str(getattr(provider, "mode", "synthetic"))
     base_counts = counter.snapshot()["counts"]
     remaining = {kind: int(CALL_CAPS[kind]) - int(base_counts[kind])
                  for kind in CALL_KINDS}
-    spec = {
-        "fixture_dir": path_for_record(provider.fixture_dir),
+    spec: dict[str, Any] = {
+        "mode": mode,
         "p_dir": path_for_record(p_dir),
         "i_dir": path_for_record(i_dir),
         "config": provider.config,
@@ -3823,7 +4174,22 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float,
         "stage": stage,
         "attempt": attempt,
         "registration_sha256": None,
+        "candidate_attempts": dict(candidate_attempts or {}),
+        "candidate_checks": candidate_attempts is not None,
+        "project_root": path_for_record(Path(project_root)),
+        "roster": dict(roster),
     }
+    if mode == "real":
+        spec["provider"] = provider.spec()
+        spec["r0_noise_path"] = (path_for_record(r0_noise_path)
+                                 if r0_noise_path is not None else None)
+        spec["r0_noise_sha256"] = r0_noise_sha256
+        spec["p_input_admission_path"] = (
+            path_for_record(p_input_admission_path)
+            if p_input_admission_path is not None else None)
+        spec["p_input_admission_sha256"] = p_input_admission_sha256
+    else:
+        spec["fixture_dir"] = path_for_record(provider.fixture_dir)
     try:
         rows = [r for r in load_index(root)
                 if r.get("stage") == stage and r.get("attempt") == attempt]
@@ -3910,8 +4276,7 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float,
         except (KeyError, ValueError, UpdateCallBudgetExceeded) as exc:
             problems.append(f"f_worker_counts:{type(exc).__name__}:{exc}")
             merged = False
-    expected_f = dict(STAGE_NOMINAL["F"])
-    expected_f["scene_setup_mj_forward"] = 0
+    expected_f = stage_nominal_for_mode(mode, "F")
     if merged:
         problems += [f"f_call_matrix:{kind}:{int(counts.get(kind, -1))}"
                      f"!={expected_f[kind]}" for kind in CALL_KINDS
@@ -3926,7 +4291,7 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float,
                   else "real_training_update_mismatch")
     final = {
         "schema": "w1_real_training_update_final_v1",
-        "mode": "synthetic",
+        "mode": mode,
         "cohort_id": COHORT_ID,
         "attempt": attempt,
         "conclusion": conclusion,
@@ -3939,6 +4304,14 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float,
         "worker": process,
         "worker_result": result,
         "worker_snapshot_ok": bool(merged),
+        "candidate_attempts": dict(candidate_attempts or {}),
+        "provisional_chain_counts": result.get("provisional_chain_counts"),
+        "provisional_training_updates": result.get(
+            "provisional_training_updates"),
+        "selected_attempts": None,
+        "selected_chain_counts": None,
+        "selected_chain_training_updates": None,
+        "training_updates_scope": "provisional_selected_chain",
         "deadline_perf_counter": deadline,
         "call_delta": dict(counts) if merged else None,
         "call_balance": counter.snapshot(),
@@ -4139,7 +4512,9 @@ def _call_balance_problems(index_row: Mapping[str, Any],
     return []
 
 
-def _reservation_problems(root: Path) -> list[str]:
+def _reservation_problems(root: Path,
+                          *, allow_current: tuple[str, str] | None = None
+                          ) -> list[str]:
     problems: list[str] = []
     for stage in STAGE_BUDGETS:
         base = stage_dir(root, stage)
@@ -4151,6 +4526,8 @@ def _reservation_problems(root: Path) -> list[str]:
             problems.append("reservation_dir_unreadable")
             continue
         for directory in dirs:
+            if allow_current == (stage, directory.name):
+                continue
             path = directory / "call_reservations.json"
             if not path.is_file():
                 continue
@@ -4214,6 +4591,280 @@ def stage_history(root: Path, stage: str,
         return total
     except (OSError, ValueError, TypeError, KeyError):
         return None
+
+
+def chain_nominal_for_mode(mode: str) -> dict[str, int]:
+    chain = {kind: int(value) for kind, value in CHAIN_NOMINAL.items()}
+    if mode == "synthetic":
+        chain["scene_setup_mj_forward"] = 0
+    return chain
+
+
+def stage_nominal_for_mode(mode: str, stage: str) -> dict[str, int]:
+    nominal = {kind: int(value)
+               for kind, value in STAGE_NOMINAL[stage].items()}
+    if mode == "synthetic":
+        nominal["scene_setup_mj_forward"] = 0
+    return nominal
+
+
+def _attempt_number(attempt: str) -> int:
+    try:
+        return int(str(attempt).split("_")[1])
+    except (IndexError, ValueError):
+        return 1 << 30
+
+
+def _reservation_consumed(root: Path, stage: str, attempt: str
+                          ) -> dict[str, int] | None:
+    path = stage_dir(root, stage) / attempt / "call_reservations.json"
+    if not path.is_file():
+        return None
+    try:
+        data = read_json(path)
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(data, Mapping):
+        return None
+    counts = data.get("consumed")
+    if not isinstance(counts, Mapping) or set(counts) != set(CALL_KINDS):
+        return None
+    if not all(_json_int(value) and int(value) >= 0
+               for value in counts.values()):
+        return None
+    return {kind: int(counts[kind]) for kind in CALL_KINDS}
+
+
+def _cohort_chain(root: Path, *, allow_current: tuple[str, str] | None = None
+                  ) -> tuple[dict[str, dict[str, dict]], dict[str, int]] | None:
+    """Reconstruct per-attempt increments from the cumulative balance chain.
+
+    The index/ledger snapshots are cohort-wide; process stages in execution
+    order (R0, P, I, F) and attempts by number.  An explicit
+    ``call_balance_before`` must equal the running cumulative and
+    ``after == before + reservation.consumed``.  Legacy rows without the
+    explicit field use the uniquely determined ``before = after - consumed``
+    and still have to line up with the running cumulative.
+    """
+    try:
+        index = load_index(root)
+        ledger = load_ledger(root)
+        disk = {stage: _disk_attempts(root, stage) for stage in STAGE_BUDGETS}
+    except (OSError, ValueError, TypeError):
+        return None
+    index_by: dict[str, dict[str, dict]] = {stage: {} for stage in STAGE_BUDGETS}
+    ledger_by: dict[str, dict[str, dict]] = {stage: {} for stage in STAGE_BUDGETS}
+    for row in index:
+        stage = row.get("stage")
+        if stage in index_by:
+            if row.get("attempt") in index_by[stage]:
+                return None
+            index_by[stage][row.get("attempt")] = row
+    for entry in ledger:
+        stage = entry.get("stage")
+        if stage in ledger_by:
+            if entry.get("attempt") in ledger_by[stage]:
+                return None
+            ledger_by[stage][entry.get("attempt")] = entry
+    for stage in STAGE_BUDGETS:
+        if set(index_by[stage]) != set(ledger_by[stage]) \
+                or set(index_by[stage]) != disk[stage]:
+            return None
+    cumulative = {kind: 0 for kind in CALL_KINDS}
+    out: dict[str, dict[str, dict]] = {stage: {} for stage in STAGE_BUDGETS}
+    for stage in STAGE_BUDGETS:
+        for attempt in sorted(index_by[stage], key=_attempt_number):
+            if allow_current == (stage, attempt):
+                continue
+            row = index_by[stage][attempt]
+            entry = ledger_by[stage][attempt]
+            after = _call_counts_from_balance(row.get("call_balance"))
+            ledger_after = _call_counts_from_balance(entry.get("call_balance"))
+            if after is None or ledger_after != after:
+                return None
+            consumed = _reservation_consumed(root, stage, attempt)
+            if consumed is None:
+                return None
+            explicit = row.get("call_balance_before")
+            if explicit is not None:
+                before = _call_counts_from_balance(explicit)
+                if before is None or before != cumulative:
+                    return None
+            else:
+                before = {kind: after[kind] - consumed[kind]
+                          for kind in CALL_KINDS}
+                if any(before[kind] < 0 for kind in CALL_KINDS):
+                    return None
+                if before != cumulative:
+                    return None
+            expected = {kind: cumulative[kind] + consumed[kind]
+                        for kind in CALL_KINDS}
+            if after != expected:
+                return None
+            out[stage][attempt] = {
+                "before": dict(before), "after": dict(after),
+                "counts": {kind: int(consumed[kind]) for kind in CALL_KINDS},
+            }
+            cumulative = after
+    return out, cumulative
+
+
+def stage_attempt_deltas(root: Path, stage: str,
+                         *, allow_current: str | None = None,
+                         current: tuple[str, str] | None = None
+                         ) -> dict[str, dict] | None:
+    skip = current if current is not None else (
+        (stage, allow_current) if allow_current is not None else None)
+    chain = _cohort_chain(root, allow_current=skip)
+    if chain is None:
+        return None
+    return chain[0].get(stage, {})
+
+
+def _stage_deltas(root: Path) -> dict[str, dict[str, dict]] | None:
+    out: dict[str, dict[str, dict]] = {}
+    for stage in STAGE_BUDGETS:
+        deltas = stage_attempt_deltas(root, stage)
+        if deltas is None:
+            return None
+        out[stage] = deltas
+    return out
+
+
+def verify_history(root: Path, *,
+                   allow_current: tuple[str, str] | None = None) -> list[str]:
+    """Full-history gate before any resume/selection decision."""
+    problems: list[str] = []
+    for stage in STAGE_BUDGETS:
+        try:
+            index = [r for r in load_index(root) if r.get("stage") == stage]
+            ledger = [r for r in load_ledger(root) if r.get("stage") == stage]
+            disk = _disk_attempts(root, stage)
+        except (OSError, ValueError, TypeError):
+            problems.append(f"history_unreadable:{stage}")
+            continue
+        index_by = {r.get("attempt"): r for r in index}
+        ledger_by = {e.get("attempt"): e for e in ledger}
+        if (len(index_by) != len(index) or len(ledger_by) != len(ledger)
+                or set(index_by) != set(ledger_by)
+                or set(disk) != set(index_by)):
+            problems.append(f"history_sets:{stage}")
+            continue
+        for attempt, row in index_by.items():
+            if allow_current == (stage, attempt):
+                if row.get("status") != "running":
+                    problems.append(f"history_current_not_running:{stage}")
+                continue
+            entry = ledger_by[attempt]
+            for problem in (_row_identity_problems(row, kind="index")
+                            + _row_identity_problems(entry, kind="ledger")):
+                problems.append(f"history_row:{stage}:{attempt}:{problem}")
+            for problem in _call_balance_problems(row, entry):
+                problems.append(f"history_balance:{stage}:{attempt}:{problem}")
+            if row.get("status") not in ("done", "crashed", "timeout",
+                                         "incomplete"):
+                problems.append(f"history_not_terminal:{stage}:{attempt}")
+            if row.get("status") != entry.get("status") \
+                    or row.get("complete") is not entry.get("complete"):
+                problems.append(f"history_state:{stage}:{attempt}")
+            if row.get("status") != "done" and row.get("complete") is not False:
+                problems.append(f"history_failed_claims_complete:{stage}:{attempt}")
+            measured = entry.get("measured_wall_s")
+            rounded = entry.get("wall_s")
+            index_measured = row.get("measured_wall_s")
+            if not (_nonneg(measured) and _nonneg(rounded)
+                    and _nonneg(index_measured)):
+                problems.append(f"history_cost:{stage}:{attempt}")
+            elif float(measured) != float(index_measured) or float(rounded) != \
+                    round(float(measured), 1):
+                problems.append(f"history_cost:{stage}:{attempt}")
+        deltas = stage_attempt_deltas(
+            root, stage,
+            current=(allow_current if allow_current
+                     and allow_current[0] == stage else None))
+        if deltas is None:
+            chain = _cohort_chain(root, allow_current=allow_current)
+            if chain is None:
+                problems.append(f"history_deltas:{stage}")
+            elif stage not in chain[0]:
+                problems.append(f"history_deltas:{stage}")
+    return problems
+
+
+def selected_chain_counts(deltas: Mapping[str, Mapping[str, Mapping[str, Any]]],
+                          selected: Mapping[str, str]) -> dict[str, int] | None:
+    if set(selected) != set(STAGE_BUDGETS):
+        return None
+    totals = {kind: 0 for kind in CALL_KINDS}
+    for stage, attempt in selected.items():
+        rec = (deltas.get(stage) or {}).get(attempt)
+        if rec is None:
+            return None
+        for kind in CALL_KINDS:
+            totals[kind] += int(rec["counts"][kind])
+    return totals
+
+
+def stage_call_totals(deltas: Mapping[str, Mapping[str, Mapping[str, Any]]],
+                      stage: str) -> dict[str, int]:
+    totals = {kind: 0 for kind in CALL_KINDS}
+    for rec in (deltas.get(stage) or {}).values():
+        for kind in CALL_KINDS:
+            totals[kind] += int(rec["counts"][kind])
+    return totals
+
+
+def cohort_call_totals_from_deltas(
+        deltas: Mapping[str, Mapping[str, Mapping[str, Any]]]
+) -> dict[str, int]:
+    totals = {kind: 0 for kind in CALL_KINDS}
+    for stage in STAGE_BUDGETS:
+        for rec in (deltas.get(stage) or {}).values():
+            for kind in CALL_KINDS:
+                totals[kind] += int(rec["counts"][kind])
+    return totals
+
+
+def cohort_call_totals(fixed_root: Path, *, exclude_root: Path | None = None
+                       ) -> dict[str, int] | None:
+    totals = {kind: 0 for kind in CALL_KINDS}
+    for sibling in _cohort_roots(fixed_root):
+        if exclude_root is not None \
+                and sibling.resolve() == Path(exclude_root).resolve():
+            continue
+        marker: dict = {}
+        marker_path = sibling / "cohort.json"
+        try:
+            if marker_path.is_file():
+                marker = read_json(marker_path)
+        except (OSError, ValueError, TypeError):
+            return None
+        if not isinstance(marker, dict):
+            return None
+        index, bi = _read_registration(sibling, "index")
+        ledger, bl = _read_registration(sibling, "ledger")
+        kind, _ = _attribution(marker, index, ledger, bi or bl)
+        if kind in ("foreign", "legacy"):
+            continue
+        if kind == "unknown" or bi or bl:
+            return None
+        deltas = _stage_deltas(sibling)
+        if deltas is None:
+            return None
+        part = cohort_call_totals_from_deltas(deltas)
+        for name in CALL_KINDS:
+            totals[name] += int(part[name])
+    return totals
+
+
+def _prior_call_counts_impl(root: Path, *, fixed_root: Path,
+                            mode: str = "real") -> dict[str, int] | None:
+    if mode == "synthetic":
+        deltas = _stage_deltas(Path(root))
+        if deltas is None:
+            return None
+        return cohort_call_totals_from_deltas(deltas)
+    return cohort_call_totals(fixed_root, exclude_root=None)
 
 
 def total_history(root: Path, *,
@@ -4344,63 +4995,7 @@ def cohort_attempts(fixed_root: Path, stage: str, *,
 
 def prior_call_counts(root: Path, *, fixed_root: Path,
                       mode: str = "real") -> dict[str, int] | None:
-    roots: list[Path] = []
-    if mode == "real":
-        for sibling in _cohort_roots(fixed_root):
-            if sibling.resolve() == Path(root).resolve():
-                continue
-            marker = {}
-            try:
-                if (sibling / "cohort.json").is_file():
-                    marker = read_json(sibling / "cohort.json")
-            except (OSError, ValueError, TypeError):
-                return None
-            index, bi = _read_registration(sibling, "index")
-            ledger, bl = _read_registration(sibling, "ledger")
-            kind, _ = _attribution(marker, index, ledger, bi or bl)
-            if kind in ("foreign", "legacy"):
-                continue
-            if kind == "unknown" or bi or bl:
-                return None
-            roots.append(sibling)
-    roots.append(Path(root))
-    totals = {kind: 0 for kind in CALL_KINDS}
-    for run_root in roots:
-        if _reservation_problems(run_root):
-            return None
-        try:
-            index = [r for r in load_index(run_root)
-                     if r.get("cohort_id") == COHORT_ID
-                     and r.get("accounting_schema") == ACCOUNTING_SCHEMA]
-            ledger = [e for e in load_ledger(run_root)
-                      if e.get("cohort_id") == COHORT_ID
-                      and e.get("accounting_schema") == ACCOUNTING_SCHEMA]
-        except (OSError, ValueError, TypeError):
-            return None
-        index_by = {(r.get("stage"), r.get("attempt")): r for r in index}
-        ledger_by = {(e.get("stage"), e.get("attempt")): e for e in ledger}
-        if (len(index_by) != len(index) or len(ledger_by) != len(ledger)
-                or set(index_by) != set(ledger_by)
-                or any(k[0] is None or k[1] is None for k in index_by)):
-            return None
-        previous = {kind: 0 for kind in CALL_KINDS}
-        for key, row in index_by.items():
-            if row.get("status") in ("running", "publishing"):
-                return None
-            if row.get("status") not in ("done", "crashed", "timeout", "incomplete"):
-                return None
-            counts = _call_counts_from_balance(row.get("call_balance"))
-            ledger_counts = _call_counts_from_balance(
-                ledger_by[key].get("call_balance"))
-            if counts is None or ledger_counts != counts:
-                return None
-            for kind in CALL_KINDS:
-                if counts[kind] < previous[kind]:
-                    return None
-                previous[kind] = counts[kind]
-        for kind in CALL_KINDS:
-            totals[kind] = max(totals[kind], previous[kind])
-    return totals
+    return _prior_call_counts_impl(root, fixed_root=fixed_root, mode=mode)
 
 
 def budget_for(root: Path, stage: str, *, fixed_root: Path,
@@ -4455,6 +5050,7 @@ def pre_register_attempt(root: Path, stage: str, attempt: str, t0: float,
     if marker.is_file() and read_json(marker).get("cohort_id") not in (None, COHORT_ID):
         raise ValueError("cohort marker mismatch")
     elapsed = max(0.0, time.perf_counter() - t0)
+    balance = dict(call_balance) if call_balance else None
     entry = {
         "status": "running", "complete": False,
         "measured_wall_s": elapsed,
@@ -4462,14 +5058,16 @@ def pre_register_attempt(root: Path, stage: str, attempt: str, t0: float,
         "cohort_id": COHORT_ID,
         "execution_registration_sha256": registration_sha,
         "scope": scope, "budget": budget,
-        "call_balance": dict(call_balance) if call_balance else None,
+        "call_balance": balance,
+        "call_balance_before": balance,
         "deadline_perf_counter": t0 + float(budget["remaining_s"]),
         "allocated_wall_s": time.time(),
     }
     upsert_index(root, stage, attempt, entry)
     upsert_cost(root, stage, attempt, elapsed,
                 {"complete": False, "scope": scope, "budget": budget,
-                 "call_balance": dict(call_balance) if call_balance else None},
+                 "call_balance": balance,
+                 "call_balance_before": balance},
                 "running")
     return entry
 
@@ -4509,11 +5107,17 @@ def finish_attempt(root: Path, stage: str, attempt: str, t0: float,
     if not _nonneg(floor):
         raise ValueError("cost floor must be finite and non-negative")
     (stage_dir(root, stage) / attempt).mkdir(parents=True, exist_ok=True)
-    row = {**row, "stage": stage, "attempt": attempt,
+    existing = _attempt_row(root, stage, attempt)
+    row = {**existing, **row, "stage": stage, "attempt": attempt,
            "accounting_schema": ACCOUNTING_SCHEMA, "cohort_id": COHORT_ID}
     balance = extra.get("call_balance")
     if isinstance(balance, Mapping):
         row["call_balance"] = dict(balance)
+        row["call_balance_after"] = dict(balance)
+        extra["call_balance_after"] = dict(balance)
+    if isinstance(existing.get("call_balance_before"), Mapping):
+        row["call_balance_before"] = dict(existing["call_balance_before"])
+        extra["call_balance_before"] = dict(existing["call_balance_before"])
     row = _report_hashes(row)
     writes: list[float] = []
     problems: list[str] = []
@@ -4621,7 +5225,47 @@ def finish_attempt(root: Path, stage: str, attempt: str, t0: float,
     return SealResult(ok, row, problems, terminal_state)
 
 
-def stage_state(root: Path, stage: str) -> tuple[dict | None, list[str]]:
+def _attempt_allowed_problems(problems: Sequence[str]) -> list[str]:
+    """Problems that only mean "not the selected attempt yet"."""
+    return [p for p in problems if p != "attempt_not_complete"]
+
+
+def _attempt_consumable(root: Path, stage: str, attempt: str,
+                        index_row: Mapping[str, Any],
+                        ledger_row: Mapping[str, Any], *,
+                        allow_current: tuple[str, str] | None = None
+                        ) -> tuple[bool, list[str]]:
+    problems: list[str] = []
+    problems += _row_identity_problems(index_row, kind="index")
+    problems += _row_identity_problems(ledger_row, kind="ledger")
+    problems += _call_balance_problems(index_row, ledger_row)
+    if index_row.get("complete") is not True:
+        problems.append("attempt_not_complete")
+    if index_row.get("status") != "done" \
+            or ledger_row.get("status") != "done":
+        problems.append("attempt_status_not_done")
+    for key in ("report", "summary"):
+        if index_row.get(key) and not (PROJECT_ROOT / index_row[key]).is_file():
+            problems.append(f"{key}_missing")
+    deltas = stage_attempt_deltas(root, stage, current=allow_current)
+    if deltas is None or attempt not in deltas:
+        problems.append("attempt_call_delta_unknown")
+    return not _attempt_allowed_problems(problems), problems
+
+
+def stage_state(root: Path, stage: str,
+                attempt: str | None = None, *,
+                allow_current: tuple[str, str] | None = None
+                ) -> tuple[dict | None, list[str]]:
+    """Selected-attempt consumer.
+
+    Without ``attempt`` the historical single-attempt contract is preserved
+    (exactly one terminal attempt).  With several terminal attempts one
+    settled failure may coexist with exactly one consumable attempt; the
+    unique consumable attempt is selected.  More than one consumable
+    candidate, an unsealed/withdrawn pick or an explicitly wrong attempt is
+    refused.
+    """
     problems: list[str] = []
     try:
         index = [r for r in load_index(root) if r.get("stage") == stage]
@@ -4636,25 +5280,56 @@ def stage_state(root: Path, stage: str) -> tuple[dict | None, list[str]]:
         return None, ["stage_attempt_sets_disagree"]
     if not index_by:
         return None, ["stage_not_registered"]
+    problems += _reservation_problems(root, allow_current=allow_current)
+    if attempt is not None and attempt not in index_by:
+        return None, ["selected_attempt_missing"]
+    history = verify_history(root, allow_current=allow_current)
+    if history:
+        nonterminal = f"history_not_terminal:{stage}"
+        if any(p.startswith(nonterminal) for p in history) and not any(
+                r.get("status") in ("done", "crashed", "timeout",
+                                    "incomplete")
+                for r in index_by.values()):
+            return None, ["stage_not_terminal"] + problems
+        only_delta = all(p.startswith("history_deltas:") for p in history)
+        if only_delta and len(index_by) == 1:
+            name = next(iter(index_by))
+            _allowed, attempt_problems = _attempt_consumable(
+                root, stage, name, index_by[name], ledger_by[name],
+                allow_current=allow_current)
+            return index_by[name], attempt_problems + history
+        return None, history
     terminal = [a for a, r in index_by.items()
                 if r.get("status") in ("done", "crashed", "timeout",
                                        "incomplete")]
-    if len(terminal) != 1:
-        return None, ["stage_not_terminal"] + _reservation_problems(root)
-    attempt = terminal[0]
-    row = index_by[attempt]
-    problems += _reservation_problems(root)
-    problems += _row_identity_problems(row, kind="index")
-    problems += _row_identity_problems(ledger_by[attempt], kind="ledger")
-    problems += _call_balance_problems(row, ledger_by[attempt])
-    if row.get("complete") is not True:
-        problems.append("attempt_not_complete")
-    if row.get("status") != "done" or ledger_by[attempt].get("status") != "done":
-        problems.append("attempt_status_not_done")
-    for key in ("report", "summary"):
-        if row.get(key) and not (PROJECT_ROOT / row[key]).is_file():
-            problems.append(f"{key}_missing")
-    return row, problems
+    candidates = [attempt] if attempt is not None else terminal
+    consumable: list[str] = []
+    per_attempt: dict[str, list[str]] = {}
+    for name in candidates:
+        allowed, attempt_problems = _attempt_consumable(
+            root, stage, name, index_by[name], ledger_by[name],
+            allow_current=allow_current)
+        per_attempt[name] = attempt_problems
+        if allowed:
+            consumable.append(name)
+    if attempt is not None:
+        if attempt not in terminal:
+            return None, ["selected_attempt_not_terminal"] + problems
+        if consumable != [attempt]:
+            return None, per_attempt.get(attempt, []) + problems
+        row = index_by[attempt]
+        return row, problems
+    if len(consumable) > 1:
+        return None, ["stage_multiple_consumable"] + problems
+    if len(consumable) == 1:
+        row = index_by[consumable[0]]
+        return row, problems
+    # No consumable attempt: preserve the historical diagnostics of the
+    # single-terminal case; otherwise report the explicit refusal.
+    if len(terminal) == 1:
+        name = terminal[0]
+        return None, per_attempt.get(name, []) + problems
+    return None, ["stage_not_terminal"] + problems
 
 
 def unit_admission(root: Path, stage: str, attempt: str,
@@ -4815,6 +5490,34 @@ def _call_balance_delta_problems(before: Any, after: Any,
     return problems
 
 
+def _withdrawn_state_problems(root: Path, stage: str,
+                              attempt: str) -> list[str]:
+    """Terminal, non-claiming state of one attempt without needing D."""
+    problems: list[str] = []
+    try:
+        index = [r for r in load_index(root)
+                 if r.get("stage") == stage and r.get("attempt") == attempt]
+        ledger = [r for r in load_ledger(root)
+                  if r.get("stage") == stage and r.get("attempt") == attempt]
+    except (OSError, ValueError, TypeError):
+        return ["stage_unreadable"]
+    if len(index) != 1 or len(ledger) != 1:
+        return ["stage_row_unreadable"]
+    row, entry = index[0], ledger[0]
+    if row.get("status") not in ("done", "crashed", "timeout", "incomplete"):
+        problems.append("attempt_not_terminal")
+    if row.get("status") != entry.get("status"):
+        problems.append("attempt_state_mismatch")
+    if row.get("complete") is not entry.get("complete"):
+        problems.append("attempt_complete_mismatch")
+    if row.get("status") != "done" and row.get("complete") is not False:
+        problems.append("attempt_claims_complete")
+    for key in ("report", "summary"):
+        if row.get(key) and not (PROJECT_ROOT / row[key]).is_file():
+            problems.append(f"{key}_missing")
+    return problems
+
+
 def withdraw_attempt_claim(root: Path, stage: str, attempt: str,
                            report_path: Path | None, row: dict,
                            reasons: Sequence[str], *, reason: str,
@@ -4883,7 +5586,7 @@ def withdraw_attempt_claim(root: Path, stage: str, attempt: str,
         cost_floor=old_cost)
     problems += list(sealed.problems)
     try:
-        _row, state_problems = stage_state(root, stage)
+        state_problems = _withdrawn_state_problems(root, stage, attempt)
     except (OSError, ValueError, TypeError):
         state_problems = ["stage_unreadable"]
     unknown = [p for p in state_problems
@@ -4948,8 +5651,10 @@ TRAIN_CONFIG_SHA = "0e2cfa96849ee2de14ac84b7343289090c606f78116bb79114ff81b046b5
 
 IMPLEMENTATION_FILES = (
     "src/ireset/eval/w1_real_training_update_audit.py",
+    "src/ireset/eval/w1_real_training_update_provider.py",
     "scripts/audit_w1_real_training_update.py",
     "tests/test_w1_real_training_update_audit.py",
+    "tests/test_w1_real_training_update_provider.py",
     "src/ireset/train/trainer.py",
     "src/ireset/train/losses.py",
     "src/ireset/model/backbone.py",
@@ -4958,9 +5663,13 @@ IMPLEMENTATION_FILES = (
     "src/ireset/eval/w1_real_fk_audit.py",
     "src/ireset/eval/w1_real_objective_audit.py",
     "configs/train/omniretarget_motion.yaml",
+    "docs/plans/omniretarget_w1_real_training_update_provider_execution_plan.md",
     "docs/plans/omniretarget_w1_real_training_update_audit_prereg_draft.md",
 )
-PREREG_DRAFT = IMPLEMENTATION_FILES[-1]
+PREREG_DRAFT = (
+    "docs/plans/omniretarget_w1_real_training_update_audit_prereg_draft.md")
+EXECUTION_PLAN = (
+    "docs/plans/omniretarget_w1_real_training_update_provider_execution_plan.md")
 
 
 def _git_identity(project_root: Path) -> dict:
@@ -5116,7 +5825,7 @@ def _resource_bound(roster: Mapping[str, Any]) -> dict:
 
 
 def run_r0(root: Path, stage: str, attempt: str, t0: float,
-           budget: Mapping[str, Any], provider: SyntheticTrainingProvider,
+           budget: Mapping[str, Any], provider: Any,
            counter: CallCounter, roster: Mapping[str, Any],
            *, mode: str, tolerance: Mapping[str, Any],
            project_root: Path = PROJECT_ROOT,
@@ -5124,32 +5833,59 @@ def run_r0(root: Path, stage: str, attempt: str, t0: float,
            authorization: Mapping[str, Any] | None = None) -> dict:
     base = stage_dir(root, stage) / attempt
     base.mkdir(parents=True, exist_ok=True)
-    fixture = provider.fixture or {}
+    fixture = provider.fixture or {} if mode == "synthetic" else {}
+    metadata = provider.metadata() if mode == "real" else {}
     problems: list[str] = list(fixture.get("problems") or [])
+    problems += [f"metadata:{p}" for p in metadata.get("problems") or []]
     gaps: list[str] = []
     # tolerance + fp32 contract
     problems += [f"tolerance:{p}" for p in tolerance_contract_problems(
-        tolerance, recompute=(mode == "real"))]
+        tolerance, recompute=False)]
     fp32_ok = True
     if mode == "real":
         fp32_ok = bool(tolerance.get("fp32_contract"))
         problems += [f"fp32:{p}" for p in tolerance.get("fp32_problems", [])
                      if p]
+        try:
+            from ireset.eval.w1_real_training_update_provider import (
+                calibration_verification_problems,
+            )
+            for problem in calibration_verification_problems(
+                    (admission_package or {}).get("calibration_verification")):
+                problems.append(f"r0_calibration:{problem}")
+        except ImportError:  # pragma: no cover
+            problems.append("r0_calibration_module_missing")
     # roster/schema/noise
     roster_here = roster_problems(provider.roster, roster)
     problems += [f"roster:{p}" for p in roster_here]
-    problems += [f"fixture:{p}" for p in _fixture_schema_problems(provider)]
+    if mode == "synthetic":
+        problems += [f"fixture:{p}" for p in _fixture_schema_problems(provider)]
     schedule = draw_noise_path(NOISE_SEED)
     counter.add("cpu_draw_units", DRAW_UNITS_PER_PATH)
     noise_ok = True
-    for a, b in zip(schedule, provider.noise):
-        if (not torch.equal(a["t"], b["t"])
-                or not torch.equal(a["epsilon"], b["epsilon"])):
-            noise_ok = False
-            problems.append("r0_noise_matrix")
-            break
+    if mode == "synthetic":
+        for a, b in zip(schedule, provider.noise):
+            if (not torch.equal(a["t"], b["t"])
+                    or not torch.equal(a["epsilon"], b["epsilon"])):
+                noise_ok = False
+                problems.append("r0_noise_matrix")
+                break
+    noise_path = None
+    if mode == "real":
+        noise_path = base / "noise_schedule.npz"
+        np.savez(
+            noise_path,
+            **{f"u{u['update']}m{u['micro']}__t": u["t"].numpy()
+               for u in schedule},
+            **{f"u{u['update']}m{u['micro']}__epsilon": u["epsilon"].numpy()
+               for u in schedule},
+            **{f"u{u['update']}m{u['micro']}__state_before":
+               u["generator_state_before"].numpy() for u in schedule},
+            **{f"u{u['update']}m{u['micro']}__state_after":
+               u["generator_state_after"].numpy() for u in schedule})
     alpha = alpha_cumprod_reference(provider.config)
-    if _hash_array(alpha) != fixture.get("alpha_cumprod_sha256"):
+    if _hash_array(alpha) != fixture.get("alpha_cumprod_sha256") \
+            and mode == "synthetic":
         problems.append("r0_alpha_hash")
     if not noise_ok:
         gaps.append("r0_noise_matrix")
@@ -5223,14 +5959,23 @@ def run_r0(root: Path, stage: str, attempt: str, t0: float,
                   "t_epsilon_sha256": [_sha_array(u["t"])
                                        + _sha_array(u["epsilon"])
                                        for u in schedule],
-                  "alpha_cumprod_sha256": _hash_array(alpha)},
+                  "alpha_cumprod_sha256": _hash_array(alpha),
+                  "alpha_source": ("config_recompute; parent array value "
+                                   "checked by the P input admission"
+                                   if mode == "real" else "config_recompute"),
+                  "schedule_path": (path_for_record(noise_path)
+                                    if noise_path is not None else None),
+                  "schedule_sha256": (sha256_file(noise_path)
+                                      if noise_path is not None else None)},
         "roster": roster,
         "row_catalog": {k: catalog[k] for k in
                         ("n_rows", "counts", "keys_sha256", "formula")},
         "config": provider.config,
         "budget": dict(budget),
         "call_caps": dict(CALL_CAPS),
-        "call_nominal": {k: dict(v) for k, v in STAGE_NOMINAL.items()},
+        "call_nominal": {k: stage_nominal_for_mode(mode, k)
+                         for k in STAGE_BUDGETS},
+        "chain_nominal": chain_nominal_for_mode(mode),
         "tolerances": tolerance.get("tolerances"),
         "tiny_zero_floors": {"gradient_abs": ZERO_GRADIENT_ABS,
                              "gradient_noise_scale": ZERO_GRADIENT_NOISE_SCALE,
@@ -5243,6 +5988,7 @@ def run_r0(root: Path, stage: str, attempt: str, t0: float,
         "environment": env,
         "resource_bound": bound,
         "disk_free_bytes": int(free),
+        "provider": (metadata if mode == "real" else provider.spec()),
         "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
     registration_path = base / "registration.json"
@@ -5264,6 +6010,13 @@ def run_r0(root: Path, stage: str, attempt: str, t0: float,
             fixture.get("zero_gradient_parameters"),
         "none_gradient_parameters":
             fixture.get("none_gradient_parameters"),
+        "metadata_only": bool(mode == "real"),
+        "payload_reads": {
+            "checkpoint_torch_load": 0,
+            "npz_values_read": 0,
+            "model_construction_calls": 0,
+            "muJoCo_compile_calls": 0,
+        } if mode == "real" else None,
         "call_balance": counter.snapshot(),
         "zero_counters": {k: 0 for k in ZERO_COUNTERS},
         "parent_files_verified": all(v["match"] for v in parents.values())
@@ -5283,6 +6036,10 @@ def run_r0(root: Path, stage: str, attempt: str, t0: float,
         "registration_sha256": registration_sha,
         "registration": path_for_record(registration_path),
         "admission": path_for_record(admission_path),
+        "noise_schedule": (path_for_record(noise_path)
+                           if noise_path is not None else None),
+        "noise_schedule_sha256": (sha256_file(noise_path)
+                                  if noise_path is not None else None),
         "fp32_ok": fp32_ok,
         "call_balance": counter.snapshot(),
     }
@@ -6077,6 +6834,9 @@ def authorization_template() -> dict:
         "parent_registration_sha256": PARENT_FILES[
             "objective_registration"][1],
         "draft_sha256": None,
+        "execution_plan_sha256": None,
+        "calibration_verification_sha256": None,
+        "acceptance_sha256": None,
         "tolerance_evidence_sha256": None,
         "fp32_contract_sha256": None,
         "admission_package_sha256": None,
@@ -6143,8 +6903,10 @@ def authorization_problems(record: Mapping[str, Any] | None) -> list[str]:
     if record.get("parent_registration_sha256") != PARENT_FILES[
             "objective_registration"][1]:
         problems.append("authorization_parent_registration")
-    for key in ("draft_sha256", "tolerance_evidence_sha256",
-                "fp32_contract_sha256", "admission_package_sha256"):
+    for key in ("draft_sha256", "execution_plan_sha256",
+                "calibration_verification_sha256", "acceptance_sha256",
+                "tolerance_evidence_sha256", "fp32_contract_sha256",
+                "admission_package_sha256"):
         value = record.get(key)
         if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}",
                                                           value):
@@ -6509,7 +7271,85 @@ def _artifact_hashes(paths: Iterable[Path | None]) -> dict:
     return out
 
 
-def run_registered_audit(run_root: Path, provider: SyntheticTrainingProvider,
+def _admission_problems_for(package: Mapping[str, Any] | None) -> list[str]:
+    from ireset.eval.w1_real_training_update_provider import (
+        REAL_ADMISSION_SCHEMA,
+        real_admission_package_problems,
+    )
+    if isinstance(package, Mapping) \
+            and package.get("schema") == REAL_ADMISSION_SCHEMA:
+        return real_admission_package_problems(package)
+    return admission_package_problems(package)
+
+
+def _report_array_binding_problems(report_path: Path | None,
+                                   files: Mapping[str, Path]) -> list[str]:
+    if report_path is None or not Path(report_path).is_file():
+        return ["report_missing"]
+    try:
+        report = read_json(Path(report_path))
+    except (OSError, ValueError, TypeError):
+        return ["report_unreadable"]
+    problems: list[str] = []
+    for model, path in files.items():
+        record = ((report.get("models") or {}).get(model) or {})
+        expected = record.get("arrays_sha256")
+        actual = sha256_file(path) if Path(path).is_file() else None
+        if expected is None or actual != expected:
+            problems.append(f"array_binding:{model}")
+    return problems
+
+
+def _selected_stage_problems(
+        deltas: Mapping[str, Mapping[str, Mapping[str, Any]]],
+        selected: Mapping[str, str], mode: str) -> list[str]:
+    problems: list[str] = []
+    for stage in STAGE_BUDGETS:
+        rec = (deltas.get(stage) or {}).get(selected.get(stage))
+        if rec is None:
+            problems.append(f"selected_delta_missing:{stage}")
+            continue
+        nominal = stage_nominal_for_mode(mode, stage)
+        for kind in CALL_KINDS:
+            if int(rec["counts"][kind]) != nominal[kind]:
+                problems.append(
+                    f"selected_stage_matrix:{stage}:{kind}:"
+                    f"{rec['counts'][kind]}!={nominal[kind]}")
+    chain = selected_chain_counts(deltas, selected)
+    expected = chain_nominal_for_mode(mode)
+    if chain is None:
+        problems.append("selected_chain_missing")
+    else:
+        for kind in CALL_KINDS:
+            if int(chain[kind]) != expected[kind]:
+                problems.append(
+                    f"full_chain_calls:{kind}:{int(chain[kind])}"
+                    f"!={expected[kind]}")
+    return problems
+
+
+def _selected_caps_problems(
+        deltas: Mapping[str, Mapping[str, Mapping[str, Any]]],
+        mode: str) -> list[str]:
+    problems: list[str] = []
+    cohort = {kind: 0 for kind in CALL_KINDS}
+    for stage in STAGE_BUDGETS:
+        totals = stage_call_totals(deltas, stage)
+        nominal = stage_nominal_for_mode(mode, stage)
+        for kind in CALL_KINDS:
+            if totals[kind] > 2 * nominal[kind]:
+                problems.append(f"stage_cap:{stage}:{kind}")
+            cohort[kind] += totals[kind]
+        used = len(deltas.get(stage) or {})
+        if used > STAGE_BUDGETS[stage]["attempts"]:
+            problems.append(f"attempt_cap:{stage}")
+    for kind in CALL_KINDS:
+        if cohort[kind] > int(CALL_CAPS[kind]):
+            problems.append(f"cohort_cap:{kind}")
+    return problems
+
+
+def run_registered_audit(run_root: Path, provider: Any,
                          *, mode: str, tolerance: Mapping[str, Any],
                          authorization_sha: str | None = None,
                          authorization: Mapping[str, Any] | None = None,
@@ -6517,20 +7357,28 @@ def run_registered_audit(run_root: Path, provider: SyntheticTrainingProvider,
                          admission_sha: str | None = None,
                          fixed_root: Path = HISTORY_ROOT,
                          project_root: Path = PROJECT_ROOT,
-                         r0_started_perf: float | None = None) -> dict:
+                         r0_started_perf: float | None = None,
+                         resume_stage: str | None = None) -> dict:
+    """Registered R0 -> P -> I -> F orchestration with resume support.
+
+    A fresh run executes the four stages once.  ``resume_stage`` reuses the
+    unique consumable upstream attempts, refuses unknown history and appends
+    one new attempt for the named stage (plan section 2.1).  Every stage
+    selection is explicit: no latest-attempt or directory-order guessing.
+    """
     if r0_started_perf is not None and (
             not _nonneg(r0_started_perf)
             or float(r0_started_perf) > time.perf_counter()):
         raise ValueError("invalid R0 launch clock")
     run_root = Path(run_root).expanduser().resolve()
-    run_root.mkdir(parents=True, exist_ok=True)
     if mode not in ("synthetic", "real"):
         raise ValueError(f"unknown mode {mode}")
+    if resume_stage is not None and resume_stage not in STAGE_BUDGETS:
+        raise ValueError(f"unknown resume stage {resume_stage}")
     contract_problems = tolerance_contract_problems(tolerance,
                                                     recompute=False)
     if contract_problems:
         raise SystemExit(f"tolerance contract refused: {contract_problems}")
-    prior = {kind: 0 for kind in CALL_KINDS}
     if mode == "real":
         base = (Path(project_root) / fixed_root).resolve()
         if run_root.parent != base:
@@ -6551,7 +7399,7 @@ def run_registered_audit(run_root: Path, provider: SyntheticTrainingProvider,
             raise SystemExit("authorization does not bind this fp32 contract")
         if admission_package is None or admission_sha is None:
             raise SystemExit("real audit requires a passed admission package")
-        pkg_problems = admission_package_problems(admission_package)
+        pkg_problems = _admission_problems_for(admission_package)
         if pkg_problems:
             raise SystemExit(f"admission package refused: {pkg_problems}")
         if authorization.get("admission_package_sha256") != admission_sha:
@@ -6566,31 +7414,98 @@ def run_registered_audit(run_root: Path, provider: SyntheticTrainingProvider,
         if authorization.get("draft_sha256") != current_impl["files"].get(
                 PREREG_DRAFT):
             raise SystemExit("authorization does not bind the current draft")
-        prior = prior_call_counts(run_root, fixed_root=fixed_root, mode=mode)
-        if prior is None:
-            raise SystemExit("call history unknown: refusing a fresh quota")
-        insufficient = {kind: {"prior": prior[kind],
-                               "required": CHAIN_NOMINAL[kind],
-                               "cap": CALL_CAPS[kind]}
-                        for kind in CALL_KINDS
-                        if prior[kind] + CHAIN_NOMINAL[kind] > CALL_CAPS[kind]}
-        if insufficient:
+        if authorization.get("execution_plan_sha256") != current_impl[
+                "files"].get(EXECUTION_PLAN):
             raise SystemExit(
-                f"cumulative call budget insufficient: {insufficient}")
+                "authorization does not bind the execution plan")
+        if authorization.get("acceptance_sha256") != admission_package.get(
+                "acceptance_sha256"):
+            raise SystemExit(
+                "authorization does not bind the synthetic acceptance")
+        if authorization.get("calibration_verification_sha256") != \
+                admission_package.get("calibration_verification_sha256"):
+            raise SystemExit(
+                "authorization does not bind the calibration verification")
+        acceptance = admission_package.get("acceptance") or {}
+        from ireset.eval.w1_real_training_update_provider import (
+            calibration_verification_problems,
+            synthetic_acceptance_problems,
+        )
+        if synthetic_acceptance_problems(acceptance):
+            raise SystemExit(
+                "admission synthetic acceptance refused: "
+                f"{synthetic_acceptance_problems(acceptance)}")
+        if calibration_verification_problems(
+                admission_package.get("calibration_verification")):
+            raise SystemExit(
+                "admission calibration verification refused: "
+                f"{calibration_verification_problems(admission_package.get('calibration_verification'))}")
+    if resume_stage is None:
+        if run_root.exists() and any(run_root.iterdir()):
+            raise SystemExit(f"fresh run root is not empty: {run_root}")
+    else:
+        if not (run_root / "cohort.json").is_file():
+            raise SystemExit("resume requires an existing registered cohort")
+    run_root.mkdir(parents=True, exist_ok=True)
+
+    selected: dict[str, str] = {}
+    if resume_stage is not None:
+        marker = read_json(run_root / "cohort.json")
+        if marker.get("cohort_id") != COHORT_ID \
+                or marker.get("mode") != mode \
+                or marker.get("authorization_sha256") != authorization_sha:
+            raise SystemExit("resume cohort identity mismatch")
+        history = verify_history(run_root)
+        if history:
+            raise SystemExit(f"resume history unknown: {history}")
+        order = list(STAGE_BUDGETS)
+        for stage in order[:order.index(resume_stage)]:
+            row, problems = stage_state(run_root, stage)
+            if problems or row is None:
+                raise SystemExit(
+                    f"resume upstream {stage} not consumable: {problems}")
+            selected[stage] = row["attempt"]
+        target_row, target_problems = stage_state(run_root, resume_stage)
+        if target_row is not None and not target_problems:
+            raise SystemExit(f"{resume_stage} is already consumable")
+        for stage in order[order.index(resume_stage) + 1:]:
+            if _disk_attempts(run_root, stage):
+                raise SystemExit(f"resume has downstream attempts: {stage}")
+    if resume_stage is None:
+        write_cohort(run_root, mode=mode, authorization_sha=authorization_sha)
+    prior = prior_call_counts(run_root, fixed_root=fixed_root, mode=mode)
+    if prior is None:
+        raise SystemExit("call history unknown: refusing a fresh quota")
+    required = chain_nominal_for_mode(mode)
+    insufficient = {kind: {"prior": prior[kind], "required": required[kind],
+                           "cap": CALL_CAPS[kind]}
+                    for kind in CALL_KINDS
+                    if prior[kind] + required[kind] > CALL_CAPS[kind]}
+    if insufficient:
         raise SystemExit(
-            "real_provider_not_registered_in_ic: the synthetic I/C delivery "
-            "does not construct real models or read checkpoints")
-    write_cohort(run_root, mode=mode, authorization_sha=authorization_sha)
+            f"cumulative call budget insufficient: {insufficient}")
     counter = CallCounter(CALL_CAPS, prior)
     binder = getattr(provider, "bind_counter", None)
     if callable(binder):
         binder(counter)
     fixture_seconds = None
+    if mode == "real":
+        try:
+            provider.load_acceptance()
+        except (OSError, ValueError, TypeError) as exc:
+            raise SystemExit(f"real provider acceptance refused: {exc}")
+        if provider.roster is None:
+            raise SystemExit("real provider has no static roster")
     if mode == "synthetic":
-        t_fx = _now()
-        provider.prepare_fixture(run_root / "fixture")
-        fixture_seconds = _now() - t_fx
-        provider.load_fixture()
+        fixture_dir = run_root / "fixture"
+        if (fixture_dir / "fixture.json").is_file():
+            provider.fixture_dir = fixture_dir
+            provider.load_fixture()
+        else:
+            t_fx = _now()
+            provider.prepare_fixture(fixture_dir)
+            fixture_seconds = _now() - t_fx
+            provider.load_fixture()
     roster = provider.roster
     scope = _stage_scope(provider, roster)
     results: dict[str, Any] = {}
@@ -6598,198 +7513,311 @@ def run_registered_audit(run_root: Path, provider: SyntheticTrainingProvider,
 
     def stop(problems: Sequence[str], gaps: Sequence[str],
              failures: Sequence[str] = ()) -> dict:
+        deltas = _stage_deltas(run_root)
+        stage_totals = ({stage: stage_call_totals(deltas, stage)
+                         for stage in STAGE_BUDGETS} if deltas else {})
         return {
             "mode": mode, "conclusion": "audit_incomplete",
             "complete_evidence": False, "covered_contract_passed": False,
             "problems": list(problems), "failures": list(failures),
             "gaps": list(gaps), "stages": results, "seals": seals,
+            "selected_attempts": None,
+            "selected_chain_counts": None,
+            "selected_chain_training_updates": None,
+            "stage_call_counts": stage_totals,
+            "cohort_call_counts": (cohort_call_totals_from_deltas(deltas)
+                                   if deltas else None),
             "fixture_build_s": fixture_seconds,
             "calls": counter.snapshot(),
             "training_updates": int(counter.counts["native_adamw_steps"]
                                     + counter.counts["explicit_reference_updates"]),
+            "training_updates_scope": "cohort",
             "zero_counters": {k: 0 for k in ZERO_COUNTERS},
             "coverage": dict(BOUNDARIES),
             "boundaries": dict(BOUNDARIES),
         }
 
+    def stage_provider(stage: str) -> Any:
+        factory = getattr(provider, "for_stage", None)
+        stage_p = factory(stage) if callable(factory) else provider
+        binder_ = getattr(stage_p, "bind_counter", None)
+        if callable(binder_):
+            binder_(counter)
+        return stage_p
+
+    def r0_noise_from(selected_attempt: str) -> tuple[Any, Path | None, str | None]:
+        if mode == "synthetic":
+            return provider.noise, None, None
+        path = (stage_dir(run_root, "R0") / selected_attempt /
+                "noise_schedule.npz")
+        if not path.is_file():
+            raise SystemExit("R0 noise schedule missing")
+        stage_p = provider.for_stage("R0")
+        schedule = stage_p.load_noise_schedule(path)
+        return schedule, path, sha256_file(path)
+
     # --- R0 -----------------------------------------------------------------
-    t0 = (_now() if r0_started_perf is None else float(r0_started_perf))
-    try:
-        budget = budget_for(run_root, "R0", fixed_root=fixed_root, mode=mode)
-    except SystemExit as exc:
-        return stop([str(exc)], [str(exc)])
-    attempt = allocate_attempt(run_root, "R0")
-    base_counts = dict(counter.counts)
-    pre_register_attempt(run_root, "R0", attempt, t0, scope=scope,
-                         budget=budget, call_balance=counter.snapshot())
-    reserve_stage_calls(run_root, "R0", attempt,
-                        {"counts": STAGE_NOMINAL["R0"]})
-    r0 = run_r0(run_root, "R0", attempt, t0, budget, provider, counter,
-                roster, mode=mode, tolerance=tolerance,
-                project_root=project_root,
-                admission_package=admission_package,
-                authorization=authorization)
-    r0_delta = _stage_delta(counter, base_counts)
-    settle_stage_calls(run_root, "R0", attempt, r0_delta)
-    results["R0"] = r0
-    admission_path = run_root / STAGE_DIRS["R0"] / attempt / "admission.json"
-    seal = finish_attempt(
-        run_root, "R0", attempt, t0, budget,
-        {"complete": bool(r0["passed"]),
-         "report": path_for_record(admission_path),
-         "summary": path_for_record(admission_path),
-         "registration_sha256": r0["registration_sha256"]},
-        status="done" if r0["passed"] else "incomplete",
-        extra={"stage": "R0", "scope": scope,
-               "call_balance": counter.snapshot()})
-    seals["R0"] = {"sealed": seal.sealed, "terminal": seal.terminal,
-                   "problems": seal.problems, "row": seal.row}
-    _row, r0_consumer = stage_state(run_root, "R0")
-    seals["R0"]["consumer_problems"] = r0_consumer
-    if not seal.sealed or not r0["passed"] or r0_consumer:
-        blockers = r0["problems"] + seal.problems + r0_consumer
-        return stop(blockers, r0["gaps"] + seal.problems + r0_consumer)
-    registration_sha = r0["registration_sha256"]
+    first_start = (_now() if r0_started_perf is None
+                   else float(r0_started_perf))
+    stage_order = list(STAGE_BUDGETS)
+    start_index = (stage_order.index(resume_stage)
+                   if resume_stage is not None else 0)
+    if start_index <= 0:
+        t0 = first_start
+        try:
+            budget = budget_for(run_root, "R0", fixed_root=fixed_root,
+                                mode=mode)
+        except SystemExit as exc:
+            return stop([str(exc)], [str(exc)])
+        attempt = allocate_attempt(run_root, "R0")
+        base_counts = dict(counter.counts)
+        pre_register_attempt(run_root, "R0", attempt, t0, scope=scope,
+                             budget=budget, call_balance=counter.snapshot())
+        reserve_stage_calls(run_root, "R0", attempt,
+                            {"counts": stage_nominal_for_mode(mode, "R0")})
+        r0_provider = stage_provider("R0")
+        r0 = run_r0(run_root, "R0", attempt, t0, budget, r0_provider, counter,
+                    roster, mode=mode, tolerance=tolerance,
+                    project_root=project_root,
+                    admission_package=admission_package,
+                    authorization=authorization)
+        r0_delta = _stage_delta(counter, base_counts)
+        settle_stage_calls(run_root, "R0", attempt, r0_delta)
+        results["R0"] = r0
+        admission_path = run_root / STAGE_DIRS["R0"] / attempt / "admission.json"
+        seal = finish_attempt(
+            run_root, "R0", attempt, t0, budget,
+            {"complete": bool(r0["passed"]),
+             "report": path_for_record(admission_path),
+             "summary": path_for_record(admission_path),
+             "registration_sha256": r0["registration_sha256"]},
+            status="done" if r0["passed"] else "incomplete",
+            extra={"stage": "R0", "scope": scope,
+                   "call_balance": counter.snapshot()})
+        seals["R0"] = {"sealed": seal.sealed, "terminal": seal.terminal,
+                       "problems": seal.problems, "row": seal.row}
+        _row, r0_consumer = stage_state(run_root, "R0")
+        seals["R0"]["consumer_problems"] = r0_consumer
+        if not seal.sealed or not r0["passed"] or r0_consumer:
+            blockers = r0["problems"] + seal.problems + r0_consumer
+            return stop(blockers, r0["gaps"] + seal.problems + r0_consumer)
+        registration_sha = r0["registration_sha256"]
+        selected["R0"] = attempt
+    else:
+        row, problems = stage_state(run_root, "R0", selected["R0"])
+        if problems or row is None:
+            return stop([f"selected_r0:{p}" for p in problems],
+                        [f"selected_r0:{p}" for p in problems])
+        registration_sha = row.get("registration_sha256")
+        results["R0"] = {"resumed": True, "attempt": selected["R0"]}
+        seals["R0"] = {"sealed": True, "terminal": True,
+                       "resumed": True, "row": row}
+    r0_noise, r0_noise_path, r0_noise_sha = r0_noise_from(selected["R0"])
 
     # --- P ------------------------------------------------------------------
-    t0 = _now()
-    try:
-        budget = budget_for(run_root, "P", fixed_root=fixed_root, mode=mode)
-    except SystemExit as exc:
-        return stop([str(exc)], [str(exc)])
-    attempt = allocate_attempt(run_root, "P")
-    base_counts = dict(counter.counts)
-    pre_register_attempt(run_root, "P", attempt, t0, scope=scope,
-                         budget=budget, registration_sha=registration_sha,
-                         call_balance=counter.snapshot())
-    reserve_stage_calls(run_root, "P", attempt,
-                        {"counts": STAGE_NOMINAL["P"]})
-    stage_deadline = t0 + float(budget["remaining_s"]) - float(budget["reserve_s"])
-    try:
-        p = run_p_stage(run_root, "P", attempt, t0, budget, provider, counter,
-                        roster, guard=_stage_unit_guard(
-                            run_root, "P", attempt,
-                            registration_sha=registration_sha,
-                            deadline=stage_deadline))
-    except (TimeoutError, UpdateCallBudgetExceeded) as exc:
-        p = {"passed": False, "failures": [type(exc).__name__],
-             "gaps": [f"p_stage_aborted:{exc}"], "rows": [], "paths": {},
-             "report": None, "arrays_sha256": {},
-             "complete_evidence": False, "numeric_passed": False}
-    p_delta = _stage_delta(counter, base_counts)
-    try:
-        settle_stage_calls(run_root, "P", attempt, p_delta)
-    except (OSError, ValueError) as exc:
-        p["passed"] = False
-        p["complete_evidence"] = False
-        p["failures"] = list(p.get("failures") or []) + [
-            f"reservation_settle:{type(exc).__name__}"]
-    results["P"] = p
-    p_complete = bool(p.get("complete_evidence"))
-    p_report = Path(p["report"]) if p.get("report") else None
-    seal = finish_attempt(
-        run_root, "P", attempt, t0, budget,
-        {"complete": p_complete,
-         "report": path_for_record(p_report) if p_report else None,
-         "summary": path_for_record(p_report) if p_report else None,
-         "registration_sha256": registration_sha,
-         "artifacts": _artifact_hashes(
-             Path(path) for path in (p.get("paths") or {}).values())},
-        status="done" if p_complete else "incomplete",
-        extra={"stage": "P", "scope": scope,
-               "numeric_passed": bool(p.get("numeric_passed")),
-               "call_balance": counter.snapshot()})
-    seals["P"] = {"sealed": seal.sealed, "terminal": seal.terminal,
-                  "problems": seal.problems, "row": seal.row}
-    p_row, p_consumer = stage_state(run_root, "P")
-    seals["P"]["consumer_problems"] = p_consumer
-    if (not seal.terminal or not seal.sealed or p_consumer
-            or not p.get("paths")):
-        blockers = seal.problems + p_consumer
-        if not p.get("paths"):
-            blockers.append("p_artifacts_missing")
-        return stop(blockers, p["gaps"] + blockers,
-                    failures=p["failures"])
-    p_dir = stage_dir(run_root, "P") / attempt
+    if start_index <= 1:
+        t0 = first_start if resume_stage is not None else _now()
+        try:
+            budget = budget_for(run_root, "P", fixed_root=fixed_root, mode=mode)
+        except SystemExit as exc:
+            return stop([str(exc)], [str(exc)])
+        attempt = allocate_attempt(run_root, "P")
+        base_counts = dict(counter.counts)
+        pre_register_attempt(run_root, "P", attempt, t0, scope=scope,
+                             budget=budget, registration_sha=registration_sha,
+                             call_balance=counter.snapshot())
+        reserve_stage_calls(run_root, "P", attempt,
+                            {"counts": stage_nominal_for_mode(mode, "P")})
+        stage_deadline = (t0 + float(budget["remaining_s"])
+                          - float(budget["reserve_s"]))
+        p_provider = stage_provider("P")
+        try:
+            p = run_p_stage(
+                run_root, "P", attempt, t0, budget, p_provider, counter,
+                roster, guard=_stage_unit_guard(
+                    run_root, "P", attempt,
+                    registration_sha=registration_sha,
+                    deadline=stage_deadline),
+                registered=True, r0_noise=r0_noise,
+                write_input_admission=(mode == "real"),
+                r0_registration_sha=registration_sha)
+        except (TimeoutError, UpdateCallBudgetExceeded) as exc:
+            p = {"passed": False, "failures": [type(exc).__name__],
+                 "gaps": [f"p_stage_aborted:{exc}"], "rows": [], "paths": {},
+                 "report": None, "arrays_sha256": {},
+                 "complete_evidence": False, "numeric_passed": False}
+        except Exception as exc:  # noqa: BLE001 -- a broken stage is evidence
+            p = {"passed": False, "failures": [type(exc).__name__],
+                 "gaps": [f"p_stage_exception:{type(exc).__name__}:{exc}"],
+                 "rows": [], "paths": {}, "report": None,
+                 "arrays_sha256": {}, "complete_evidence": False,
+                 "numeric_passed": False}
+        p_delta = _stage_delta(counter, base_counts)
+        try:
+            settle_stage_calls(run_root, "P", attempt, p_delta)
+        except (OSError, ValueError) as exc:
+            p["passed"] = False
+            p["complete_evidence"] = False
+            p["failures"] = list(p.get("failures") or []) + [
+                f"reservation_settle:{type(exc).__name__}"]
+        results["P"] = p
+        p_complete = bool(p.get("complete_evidence"))
+        p_report = Path(p["report"]) if p.get("report") else None
+        seal = finish_attempt(
+            run_root, "P", attempt, t0, budget,
+            {"complete": p_complete,
+             "report": path_for_record(p_report) if p_report else None,
+             "summary": path_for_record(p_report) if p_report else None,
+             "registration_sha256": registration_sha,
+             "artifacts": _artifact_hashes(
+                 Path(path) for path in (p.get("paths") or {}).values())},
+            status="done" if p_complete else "incomplete",
+            extra={"stage": "P", "scope": scope,
+                   "numeric_passed": bool(p.get("numeric_passed")),
+                   "call_balance": counter.snapshot()})
+        seals["P"] = {"sealed": seal.sealed, "terminal": seal.terminal,
+                      "problems": seal.problems, "row": seal.row}
+        p_row, p_consumer = stage_state(run_root, "P", attempt)
+        seals["P"]["consumer_problems"] = p_consumer
+        if (not seal.terminal or not seal.sealed or p_consumer
+                or not p.get("paths")):
+            blockers = seal.problems + p_consumer
+            if not p.get("paths"):
+                blockers.append("p_artifacts_missing")
+            return stop(blockers, p["gaps"] + blockers,
+                        failures=p["failures"])
+        selected["P"] = attempt
+        p_dir = stage_dir(run_root, "P") / attempt
+    else:
+        row, problems = stage_state(run_root, "P", selected["P"])
+        if problems or row is None:
+            return stop([f"selected_p:{p}" for p in problems],
+                        [f"selected_p:{p}" for p in problems])
+        results["P"] = {"resumed": True, "attempt": selected["P"]}
+        seals["P"] = {"sealed": True, "terminal": True,
+                      "resumed": True, "row": row}
+        p_dir = stage_dir(run_root, "P") / selected["P"]
+    p_input_admission_path = p_dir / "input_admission.json"
+    p_input_admission = None
+    if mode == "real":
+        if not p_input_admission_path.is_file():
+            return stop(["p_input_admission_missing"],
+                        ["p_input_admission_missing"])
+        p_input_admission = read_json(p_input_admission_path)
+        if p_input_admission.get("passed") is not True:
+            return stop(["p_input_admission_not_passed"],
+                        ["p_input_admission_not_passed"])
 
     # --- I ------------------------------------------------------------------
-    t0 = _now()
-    try:
-        budget = budget_for(run_root, "I", fixed_root=fixed_root, mode=mode)
-    except SystemExit as exc:
-        return stop([str(exc)], [str(exc)])
-    attempt = allocate_attempt(run_root, "I")
-    base_counts = dict(counter.counts)
-    pre_register_attempt(run_root, "I", attempt, t0, scope=scope,
-                         budget=budget, registration_sha=registration_sha,
-                         call_balance=counter.snapshot())
-    reserve_stage_calls(run_root, "I", attempt,
-                        {"counts": STAGE_NOMINAL["I"]})
-    stage_deadline = t0 + float(budget["remaining_s"]) - float(budget["reserve_s"])
-    try:
-        i = run_i_stage(run_root, "I", attempt, t0, budget, provider, counter,
-                        roster, p_dir, tolerance=tolerance,
-                        guard=_stage_unit_guard(
-                            run_root, "I", attempt,
-                            registration_sha=registration_sha,
-                            deadline=stage_deadline))
-    except (TimeoutError, UpdateCallBudgetExceeded) as exc:
-        i = {"passed": False, "failures": [type(exc).__name__],
-             "gaps": [f"i_stage_aborted:{exc}"], "rows": [], "paths": {},
-             "report": None, "arrays_sha256": {},
-             "complete_evidence": False, "numeric_passed": False}
-    i_delta = _stage_delta(counter, base_counts)
-    try:
-        settle_stage_calls(run_root, "I", attempt, i_delta)
-    except (OSError, ValueError) as exc:
-        i["passed"] = False
-        i["complete_evidence"] = False
-        i["failures"] = list(i.get("failures") or []) + [
-            f"reservation_settle:{type(exc).__name__}"]
-    results["I"] = i
-    i_complete = bool(i.get("complete_evidence"))
-    i_report = Path(i["report"]) if i.get("report") else None
-    seal = finish_attempt(
-        run_root, "I", attempt, t0, budget,
-        {"complete": i_complete,
-         "report": path_for_record(i_report) if i_report else None,
-         "summary": path_for_record(i_report) if i_report else None,
-         "registration_sha256": registration_sha,
-         "artifacts": _artifact_hashes(
-             Path(path) for path in (i.get("paths") or {}).values())},
-        status="done" if i_complete else "incomplete",
-        extra={"stage": "I", "scope": scope,
-               "numeric_passed": bool(i.get("numeric_passed")),
-               "call_balance": counter.snapshot()})
-    seals["I"] = {"sealed": seal.sealed, "terminal": seal.terminal,
-                  "problems": seal.problems, "row": seal.row}
-    i_row, i_consumer = stage_state(run_root, "I")
-    seals["I"]["consumer_problems"] = i_consumer
-    if (not seal.terminal or not seal.sealed or i_consumer
-            or not i.get("paths")):
-        blockers = seal.problems + i_consumer
-        if not i.get("paths"):
-            blockers.append("i_artifacts_missing")
-        return stop(blockers, i["gaps"] + blockers,
-                    failures=i["failures"])
-    i_dir = stage_dir(run_root, "I") / attempt
+    if start_index <= 2:
+        t0 = first_start if resume_stage is not None else _now()
+        try:
+            budget = budget_for(run_root, "I", fixed_root=fixed_root, mode=mode)
+        except SystemExit as exc:
+            return stop([str(exc)], [str(exc)])
+        attempt = allocate_attempt(run_root, "I")
+        base_counts = dict(counter.counts)
+        pre_register_attempt(run_root, "I", attempt, t0, scope=scope,
+                             budget=budget, registration_sha=registration_sha,
+                             call_balance=counter.snapshot())
+        reserve_stage_calls(run_root, "I", attempt,
+                            {"counts": stage_nominal_for_mode(mode, "I")})
+        stage_deadline = (t0 + float(budget["remaining_s"])
+                          - float(budget["reserve_s"]))
+        i_provider = stage_provider("I")
+        try:
+            i = run_i_stage(
+                run_root, "I", attempt, t0, budget, i_provider, counter,
+                roster, p_dir, tolerance=tolerance,
+                guard=_stage_unit_guard(
+                    run_root, "I", attempt,
+                    registration_sha=registration_sha,
+                    deadline=stage_deadline),
+                registered=True, r0_noise=r0_noise,
+                parent_input_admission=p_input_admission,
+                r0_registration_sha=registration_sha)
+        except (TimeoutError, UpdateCallBudgetExceeded) as exc:
+            i = {"passed": False, "failures": [type(exc).__name__],
+                 "gaps": [f"i_stage_aborted:{exc}"], "rows": [], "paths": {},
+                 "report": None, "arrays_sha256": {},
+                 "complete_evidence": False, "numeric_passed": False}
+        except Exception as exc:  # noqa: BLE001 -- a broken stage is evidence
+            i = {"passed": False, "failures": [type(exc).__name__],
+                 "gaps": [f"i_stage_exception:{type(exc).__name__}:{exc}"],
+                 "rows": [], "paths": {}, "report": None,
+                 "arrays_sha256": {}, "complete_evidence": False,
+                 "numeric_passed": False}
+        i_delta = _stage_delta(counter, base_counts)
+        try:
+            settle_stage_calls(run_root, "I", attempt, i_delta)
+        except (OSError, ValueError) as exc:
+            i["passed"] = False
+            i["complete_evidence"] = False
+            i["failures"] = list(i.get("failures") or []) + [
+                f"reservation_settle:{type(exc).__name__}"]
+        results["I"] = i
+        i_complete = bool(i.get("complete_evidence"))
+        i_report = Path(i["report"]) if i.get("report") else None
+        seal = finish_attempt(
+            run_root, "I", attempt, t0, budget,
+            {"complete": i_complete,
+             "report": path_for_record(i_report) if i_report else None,
+             "summary": path_for_record(i_report) if i_report else None,
+             "registration_sha256": registration_sha,
+             "artifacts": _artifact_hashes(
+                 Path(path) for path in (i.get("paths") or {}).values())},
+            status="done" if i_complete else "incomplete",
+            extra={"stage": "I", "scope": scope,
+                   "numeric_passed": bool(i.get("numeric_passed")),
+                   "call_balance": counter.snapshot()})
+        seals["I"] = {"sealed": seal.sealed, "terminal": seal.terminal,
+                      "problems": seal.problems, "row": seal.row}
+        i_row, i_consumer = stage_state(run_root, "I", attempt)
+        seals["I"]["consumer_problems"] = i_consumer
+        if (not seal.terminal or not seal.sealed or i_consumer
+                or not i.get("paths")):
+            blockers = seal.problems + i_consumer
+            if not i.get("paths"):
+                blockers.append("i_artifacts_missing")
+            return stop(blockers, i["gaps"] + blockers,
+                        failures=i["failures"])
+        selected["I"] = attempt
+        i_dir = stage_dir(run_root, "I") / attempt
+    else:
+        row, problems = stage_state(run_root, "I", selected["I"])
+        if problems or row is None:
+            return stop([f"selected_i:{p}" for p in problems],
+                        [f"selected_i:{p}" for p in problems])
+        results["I"] = {"resumed": True, "attempt": selected["I"]}
+        seals["I"] = {"sealed": True, "terminal": True,
+                      "resumed": True, "row": row}
+        i_dir = stage_dir(run_root, "I") / selected["I"]
 
     # --- F ------------------------------------------------------------------
-    t0 = _now()
+    t0 = first_start if resume_stage == "F" else _now()
     try:
         budget = budget_for(run_root, "F", fixed_root=fixed_root, mode=mode)
     except SystemExit as exc:
         return stop([str(exc)], [str(exc)])
     attempt = allocate_attempt(run_root, "F")
+    candidates = {"R0": selected["R0"], "P": selected["P"],
+                  "I": selected["I"], "F": attempt}
     pre_register_attempt(run_root, "F", attempt, t0, scope=scope,
                          budget=budget, registration_sha=registration_sha,
                          call_balance=counter.snapshot())
     reserve_stage_calls(run_root, "F", attempt,
-                        {"counts": STAGE_NOMINAL["F"]})
+                        {"counts": stage_nominal_for_mode(mode, "F")})
+    f_provider = stage_provider("F")
     try:
-        f = run_f_stage(run_root, "F", attempt, t0, budget, provider, counter,
-                        roster, p_dir, i_dir, tolerance=tolerance,
-                        project_root=project_root)
+        f = run_f_stage(
+            run_root, "F", attempt, t0, budget, f_provider, counter,
+            roster, p_dir, i_dir, tolerance=tolerance,
+            project_root=project_root, candidate_attempts=candidates,
+            r0_noise_path=r0_noise_path, r0_noise_sha256=r0_noise_sha,
+            p_input_admission_path=(p_input_admission_path
+                                    if mode == "real" else None),
+            p_input_admission_sha256=(sha256_file(p_input_admission_path)
+                                      if mode == "real" else None))
     except (TimeoutError, UpdateCallBudgetExceeded) as exc:
         f = {"conclusion": "audit_incomplete", "complete_evidence": False,
              "covered_contract_passed": False,
@@ -6807,33 +7835,103 @@ def run_registered_audit(run_root: Path, provider: SyntheticTrainingProvider,
         f["covered_contract_passed"] = False
         f["conclusion"] = "audit_incomplete"
     results["F"] = f
-    expected_full = dict(CHAIN_NOMINAL)
-    if mode == "synthetic":
-        expected_full["scene_setup_mj_forward"] = 0
-    matrix_problems = [
-        f"full_chain_calls:{kind}:{int(counter.counts[kind])}"
-        f"!={int(expected_full[kind])}"
-        for kind in CALL_KINDS
-        if int(counter.counts[kind]) != int(expected_full[kind])]
-    if matrix_problems:
+    pre_seal_veto: list[str] = []
+    final_balance = counter.snapshot()
+    final_counts = _call_counts_from_balance(final_balance)
+    if settled and final_counts is not None:
+        current = _attempt_row(run_root, "F", attempt)
+        updates = {**current, "call_balance": final_balance,
+                   "call_balance_after": final_balance}
+        try:
+            upsert_index(run_root, "F", attempt, updates)
+            upsert_cost(run_root, "F", attempt,
+                        float(current.get("measured_wall_s", 0.0)),
+                        {"complete": False, "scope": scope,
+                         "call_balance": final_balance,
+                         "call_balance_before": current.get(
+                             "call_balance_before"),
+                         "call_balance_after": final_balance},
+                        "running")
+        except (OSError, ValueError, TypeError):
+            pre_seal_veto.append("f_settlement_persist")
+    if not settled:
+        pre_seal_veto.append("f_call_settlement_unknown")
+    if settled and not pre_seal_veto:
+        history = verify_history(run_root, allow_current=("F", attempt))
+        pre_seal_veto += history
+        deltas = _stage_deltas(run_root)
+        if deltas is None:
+            pre_seal_veto.append("f_call_delta_unknown")
+        else:
+            current_rec = deltas.get("F", {}).get(attempt)
+            if current_rec is None:
+                pre_seal_veto.append("f_current_delta_missing")
+            else:
+                for kind in CALL_KINDS:
+                    if int(current_rec["counts"][kind]) != int(
+                            (snapshot or {}).get(kind, -1)):
+                        pre_seal_veto.append(
+                            f"f_settlement_snapshot:{kind}")
+            upstream = {"R0": selected["R0"], "P": selected["P"],
+                        "I": selected["I"], "F": attempt}
+            problems = _selected_stage_problems(deltas, upstream, mode)
+            pre_seal_veto += problems
+            pre_seal_veto += _selected_caps_problems(deltas, mode)
+            worker = f.get("worker_result") or {}
+            if (worker.get("provisional_chain_counts")
+                    != selected_chain_counts(deltas, upstream)):
+                pre_seal_veto.append("f_provisional_chain")
+            if (worker.get("precheck") or {}).get("R0", {}).get(
+                    "attempt") != selected["R0"]:
+                pre_seal_veto.append("f_precheck_binding")
+            for stage, attempt_name in (("R0", selected["R0"]),
+                                        ("P", selected["P"]),
+                                        ("I", selected["I"])):
+                row, state = stage_state(run_root, stage, attempt_name,
+                                         allow_current=("F", attempt))
+                if state:
+                    pre_seal_veto += [f"f_parent:{stage}:{p}" for p in state]
+                    continue
+                if row.get("report") and row.get("report_sha256") and \
+                        sha256_file(PROJECT_ROOT / row["report"]) != \
+                        row["report_sha256"]:
+                    pre_seal_veto.append(f"f_parent_report_sha:{stage}")
+            p_report_path = stage_dir(run_root, "P") / selected["P"] / \
+                "p_report.json"
+            i_report_path = stage_dir(run_root, "I") / selected["I"] / \
+                "i_report.json"
+            pre_seal_veto += [f"f_array:{p}" for p in
+                              _report_array_binding_problems(
+                                  p_report_path,
+                                  {m: stage_dir(run_root, "P") /
+                                   selected["P"] / f"p_{m}.npz"
+                                   for m in MODELS})]
+            pre_seal_veto += [f"f_array:{p}" for p in
+                              _report_array_binding_problems(
+                                  i_report_path,
+                                  {m: stage_dir(run_root, "I") /
+                                   selected["I"] / f"i_{m}.npz"
+                                   for m in MODELS})]
+            if mode == "real":
+                try:
+                    p_report_data = read_json(p_report_path)
+                    admission_record = p_report_data.get(
+                        "input_admission") or {}
+                except (OSError, ValueError, TypeError):
+                    admission_record = {}
+                expected_sha = (sha256_file(p_input_admission_path)
+                                if p_input_admission_path.is_file() else None)
+                if (not admission_record
+                        or admission_record.get("sha256") != expected_sha
+                        or Path(admission_record.get("path", "")).resolve()
+                        != p_input_admission_path.resolve()):
+                    pre_seal_veto.append("f_p_input_admission_binding")
+    if not settled:
         f["complete_evidence"] = False
         f["covered_contract_passed"] = False
         f["conclusion"] = "audit_incomplete"
-        f.setdefault("verification_problems", []).extend(matrix_problems)
     f_report = Path(f["report"]) if f.get("report") else None
-    pre_seal_veto = list(matrix_problems)
-    if not settled:
-        pre_seal_veto.append("f_call_settlement_unknown")
-    final_balance = counter.snapshot()
-    if settled:
-        pre_seal_veto += _call_balance_delta_problems(
-            _attempt_row(run_root, "F", attempt).get("call_balance"),
-            final_balance, snapshot)
     if pre_seal_veto:
-        # Retract the just-written pass claim before the terminal seal and
-        # rebind the report hash through the same publishing protocol.  The
-        # withdrawal stores the post-execution cumulative call snapshot, not
-        # the pre-F balance copied from the running row.
         _amend_final_report(f_report, pre_seal_veto)
         wrow, wprobs, proven = withdraw_attempt_claim(
             run_root, "F", attempt, f_report,
@@ -6856,11 +7954,125 @@ def run_registered_audit(run_root: Path, provider: SyntheticTrainingProvider,
                    "call_balance": counter.snapshot()})
         seals["F"] = {"sealed": seal.sealed, "terminal": seal.terminal,
                       "problems": seal.problems, "row": seal.row}
-    consumer_row, consumer_problems = stage_state(run_root, "F")
+
+    # --- post-seal final selection -----------------------------------------
+    selected_all: dict[str, str] = {}
+    selection_problems: list[str] = []
+    selected_chain = None
+    stage_totals: dict = {}
+    cohort_totals = None
+    if seal.terminal and seal.sealed and f.get("complete_evidence"):
+        for stage, attempt_name in candidates.items():
+            row, state = stage_state(run_root, stage, attempt_name)
+            if state or row is None:
+                selection_problems += [f"selection:{stage}:{p}" for p in state]
+            else:
+                selected_all[stage] = attempt_name
+        deltas = _stage_deltas(run_root)
+        if deltas is None:
+            selection_problems.append("selection_delta_unknown")
+        else:
+            if set(selected_all) == set(STAGE_BUDGETS):
+                selected_chain = selected_chain_counts(deltas, selected_all)
+                selection_problems += _selected_stage_problems(
+                    deltas, selected_all, mode)
+            selection_problems += _selected_caps_problems(deltas, mode)
+            stage_totals = {stage: stage_call_totals(deltas, stage)
+                            for stage in STAGE_BUDGETS}
+            cohort_totals = cohort_call_totals_from_deltas(deltas)
+    elif seal.terminal and seal.sealed and not pre_seal_veto:
+        selection_problems.append("selection_evidence_incomplete")
+    if pre_seal_veto:
+        selection_problems.append("pre_seal_veto")
+    if selection_problems:
+        revoke = list(selection_problems)
+        if _report_claims_complete(f_report):
+            _amend_final_report(f_report, revoke)
+            wrow, wprobs, proven = withdraw_attempt_claim(
+                run_root, "F", attempt, f_report,
+                seals["F"].get("row") or _attempt_row(run_root, "F", attempt),
+                revoke, reason="post_seal_veto", t0=t0, budget=budget,
+                call_balance=counter.snapshot())
+            seals["F"]["post_seal_withdrawal"] = {
+                "row": wrow, "problems": wprobs, "proven": bool(proven)}
+            seal = SealResult(False, wrow, list(seal.problems) + wprobs,
+                              bool(proven))
+            seals["F"].update({"sealed": False, "terminal": bool(proven),
+                               "problems": seal.problems, "row": wrow})
+    else:
+        selection_record = {
+            "schema": "w1_real_training_update_terminal_selection_v1",
+            "selected_attempts": selected_all,
+            "selected_chain_counts": selected_chain,
+            "selected_chain_training_updates": int(
+                (selected_chain or {}).get("native_adamw_steps", 0)
+                + (selected_chain or {}).get("explicit_reference_updates", 0)),
+            "stage_call_counts": stage_totals,
+            "cohort_call_counts": cohort_totals,
+            "cohort_training_updates": int(
+                (cohort_totals or {}).get("native_adamw_steps", 0)
+                + (cohort_totals or {}).get("explicit_reference_updates", 0)),
+            "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        }
+        if f_report is not None and f_report.is_file():
+            try:
+                data = read_json(f_report)
+                data.update(
+                    selected_attempts=selected_all,
+                    selected_chain_counts=selected_chain,
+                    selected_chain_training_updates=selection_record[
+                        "selected_chain_training_updates"],
+                    stage_call_counts=stage_totals,
+                    cohort_call_counts=cohort_totals,
+                    cohort_training_updates=selection_record[
+                        "cohort_training_updates"],
+                    training_updates_scope="cohort",
+                    training_updates=selection_record[
+                        "cohort_training_updates"])
+                write_json(f_report, data)
+            except (OSError, ValueError, TypeError):
+                selection_problems.append("selection_report_rewrite")
+        previous_cost = float(
+            seals["F"].get("row", {}).get("measured_wall_s", 0.0) or 0.0)
+        reseal = finish_attempt(
+            run_root, "F", attempt, t0, budget,
+            {"complete": True,
+             "report": path_for_record(f_report) if f_report else None,
+             "summary": path_for_record(f_report) if f_report else None,
+             "registration_sha256": registration_sha,
+             "artifacts": _artifact_hashes([f_report]),
+             "selection": selection_record},
+            status="done",
+            extra={"stage": "F", "scope": scope,
+                   "call_balance": counter.snapshot(),
+                   "selection": selection_record},
+            cost_floor=previous_cost)
+        seals["F"] = {"sealed": reseal.sealed, "terminal": reseal.terminal,
+                      "problems": reseal.problems, "row": reseal.row,
+                      "resealed_for_selection": True}
+        seal = reseal
+        if selection_problems or not reseal.sealed:
+            selection_problems += list(reseal.problems)
+            if _report_claims_complete(f_report):
+                _amend_final_report(f_report, selection_problems)
+                wrow, wprobs, proven = withdraw_attempt_claim(
+                    run_root, "F", attempt, f_report,
+                    reseal.row, selection_problems,
+                    reason="post_seal_veto", t0=t0, budget=budget,
+                    call_balance=counter.snapshot())
+                seals["F"]["post_seal_withdrawal"] = {
+                    "row": wrow, "problems": wprobs, "proven": bool(proven)}
+                seal = SealResult(False, wrow, list(seal.problems) + wprobs,
+                                  bool(proven))
+                seals["F"].update({"sealed": False,
+                                   "terminal": bool(proven),
+                                   "problems": seal.problems, "row": wrow})
+    consumer_row, consumer_problems = stage_state(run_root, "F", attempt)
     prerequisite = {}
     prerequisite_problems = []
     for stage_name in ("P", "I"):
-        _row, state_problems = stage_state(run_root, stage_name)
+        _row, state_problems = stage_state(run_root, stage_name,
+                                           selected[stage_name])
         prerequisite[stage_name] = state_problems
         prerequisite_problems += [
             f"prerequisite_not_consumable:{stage_name}:{p}"
@@ -6869,12 +8081,10 @@ def run_registered_audit(run_root: Path, provider: SyntheticTrainingProvider,
     seals["F"]["prerequisite_consumer_problems"] = prerequisite
     revoke = (list(seal.problems)
               + [p for p in consumer_problems if p != "attempt_not_complete"]
-              + prerequisite_problems + matrix_problems)
+              + prerequisite_problems + selection_problems)
     if not settled:
         revoke.append("f_call_settlement_unknown")
     if revoke and _report_claims_complete(f_report):
-        # A completed claim survived a post-seal veto (or the seal failed):
-        # rewrite the report and reseal incomplete with the old cost floor.
         _amend_final_report(f_report, revoke)
         wrow, wprobs, proven = withdraw_attempt_claim(
             run_root, "F", attempt, f_report,
@@ -6887,8 +8097,7 @@ def run_registered_audit(run_root: Path, provider: SyntheticTrainingProvider,
                           bool(proven))
         seals["F"].update({"sealed": False, "terminal": bool(proven),
                            "problems": seal.problems, "row": wrow})
-        if not proven:
-            revoke.append("f_withdraw_unproven")
+        selection_problems.append("f_withdraw_unproven")
     if f_report is not None and f_report.is_file():
         try:
             f["summary"] = read_json(f_report)
@@ -6897,15 +8106,20 @@ def run_registered_audit(run_root: Path, provider: SyntheticTrainingProvider,
     conclusion = f["conclusion"]
     complete = bool(f["complete_evidence"])
     covered = bool(f["covered_contract_passed"])
-    if revoke or not seal.terminal or not seal.sealed and not complete:
+    if revoke or selection_problems or not seal.terminal or (
+            not seal.sealed and not complete):
         conclusion = "audit_incomplete"
         complete = False
         covered = False
-    if not seal.sealed and not complete:
-        conclusion = "audit_incomplete"
     disk_problems = []
     if isinstance(f.get("summary"), Mapping):
         disk_problems = list(f["summary"].get("verification_problems") or [])
+    selection_confirmed = (not selection_problems and complete
+                           and seal.sealed and seal.terminal)
+    deltas = _stage_deltas(run_root)
+    stage_totals_final = ({stage: stage_call_totals(deltas, stage)
+                           for stage in STAGE_BUDGETS} if deltas else {})
+    cohort_final = cohort_call_totals_from_deltas(deltas) if deltas else None
     return {
         "mode": mode,
         "conclusion": conclusion,
@@ -6920,10 +8134,20 @@ def run_registered_audit(run_root: Path, provider: SyntheticTrainingProvider,
         "prerequisite_consumer_states": prerequisite,
         "summary": f.get("summary", {}),
         "summary_path": f.get("report"),
+        "selected_attempts": selected_all if selection_confirmed else None,
+        "selected_chain_counts": (selected_chain
+                                  if selection_confirmed else None),
+        "selected_chain_training_updates": (
+            int((selected_chain or {}).get("native_adamw_steps", 0)
+                + (selected_chain or {}).get("explicit_reference_updates", 0))
+            if selection_confirmed else None),
+        "stage_call_counts": stage_totals_final,
+        "cohort_call_counts": cohort_final,
         "fixture_build_s": fixture_seconds,
         "calls": counter.snapshot(),
         "training_updates": int(counter.counts["native_adamw_steps"]
                                 + counter.counts["explicit_reference_updates"]),
+        "training_updates_scope": "cohort",
         "zero_counters": {k: 0 for k in ZERO_COUNTERS},
         "runtime": getattr(provider, "runtime", None),
         "coverage": dict(BOUNDARIES),
@@ -6934,7 +8158,9 @@ def run_registered_audit(run_root: Path, provider: SyntheticTrainingProvider,
 def synthetic_self_test(out_root: Path, *, seed: int = FIXTURE_SEED,
                         device: str = "cuda",
                         tolerance: Mapping[str, Any] | None = None,
-                        config: Mapping[str, Any] | None = None) -> dict:
+                        config: Mapping[str, Any] | None = None,
+                        calibration_verification_record: Mapping[str, Any]
+                        | None = None) -> dict:
     """Full analytic R0->P->I->F chain; no real asset/dataset/checkpoint."""
     run_root = Path(out_root).expanduser().resolve()
     if run_root.exists() and any(run_root.iterdir()):
@@ -6952,5 +8178,21 @@ def synthetic_self_test(out_root: Path, *, seed: int = FIXTURE_SEED,
         fixed_root=HISTORY_ROOT)
     result["run_root"] = path_for_record(run_root)
     result["tolerance_contract"] = contract
+    if calibration_verification_record is not None:
+        from ireset.eval.w1_real_training_update_provider import (
+            synthetic_acceptance,
+        )
+        acceptance = synthetic_acceptance(
+            result, run_root=run_root, tolerance_contract=contract,
+            calibration_verification_record=calibration_verification_record,
+            roster=provider.roster)
+        acceptance_path = run_root / "synthetic_acceptance.json"
+        write_json(acceptance_path, acceptance)
+        result["synthetic_acceptance"] = {
+            "path": path_for_record(acceptance_path),
+            "sha256": sha256_file(acceptance_path),
+            "passed": acceptance["passed"],
+            "problems": acceptance["problems"],
+        }
     write_json(run_root / "audit_result.json", result)
     return result

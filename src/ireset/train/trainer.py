@@ -161,7 +161,8 @@ class Trainer:
                  identity: dict | None = None,
                  formal_eval=None, formal_eval_every: int | None = None,
                  budget_deadline: float | None = None,
-                 *, loss_fn=None, build_optimizer: bool = True) -> None:
+                 *, loss_fn=None, build_optimizer: bool = True,
+                 construction_observer=None) -> None:
         self.cfg, self.tokenizer = cfg, tokenizer
         self.train_ds, self.val_ds = train_ds, val_ds
         self.out_dir = Path(out_dir)
@@ -188,6 +189,7 @@ class Trainer:
         self._last_formal_evidence: dict | None = None
 
         # Preserve the exact accepted initialization/RNG order.
+        self._construction_observer = construction_observer
         torch.manual_seed(cfg.seed)
         np.random.seed(cfg.seed)
         if cfg.model_type == "diffusion":
@@ -198,7 +200,9 @@ class Trainer:
             ).to(cfg.device)
         else:
             self.model = DeterministicG1(**cfg.backbone_kwargs()).to(cfg.device)
+        self._constructed("model")
         self.conditioner = ConditionEncoder(cfg.d_model).to(cfg.device)
+        self._constructed("conditioner")
         # ``loss_fn`` is an audit-only injection (pure-synthetic FK/geometry);
         # ``build_optimizer=False`` lets the independent-reference stage reuse
         # the shared forward without constructing a second native optimizer.
@@ -208,6 +212,8 @@ class Trainer:
             [*self.model.parameters(), *self.conditioner.parameters()],
             lr=cfg.lr, weight_decay=cfg.weight_decay,
         ) if build_optimizer else None)
+        if self.opt is not None:
+            self._constructed("optimizer")
         g = torch.Generator().manual_seed(cfg.seed)
         self.train_loader = DataLoader(
             train_ds, batch_size=cfg.micro_batch, shuffle=True,
@@ -220,6 +226,11 @@ class Trainer:
             val_ds, batch_size=cfg.micro_batch, shuffle=False,
             num_workers=0, drop_last=False, generator=g_val,
         )
+
+    def _constructed(self, unit: str) -> None:
+        observer = getattr(self, "_construction_observer", None)
+        if observer is not None:
+            observer(unit)
 
     def _to_device(self, batch: dict) -> dict:
         return {k: (v.to(self.cfg.device) if torch.is_tensor(v) else v)
