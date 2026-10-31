@@ -29,6 +29,7 @@ No disk access happens at import time.
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
 import math
 import os
@@ -3960,6 +3961,11 @@ def _worker_main(spec_path: str, out_dir: str) -> int:
         runtime = configure_production_runtime()
         if runtime["problems"]:
             problems += [f"worker_runtime:{p}" for p in runtime["problems"]]
+        if mode == "real":
+            problems += [f"worker_runtime_identity:{p}" for p in
+                         runtime_identity_problems(
+                             (spec.get("provider") or {}).get(
+                                 "runtime_identity"))]
         candidates_problems = (precheck_candidates()
                                if candidate_checks else [])
         if candidates_problems:
@@ -4101,6 +4107,7 @@ def _worker_main(spec_path: str, out_dir: str) -> int:
             "ppid": os.getppid(),
             "python": sys.version.split()[0],
             "runtime": runtime,
+            "runtime_identity": runtime_identity_facts(),
             "provider": (path_for_record(provider.fixture_dir)
                          if mode == "synthetic" and provider is not None
                          and provider.fixture_dir is not None
@@ -4606,6 +4613,24 @@ def stage_nominal_for_mode(mode: str, stage: str) -> dict[str, int]:
     if mode == "synthetic":
         nominal["scene_setup_mj_forward"] = 0
     return nominal
+
+
+def remaining_nominal_for_mode(mode: str, resume_stage: str | None
+                               ) -> dict[str, int]:
+    """Nominal calls of the stages that still have to execute.
+
+    A resume re-runs only ``resume_stage`` and its downstream stages; the
+    already-settled upstream calls are part of the cohort history, not of the
+    required remainder.
+    """
+    order = list(STAGE_BUDGETS)
+    stages = (order if resume_stage is None
+              else order[order.index(resume_stage):])
+    total = {kind: 0 for kind in CALL_KINDS}
+    for stage in stages:
+        for kind, value in stage_nominal_for_mode(mode, stage).items():
+            total[kind] += int(value)
+    return total
 
 
 def _attempt_number(attempt: str) -> int:
@@ -5225,11 +5250,6 @@ def finish_attempt(root: Path, stage: str, attempt: str, t0: float,
     return SealResult(ok, row, problems, terminal_state)
 
 
-def _attempt_allowed_problems(problems: Sequence[str]) -> list[str]:
-    """Problems that only mean "not the selected attempt yet"."""
-    return [p for p in problems if p != "attempt_not_complete"]
-
-
 def _attempt_consumable(root: Path, stage: str, attempt: str,
                         index_row: Mapping[str, Any],
                         ledger_row: Mapping[str, Any], *,
@@ -5250,7 +5270,7 @@ def _attempt_consumable(root: Path, stage: str, attempt: str,
     deltas = stage_attempt_deltas(root, stage, current=allow_current)
     if deltas is None or attempt not in deltas:
         problems.append("attempt_call_delta_unknown")
-    return not _attempt_allowed_problems(problems), problems
+    return not problems, problems
 
 
 def stage_state(root: Path, stage: str,
@@ -5302,10 +5322,9 @@ def stage_state(root: Path, stage: str,
     terminal = [a for a, r in index_by.items()
                 if r.get("status") in ("done", "crashed", "timeout",
                                        "incomplete")]
-    candidates = [attempt] if attempt is not None else terminal
     consumable: list[str] = []
     per_attempt: dict[str, list[str]] = {}
-    for name in candidates:
+    for name in terminal:
         allowed, attempt_problems = _attempt_consumable(
             root, stage, name, index_by[name], ledger_by[name],
             allow_current=allow_current)
@@ -5315,10 +5334,11 @@ def stage_state(root: Path, stage: str,
     if attempt is not None:
         if attempt not in terminal:
             return None, ["selected_attempt_not_terminal"] + problems
+        if len(consumable) > 1:
+            return None, ["stage_multiple_consumable"] + problems
         if consumable != [attempt]:
             return None, per_attempt.get(attempt, []) + problems
-        row = index_by[attempt]
-        return row, problems
+        return index_by[attempt], problems
     if len(consumable) > 1:
         return None, ["stage_multiple_consumable"] + problems
     if len(consumable) == 1:
@@ -5659,9 +5679,19 @@ IMPLEMENTATION_FILES = (
     "src/ireset/train/losses.py",
     "src/ireset/model/backbone.py",
     "src/ireset/model/conditioner.py",
+    "src/ireset/model/deterministic.py",
+    "src/ireset/model/tokens.py",
     "src/ireset/diffusion/generator.py",
+    "src/ireset/eval/training_objective_audit.py",
     "src/ireset/eval/w1_real_fk_audit.py",
     "src/ireset/eval/w1_real_objective_audit.py",
+    "src/ireset/kinematics/torch_adapter.py",
+    "src/ireset/kinematics/rotation_adapter.py",
+    "src/ireset/geometry/distance_adapter.py",
+    "src/ireset/embodied/g1_spec.py",
+    "src/ireset/paths.py",
+    "pyproject.toml",
+    "uv.lock",
     "configs/train/omniretarget_motion.yaml",
     "docs/plans/omniretarget_w1_real_training_update_provider_execution_plan.md",
     "docs/plans/omniretarget_w1_real_training_update_audit_prereg_draft.md",
@@ -5699,6 +5729,60 @@ def implementation_identity(project_root: Path) -> dict:
         files[rel] = sha256_file(p) if p.is_file() else None
     return {"schema": "w1_real_training_update_implementation_v1",
             "files": files, "git": _git_identity(root)}
+
+
+#: Runtime facts whose drift invalidates the frozen numeric calibration.  The
+#: check is metadata/source-hash only; it never runs a numeric probe.
+RUNTIME_IDENTITY_KEYS = (
+    "python", "torch", "numpy", "scipy", "cuda_available",
+    "cuda_device_count", "cuda_version",
+)
+ADAM_SOURCE_MODULES = ("torch.optim.adam", "torch.optim.adamw")
+
+
+def _adamw_source_sha256() -> dict:
+    source = {}
+    for name in ADAM_SOURCE_MODULES:
+        try:
+            mod = __import__(name, fromlist=["x"])
+            source[name] = sha256_file(Path(mod.__file__))
+        except (ImportError, OSError, TypeError):
+            source[name] = None
+    return source
+
+
+def runtime_identity_facts() -> dict:
+    env = environment_facts()
+    facts = {key: env.get(key) for key in RUNTIME_IDENTITY_KEYS}
+    facts["device_name"] = (
+        torch.cuda.get_device_name(0) if torch.cuda.is_available() else None)
+    try:
+        facts["mujoco"] = importlib.metadata.version("mujoco")
+    except importlib.metadata.PackageNotFoundError:
+        facts["mujoco"] = None
+    facts["adamw_source_sha256"] = _adamw_source_sha256()
+    return facts
+
+
+def runtime_identity_problems(reference: Mapping[str, Any] | None,
+                              current: Mapping[str, Any] | None = None
+                              ) -> list[str]:
+    if not isinstance(reference, Mapping):
+        return ["runtime_identity_missing"]
+    current = runtime_identity_facts() if current is None else current
+    problems = [f"runtime_identity:{key}"
+                for key in (*RUNTIME_IDENTITY_KEYS, "device_name", "mujoco")
+                if reference.get(key) != current.get(key)]
+    reference_sources = reference.get("adamw_source_sha256")
+    current_sources = current.get("adamw_source_sha256") or {}
+    if not isinstance(reference_sources, Mapping) or any(
+            not isinstance(v, str) for v in reference_sources.values()):
+        problems.append("runtime_identity:adamw_source_sha256")
+    else:
+        for name in ADAM_SOURCE_MODULES:
+            if reference_sources.get(name) != current_sources.get(name):
+                problems.append(f"runtime_identity:source:{name}")
+    return problems
 
 
 def _fixture_schema_problems(provider: SyntheticTrainingProvider) -> list[str]:
@@ -5846,6 +5930,10 @@ def run_r0(root: Path, stage: str, attempt: str, t0: float,
         fp32_ok = bool(tolerance.get("fp32_contract"))
         problems += [f"fp32:{p}" for p in tolerance.get("fp32_problems", [])
                      if p]
+        problems += [f"r0_runtime_identity:{p}" for p in
+                     runtime_identity_problems(
+                         (tolerance.get("fp32_contract") or {}).get(
+                             "runtime_identity"))]
         try:
             from ireset.eval.w1_real_training_update_provider import (
                 calibration_verification_problems,
@@ -5986,6 +6074,7 @@ def run_r0(root: Path, stage: str, attempt: str, t0: float,
         "implementation": impl,
         "runtime": runtime,
         "environment": env,
+        "runtime_identity": runtime_identity_facts(),
         "resource_bound": bound,
         "disk_free_bytes": int(free),
         "provider": (metadata if mode == "real" else provider.spec()),
@@ -6176,13 +6265,8 @@ def build_fp32_contract(device: str = "cuda") -> dict:
                     "is_subnormal": bool(0 < abs(float(x[0]))
                                          < float(np.finfo(np.float32).tiny))})
     env = environment_facts()
-    source = {}
-    for name in ("torch.optim.adam", "torch.optim.adamw"):
-        try:
-            mod = __import__(name, fromlist=["x"])
-            source[name] = sha256_file(Path(mod.__file__))
-        except (ImportError, OSError):
-            source[name] = None
+    runtime_identity = runtime_identity_facts()
+    source = dict(runtime_identity["adamw_source_sha256"])
     device_name = torch.cuda.get_device_name(0)
     record = {
         "schema": FP32_SCHEMA,
@@ -6191,6 +6275,7 @@ def build_fp32_contract(device: str = "cuda") -> dict:
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
         "source_sha256": source,
+        "runtime_identity": runtime_identity,
         "adams": dict(ADAM_DEFAULTS),
         "lr": 1e-4,
         "weight_decay": 1e-5,
@@ -6241,10 +6326,12 @@ def fp32_contract_problems(contract: Mapping[str, Any] | None,
             not isinstance(v, str) for v in
             (contract.get("source_sha256") or {}).values()):
         problems.append("fp32_source_missing")
+    problems += [f"fp32_{p}" for p in runtime_identity_problems(
+        contract.get("runtime_identity"))]
     if recompute:
         fresh = build_fp32_contract("cuda")
         for key in ("node_graph", "probe_mismatches", "two_step_match",
-                    "source_sha256", "valid"):
+                    "source_sha256", "runtime_identity", "valid"):
             if _jsonable(fresh.get(key)) != _jsonable(contract.get(key)):
                 problems.append(f"fp32_not_reproducible:{key}")
     return problems
@@ -7476,7 +7563,7 @@ def run_registered_audit(run_root: Path, provider: Any,
     prior = prior_call_counts(run_root, fixed_root=fixed_root, mode=mode)
     if prior is None:
         raise SystemExit("call history unknown: refusing a fresh quota")
-    required = chain_nominal_for_mode(mode)
+    required = remaining_nominal_for_mode(mode, resume_stage)
     insufficient = {kind: {"prior": prior[kind], "required": required[kind],
                            "cap": CALL_CAPS[kind]}
                     for kind in CALL_KINDS
@@ -7616,7 +7703,7 @@ def run_registered_audit(run_root: Path, provider: Any,
 
     # --- P ------------------------------------------------------------------
     if start_index <= 1:
-        t0 = first_start if resume_stage is not None else _now()
+        t0 = first_start if resume_stage == "P" else _now()
         try:
             budget = budget_for(run_root, "P", fixed_root=fixed_root, mode=mode)
         except SystemExit as exc:
@@ -7710,7 +7797,7 @@ def run_registered_audit(run_root: Path, provider: Any,
 
     # --- I ------------------------------------------------------------------
     if start_index <= 2:
-        t0 = first_start if resume_stage is not None else _now()
+        t0 = first_start if resume_stage == "I" else _now()
         try:
             budget = budget_for(run_root, "I", fixed_root=fixed_root, mode=mode)
         except SystemExit as exc:

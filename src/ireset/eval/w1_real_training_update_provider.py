@@ -55,6 +55,7 @@ from ireset.eval.w1_real_training_update_audit import (
     PARENT_FILES,
     PREREG_DRAFT,
     STAGE_BUDGETS,
+    STAGE_DIRS,
     STAGE_NOMINAL,
     TRAIN_CONFIG_PATH,
     TRAIN_CONFIG_SHA,
@@ -86,6 +87,8 @@ from ireset.eval.w1_real_training_update_audit import (
     read_json,
     row_catalog,
     roster_problems,
+    runtime_identity_facts,
+    runtime_identity_problems,
     sha256_file,
     write_json,
 )
@@ -513,6 +516,7 @@ def calibration_verification(contract: Mapping[str, Any],
         "real_model_calls": int(calibration.get("real_model_calls") or 0),
         "implementation": implementation_identity(PROJECT_ROOT),
         "environment": environment_facts(),
+        "runtime_identity": runtime_identity_facts(),
         "passed": not recompute and four_x_ok,
         "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
@@ -543,7 +547,71 @@ def calibration_verification_problems(
                 "fp32_contract_sha256"):
         if not isinstance(verification.get(key), str):
             problems.append(f"calibration_verification_binding:{key}")
+    problems += [f"calibration_{p}" for p in runtime_identity_problems(
+        verification.get("runtime_identity"))]
     return problems
+
+
+def _record_path(value: Any) -> Path | None:
+    if not isinstance(value, str) or not value:
+        return None
+    path = Path(value)
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def _file_manifest(directory: Path) -> tuple[dict, list[str]]:
+    """Hash every regular file below ``directory`` (sorted relative paths)."""
+    directory = Path(directory)
+    files: dict[str, dict] = {}
+    problems: list[str] = []
+    if not directory.is_dir():
+        return files, [f"directory_missing:{path_for_record(directory)}"]
+    for path in sorted(p for p in directory.rglob("*") if p.is_file()):
+        rel = path.relative_to(directory).as_posix()
+        try:
+            files[rel] = {"sha256": sha256_file(path),
+                          "bytes": int(path.stat().st_size)}
+        except (OSError, ValueError) as exc:
+            problems.append(f"unreadable:{rel}:{type(exc).__name__}")
+    return files, problems
+
+
+def _manifest_problems(directory: Path, files: Any, *, label: str
+                       ) -> list[str]:
+    if not isinstance(files, Mapping) or not files:
+        return [f"manifest_missing:{label}"]
+    problems: list[str] = []
+    root = Path(directory)
+    for rel, record in files.items():
+        if not isinstance(rel, str) or not isinstance(record, Mapping):
+            problems.append(f"manifest_entry:{label}:{rel}")
+            continue
+        path = root / rel
+        if not path.is_file():
+            problems.append(f"file_missing:{label}:{rel}")
+            continue
+        actual = sha256_file(path)
+        if actual != record.get("sha256"):
+            problems.append(f"file_sha:{label}:{rel}")
+        if int(path.stat().st_size) != record.get("bytes"):
+            problems.append(f"file_size:{label}:{rel}")
+    return problems
+
+
+#: Evidence files every sealed synthetic stage must expose.  A trimmed
+#: manifest that drops one of these is refused even if the hashes agree.
+STAGE_REQUIRED_FILES = {
+    "R0": ("registration.json", "admission.json", "call_reservations.json"),
+    "P": ("p_report.json", "p_rows.json", "p_deterministic.npz",
+          "p_diffusion.npz", "call_reservations.json"),
+    "I": ("i_report.json", "i_rows.json", "i_deterministic.npz",
+          "i_diffusion.npz", "call_reservations.json"),
+    "F": ("training_update_final.json", "worker_spec.json",
+          "worker/worker_result.json", "call_reservations.json"),
+}
+RUN_REQUIRED_FILES = ("cohort.json", "attempts_index.json", "costs.json")
+FIXTURE_REQUIRED_FILES = ("fixture.json", "roster.json", "noise.npz",
+                          "windows.npz")
 
 
 def synthetic_acceptance(
@@ -555,7 +623,9 @@ def synthetic_acceptance(
     stages = result.get("stages") or {}
     seals = result.get("seals") or {}
     f_stage = stages.get("F") or {}
+    selected_attempts = result.get("selected_attempts") or {}
     stage_records = {}
+    file_problems: list[str] = []
     for stage in ("R0", "P", "I", "F"):
         payload = stages.get(stage) or {}
         seal = seals.get(stage) or {}
@@ -565,7 +635,16 @@ def synthetic_acceptance(
         report = payload.get("report")
         if report is None and stage == "R0":
             report = payload.get("admission")
+        attempt = selected_attempts.get(stage)
+        directory = (Path(run_root) / STAGE_DIRS[stage] / str(attempt)
+                     if attempt else None)
+        files, problems = (_file_manifest(directory) if directory is not None
+                           else ({}, [f"stage_attempt_missing:{stage}"]))
+        file_problems += [f"{stage}:{p}" for p in problems]
         stage_records[stage] = {
+            "attempt": attempt,
+            "directory": path_for_record(directory) if directory else None,
+            "files": files,
             "complete_evidence": bool(complete),
             "failures": len(payload.get("failures") or []),
             "gaps": len(payload.get("gaps") or []),
@@ -574,9 +653,27 @@ def synthetic_acceptance(
             "terminal": bool(seal.get("terminal")),
             "seal_problems": list(seal.get("problems") or []),
         }
+    run_files: dict[str, dict] = {}
+    for name in RUN_REQUIRED_FILES:
+        path = Path(run_root) / name
+        if path.is_file():
+            run_files[name] = {"sha256": sha256_file(path),
+                               "bytes": int(path.stat().st_size)}
+    fixture_files, problems = _file_manifest(Path(run_root) / "fixture")
+    file_problems += [f"fixture:{p}" for p in problems]
+    for stage in STAGES:
+        for name in STAGE_REQUIRED_FILES[stage]:
+            if name not in (stage_records[stage].get("files") or {}):
+                file_problems.append(f"{stage}:required_missing:{name}")
+    for name in RUN_REQUIRED_FILES:
+        if name not in run_files:
+            file_problems.append(f"run:required_missing:{name}")
+    for name in FIXTURE_REQUIRED_FILES:
+        if name not in fixture_files:
+            file_problems.append(f"fixture:required_missing:{name}")
     worker = (result.get("stages") or {}).get("F", {}).get("worker_result") \
         or {}
-    problems: list[str] = []
+    problems = list(file_problems)
     if result.get("complete_evidence") is not True:
         problems.append("acceptance_incomplete_evidence")
     if result.get("problems"):
@@ -616,6 +713,8 @@ def synthetic_acceptance(
         "run_root": path_for_record(run_root),
         "run_sha256": _canonical_sha256({
             "stages": stage_records,
+            "run_files": run_files,
+            "fixture_files": fixture_files,
             "conclusion": result.get("conclusion"),
             "calls": (result.get("calls") or {}).get("counts"),
             "selected_chain_counts": selected,
@@ -627,6 +726,8 @@ def synthetic_acceptance(
         "problems": problems,
         "passed": not problems,
         "stages": stage_records,
+        "run_files": run_files,
+        "fixture_files": fixture_files,
         "selected_chain_counts": selected,
         "selected_chain_training_updates": int(
             selected.get("native_adamw_steps", 0)
@@ -652,6 +753,7 @@ def synthetic_acceptance(
             dict(calibration_verification_record or {})),
         "implementation": implementation_identity(PROJECT_ROOT),
         "environment": environment_facts(),
+        "runtime_identity": runtime_identity_facts(),
         "read_scope": {
             "real_checkpoint_loaded": False,
             "real_asset_loaded": False,
@@ -694,6 +796,50 @@ def synthetic_acceptance_problems(record: Mapping[str, Any] | None) -> list[str]
                 problems.append(f"acceptance_stage_evidence:{stage}")
             if rec.get("failures") != 0 or rec.get("seal_problems"):
                 problems.append(f"acceptance_stage_failures:{stage}")
+            directory = _record_path(rec.get("directory"))
+            files = rec.get("files")
+            if directory is None:
+                problems.append(f"acceptance_stage_directory:{stage}")
+                continue
+            problems += [f"acceptance_stage_file:{stage}:{p}"
+                         for p in _manifest_problems(
+                             directory, files, label=f"stage:{stage}")]
+            if not isinstance(files, Mapping):
+                continue
+            for name in STAGE_REQUIRED_FILES[stage]:
+                if name not in files:
+                    problems.append(
+                        f"acceptance_stage_required:{stage}:{name}")
+            report = _record_path(rec.get("report"))
+            if report is None:
+                problems.append(f"acceptance_stage_report:{stage}")
+            else:
+                if report.resolve().parent != directory.resolve():
+                    problems.append(f"acceptance_stage_report_dir:{stage}")
+                if report.name not in files:
+                    problems.append(f"acceptance_stage_report_manifest:{stage}")
+    run_root = _record_path(record.get("run_root"))
+    run_files = record.get("run_files")
+    fixture_files = record.get("fixture_files")
+    if run_root is None:
+        problems.append("acceptance_run_root")
+    else:
+        problems += [f"acceptance_run_file:{p}" for p in _manifest_problems(
+            run_root, run_files, label="run")]
+        if isinstance(run_files, Mapping):
+            for name in RUN_REQUIRED_FILES:
+                if name not in run_files:
+                    problems.append(f"acceptance_run_required:{name}")
+        problems += [f"acceptance_fixture_file:{p}"
+                     for p in _manifest_problems(
+                         run_root / "fixture", fixture_files,
+                         label="fixture")]
+        if isinstance(fixture_files, Mapping):
+            for name in FIXTURE_REQUIRED_FILES:
+                if name not in fixture_files:
+                    problems.append(f"acceptance_fixture_required:{name}")
+    problems += [f"acceptance_runtime:{p}" for p in runtime_identity_problems(
+        record.get("runtime_identity"))]
     selected = record.get("selected_chain_counts") or {}
     expected = dict(CHAIN_NOMINAL)
     expected["scene_setup_mj_forward"] = 0
@@ -816,6 +962,7 @@ class RealTrainingProvider:
             Path(acceptance_path) if acceptance_path is not None else None)
         self.acceptance: dict | None = None
         self.acceptance_sha: str | None = None
+        self.source_sha256: str | None = None
         self.input_admission: dict | None = None
         self.materialized_stage: str | None = None
         self._deadline: float | None = None
@@ -848,6 +995,7 @@ class RealTrainingProvider:
             "acceptance_path": (path_for_record(self.acceptance_path)
                                 if self.acceptance_path is not None else None),
             "acceptance_sha256": self.acceptance_sha,
+            "runtime_identity": runtime_identity_facts(),
         }
 
     @classmethod
@@ -969,6 +1117,12 @@ class RealTrainingProvider:
         runtime = configure_production_runtime()
         problems += [f"runtime:{p}" for p in runtime["problems"]]
         environment = environment_facts()
+        runtime_identity = runtime_identity_facts()
+        if isinstance(self.acceptance, Mapping):
+            problems += [f"runtime_identity:{p}"
+                         for p in runtime_identity_problems(
+                             self.acceptance.get("runtime_identity"),
+                             runtime_identity)]
         roster = self.roster or {}
         if roster:
             catalog = row_catalog(roster)
@@ -1010,6 +1164,7 @@ class RealTrainingProvider:
             },
             "runtime": runtime,
             "environment": environment,
+            "runtime_identity": runtime_identity,
             "implementation": impl,
             "read_scope": {
                 "metadata_only": True,
@@ -1042,12 +1197,45 @@ class RealTrainingProvider:
         self.constants = None
         self.alpha = None
         self.reference = None
+        self.source_sha256 = None
         self.input_admission = None
         self.materialized_stage = None
         self._production_assembler = None
         self._scene_setup_counted = False
 
+    def _check(self, unit: str) -> None:
+        if self._deadline is not None \
+                and time.perf_counter() >= self._deadline:
+            raise TimeoutError(f"provider_deadline:{unit}")
+        if self._guard is not None:
+            self._guard(unit)
+
+    def _verify_source_digests(self) -> None:
+        """Re-hash the frozen parent sources before decoding any value.
+
+        Resuming from a settled R0 skips the metadata lifecycle, so the same
+        byte check has to run again on every materialization.
+        """
+        self._check("materialize_source_digests")
+        arrays_rel, arrays_sha = PARENT_FILES["objective_arrays"]
+        arrays_path = self.root / arrays_rel
+        actual = sha256_file(arrays_path) if arrays_path.is_file() else None
+        if actual is None:
+            raise ValueError("parent objective arrays missing")
+        if actual != arrays_sha:
+            raise ValueError(
+                f"parent objective arrays drifted: {actual} != {arrays_sha}")
+        config_path = self.root / TRAIN_CONFIG_PATH
+        config_actual = (sha256_file(config_path)
+                         if config_path.is_file() else None)
+        if config_actual != TRAIN_CONFIG_SHA:
+            raise ValueError(
+                f"train config drifted: {config_actual} != {TRAIN_CONFIG_SHA}")
+        self.source_sha256 = actual
+
     def _load_arrays(self) -> dict[str, np.ndarray]:
+        self._verify_source_digests()
+        self._check("materialize_array_decode")
         path = self.root / PARENT_FILES["objective_arrays"][0]
         with np.load(path) as archive:
             arrays = {key: np.asarray(archive[key])
@@ -1131,7 +1319,7 @@ class RealTrainingProvider:
             "window_ids": list(WINDOW_IDS),
             "source": path_for_record(
                 self.root / PARENT_FILES["objective_arrays"][0]),
-            "source_sha256": PARENT_FILES["objective_arrays"][1],
+            "source_sha256": self.source_sha256,
             "read_scope": {"npz_values_read": len(WINDOW_VALUE_KEYS),
                            "checkpoint_payload_read": 0,
                            "model_constructor_calls": 0,
@@ -1154,10 +1342,18 @@ class RealTrainingProvider:
             raise ValueError("materialize requires a bound counter")
         self._guard = guard
         self._deadline = None if deadline is None else float(deadline)
+        self._check("materialize_start")
+        if isinstance(self.acceptance, Mapping):
+            identity = runtime_identity_problems(
+                self.acceptance.get("runtime_identity"))
+            if identity:
+                raise ValueError(
+                    f"runtime identity drifted since Gate B: {identity}")
         if r0_noise is None:
             raise ValueError("materialize requires the R0 noise schedule")
         self.noise = list(r0_noise)
         arrays = self._load_arrays()
+        self._check("materialize_tokenizer")
         self._build_tokenizer(arrays)
         problems = _window_values_problems(arrays, self.constants or {})
         if problems:
@@ -1177,6 +1373,7 @@ class RealTrainingProvider:
                     np.float32),
             }
         self.alpha = np.asarray(arrays["alpha_cumprod"], np.float64)
+        self._check("materialize_input_admission")
         admission = self._input_admission(arrays, counter=counter)
         admission["r0_registration_sha256"] = r0_registration_sha
         self.input_admission = admission
@@ -1193,6 +1390,7 @@ class RealTrainingProvider:
         elif stage in ("I", "F-I"):
             raise ValueError("independent stage requires the P input admission")
         self.materialized_stage = stage
+        self._check("materialize_reference_backend")
         self.reference = RealReferenceBackend(
             counter, deadline=self._deadline, guard=self._guard,
             joint_lo=np.asarray(arrays["joint_lo"], np.float64),
@@ -1259,6 +1457,7 @@ class RealTrainingProvider:
 
     def _load_checkpoint(self, model_type: str,
                          counter: CallCounter) -> dict:
+        self._check("checkpoint_sha")
         rel, want = CHECKPOINTS[model_type]
         path = self.root / rel
         actual = sha256_file(path) if path.is_file() else None
@@ -1267,6 +1466,7 @@ class RealTrainingProvider:
         # Trusted local checkpoint whose bytes were verified above.  The
         # payload embeds numpy root statistics, so weights_only=True cannot
         # decode it; no untrusted file reaches this call.
+        self._check("checkpoint_load")
         payload = torch.load(path, map_location="cpu", weights_only=False)
         counter.add("checkpoint_loads", 1)
         if not isinstance(payload, dict):
@@ -1315,6 +1515,7 @@ class RealTrainingProvider:
                       out_dir: Path | None = None) -> Trainer:
         if self.tokenizer is None:
             raise ValueError("provider is not materialized")
+        self._check("trainer_construction")
         cfg = TrainConfig(
             model_type=model_type,
             steps=len(UPDATES),
@@ -1354,12 +1555,14 @@ class RealTrainingProvider:
             elif unit == "optimizer" and with_optimizer:
                 counter.add("native_optimizer_constructions", 1)
 
+        self._check("trainer_construction")
         with torch.random.fork_rng(devices=[]):
             trainer = Trainer(
                 cfg, self.tokenizer, _PlaceholderDataset(),
                 _PlaceholderDataset(), out, loss_fn=loss,
                 build_optimizer=with_optimizer,
                 construction_observer=construction)
+        self._check("trainer_state_dict")
         payload = self._load_checkpoint(model_type, counter)
         trainer.model.load_state_dict(payload["model"], strict=True)
         trainer.conditioner.load_state_dict(payload["conditioner"],
@@ -1537,6 +1740,9 @@ def real_admission_package_problems(
         if runtime.get("observed_after_setup") != runtime.get(
                 "requirements"):
             problems.append("admission_runtime_observation")
+    problems += [f"admission_runtime_identity:{p}"
+                 for p in runtime_identity_problems(
+                     package.get("runtime_identity"))]
     chain = package.get("cohort", {}).get("full_chain_calls") or {}
     real_chain = dict(CHAIN_NOMINAL)
     if chain != real_chain:
@@ -1591,6 +1797,16 @@ def build_real_admission_package(        project_root: Path, *, tolerance_contra
         problems.append("acceptance_tolerance_binding")
     if acceptance_tolerance.get("fp32_contract_sha256") != fp32_sha:
         problems.append("acceptance_fp32_binding")
+    runtime_identity = runtime_identity_facts()
+    problems += [f"runtime_identity:{p}" for p in runtime_identity_problems(
+        fp32.get("runtime_identity"), runtime_identity)]
+    problems += [f"acceptance_runtime_identity:{p}"
+                 for p in runtime_identity_problems(
+                     acceptance.get("runtime_identity"), runtime_identity)]
+    problems += [f"calibration_runtime_identity:{p}"
+                 for p in runtime_identity_problems(
+                     calibration_verification_record.get("runtime_identity"),
+                     runtime_identity)]
     impl = implementation_identity(root)
     missing = [rel for rel, sha in impl["files"].items()
                if not isinstance(sha, str)]
@@ -1678,6 +1894,7 @@ def build_real_admission_package(        project_root: Path, *, tolerance_contra
                           "artifacts_gib": 16, "disk_free_min_gib": 20},
         "implementation": impl,
         "environment": metadata.get("environment"),
+        "runtime_identity": runtime_identity,
         "runtime": {
             "requirements": RUNTIME_REQUIREMENTS,
             "observed_after_setup": dict(runtime["after"]),

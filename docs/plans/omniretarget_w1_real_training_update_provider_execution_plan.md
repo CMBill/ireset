@@ -1,10 +1,10 @@
 # W1 真实网络参数梯度与优化更新链路——真实 provider 接入与执行计划
 
-日期：2026-10-31。版本：v0.6。状态：**`gate_a_implemented / gate_b_acceptance_passed / gate_c_not_authorized / gate_d_e_not_run`**。
+日期：2026-10-31。版本：v0.7。状态：**`gate_a_implemented / gate_b_acceptance_passed / gate_c_not_authorized / gate_d_e_not_run`**。
 
-本计划承接 v0.9 的纯合成 I/C 交付，目标是实现真实 provider、完成只读准入和 R0 元数据登记，并在取得新的 §10.2 明确授权后执行一次真实 **R0→P→I→F**。v0.6 已实施 Gate A/B：真实 provider 与参考后端、续跑/显式 attempt 选择、F 候选预检/结算后终检/封口后最终选择、真实 admission schema、CLI 分派、新校准与合成接受报告均已落地；Gate B 校准/合成/准入已在新目录通过。Gate C（新的明确授权）、Gate D（真实 R0）与 Gate E（真实 P→I→F）仍未执行；本轮不读取真实 checkpoint payload 或源 NPZ 数值，不编译真实资产，不创建真实 cohort/reservation/experiment run，也不改变 v0.9 的历史工件。
+本计划承接 v0.9 的纯合成 I/C 交付，目标是实现真实 provider、完成只读准入和 R0 元数据登记，并在取得新的 §10.2 明确授权后执行一次真实 **R0→P→I→F**。v0.7 承接 v0.6 的 Gate A/B 实施并按独立审阅修复 5 P1+4 P2，重新冻结校准、完整合成、合成接受与真实 metadata-only admission：真实 provider 与参考后端、续跑/显式 attempt 选择、F 候选预检/结算后终检/封口后最终选择、真实 admission schema、CLI 分派均已落地。Gate C（新的明确授权）、Gate D（真实 R0）与 Gate E（真实 P→I→F）仍未执行；本轮不读取真实 checkpoint payload 或源 NPZ 数值，不编译真实资产，不创建真实 cohort/reservation/experiment run，也不改变 v0.9 的历史工件。
 
-下文 Gate A–E、测试、校准、准入及真实运行中的已执行部分以 §6 的 v0.6 记录为准；未执行部分仍为后续待办。文档状态不代表真实授权或真实链已通过。
+下文 Gate A–E、测试、校准、准入及真实运行中的已执行部分以 §6 的 v0.6/v0.7 记录为准；未执行部分仍为后续待办。文档状态不代表真实授权或真实链已通过。
 
 ## 1. 固定依据与边界
 
@@ -92,7 +92,7 @@ Gate A 的完成条件：接口与上述接线齐备，provider 单元测试、�
 
 ### Gate B：合成回归与只读 admission
 
-先以新实现重新验证数值契约，再生成新的 admission attempt；完整绑定范围见 §1.2，不能继续消费 `attempt_012` 的旧实现哈希。以下 provider 测试文件、`--real-admission`、`--synthetic-acceptance` 及验收报告输出为拟新增接口，当前尚未实现。
+先以新实现重新验证数值契约，再生成新的 admission attempt；完整绑定范围见 §1.2，不能继续消费 `attempt_012` 的旧实现哈希。provider 测试文件、`--real-admission`、`--synthetic-acceptance` 及验收报告输出已在 v0.6 实现，v0.7 修复后重新冻结。
 
 后续实施时必须运行以下检查。本轮不执行；所有 `<fresh-...>` 路径需先换成未占用的新目录，输出入口须拒绝覆盖已有校准/合成运行：
 
@@ -325,3 +325,14 @@ v0.5 文档静态检查：版本/索引、链接/代码围栏/空白、两段命
 - Gate B 执行：新 provider 测试 **20 passed**；既有审计模块 **55 passed**；六个相关回归 **263 passed**。校准在新目录重算通过（`recompute_problems=[]`、4× 全部 ≤1），tolerances/rules/tiny-zero floors 与 v0.9 逐项相同，仅环境（内核版本/CPU 线程）使新的 fp32 canonical/evidence SHA 与 v0.9 不同。完整合成链四阶段 done/sealed、264 tensor/3864 行、调用矩阵精确、`training_updates=16`、F 新进程重放；结论 `audit_incomplete`（`complete_evidence=true`、`failures/problems=[]`、582 条必测 gap：392 precision + 190 sensitivity + 0 bound-unverifiable），与 v0.9 逐项一致。`synthetic_acceptance.json` passed；真实 metadata-only admission passed（`asset_closure_verified=true`、`npz_values_read/checkpoint_payload_read/torch_load_calls/model_constructor_calls/muJoCo_compile_calls=0`、父锚/checkpoint/资产闭包/264 tensor/3864 行/真实 scene=2 全过）。最终运行路径与 SHA 以验证记录 §10 为准。
 - 首次尝试的中间运行使用 `OMP_NUM_THREADS=1` 且在 `i_accumulated:diffusion:u1:model.net.root_out.weight` 出现 1 条近阈值 failure（582→585 gap）；撤销线程覆盖后 failures=0、gap=582，与 v0.9 一致，故该中间运行不纳入 Gate B 依据，保留为线程环境影响证据。阈值、窗口、lr、dtype 未调整。
 - 边界：真实 checkpoint payload、父 NPZ 数值、G1 资产编译、真实模型/优化器构造、真实 R0→P→I→F、真实授权/注册/cohort 均未执行；Gate C/D/E 状态不变，v0.9 校准/合成/准入/方案字节保持不变。
+
+**v0.7 审阅修复与 Gate B 重新冻结（2026-10-31）：`5 P1 + 4 P2` 全部修复，`gate_b_acceptance_passed` 重新成立，Gate C/D/E 仍未执行。**
+- **P1 物化前守卫**：`RealTrainingProvider` 现在在 `materialize` 入口、父数组摘要/解码、tokenizer、input admission、MuJoCo 参考后端构造，以及 `build_trainer` 模型构造/`_load_checkpoint` 的 SHA 与 payload 读取前执行同一 deadline+guard；截止或父登记失效时不再启动数组读取、编译或 `torch.load`。
+- **P1 源数组实际摘要**：每次 materialize（含续跑复用已封口 R0）先重新计算父 `objective_arrays` 文件 SHA 与 train config SHA，并解码前与冻结值比较；`input_admission.source_sha256` 改为实际摘要。文件漂移直接拒绝，不再携带旧摘要。
+- **P1 实现冻结清单**：`IMPLEMENTATION_FILES` 由 15 项扩为 25 项，补入 `model/tokens.py`、`model/deterministic.py`、`kinematics/torch_adapter.py`、`kinematics/rotation_adapter.py`、`geometry/distance_adapter.py`、`embodied/g1_spec.py`、`paths.py`、`eval/training_objective_audit.py`、`pyproject.toml`、`uv.lock`，并用静态依赖测试锁定。
+- **P1 合成接受文件闭包**：`synthetic_acceptance.json` 为每个阶段保存 attempt、目录、逐文件路径/字节/SHA，另绑定 fixture 与 run 级 `cohort.json/attempts_index.json/costs.json`；消费端逐文件复核存在性/大小/SHA、阶段必需文件与报告路径，并把 runtime identity 纳入拒绝条件。删除/改写/搬移任一证据文件都会使真实准入失败。
+- **P1 运行时身份对账**：fp32 contract 冻结 Python/Torch/NumPy/SciPy/CUDA/设备/MuJoCo 版本与 `torch.optim.adam{,w}` 源码 SHA；校准验证、合成接受、真实准入、R0、F 子进程与 P/I 物化均做无数值计算的身份比较。漂移使旧数值契约不可消费并退回 Gate B。
+- **P2 续跑调用量**：`required` 只汇总 `resume_stage` 及其下游阶段的名义调用，已结算的上游与失败 attempt 只留在历史。新增“P 失败 2 次加载→P/I 成功→F 失败已结算 4 次→resume F”反例：10+4=14≤16 合法，旧 10+8=18 的误拒被消除。
+- **P2 续跑起点**：`first_start` 只归入 resume 阶段本身；P 之后的 I、I 之后的 F 各自使用新起点，上游执行/封口耗时不再重复计入并提前耗尽下游截止。
+- **P2/P2 选择与完成硬门**：显式 attempt 也必须先检查全阶段唯一可消费候选，两个可消费 attempt 下指定其一仍拒绝；`complete=true` 是消费硬条件，`attempt_not_complete` 不再被过滤，两个 `done/complete=false` 也不能被返回为可消费。
+- **测试**：provider 模块 **31 passed**（新增 11 项守卫/摘要/文件闭包/身份/续跑/选择反例），审计模块 **55 passed**，六个相关文件 **263 passed**，合并 **349 passed（378.47s）**。Gate B 重新执行写入 `calibration/attempt_007`、`synthetic/attempt_007`、`admission_real/attempt_007`；最终 SHA、调用矩阵、582 gap、16 次更新、F 新进程与工件大小以验证记录 §10 为准。v0.9 方案/校准/合成/准入字节不变。

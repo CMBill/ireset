@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import json
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -316,6 +317,8 @@ def _checkpoint_provider(tmp_path, monkeypatch):
     provider.config = dict(TINY_CONFIG)
     provider.device = "cpu"
     provider.counter = None
+    provider._deadline = None
+    provider._guard = None
     monkeypatch.setattr(P, "MODEL_CONFIG", dict(TINY_CONFIG))
     provider.tokenizer = StateTokenizer(
         np.tile(np.array([-1.0, 1.0]), (29, 1)),
@@ -354,6 +357,90 @@ def test_checkpoint_payload_strict_rules(tmp_path, monkeypatch):
         with pytest.raises(ValueError):
             provider._load_checkpoint("deterministic",
                                       A.CallCounter(A.CALL_CAPS))
+
+
+# ---------------------------------------------------------------------------
+# materialization guards and source digests
+# ---------------------------------------------------------------------------
+
+
+def test_real_materialize_checks_guard_before_reading_anything(tmp_path):
+    provider = P.RealTrainingProvider(tmp_path)
+    calls: list[str] = []
+
+    def guard(unit: str) -> None:
+        calls.append(unit)
+        raise TimeoutError(unit)
+
+    with pytest.raises(TimeoutError):
+        provider.materialize(
+            stage="P", r0_noise=[],
+            counter=A.CallCounter(A.CALL_CAPS), guard=guard,
+            deadline=time.perf_counter() + 60.0)
+    # The first guard unit is the materialization entry; no array was read.
+    assert calls == ["materialize_start"]
+    assert provider.window_arrays == {}
+
+    expired = P.RealTrainingProvider(tmp_path)
+    with pytest.raises(TimeoutError):
+        expired.materialize(
+            stage="P", r0_noise=[],
+            counter=A.CallCounter(A.CALL_CAPS),
+            deadline=time.perf_counter() - 1.0)
+
+
+def test_real_materialize_rehashes_parent_arrays_before_decode(
+        tmp_path, monkeypatch):
+    arrays_path = tmp_path / "arrays.npz"
+    np.savez(arrays_path,
+             **{key: np.zeros(1) for key in P.WINDOW_VALUE_KEYS})
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("config")
+    parents = dict(P.PARENT_FILES)
+    expected = A.sha256_file(arrays_path)
+    parents["objective_arrays"] = (Path("arrays.npz"), expected)
+    monkeypatch.setattr(P, "PARENT_FILES", parents)
+    monkeypatch.setattr(P, "TRAIN_CONFIG_PATH", Path("config.yaml"))
+    monkeypatch.setattr(P, "TRAIN_CONFIG_SHA", A.sha256_file(config_path))
+    provider = P.RealTrainingProvider(tmp_path)
+    arrays = provider._load_arrays()
+    assert set(arrays) == set(P.WINDOW_VALUE_KEYS)
+    assert provider.source_sha256 == expected
+
+    with open(arrays_path, "ab") as handle:
+        handle.write(b"drift")
+    monkeypatch.setattr(
+        P.np, "load",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("payload decode must not run")))
+    with pytest.raises(ValueError, match="drifted"):
+        provider._load_arrays()
+
+
+def test_build_and_checkpoint_units_recheck_the_guard(tmp_path):
+    provider = P.RealTrainingProvider(tmp_path)
+    provider.tokenizer = StateTokenizer(
+        np.tile(np.array([-1.0, 1.0]), (29, 1)),
+        RootStats(mean=np.zeros(3), std=np.ones(3)))
+    units: list[str] = []
+
+    def guard(unit: str) -> None:
+        units.append(unit)
+        raise TimeoutError(unit)
+
+    provider._guard = guard
+    counter = A.CallCounter(A.CALL_CAPS)
+    with pytest.raises(TimeoutError):
+        provider.build_trainer("deterministic", with_optimizer=True,
+                               counter=counter)
+    assert units == ["trainer_construction"]
+    assert counter.counts["model_constructions"] == 0
+
+    units.clear()
+    with pytest.raises(TimeoutError):
+        provider._load_checkpoint("deterministic", counter)
+    assert units == ["checkpoint_sha"]
+    assert counter.counts["checkpoint_loads"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -436,6 +523,105 @@ def test_resume_f_reuses_upstream_and_selects_new_attempt(tmp_path,
                 if r["stage"] == "F"]) == 2
 
 
+def test_remaining_nominal_covers_only_stages_still_to_run():
+    full = A.remaining_nominal_for_mode("real", None)
+    assert full["checkpoint_loads"] == 8
+    assert A.remaining_nominal_for_mode("real", "R0") == full
+    assert A.remaining_nominal_for_mode("real", "P")["checkpoint_loads"] == 8
+    assert A.remaining_nominal_for_mode("real", "I")["checkpoint_loads"] == 6
+    assert A.remaining_nominal_for_mode("real", "F")["checkpoint_loads"] == 4
+    assert A.remaining_nominal_for_mode("synthetic", "F")[
+        "scene_setup_mj_forward"] == 0
+
+
+def test_resume_f_only_requires_remaining_stage_calls(tmp_path, monkeypatch):
+    provider = _provider()
+    root = tmp_path / "cohort"
+    original_p = A.run_p_stage
+    original_f = A.run_f_stage
+    state = {"p": 0, "f": 0}
+
+    def failing_p(*args, **kwargs):
+        if state["p"] == 0:
+            state["p"] = 1
+            args[6].add("checkpoint_loads", 2)
+            return {"passed": False, "failures": ["injected_p"], "gaps": [],
+                    "rows": [], "paths": {}, "report": None,
+                    "arrays_sha256": {}, "complete_evidence": False,
+                    "numeric_passed": False}
+        return original_p(*args, **kwargs)
+
+    def failing_f(*args, **kwargs):
+        if state["f"] == 0:
+            state["f"] = 1
+            args[6].add("checkpoint_loads", 4)
+            delta = {kind: 0 for kind in A.CALL_KINDS}
+            delta["checkpoint_loads"] = 4
+            return {"conclusion": "audit_incomplete",
+                    "complete_evidence": False,
+                    "covered_contract_passed": False,
+                    "verification_problems": ["injected_f_failure"],
+                    "failures": [], "gaps": ["injected_f_failure"],
+                    "report": None, "summary": {}, "worker": {},
+                    "call_delta": delta}
+        return original_f(*args, **kwargs)
+
+    monkeypatch.setattr(A, "run_p_stage", failing_p)
+    first = A.run_registered_audit(root, provider, mode="synthetic",
+                                   tolerance=_tolerance())
+    assert first["conclusion"] == "audit_incomplete"
+    monkeypatch.setattr(A, "run_p_stage", original_p)
+    monkeypatch.setattr(A, "run_f_stage", failing_f)
+    second = A.run_registered_audit(root, provider, mode="synthetic",
+                                    tolerance=_tolerance(), resume_stage="P")
+    assert second["conclusion"] == "audit_incomplete"
+    p_row, p_problems = A.stage_state(root, "P")
+    assert p_problems == [] and p_row["attempt"] == "attempt_002"
+    # History: failed P 2 + retry P 2 + I 2 + failed F 4 = 10 loads.  A
+    # resumed F needs 4, so 14 <= 16; the old whole-chain requirement (8)
+    # would have refused a legitimate resume.
+    monkeypatch.setattr(A, "run_f_stage", original_f)
+    third = A.run_registered_audit(root, provider, mode="synthetic",
+                                   tolerance=_tolerance(), resume_stage="F")
+    assert third["complete_evidence"] is True, third["problems"]
+    assert third["selected_attempts"]["F"] == "attempt_002"
+    assert third["calls"]["counts"]["checkpoint_loads"] == 14
+
+
+def test_resume_uses_a_fresh_start_after_the_resumed_stage(tmp_path,
+                                                            monkeypatch):
+    provider = _provider()
+    root = tmp_path / "cohort"
+    original_p = A.run_p_stage
+    state = {"first": True}
+
+    def failing_p(*args, **kwargs):
+        if state["first"]:
+            state["first"] = False
+            return {"passed": False, "failures": ["injected_p"], "gaps": [],
+                    "rows": [], "paths": {}, "report": None,
+                    "arrays_sha256": {}, "complete_evidence": False,
+                    "numeric_passed": False}
+        return original_p(*args, **kwargs)
+
+    monkeypatch.setattr(A, "run_p_stage", failing_p)
+    A.run_registered_audit(root, provider, mode="synthetic",
+                           tolerance=_tolerance())
+    monkeypatch.setattr(A, "run_p_stage", original_p)
+    starts: dict[str, float] = {}
+    original_pre = A.pre_register_attempt
+
+    def recording_pre(root_, stage, attempt, t0, **kwargs):
+        starts[stage] = t0
+        return original_pre(root_, stage, attempt, t0, **kwargs)
+
+    monkeypatch.setattr(A, "pre_register_attempt", recording_pre)
+    result = A.run_registered_audit(root, provider, mode="synthetic",
+                                    tolerance=_tolerance(), resume_stage="P")
+    assert result["complete_evidence"] is True, result["problems"]
+    assert starts["P"] < starts["I"] < starts["F"]
+
+
 def test_resume_rejects_unknown_or_already_consumable_stage(tmp_path,
                                                             monkeypatch):
     provider = _provider()
@@ -478,6 +664,30 @@ def test_stage_state_rejects_multiple_consumable_attempts(tmp_path):
     row, problems = A.stage_state(root, "P")
     assert row is None
     assert "stage_multiple_consumable" in problems
+    # An explicitly requested attempt cannot bypass the uniqueness check.
+    row, problems = A.stage_state(root, "P", "attempt_002")
+    assert row is None
+    assert "stage_multiple_consumable" in problems
+
+
+def test_incomplete_attempt_is_never_consumable(tmp_path):
+    root = tmp_path / "run"
+    A.write_cohort(root, mode="synthetic")
+    _manual_attempt(root, "P", "attempt_001", complete=False)
+    row, problems = A.stage_state(root, "P")
+    assert row is None
+    assert "attempt_not_complete" in problems
+    row, problems = A.stage_state(root, "P", "attempt_001")
+    assert row is None
+    assert "attempt_not_complete" in problems
+    # Two incomplete attempts stay unconsumable exactly like one.
+    _manual_attempt(root, "P", "attempt_002", complete=False)
+    row, problems = A.stage_state(root, "P", "attempt_001")
+    assert row is None
+    assert "attempt_not_complete" in problems
+    row, problems = A.stage_state(root, "P")
+    assert row is None
+    assert problems
 
 
 def test_stage_state_allows_one_failure_plus_one_consumable(tmp_path):
@@ -582,6 +792,152 @@ def test_calibration_verification_rejects_real_reads():
     }
     assert "calibration_verification_real_reads" in \
         P.calibration_verification_problems(record)
+
+
+def test_runtime_identity_drift_is_refused():
+    current = A.runtime_identity_facts()
+    assert A.runtime_identity_problems(current, current) == []
+    tampered = copy.deepcopy(current)
+    tampered["torch"] = "0.0.0"
+    assert "runtime_identity:torch" in A.runtime_identity_problems(
+        tampered, current)
+    tampered = copy.deepcopy(current)
+    tampered["mujoco"] = "0.0.0"
+    assert "runtime_identity:mujoco" in A.runtime_identity_problems(
+        tampered, current)
+    tampered = copy.deepcopy(current)
+    tampered["adamw_source_sha256"]["torch.optim.adam"] = "0" * 64
+    assert "runtime_identity:source:torch.optim.adam" in \
+        A.runtime_identity_problems(tampered, current)
+    assert A.runtime_identity_problems(None, current) == [
+        "runtime_identity_missing"]
+    contract = A.build_fp32_contract("cuda")
+    assert A.fp32_contract_problems(contract, recompute=False) == []
+    tampered_contract = copy.deepcopy(contract)
+    tampered_contract["runtime_identity"]["python"] = "0.0"
+    assert "fp32_runtime_identity:python" in A.fp32_contract_problems(
+        tampered_contract, recompute=False)
+
+
+def test_implementation_files_cover_calculation_dependencies():
+    required = {
+        "src/ireset/model/tokens.py",
+        "src/ireset/model/deterministic.py",
+        "src/ireset/kinematics/torch_adapter.py",
+        "src/ireset/kinematics/rotation_adapter.py",
+        "src/ireset/geometry/distance_adapter.py",
+        "src/ireset/embodied/g1_spec.py",
+        "src/ireset/paths.py",
+        "src/ireset/eval/training_objective_audit.py",
+        "pyproject.toml",
+        "uv.lock",
+    }
+    assert required <= set(A.IMPLEMENTATION_FILES)
+    identity = A.implementation_identity(Path(__file__).resolve().parents[1])
+    assert all(identity["files"].get(rel) for rel in required)
+
+
+def _acceptance_fixture(tmp_path):
+    run_root = tmp_path / "synthetic_run"
+    selected = {stage: "attempt_001" for stage in A.STAGE_BUDGETS}
+    report_names = {"R0": "admission.json", "P": "p_report.json",
+                    "I": "i_report.json",
+                    "F": "training_update_final.json"}
+    stages = {}
+    for stage in A.STAGE_BUDGETS:
+        directory = run_root / A.STAGE_DIRS[stage] / "attempt_001"
+        for name in P.STAGE_REQUIRED_FILES[stage]:
+            path = directory / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"{stage}:{name}")
+        stages[stage] = {
+            "complete_evidence": True, "failures": [], "gaps": [],
+            "report": A.path_for_record(directory / report_names[stage]),
+            "worker_result": {"pid": 2, "ppid": 1},
+        }
+    fixture = run_root / "fixture"
+    fixture.mkdir(parents=True)
+    for name in P.FIXTURE_REQUIRED_FILES:
+        (fixture / name).write_text(name)
+    for name in P.RUN_REQUIRED_FILES:
+        (run_root / name).write_text(name)
+    result = {
+        "stages": stages,
+        "seals": {stage: {"sealed": True, "terminal": True, "problems": []}
+                  for stage in A.STAGE_BUDGETS},
+        "selected_attempts": selected,
+        "selected_chain_counts": A.chain_nominal_for_mode("synthetic"),
+        "complete_evidence": True, "problems": [], "failures": [],
+        "conclusion": "audit_incomplete",
+    }
+    roster = A.build_parameter_roster(TINY_CONFIG)
+    tolerance = {"mode": "synthetic_calibrated",
+                 "evidence_sha256": "a" * 64,
+                 "fp32_contract_sha256": "b" * 64}
+    calibration = {
+        "schema": P.CALIBRATION_VERIFICATION_SCHEMA,
+        "mode": "synthetic_calibrated", "passed": True,
+        "recompute_problems": [], "four_x_ok": True,
+        "real_dataset_loaded": False, "real_checkpoint_loaded": False,
+        "real_asset_loaded": False, "real_model_calls": 0,
+        "contract_sha256": "c" * 64, "evidence_sha256": "a" * 64,
+        "fp32_contract_sha256": "b" * 64,
+        "runtime_identity": A.runtime_identity_facts(),
+    }
+    return run_root, result, roster, tolerance, calibration
+
+
+def test_synthetic_acceptance_binds_every_evidence_file(tmp_path):
+    run_root, result, roster, tolerance, calibration = \
+        _acceptance_fixture(tmp_path)
+    record = P.synthetic_acceptance(
+        result, run_root=run_root, tolerance_contract=tolerance,
+        calibration_verification_record=calibration, roster=roster)
+    assert record["passed"] is True, record["problems"]
+    assert P.synthetic_acceptance_problems(record) == []
+
+    # Deleting any evidence file breaks the binding.
+    victim = run_root / A.STAGE_DIRS["P"] / "attempt_001" / "p_report.json"
+    victim.unlink()
+    problems = P.synthetic_acceptance_problems(record)
+    assert any("file_missing" in p for p in problems)
+
+    # Restoring the path with different bytes is caught by the digest.
+    victim.write_text("tampered")
+    problems = P.synthetic_acceptance_problems(record)
+    assert any("file_sha" in p for p in problems)
+
+    # Replacing every report path also fails (the manifest no longer matches).
+    tampered = copy.deepcopy(record)
+    for stage in A.STAGE_BUDGETS:
+        tampered["stages"][stage]["report"] = str(
+            tmp_path / "missing" / "report.json")
+    problems = P.synthetic_acceptance_problems(tampered)
+    assert any("acceptance_stage_report" in p for p in problems)
+
+    # Runtime drift is a Gate B return, not a warning.
+    drifted = copy.deepcopy(record)
+    drifted["runtime_identity"]["torch"] = "0.0.0"
+    assert any("acceptance_runtime:runtime_identity:torch" in p
+               for p in P.synthetic_acceptance_problems(drifted))
+
+
+def test_calibration_verification_rejects_runtime_drift():
+    record = {
+        "schema": P.CALIBRATION_VERIFICATION_SCHEMA,
+        "mode": "synthetic_calibrated", "passed": True,
+        "recompute_problems": [], "four_x_ok": True,
+        "real_dataset_loaded": False, "real_checkpoint_loaded": False,
+        "real_asset_loaded": False, "real_model_calls": 0,
+        "contract_sha256": "a" * 64, "evidence_sha256": "b" * 64,
+        "fp32_contract_sha256": "c" * 64,
+        "runtime_identity": A.runtime_identity_facts(),
+    }
+    assert P.calibration_verification_problems(record) == []
+    drifted = copy.deepcopy(record)
+    drifted["runtime_identity"]["cuda_version"] = "0.0"
+    assert "calibration_runtime_identity:cuda_version" in \
+        P.calibration_verification_problems(drifted)
 
 
 def test_cli_refuses_to_overwrite_calibration(tmp_path, monkeypatch):
