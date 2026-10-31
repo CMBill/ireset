@@ -375,7 +375,10 @@ def test_stage_state_rejects_running_publishing_and_unsettled(tmp_path):
     _row, problems = A.stage_state(root, "P")
     assert "stage_not_terminal" in problems
     assert any(p.startswith("reservation_unsettled") for p in problems)
-    row = {"complete": True, "report": None, "summary": None}
+    report = A.stage_dir(root, "P") / attempt / "p_report.json"
+    A.write_json(report, {"complete_evidence": True})
+    row = {"complete": True, "report": A.path_for_record(report),
+           "summary": A.path_for_record(report)}
     seal = A.finish_attempt(root, "P", attempt, A._now(), budget, row,
                             status="done",
                             extra={"call_balance": A.CallCounter(
@@ -385,6 +388,48 @@ def test_stage_state_rejects_running_publishing_and_unsettled(tmp_path):
                          {"counts": A.CallCounter(A.CALL_CAPS).snapshot()["counts"]})
     _row, problems = A.stage_state(root, "P")
     assert problems == []
+
+
+def test_stage_state_rejects_evidence_changed_after_seal(tmp_path):
+    root = tmp_path / "sealed"
+    A.write_cohort(root, mode="synthetic")
+    attempt = "attempt_001"
+    directory = A.stage_dir(root, "P") / attempt
+    directory.mkdir(parents=True)
+    report = directory / "p_report.json"
+    artifact = directory / "p_arrays.npz"
+    A.write_json(report, {"complete_evidence": True})
+    artifact.write_bytes(b"arrays")
+    report_bytes = report.read_bytes()
+    budget = {"remaining_s": 10.0, "reserve_s": 1.0, "attempts": 2,
+              "attempts_used": 0}
+    A.pre_register_attempt(root, "P", attempt, A._now(), scope={},
+                           budget=budget,
+                           call_balance=A.CallCounter(A.CALL_CAPS).snapshot())
+    A.reserve_stage_calls(root, "P", attempt,
+                          {"counts": A.STAGE_NOMINAL["P"]})
+    seal = A.finish_attempt(
+        root, "P", attempt, A._now(), budget,
+        {"complete": True, "report": A.path_for_record(report),
+         "summary": A.path_for_record(report),
+         "artifacts": {A.path_for_record(artifact):
+                       A.sha256_file(artifact)}},
+        status="done",
+        extra={"call_balance": A.CallCounter(A.CALL_CAPS).snapshot()})
+    assert seal.sealed
+    A.settle_stage_calls(root, "P", attempt,
+                         {"counts": A.CallCounter(A.CALL_CAPS).snapshot()["counts"]})
+    assert A.stage_state(root, "P")[1] == []
+
+    report.write_text('{"complete_evidence": false}')
+    _row, problems = A.stage_state(root, "P")
+    assert "report_drifted" in problems
+    report.write_bytes(report_bytes)
+    assert A.stage_state(root, "P")[1] == []
+
+    artifact.write_bytes(b"tampered")
+    _row, problems = A.stage_state(root, "P")
+    assert "artifact_drifted:p_arrays.npz" in problems
 
 
 def test_authorization_template_is_refused_and_faithful_record_accepted(

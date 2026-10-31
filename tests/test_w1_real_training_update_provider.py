@@ -443,6 +443,120 @@ def test_build_and_checkpoint_units_recheck_the_guard(tmp_path):
     assert counter.counts["checkpoint_loads"] == 0
 
 
+def test_fk_deadline_stops_the_scene_compile(tmp_path, monkeypatch):
+    import ireset.kinematics.torch_adapter as TA
+
+    calls: list[str] = []
+
+    class FakeFK:
+        def __init__(self, device="cpu", dtype=None):
+            calls.append("fk")
+
+        def site_world_positions(self, *args, **kwargs):
+            raise AssertionError("FK must not run during construction")
+
+    class FakeAssembler:
+        def __init__(self, *args, **kwargs):
+            calls.append("assembler")
+
+    monkeypatch.setattr(TA, "G1TorchFK", FakeFK)
+    monkeypatch.setattr(P, "LossAssembler", FakeAssembler)
+    provider = P.RealTrainingProvider(tmp_path)
+    provider.tokenizer = StateTokenizer(
+        np.tile(np.array([-1.0, 1.0]), (29, 1)),
+        RootStats(mean=np.zeros(3), std=np.ones(3)))
+    counter = A.CallCounter(A.CALL_CAPS)
+
+    def expired(unit: str) -> None:
+        if unit == "production_scene_construction":
+            raise TimeoutError(unit)
+
+    provider._guard = expired
+    with pytest.raises(TimeoutError):
+        provider._production_loss(counter)
+    assert calls == ["fk"]
+    assert counter.counts["scene_setup_mj_forward"] == 0
+    assert provider._production_assembler is None
+
+    # Once the compile completes it stays counted, even if a later unit
+    # refuses to continue.
+    calls.clear()
+    provider._guard = None
+    provider._production_loss(counter)
+    assert calls == ["fk", "assembler"]
+    assert counter.counts["scene_setup_mj_forward"] == 1
+
+
+def test_checkpoint_state_contract_checks_dtype_shape_and_finite():
+    module = torch.nn.Linear(3, 2)
+    state = module.state_dict()
+    P._copy_state_strict(module, state, "model")
+    float64 = {name: value.to(torch.float64)
+               for name, value in state.items()}
+    with pytest.raises(ValueError, match="model_dtype:weight"):
+        P._copy_state_strict(module, float64, "model")
+    nonfinite = {name: value.clone() for name, value in state.items()}
+    nonfinite["weight"].fill_(float("nan"))
+    with pytest.raises(ValueError, match="model_nonfinite:weight"):
+        P._copy_state_strict(module, nonfinite, "model")
+    wrong_shape = {name: value.clone() for name, value in state.items()}
+    wrong_shape["weight"] = torch.zeros(1, 1)
+    with pytest.raises(ValueError, match="model_shape:weight"):
+        P._copy_state_strict(module, wrong_shape, "model")
+    missing = {name: value.clone() for name, value in state.items()}
+    missing.pop("bias")
+    with pytest.raises(ValueError, match="model_missing:bias"):
+        P._copy_state_strict(module, missing, "model")
+
+
+def test_materialize_rechecks_the_frozen_asset_closure(tmp_path, monkeypatch):
+    import ireset.eval.w1_real_fk_audit as F
+
+    (tmp_path / "lock_record.json").write_text("{}")
+    (tmp_path / "robot.urdf").write_text("<robot/>")
+    (tmp_path / "scene_body.xml").write_text("<mujoco/>")
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    mesh = assets / "a.obj"
+    mesh.write_text("mesh")
+    (tmp_path / "include.xml").write_text("<mujoco/>")
+    (tmp_path / "scene.xml").write_text(
+        '<mujoco><compiler meshdir="assets"/>'
+        '<include file="include.xml"/>'
+        '<asset><mesh file="a.obj"/></asset></mujoco>')
+    monkeypatch.setattr(F, "LOCKED_ASSETS", {
+        "lock_record": Path("lock_record.json"),
+        "xml": Path("scene.xml"),
+        "scene_xml": Path("scene_body.xml"),
+        "urdf": Path("robot.urdf"),
+    })
+    facts = F._asset_closure_facts(tmp_path, mode="real")
+    assert facts["problems"] == []
+    assert facts["reference_count"] == 2
+    registration = tmp_path / "registration.json"
+    P.write_json(registration, {"locked_assets": facts})
+    parents = dict(P.PARENT_FILES)
+    parents["fk_registration"] = (Path("registration.json"),
+                                  A.sha256_file(registration))
+    monkeypatch.setattr(P, "PARENT_FILES", parents)
+    provider = P.RealTrainingProvider(tmp_path)
+    provider._verify_asset_closure()
+
+    units: list[str] = []
+    provider._guard = lambda unit: units.append(unit)
+    provider._verify_asset_closure()
+    assert units == ["materialize_asset_closure"]
+
+    mesh.write_text("drifted")
+    with pytest.raises(ValueError, match="asset_reference_sha"):
+        provider._verify_asset_closure()
+
+    mesh.write_text("mesh")
+    (tmp_path / "include.xml").unlink()
+    with pytest.raises(ValueError, match="asset_reference_missing"):
+        provider._verify_asset_closure()
+
+
 # ---------------------------------------------------------------------------
 # resume / attempt selection / 16-vs-17 accounting
 # ---------------------------------------------------------------------------
@@ -806,6 +920,10 @@ def test_runtime_identity_drift_is_refused():
     assert "runtime_identity:mujoco" in A.runtime_identity_problems(
         tampered, current)
     tampered = copy.deepcopy(current)
+    tampered["cpu_threads"] = int(current["cpu_threads"]) + 1
+    assert "runtime_identity:cpu_threads" in A.runtime_identity_problems(
+        tampered, current)
+    tampered = copy.deepcopy(current)
     tampered["adamw_source_sha256"]["torch.optim.adam"] = "0" * 64
     assert "runtime_identity:source:torch.optim.adam" in \
         A.runtime_identity_problems(tampered, current)
@@ -920,6 +1038,63 @@ def test_synthetic_acceptance_binds_every_evidence_file(tmp_path):
     drifted["runtime_identity"]["torch"] = "0.0.0"
     assert any("acceptance_runtime:runtime_identity:torch" in p
                for p in P.synthetic_acceptance_problems(drifted))
+
+
+def test_from_spec_restores_the_acceptance_identity(tmp_path):
+    run_root, result, roster, tolerance, calibration = \
+        _acceptance_fixture(tmp_path)
+    record = P.synthetic_acceptance(
+        result, run_root=run_root, tolerance_contract=tolerance,
+        calibration_verification_record=calibration, roster=roster)
+    path = tmp_path / "acceptance.json"
+    P.write_json(path, record)
+    spec = {"mode": "real", "config": TINY_CONFIG, "device": "cpu",
+            "acceptance_path": "acceptance.json",
+            "acceptance_sha256": A.sha256_file(path)}
+    provider = P.RealTrainingProvider.from_spec(spec, project_root=tmp_path)
+    assert provider.acceptance_path == path
+    assert provider.acceptance is not None
+    assert provider.acceptance_sha == A.sha256_file(path)
+
+    drifted = dict(spec)
+    drifted["acceptance_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="sha drifted"):
+        P.RealTrainingProvider.from_spec(drifted, project_root=tmp_path)
+
+
+def test_worker_aborts_on_runtime_identity_before_real_calls(
+        tmp_path, monkeypatch):
+    root = tmp_path / "cohort"
+    A.write_cohort(root, mode="real")
+    attempt = "attempt_001"
+    A.pre_register_attempt(root, "F", attempt, A._now(), scope={},
+                           budget=_budget())
+    A.reserve_stage_calls(
+        root, "F", attempt,
+        {"counts": A.stage_nominal_for_mode("real", "F")})
+    spec_path = tmp_path / "worker_spec.json"
+    A.write_json(spec_path, {
+        "mode": "real", "run_root": str(root), "stage": "F",
+        "attempt": attempt, "deadline_perf_counter": A._now() + 60.0,
+        "reserve_s": 0.0, "remaining_caps": dict(A.CALL_CAPS),
+        "registration_sha256": None, "candidate_attempts": {},
+        "candidate_checks": False, "project_root": str(tmp_path),
+        "roster": {}, "config": TINY_CONFIG, "device": "cpu",
+        "provider": {"runtime_identity": {}},
+    })
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("real provider must not be constructed")
+
+    monkeypatch.setattr(P.RealTrainingProvider, "from_spec",
+                        classmethod(forbidden))
+    out = tmp_path / "worker"
+    assert A._worker_main(str(spec_path), str(out)) == 2
+    result = A.read_json(out / "worker_result.json")
+    assert any(p.startswith("worker_runtime_identity:")
+               for p in result["problems"])
+    assert result["provider"] is None
+    assert all(int(value) == 0 for value in result["counts"]["counts"].values())
 
 
 def test_calibration_verification_rejects_runtime_drift():

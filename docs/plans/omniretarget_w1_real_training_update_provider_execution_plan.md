@@ -1,10 +1,10 @@
 # W1 真实网络参数梯度与优化更新链路——真实 provider 接入与执行计划
 
-日期：2026-10-31。版本：v0.7。状态：**`gate_a_implemented / gate_b_acceptance_passed / gate_c_not_authorized / gate_d_e_not_run`**。
+日期：2026-10-31。版本：v0.8。状态：**`gate_a_implemented / gate_b_acceptance_passed / gate_c_not_authorized / gate_d_e_not_run`**。
 
-本计划承接 v0.9 的纯合成 I/C 交付，目标是实现真实 provider、完成只读准入和 R0 元数据登记，并在取得新的 §10.2 明确授权后执行一次真实 **R0→P→I→F**。v0.7 承接 v0.6 的 Gate A/B 实施并按独立审阅修复 5 P1+4 P2，重新冻结校准、完整合成、合成接受与真实 metadata-only admission：真实 provider 与参考后端、续跑/显式 attempt 选择、F 候选预检/结算后终检/封口后最终选择、真实 admission schema、CLI 分派均已落地。Gate C（新的明确授权）、Gate D（真实 R0）与 Gate E（真实 P→I→F）仍未执行；本轮不读取真实 checkpoint payload 或源 NPZ 数值，不编译真实资产，不创建真实 cohort/reservation/experiment run，也不改变 v0.9 的历史工件。
+本计划承接 v0.9 的纯合成 I/C 交付，目标是实现真实 provider、完成只读准入和 R0 元数据登记，并在取得新的 §10.2 明确授权后执行一次真实 **R0→P→I→F**。v0.8 承接 v0.7 的 Gate A/B 实现并按独立审阅修复 4 P1+3 P2，重新冻结校准、完整合成、合成接受与真实 metadata-only admission：真实 provider 与参考后端、续跑/显式 attempt 选择、F 候选预检/结算后终检/封口后最终选择、真实 admission schema、CLI 分派均已落地。Gate C（新的明确授权）、Gate D（真实 R0）与 Gate E（真实 P→I→F）仍未执行；本轮不读取真实 checkpoint payload 或源 NPZ 数值，不编译真实资产，不创建真实 cohort/reservation/experiment run，也不改变 v0.9 的历史工件。
 
-下文 Gate A–E、测试、校准、准入及真实运行中的已执行部分以 §6 的 v0.6/v0.7 记录为准；未执行部分仍为后续待办。文档状态不代表真实授权或真实链已通过。
+下文 Gate A–E、测试、校准、准入及真实运行中的已执行部分以 §6 的 v0.6/v0.7/v0.8 记录为准；未执行部分仍为后续待办。文档状态不代表真实授权或真实链已通过。
 
 ## 1. 固定依据与边界
 
@@ -92,9 +92,9 @@ Gate A 的完成条件：接口与上述接线齐备，provider 单元测试、�
 
 ### Gate B：合成回归与只读 admission
 
-先以新实现重新验证数值契约，再生成新的 admission attempt；完整绑定范围见 §1.2，不能继续消费 `attempt_012` 的旧实现哈希。provider 测试文件、`--real-admission`、`--synthetic-acceptance` 及验收报告输出已在 v0.6 实现，v0.7 修复后重新冻结。
+先以新实现重新验证数值契约，再生成新的 admission attempt；完整绑定范围见 §1.2，不能继续消费 `attempt_012` 的旧实现哈希。provider 测试文件、`--real-admission`、`--synthetic-acceptance` 及验收报告输出已在 v0.6 实现，v0.7/v0.8 修复后重新冻结。
 
-后续实施时必须运行以下检查。本轮不执行；所有 `<fresh-...>` 路径需先换成未占用的新目录，输出入口须拒绝覆盖已有校准/合成运行：
+以下为复现/重新冻结命令。所有 `<fresh-...>` 路径需先换成未占用的新目录，输出入口须拒绝覆盖已有校准/合成运行：
 
 ```bash
 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
@@ -336,3 +336,13 @@ v0.5 文档静态检查：版本/索引、链接/代码围栏/空白、两段命
 - **P2 续跑起点**：`first_start` 只归入 resume 阶段本身；P 之后的 I、I 之后的 F 各自使用新起点，上游执行/封口耗时不再重复计入并提前耗尽下游截止。
 - **P2/P2 选择与完成硬门**：显式 attempt 也必须先检查全阶段唯一可消费候选，两个可消费 attempt 下指定其一仍拒绝；`complete=true` 是消费硬条件，`attempt_not_complete` 不再被过滤，两个 `done/complete=false` 也不能被返回为可消费。
 - **测试**：provider 模块 **31 passed**（新增 11 项守卫/摘要/文件闭包/身份/续跑/选择反例），审计模块 **55 passed**，六个相关文件 **263 passed**，合并 **349 passed（378.47s）**。Gate B 重新执行写入 `calibration/attempt_007`、`synthetic/attempt_007`、`admission_real/attempt_007`；最终 SHA、调用矩阵、582 gap、16 次更新、F 新进程与工件大小以验证记录 §10 为准。v0.9 方案/校准/合成/准入字节不变。
+
+**v0.8 审阅修复与 Gate B 重新冻结（2026-10-31）：`4 P1 + 3 P2` 全部修复，`gate_b_acceptance_passed` 重新成立，Gate C/D/E 仍未执行。** 本轮只修改 provider/审计器/测试与本计划；不读取真实 checkpoint payload、父 NPZ 数值或编译真实资产。
+- **P1 构造分项守卫**：`_production_loss` 在 `G1TorchFK` 之前、`LossAssembler`（真实大箱体场景编译）之前分别执行同一 deadline+guard；场景编译完成后立即计入 `scene_setup_mj_forward`，即使后续单元拒绝也保留已完成的实际计数；构造失败不缓存半成品 assembler。`build_trainer` 在 payload 复制前另设 `trainer_state_copy` 单元。
+- **P1 资产闭包复验**：每次 `materialize`（含续跑复用已封口 R0、跳过 metadata）在父数组/config 实际摘要之后、tokenizer/参考后端/模型构造之前执行 `_verify_asset_closure`：先核验父 FK registration 文件自身冻结 SHA，再核对四个锁定文件、37 个引用、解析目标集合、`from`/`tag`/SHA、`reference_count` 与 `closure_sha256`。缺失、增加或漂移均在任何真实编译前拒绝。
+- **P1 封口摘要消费**：`_attempt_consumable` 新增 `_sealed_evidence_problems`，逐项核验 `report`/`summary` 的保存 SHA 与 `artifacts` 路径/摘要；complete 但无报告、报告被改写或数组工件漂移均不可消费，续跑/下游不会消费已变化的上游证据。
+- **P1 F 身份门阻断**：F worker 的 `worker_runtime_identity` 与候选预检同列硬门，任一非空即在 `from_spec`/fixture/真实读取/构造/重放之前终止；`from_spec` 现在解析并加载 acceptance、核对其 SHA，使 `materialize` 的身份检查在 worker 内同样生效；`finally` 仍按实际计数收口。
+- **P2 线程数身份**：`RUNTIME_IDENTITY_KEYS` 增加 `cpu_threads`（校准记录默认 20）；父进程、合成接受、真实准入、R0、F worker 与 P/I 物化均核对该值，单线程等环境漂移不再因其他字段相同而放行。
+- **P2 payload dtype 契约**：`load_state_dict(strict=True)` 前新增逐张量键集、dtype、shape 与有限性检查；float64 权重、静默 dtype 转换、坏形状/缺失键/非有限值均在复制前拒绝，`strict=True` 仍保留。
+- **P2 文档订正**：v0.9 冻结校准 evidence 为 `aa4bd831…`，attempt_007 为 `8fc90e39…`；两者数值门/校准数值相同，但 `calibration.fp32_contract_sha256` 已变化，故 evidence 摘要不同，不能表述为“与 v0.9 相同”。本版及验证记录给出新旧摘要的明确区分。
+- **测试**：provider 模块 **36 passed**（新增 5 项：FK→场景截止、payload dtype/shape/finite、资产闭包复验、from_spec acceptance、worker 身份先于真实构造），审计模块 **56 passed**（新增封口摘要/工件反例），六个相关文件 **263 passed**，合并 **355 passed（379.25s）**。Gate B 重新执行写入 `calibration/attempt_008`、`synthetic/attempt_008`、`admission_real/attempt_008`；最终 SHA、调用矩阵、582 gap、16 次更新、F 新进程与工件大小以验证记录 §10.7 为准。v0.9 方案/校准/合成/准入字节不变。

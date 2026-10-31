@@ -243,10 +243,10 @@ v0.8 的第六轮 2 P1 修复与 54 项测试保留在历史（`synthetic/histor
 ## 10. Gate A/B 真实 provider 接入与执行计划实现（2026-10-31）
 
 执行计划：[W1 真实 provider 接入与执行计划](../plans/omniretarget_w1_real_training_update_provider_execution_plan.md)
-（v0.7，`gate_a_implemented / gate_b_acceptance_passed / gate_c_not_authorized /
-gate_d_e_not_run`）。§10.1–§10.4 记录 v0.6 初次 Gate A/B 实现；§10.6 记录独立审阅 5 P1+4 P2
-修复后的最终重新冻结（当前权威为 attempt_007）。Gate C（新的 §10.2 明确授权）、Gate D（真实 R0）
-与 Gate E（真实 P→I→F）未执行。
+（v0.8，`gate_a_implemented / gate_b_acceptance_passed / gate_c_not_authorized /
+gate_d_e_not_run`）。§10.1–§10.4 记录 v0.6 初次 Gate A/B 实现；§10.6 记录 v0.7 的 5 P1+4 P2
+修复与 attempt_007；§10.7 记录 v0.8 的 4 P1+3 P2 修复与 attempt_008，为当前权威。Gate C
+（新的 §10.2 明确授权）、Gate D（真实 R0）与 Gate E（真实 P→I→F）未执行。
 
 ### 10.1 Gate A 实现
 
@@ -351,15 +351,16 @@ gate_d_e_not_run`）。§10.1–§10.4 记录 v0.6 初次 Gate A/B 实现；§10
 
 ### 10.5 Gate B 后的下一步
 
-先由用户复阅本记录、执行计划 v0.7、`calibration/attempt_007`、`synthetic/attempt_007` 与
-`admission_real/attempt_007`；随后提供新的 §10.2 明确授权记录（10 项 checklist 全 true，
-并绑定执行计划/校准验证/接受报告/准入包/实现哈希）。未取得授权前不得运行
+先由用户复阅本记录、执行计划 v0.8、`calibration/attempt_008`、`synthetic/attempt_008` 与
+`admission_real/attempt_008`（§10.7）；随后提供新的 §10.2 明确授权记录（10 项 checklist
+全 true，并绑定执行计划/校准验证/接受报告/准入包/实现哈希）。未取得授权前不得运行
 `--real`/`--resume`，不得创建真实 cohort 或消耗真实调用额度。
 
-### 10.6 v0.7 审阅修复与 Gate B 重新冻结（2026-10-31）
+### 10.6 v0.7 审阅修复与 Gate B 重新冻结（2026-10-31；已被 §10.7 取代）
 
-独立审阅确认 5 P1 + 4 P2；全部按反例修复后，Gate B 以最终字节重新执行。本节是当前权威；
-attempt_006 与更早 attempt 仅作历史保留。
+独立审阅确认 5 P1 + 4 P2；全部按反例修复后，Gate B 以最终字节重新执行。本节保留
+attempt_007 的历史事实；当前权威为 §10.7（v0.8/attempt_008）。attempt_006 与更早 attempt
+仅作历史保留。
 
 **修复项（均有新增反例）**
 
@@ -405,7 +406,9 @@ attempt_006 与更早 attempt 仅作历史保留。
 
 - 校准 `derived/audit/w1_real_training_update_audit/calibration/attempt_007/`：
   `tolerance_contract.json` SHA `b97e3e6be7bf02eec08592af69160b4fb101e7f7f9dd6184cc64c0016c4874e4`、
-  evidence `8fc90e39d42e4f94ead51bcaba26418a1992aa2f8bb6af593fba0f115e982d90`（与 v0.9 相同）、
+  evidence `8fc90e39d42e4f94ead51bcaba26418a1992aa2f8bb6af593fba0f115e982d90`（v0.9 冻结
+  evidence 为 `aa4bd831…`；v0.7 新增 runtime identity 后 `calibration.fp32_contract_sha256`
+  由 `6d7a24d0…` 变为 `47390b08…`，故 evidence 摘要不同；数值门/校准数值相同）、
   fp32 canonical `47390b08c52697106573264b6c0d5439b4bc4be78cf390e0cd0e3824c30088cd`
   （新增 runtime identity 后变化）、`calibration_verification.json` 文件 SHA
   `756531cefbd12b1a89db10a613ae295cf6611701b1fc341ff0d4f166871e6659`、canonical
@@ -446,6 +449,112 @@ attempt_006 与更早 attempt 仅作历史保留。
   为满足磁盘门，曾将已冻结且被取代的 `synthetic/final`（v0.4 历史权威）临时移至
   `/dev/shm`，Gate B 完成后原样移回；`derived/audit/w1_real_training_update_audit/`
   其余历史 attempt 未删除。完成后磁盘余量约 7.3 GiB。
+- 边界不变：未读取真实 checkpoint payload/父 NPZ 数值、未编译真实资产、未构造真实模型/
+  优化器、未执行真实前向/反向/FK/AdamW、未创建真实 cohort/授权/注册；Gate C/D/E 仍未运行。
+  `objective_coverage=partial`、`full_objective_contract_passed=null`、
+  `factor_selected=false`、`auto_execute=false`、`final_interaction_method=not_ready`、
+  `production_integration=false`。v0.9 方案/校准/合成/准入字节未改写。
+
+### 10.7 v0.8 审阅修复与 Gate B 重新冻结（2026-10-31）
+
+独立审阅确认 **4 P1 + 3 P2**；全部按反例修复后，Gate B 以最终字节重新执行。本节是当前
+权威；§10.6（v0.7/attempt_007）及更早 attempt 仅作历史保留。
+
+**修复项（均有新增反例）**
+
+- **P1 构造分项守卫**：`_production_loss` 在 `G1TorchFK` 之前、`LossAssembler`（真实大箱体
+  场景编译）之前分别执行同一 deadline+guard；场景编译完成后立即计入
+  `scene_setup_mj_forward`，即使后续单元拒绝也保留已完成的实际计数；构造失败不缓存半成品
+  assembler。隔离时钟使 FK 构造返回时已过期：仅 FK 被构造，`LossAssembler` 与
+  `scene_setup_mj_forward` 均为 0；成功后再次调用仍只计 1 次真实编译。
+- **P1 资产闭包复验**：每次 `materialize`（含续跑复用已封口 R0、跳过 metadata）在父数组/
+  config 实际摘要之后、tokenizer/参考后端/模型构造之前执行 `_verify_asset_closure`：先核验
+  父 FK registration 文件自身冻结 SHA，再核对四个锁定文件、37 个引用、解析目标集合、
+  `from`/`tag`/SHA、`reference_count` 与 `closure_sha256`。隔离反例中改写 mesh 字节或删除
+  include 均在真实编译前以 `asset_reference_sha`/`asset_reference_missing` 拒绝。
+- **P1 封口摘要消费**：`_attempt_consumable` 新增 `_sealed_evidence_problems`，逐项核验
+  `report`/`summary` 的保存 SHA 与 `artifacts` 路径/摘要；complete 但无报告、报告被改写或
+  数组工件漂移均不可消费。隔离检查把报告 `complete_evidence` 改为 false 而保留原封口摘要后，
+  `stage_state` 返回 `report_drifted`；恢复原字节后重新可消费，篡改工件后返回
+  `artifact_drifted`。
+- **P1 F 身份门阻断**：F worker 的 `worker_runtime_identity` 与候选预检同列硬门，任一非空
+  即在 `from_spec`/fixture/真实读取/构造/重放之前终止；`from_spec` 现在解析并加载
+  acceptance、核对 `acceptance_sha256`，使 `materialize` 的身份检查在 worker 内同样生效；
+  `finally` 仍按实际计数收口。隔离反例中故意漂移身份后 worker 返回 2、`from_spec` 从未
+  被调用、所有计数为 0。
+- **P2 线程数身份**：`RUNTIME_IDENTITY_KEYS` 增加 `cpu_threads`（本次校准/全链均为 20）；
+  父进程、合成接受、真实准入、R0、F worker 与 P/I 物化均核对该值，单线程环境漂移不再因
+  其他字段相同而放行。
+- **P2 payload dtype 契约**：`load_state_dict(strict=True)` 前新增逐张量键集、dtype、shape
+  与有限性检查；float64 权重（含 `1.0000000001` 被静默舍入为 `1.0` 的形态）、坏形状、
+  缺失键与非有限值均在复制前拒绝，`strict=True` 仍保留。隔离的小型 CPU 模块反例覆盖
+  `model_dtype/model_shape/model_nonfinite/model_missing`。
+- **P2 文档订正**：v0.9 冻结校准 evidence 为 `aa4bd83167ea11a7c1cb159e494269b7d843f8233bbbc272558caf9c59e0a9ed`
+  （fp32 canonical `6d7a24d0…`）；attempt_007 为 `8fc90e39…`（fp32 `47390b08…`，v0.7 新增
+  runtime identity）；attempt_008 为 `28bb6625…`（fp32 `a9513ca3…`，v0.8 新增
+  `cpu_threads`）。三者数值门/校准数值逐项相同，但 `calibration.fp32_contract_sha256`
+  变化使 evidence 摘要变化，不能表述为“与 v0.9 相同”。
+
+**测试（最终字节）**
+
+- `tests/test_w1_real_training_update_provider.py`：**36 passed**（新增 5 项：FK→场景截止、
+  payload dtype/shape/finite、资产闭包复验、`from_spec` acceptance、worker 身份先于真实构造；
+  另有线程数身份断言）。
+- `tests/test_w1_real_training_update_audit.py`：**56 passed**（新增 1 项封口摘要/工件反例）。
+- 六个相关回归文件：**263 passed**。
+- 合并运行（2+6 文件）：**355 passed（379.25s）**；全项目套件未重跑。
+
+**Gate B 最终产物（attempt_008）**
+
+- 校准 `derived/audit/w1_real_training_update_audit/calibration/attempt_008/`：
+  `tolerance_contract.json` SHA `6af1d60529d83a0d01b75d24bad1c871718e8b3b29541de3ef55537381d481a5`、
+  evidence `28bb66259d12dd224bef34064cef2419efd02aed847175a487abdd403237bfc6`、
+  fp32 canonical `a9513ca311d530c8554844a474080aefd1359e300b1f0790c7aa256756f44f3e`；
+  `calibration_verification.json` 文件 SHA
+  `44c20b42e0d556b76fb5e65685366999de52d065e0c12e355fd3e19593dfdfef`、canonical
+  `54091ea62f230a48687baba5224f722009f452342144d31c753660f6c5fb46e4`；
+  `recompute_problems=[]`、`four_x_ok=true`，最大 4× 比值 `delta_same_input=0.925540`
+  （其余 `alpha_x_t=0.867157`、`delta_cross_path=0.864409`、`state_cross_path=0.579252`、
+  `parameter_gradient=0.361710`、`theta_cross_path=0.300759`、`output_cotangent=0.068296`、
+  `loss_scalar=0.032639`、`global_norm_clip=0.002895`、`independent_float64=0.0`）。
+  阈值/规则/零底与 v0.9 逐项相同；runtime identity 记录 Python 3.12.13、Torch
+  2.14.0+cu126、NumPy 2.5.3、SciPy 1.18.1、CUDA 12.6、RTX 3090、MuJoCo 3.13.0、
+  `cpu_threads=20`、AdamW 源码 `6f4a96e7…`/`39c5eaa0…`。
+- 完整合成链 `derived/audit/w1_real_training_update_audit/synthetic/attempt_008/`：
+  `audit_result.json` SHA `1e31b28e7ef194c4bf8a2dde3cdc8080536f6a7fea889f8c7fa365cef51d6627`、
+  final `cda2647b2ba0042976acd11640aa23db861fe74c1a86ca190a7c21a36221ceb7`、
+  registration `7b3d95a75987475464f1e3da6b9f1982d10499e267dcaeed3f65656eb0ae49a5`；
+  四 stage done/sealed、consumer problems 均空、264 tensor/3864 行、调用矩阵精确
+  （8 loads、64/64 forwards、48 draw units、32/32 VJP、64 production FK、16/16 updates、
+  15840/115200 reference FK、64 micro、0 synthetic scene）、`training_updates=16`；结论
+  **`audit_incomplete`**（`complete_evidence=true`、`failures=[]`、`problems=[]`、
+  **582** gap：392 precision + 190 sensitivity + 0 bound-unverifiable）。F 新进程
+  pid 1832099/ppid 1829291（pid≠ppid、ppid=父）、exit `ok`、`verification_problems=[]`；
+  成本 R0 1.1751/P 13.5609/I 58.2882/F 121.0190 = **194.0433s**，各 1/2 次；工件
+  7,404,757,557 bytes（约 6.896 GiB）。`synthetic_acceptance.json` SHA
+  `f3976183f288900fb74b9eb2ad840a86d5066f5b7b3e8a32e9529521009a8224`、
+  `passed=true/problems=[]`、`run_sha256=eec4bad18b50aa6cc4452992f2296fb197c7db56256f7785263f90b3756f26a2`；
+  阶段文件数 R0 3/P 5/I 5/F 12、fixture 6、run 3，消费校验 `[]`。
+- 真实 metadata-only admission
+  `derived/audit/w1_real_training_update_audit/admission_real/attempt_008/admission_package.json`
+  SHA **`8a16c0599822538d07deba5001cb074812a196e7b76c4aaeecf34042d28048c0`**（452,490 bytes），
+  `passed=true/problems=[]`、validator `[]`，绑定 acceptance `f3976183…`、校准 canonical
+  `54091ea6…`、evidence `28bb6625…`、fp32 `a9513ca3…`；实现闭包 **25 文件**且与当前树逐位
+  一致（plan `f82c89a8…`、audit `6166f675…`、provider `1e4b79fd…`、provider tests
+  `21a6519a…`、audit tests `a1e12ea8…`）；父锚 10/10、checkpoint 2/2、资产闭包
+  `checked=true`/37 引用/problems 空；read scope
+  `npz_values_read/checkpoint_payload_read/torch_load_calls/model_constructor_calls/
+  muJoCo_compile_calls/conditioner_forward/model_forward/vjp_calls/optimizer_steps=0`，
+  `asset_closure_verified=true`、`cohort_created=false/registered_attempt_created=false`；
+  `runtime_identity.cpu_threads=20` 且与校准记录逐项一致；状态保持
+  `authorized=false/registered=false/run=not_run/section_10_2_checked=false`。
+- 被取代证据：`synthetic/attempt_007` 与 `admission_real/attempt_007` 在本轮实现/plan 字节
+  更新后被 attempt_008 取代并保留为历史。为满足 R0 的 20 GiB 磁盘门，本轮曾将已冻结且被
+  取代的 `synthetic/final` 与 `synthetic/attempt_006` 临时移至
+  `/dev/shm/w1_quarantine_20261031/`，Gate B 完成后原样移回；首次 attempt_008 因余量
+  18.9 GiB < 20 GiB 在 R0 失败（`r0_disk_free`，无阶段计算），该临时输出与本轮 pytest
+  临时目录（约 5.2 GiB）已删除后重跑。其余历史 attempt 未删除；恢复后磁盘余量约
+  **3.45 GiB**。
 - 边界不变：未读取真实 checkpoint payload/父 NPZ 数值、未编译真实资产、未构造真实模型/
   优化器、未执行真实前向/反向/FK/AdamW、未创建真实 cohort/授权/注册；Gate C/D/E 仍未运行。
   `objective_coverage=partial`、`full_objective_contract_passed=null`、

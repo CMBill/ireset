@@ -3961,16 +3961,20 @@ def _worker_main(spec_path: str, out_dir: str) -> int:
         runtime = configure_production_runtime()
         if runtime["problems"]:
             problems += [f"worker_runtime:{p}" for p in runtime["problems"]]
+        identity_problems: list[str] = []
         if mode == "real":
-            problems += [f"worker_runtime_identity:{p}" for p in
-                         runtime_identity_problems(
-                             (spec.get("provider") or {}).get(
-                                 "runtime_identity"))]
+            identity_problems = [f"worker_runtime_identity:{p}" for p in
+                                 runtime_identity_problems(
+                                     (spec.get("provider") or {}).get(
+                                         "runtime_identity"))]
+            problems += identity_problems
         candidates_problems = (precheck_candidates()
                                if candidate_checks else [])
-        if candidates_problems:
+        if candidates_problems or identity_problems:
             problems += candidates_problems
-            raise TimeoutError("candidate_precheck_failed")
+            raise TimeoutError(
+                "candidate_precheck_failed" if candidates_problems
+                else "runtime_identity_failed")
         guard("fixture_load")
         if mode == "real":
             from ireset.eval.w1_real_training_update_provider import (
@@ -5250,6 +5254,43 @@ def finish_attempt(root: Path, stage: str, attempt: str, t0: float,
     return SealResult(ok, row, problems, terminal_state)
 
 
+def _sealed_evidence_problems(index_row: Mapping[str, Any]) -> list[str]:
+    """Verify the sealed report/summary/artifact digests on disk.
+
+    A consumer must never accept evidence that changed after sealing; the
+    recorded digests are the only binding between the row and its files.
+    """
+    problems: list[str] = []
+    for key in ("report", "summary"):
+        rel = index_row.get(key)
+        if not rel:
+            if key == "report" and index_row.get("complete") is True:
+                problems.append("report_missing")
+            continue
+        path = PROJECT_ROOT / str(rel)
+        if not path.is_file():
+            problems.append(f"{key}_missing")
+            continue
+        expected = index_row.get(f"{key}_sha256")
+        if not expected:
+            problems.append(f"{key}_sha256_missing")
+        elif sha256_file(path) != expected:
+            problems.append(f"{key}_drifted")
+    artifacts = index_row.get("artifacts")
+    if artifacts is not None:
+        if not isinstance(artifacts, Mapping):
+            problems.append("artifacts_invalid")
+        else:
+            for rel, expected in artifacts.items():
+                path = PROJECT_ROOT / str(rel)
+                name = Path(str(rel)).name
+                if not path.is_file():
+                    problems.append(f"artifact_missing:{name}")
+                elif not isinstance(expected, str) or sha256_file(path) != expected:
+                    problems.append(f"artifact_drifted:{name}")
+    return problems
+
+
 def _attempt_consumable(root: Path, stage: str, attempt: str,
                         index_row: Mapping[str, Any],
                         ledger_row: Mapping[str, Any], *,
@@ -5264,9 +5305,7 @@ def _attempt_consumable(root: Path, stage: str, attempt: str,
     if index_row.get("status") != "done" \
             or ledger_row.get("status") != "done":
         problems.append("attempt_status_not_done")
-    for key in ("report", "summary"):
-        if index_row.get(key) and not (PROJECT_ROOT / index_row[key]).is_file():
-            problems.append(f"{key}_missing")
+    problems += _sealed_evidence_problems(index_row)
     deltas = stage_attempt_deltas(root, stage, current=allow_current)
     if deltas is None or attempt not in deltas:
         problems.append("attempt_call_delta_unknown")
@@ -5735,7 +5774,7 @@ def implementation_identity(project_root: Path) -> dict:
 #: check is metadata/source-hash only; it never runs a numeric probe.
 RUNTIME_IDENTITY_KEYS = (
     "python", "torch", "numpy", "scipy", "cuda_available",
-    "cuda_device_count", "cuda_version",
+    "cuda_device_count", "cuda_version", "cpu_threads",
 )
 ADAM_SOURCE_MODULES = ("torch.optim.adam", "torch.optim.adamw")
 

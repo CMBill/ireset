@@ -936,6 +936,40 @@ def _window_meta_problems(window_keys: Any) -> list[str]:
     return problems
 
 
+def _state_dict_problems(module: Any, payload: Any,
+                         label: str) -> list[str]:
+    """Strict payload contract: exact keys, dtype, shape and finiteness."""
+    if not isinstance(payload, Mapping):
+        return [f"{label}_payload_not_mapping"]
+    state = module.state_dict()
+    problems: list[str] = []
+    missing = sorted(set(state) - set(payload))
+    extra = sorted(set(payload) - set(state))
+    if missing:
+        problems.append(f"{label}_missing:{','.join(missing[:3])}")
+    if extra:
+        problems.append(f"{label}_unexpected:{','.join(extra[:3])}")
+    for name, target in state.items():
+        value = payload.get(name)
+        if not torch.is_tensor(value):
+            problems.append(f"{label}_not_tensor:{name}")
+            continue
+        if value.dtype != target.dtype:
+            problems.append(f"{label}_dtype:{name}:{value.dtype}")
+        if tuple(value.shape) != tuple(target.shape):
+            problems.append(f"{label}_shape:{name}")
+        if not bool(torch.isfinite(value).all()):
+            problems.append(f"{label}_nonfinite:{name}")
+    return problems
+
+
+def _copy_state_strict(module: Any, payload: Any, label: str) -> None:
+    problems = _state_dict_problems(module, payload, label)
+    if problems:
+        raise ValueError(f"checkpoint state refused: {problems}")
+    module.load_state_dict(payload, strict=True)
+
+
 class RealTrainingProvider:
     """Registered real provider; never constructed without Gate A wiring."""
 
@@ -1003,11 +1037,24 @@ class RealTrainingProvider:
                   project_root: Path = PROJECT_ROOT) -> "RealTrainingProvider":
         if spec.get("mode") != "real":
             raise ValueError("real provider spec mode mismatch")
-        return cls(project_root,
-                   spec.get("config") or MODEL_CONFIG,
-                   device=str(spec.get("device", "cuda")),
-                   acceptance_path=(Path(spec["acceptance_path"])
-                                    if spec.get("acceptance_path") else None))
+        root = Path(project_root)
+        acceptance = spec.get("acceptance_path")
+        acceptance_path = None
+        if acceptance:
+            acceptance_path = Path(acceptance)
+            if not acceptance_path.is_absolute():
+                acceptance_path = root / acceptance_path
+        provider = cls(root, spec.get("config") or MODEL_CONFIG,
+                       device=str(spec.get("device", "cuda")),
+                       acceptance_path=acceptance_path)
+        if provider.acceptance_path is not None:
+            # The worker must carry the same acceptance identity as its
+            # parent; without this the materialize guard cannot re-check it.
+            provider.load_acceptance()
+            if spec.get("acceptance_sha256") \
+                    and provider.acceptance_sha != spec.get("acceptance_sha256"):
+                raise ValueError("synthetic acceptance sha drifted")
+        return provider
 
     def for_stage(self, stage: str) -> "RealTrainingProvider":
         provider = RealTrainingProvider(
@@ -1233,6 +1280,27 @@ class RealTrainingProvider:
                 f"train config drifted: {config_actual} != {TRAIN_CONFIG_SHA}")
         self.source_sha256 = actual
 
+    def _verify_asset_closure(self) -> None:
+        """Re-hash the frozen locked-asset closure before any compilation.
+
+        Resuming from a sealed R0 skips ``metadata()``, so every
+        materialization re-hashes the four locked files, every resolved
+        mesh/include target and the parent FK registration itself.
+        """
+        self._check("materialize_asset_closure")
+        rel, want = PARENT_FILES["fk_registration"]
+        path = self.root / rel
+        actual = sha256_file(path) if path.is_file() else None
+        if actual != want:
+            raise ValueError("parent FK registration drifted")
+        registration = read_json(path)
+        expected = (registration or {}).get("locked_assets") or {}
+        assets = _asset_closure_facts(self.root, mode="real")
+        problems = [f"asset:{p}" for p in assets.get("problems") or []]
+        problems += _asset_binding_problems(assets, expected)
+        if problems:
+            raise ValueError(f"asset closure refused: {problems}")
+
     def _load_arrays(self) -> dict[str, np.ndarray]:
         self._verify_source_digests()
         self._check("materialize_array_decode")
@@ -1353,6 +1421,7 @@ class RealTrainingProvider:
             raise ValueError("materialize requires the R0 noise schedule")
         self.noise = list(r0_noise)
         arrays = self._load_arrays()
+        self._verify_asset_closure()
         self._check("materialize_tokenizer")
         self._build_tokenizer(arrays)
         problems = _window_values_problems(arrays, self.constants or {})
@@ -1446,13 +1515,20 @@ class RealTrainingProvider:
         if self._production_assembler is None:
             from ireset.kinematics.torch_adapter import G1TorchFK
 
+            self._check("production_fk_construction")
             fk = G1TorchFK(device=self.device, dtype=torch.float32)
-            self._production_assembler = LossAssembler(
+            # The scene compile is an independent real-asset operation; a
+            # deadline crossed during FK construction must stop it here.
+            self._check("production_scene_construction")
+            assembler = LossAssembler(
                 self.tokenizer, LOSS_WEIGHTS, self.device,
                 fk=CountingFk(_GuardedFk(fk, self), counter))
             if not self._scene_setup_counted:
+                # Count the compile that actually completed, even if a later
+                # unit then refuses to continue.
                 counter.add("scene_setup_mj_forward", 1)
                 self._scene_setup_counted = True
+            self._production_assembler = assembler
         return self._production_assembler
 
     def _load_checkpoint(self, model_type: str,
@@ -1564,9 +1640,12 @@ class RealTrainingProvider:
                 construction_observer=construction)
         self._check("trainer_state_dict")
         payload = self._load_checkpoint(model_type, counter)
-        trainer.model.load_state_dict(payload["model"], strict=True)
-        trainer.conditioner.load_state_dict(payload["conditioner"],
-                                            strict=True)
+        self._check("trainer_state_copy")
+        # load_state_dict(strict=True) still casts a float64 payload into the
+        # float32 parameters, so every tensor is checked before the copy.
+        _copy_state_strict(trainer.model, payload["model"], "model")
+        _copy_state_strict(trainer.conditioner, payload["conditioner"],
+                           "conditioner")
         if not all(bool(torch.isfinite(p).all())
                    for p in (*trainer.model.parameters(),
                              *trainer.conditioner.parameters())):
@@ -1638,6 +1717,8 @@ def _asset_binding_problems(actual: Mapping[str, Any],
             problems.append(f"asset_reference_sha:{Path(key).name}")
         if got.get("tag") != rec.get("tag"):
             problems.append(f"asset_reference_tag:{Path(key).name}")
+        if got.get("from") != rec.get("from"):
+            problems.append(f"asset_reference_from:{Path(key).name}")
     if actual.get("closure_sha256") != expected.get("closure_sha256"):
         problems.append("asset_closure_sha")
     if int(actual.get("reference_count", -1)) != int(
