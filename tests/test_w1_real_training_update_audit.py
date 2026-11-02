@@ -1156,6 +1156,94 @@ def test_stage_unit_guard_admits_only_the_running_parent(tmp_path):
     assert "unit_parent_not_registered" in str(caught.value)
 
 
+def _noise_stage_provider() -> object:
+    class Provider:
+        mode = "real"
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def bind_counter(self, _counter: object) -> None:
+            pass
+
+        def load_noise_schedule(self, _path: Path) -> list[dict]:
+            self.calls.append("noise")
+            return [{"update": 1, "micro": 0}]
+
+        def materialize(self, **_kwargs: object) -> dict:
+            self.calls.append("materialize")
+            raise RuntimeError("stop_after_materialize")
+
+    return Provider()
+
+
+@pytest.mark.parametrize("stage", ["P", "I"])
+def test_stage_decodes_r0_noise_before_materialize_under_the_guard(
+        tmp_path, stage):
+    noise = tmp_path / "noise_schedule.npz"
+    noise.write_bytes(b"frozen-noise")
+    digest = A.sha256_file(noise)
+    provider = _noise_stage_provider()
+    units: list[str] = []
+
+    def guard(unit: str) -> None:
+        units.append(unit)
+        if unit == "r0_noise_decoded":
+            raise TimeoutError(unit)
+
+    budget = {"remaining_s": 10.0, "reserve_s": 0.0}
+    with pytest.raises(TimeoutError):
+        if stage == "P":
+            A.run_p_stage(
+                tmp_path / "P", "P", "attempt_001", A._now(), budget,
+                provider, A.CallCounter(A.CALL_CAPS), {},
+                out_dir=tmp_path / "P", guard=guard,
+                r0_noise_path=noise, r0_noise_sha256=digest)
+        else:
+            A.run_i_stage(
+                tmp_path / "I", "I", "attempt_001", A._now(), budget,
+                provider, A.CallCounter(A.CALL_CAPS), {},
+                tmp_path / "P", tolerance={"tolerances": A.TOLERANCE_PROPOSALS},
+                out_dir=tmp_path / "I", guard=guard,
+                r0_noise_path=noise, r0_noise_sha256=digest)
+    # The decode is admitted and post-checked by the stage guard; the
+    # consumer never starts after an expired decode.
+    assert units == ["r0_noise_digest", "r0_noise_decode",
+                     "r0_noise_decoded"]
+    assert provider.calls == ["noise"]
+
+
+def test_stage_noise_digest_drift_aborts_before_decode(tmp_path):
+    noise = tmp_path / "noise_schedule.npz"
+    noise.write_bytes(b"frozen-noise")
+    provider = _noise_stage_provider()
+    with pytest.raises(ValueError, match="drifted"):
+        A.run_p_stage(
+            tmp_path / "P", "P", "attempt_001", A._now(),
+            {"remaining_s": 10.0, "reserve_s": 0.0}, provider,
+            A.CallCounter(A.CALL_CAPS), {}, out_dir=tmp_path / "P",
+            r0_noise_path=noise, r0_noise_sha256="0" * 64)
+    assert provider.calls == []
+
+
+def test_frozen_noise_source_carries_only_the_sealed_digest(tmp_path):
+    root = tmp_path / "run"
+    path = A.stage_dir(root, "R0") / "attempt_001" / "noise_schedule.npz"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"frozen-noise")
+    sealed = "f" * 64
+    row = {"artifacts": {A.path_for_record(path): sealed}}
+    got_path, got_digest = A.frozen_noise_source(root, "attempt_001", row)
+    assert got_path == path and got_digest == sealed
+    # The digest is the sealed value, not a fresh hash of the file.
+    assert got_digest != A.sha256_file(path)
+    with pytest.raises(SystemExit, match="digest missing"):
+        A.frozen_noise_source(root, "attempt_001", {})
+    path.unlink()
+    with pytest.raises(SystemExit, match="noise schedule missing"):
+        A.frozen_noise_source(root, "attempt_001", row)
+
+
 def test_i_stage_checks_deadline_before_reference_context(chain, tmp_path):
     counter = A.CallCounter(A.CALL_CAPS)
     with pytest.raises(TimeoutError) as caught:

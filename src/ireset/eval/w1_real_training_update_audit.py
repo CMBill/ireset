@@ -1768,6 +1768,49 @@ def _noise_unit_index() -> dict[tuple[int, int], int]:
             for u in UPDATES for m in range(MICRO_COUNT)}
 
 
+def _decode_r0_noise(provider: Any, *, path: Path | None,
+                     digest: str | None,
+                     check: Callable[[str], None]) -> list[dict]:
+    """Decode the frozen R0 schedule inside the consuming attempt.
+
+    Only the sealed path and digest cross the stage boundary.  The decode
+    runs under the stage's deadline and unit admission, so a slow read is
+    charged to the stage that consumes it instead of slipping between two
+    registered attempts.
+    """
+    if path is None or not digest:
+        raise ValueError("R0 noise schedule missing")
+    check("r0_noise_digest")
+    actual = sha256_file(Path(path))
+    if actual != digest:
+        raise ValueError(f"R0 noise schedule drifted: {actual}")
+    check("r0_noise_decode")
+    schedule = provider.load_noise_schedule(Path(path))
+    check("r0_noise_decoded")
+    return list(schedule)
+
+
+def frozen_noise_source(root: Path, attempt: str,
+                        row: Mapping[str, Any] | None
+                        ) -> tuple[Path, str]:
+    """Return the R0 path and digest carried by the sealed row.
+
+    The digest is read from the sealed artifacts, never recomputed between
+    stages: a consumer must re-verify it inside its own registered window.
+    """
+    path = stage_dir(root, "R0") / attempt / "noise_schedule.npz"
+    digest = None
+    if isinstance(row, Mapping) and isinstance(row.get("artifacts"),
+                                               Mapping):
+        digest = row["artifacts"].get(path_for_record(path))
+    if not path.is_file():
+        raise SystemExit("R0 noise schedule missing")
+    if not isinstance(digest, str) or not digest:
+        raise SystemExit("R0 noise schedule digest missing")
+    return path, digest
+
+
+
 def run_p_stage(root: Path, stage: str, attempt: str, t0: float,
                 budget: Mapping[str, Any], provider: Any,
                 counter: CallCounter, roster: Mapping[str, Any],
@@ -1776,6 +1819,8 @@ def run_p_stage(root: Path, stage: str, attempt: str, t0: float,
                 guard: Callable[[str], None] | None = None,
                 registered: bool = True,
                 r0_noise: Sequence[dict] | None = None,
+                r0_noise_path: Path | None = None,
+                r0_noise_sha256: str | None = None,
                 parent_input_admission: Mapping[str, Any] | None = None,
                 write_input_admission: bool = False,
                 r0_registration_sha: str | None = None) -> dict:
@@ -1800,6 +1845,10 @@ def run_p_stage(root: Path, stage: str, attempt: str, t0: float,
     admission_path: Path | None = None
     admission_sha: str | None = None
     if mode == "real":
+        if r0_noise is None:
+            r0_noise = _decode_r0_noise(
+                provider, path=r0_noise_path, digest=r0_noise_sha256,
+                check=check)
         admission = provider.materialize(
             stage="P", r0_noise=r0_noise, counter=counter, guard=check,
             deadline=deadline, registered=registered,
@@ -3029,6 +3078,8 @@ def run_i_stage(root: Path, stage: str, attempt: str, t0: float,
                 guard: Callable[[str], None] | None = None,
                 registered: bool = True,
                 r0_noise: Sequence[dict] | None = None,
+                r0_noise_path: Path | None = None,
+                r0_noise_sha256: str | None = None,
                 parent_input_admission: Mapping[str, Any] | None = None,
                 r0_registration_sha: str | None = None) -> dict:
     base = Path(out_dir or (stage_dir(root, stage) / attempt))
@@ -3049,6 +3100,10 @@ def run_i_stage(root: Path, stage: str, attempt: str, t0: float,
     failures: list[str] = []
     gaps: list[str] = []
     if mode == "real":
+        if r0_noise is None:
+            r0_noise = _decode_r0_noise(
+                provider, path=r0_noise_path, digest=r0_noise_sha256,
+                check=check)
         admission = provider.materialize(
             stage="I", r0_noise=r0_noise, counter=counter, guard=check,
             deadline=deadline, registered=registered,
@@ -7899,16 +7954,13 @@ def run_registered_audit(run_root: Path, provider: Any,
             binder_(counter)
         return stage_p
 
-    def r0_noise_from(selected_attempt: str) -> tuple[Any, Path | None, str | None]:
+    def r0_noise_frozen(selected_attempt: str,
+                        row: Mapping[str, Any] | None
+                        ) -> tuple[Path | None, str | None]:
+        """Sealed path and digest only; values are decoded in the consumer."""
         if mode == "synthetic":
-            return provider.noise, None, None
-        path = (stage_dir(run_root, "R0") / selected_attempt /
-                "noise_schedule.npz")
-        if not path.is_file():
-            raise SystemExit("R0 noise schedule missing")
-        stage_p = provider.for_stage("R0")
-        schedule = stage_p.load_noise_schedule(path)
-        return schedule, path, sha256_file(path)
+            return None, None
+        return frozen_noise_source(run_root, selected_attempt, row)
 
     # --- R0 -----------------------------------------------------------------
     first_start = (_now() if r0_started_perf is None
@@ -7970,6 +8022,7 @@ def run_registered_audit(run_root: Path, provider: Any,
         if not seal.sealed or not r0["passed"] or r0_consumer:
             blockers = r0["problems"] + seal.problems + r0_consumer
             return stop(blockers, r0["gaps"] + seal.problems + r0_consumer)
+        r0_row = seal.row
         registration_sha = r0["registration_sha256"]
         selected["R0"] = attempt
     else:
@@ -7977,11 +8030,12 @@ def run_registered_audit(run_root: Path, provider: Any,
         if problems or row is None:
             return stop([f"selected_r0:{p}" for p in problems],
                         [f"selected_r0:{p}" for p in problems])
+        r0_row = row
         registration_sha = row.get("registration_sha256")
         results["R0"] = {"resumed": True, "attempt": selected["R0"]}
         seals["R0"] = {"sealed": True, "terminal": True,
                        "resumed": True, "row": row}
-    r0_noise, r0_noise_path, r0_noise_sha = r0_noise_from(selected["R0"])
+    r0_noise_path, r0_noise_sha = r0_noise_frozen(selected["R0"], r0_row)
 
     # --- P ------------------------------------------------------------------
     if start_index <= 1:
@@ -8007,7 +8061,10 @@ def run_registered_audit(run_root: Path, provider: Any,
                     run_root, "P", attempt,
                     registration_sha=registration_sha,
                     deadline=stage_deadline),
-                registered=True, r0_noise=r0_noise,
+                registered=True,
+                r0_noise=(provider.noise if mode == "synthetic" else None),
+                r0_noise_path=r0_noise_path,
+                r0_noise_sha256=r0_noise_sha,
                 write_input_admission=(mode == "real"),
                 r0_registration_sha=registration_sha)
         except (TimeoutError, UpdateCallBudgetExceeded) as exc:
@@ -8115,7 +8172,10 @@ def run_registered_audit(run_root: Path, provider: Any,
                     run_root, "I", attempt,
                     registration_sha=registration_sha,
                     deadline=stage_deadline),
-                registered=True, r0_noise=r0_noise,
+                registered=True,
+                r0_noise=(provider.noise if mode == "synthetic" else None),
+                r0_noise_path=r0_noise_path,
+                r0_noise_sha256=r0_noise_sha,
                 parent_input_admission=p_input_admission,
                 r0_registration_sha=registration_sha)
         except (TimeoutError, UpdateCallBudgetExceeded) as exc:

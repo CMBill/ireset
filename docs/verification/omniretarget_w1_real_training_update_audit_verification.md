@@ -243,12 +243,12 @@ v0.8 的第六轮 2 P1 修复与 54 项测试保留在历史（`synthetic/histor
 ## 10. Gate A/B 真实 provider 接入与执行计划实现（2026-10-31）
 
 执行计划：[W1 真实 provider 接入与执行计划](../plans/omniretarget_w1_real_training_update_provider_execution_plan.md)
-（v0.10，`gate_a_implemented / gate_b_acceptance_passed / gate_c_not_authorized /
+（v0.11，`gate_a_implemented / gate_b_acceptance_passed / gate_c_not_authorized /
 gate_d_e_not_run`）。§10.1–§10.4 记录 v0.6 初次 Gate A/B 实现；§10.6 记录 v0.7 的 5 P1+4 P2
 修复与 attempt_007；§10.7 记录 v0.8 的 4 P1+3 P2 修复与 attempt_008；§10.8–§10.9 记录
 v0.9 的 4 P1+2 P2 修复、选择字段撤回与 attempt_009/010；§10.10 记录 v0.10 的 1 P1+1 P2
-修复与 attempt_011，为当前权威。Gate C（新的 §10.2 明确授权）、Gate D（真实 R0）与 Gate E
-（真实 P→I→F）未执行。
+修复与 attempt_011；§10.11 记录 v0.11 的 1 P2 修复与 attempt_012，为当前权威。Gate C
+（新的 §10.2 明确授权）、Gate D（真实 R0）与 Gate E（真实 P→I→F）未执行。
 
 ### 10.1 Gate A 实现
 
@@ -353,8 +353,8 @@ v0.9 的 4 P1+2 P2 修复、选择字段撤回与 attempt_009/010；§10.10 记�
 
 ### 10.5 Gate B 后的下一步
 
-先由用户复阅本记录、执行计划 v0.10、`calibration/attempt_011`、`synthetic/attempt_011` 与
-`admission_real/attempt_011`（§10.10）；随后提供新的 §10.2 明确授权记录（10 项 checklist
+先由用户复阅本记录、执行计划 v0.11、`calibration/attempt_012`、`synthetic/attempt_012` 与
+`admission_real/attempt_012`（§10.11）；随后提供新的 §10.2 明确授权记录（10 项 checklist
 全 true，并绑定执行计划/校准验证/接受报告/准入包/实现哈希）。未取得授权前不得运行
 `--real`/`--resume`，不得创建真实 cohort 或消耗真实调用额度。
 
@@ -730,10 +730,11 @@ attempt_010）。§10.7（v0.8/attempt_008）、§10.6（v0.7/attempt_007）及�
   `factor_selected=false`、`auto_execute=false`、`final_interaction_method=not_ready`、
   `production_integration=false`。v0.9 方案/校准/合成/准入字节未改写。
 
-### 10.10 v0.10 场景内部守卫与阶段消费计费修复（2026-10-31）
+### 10.10 v0.10 场景内部守卫与阶段消费计费修复（2026-10-31；已被 §10.11 取代）
 
-独立审阅确认 **1 P1 + 1 P2**；全部按反例修复后，Gate B 以最终字节重新执行。本节为当前
-权威；§10.8–§10.9（v0.9/attempt_009/010）及更早 attempt 仅作历史保留。
+独立审阅确认 **1 P1 + 1 P2**；全部按反例修复后，Gate B 以最终字节重新执行。本节保留
+attempt_011 的历史事实；当前权威为 §10.11（v0.11/attempt_012），§10.8–§10.9
+（v0.9/attempt_009/010）及更早 attempt 仅作历史保留。
 
 **修复项（均有新增反例）**
 
@@ -797,6 +798,78 @@ attempt_010）。§10.7（v0.8/attempt_008）、§10.6（v0.7/attempt_007）及�
 - 被取代证据：`synthetic/attempt_010` 与 `admission_real/attempt_010` 在场景内部守卫与
   阶段消费计费修复后被 attempt_011 取代并保留为历史；更早 attempt 未删除。当前余盘约
   **171.11 GiB**，满足 R0 的 20 GiB 门。
+- 边界不变：未读取真实 checkpoint payload/父 NPZ 数值、未编译真实资产、未构造真实模型/
+  优化器、未执行真实前向/反向/FK/AdamW、未创建真实 cohort/授权/注册；Gate C/D/E 仍未运行。
+  `objective_coverage=partial`、`full_objective_contract_passed=null`、
+  `factor_selected=false`、`auto_execute=false`、`final_interaction_method=not_ready`、
+  `production_integration=false`。v0.9 方案/校准/合成/准入字节未改写。
+
+### 10.11 v0.11 阶段间噪声解码计费修复（2026-11-02）
+
+独立审阅确认 **1 P2**；按反例修复后，Gate B 以最终字节重新执行（`calibration/attempt_012`、
+`synthetic/attempt_012`、`admission_real/attempt_012`）。本节为当前权威；§10.10
+（v0.10/attempt_011）及更早 attempt 仅作历史保留。
+
+**修复项（均有新增反例）**
+
+- **P2 噪声解码移入已登记阶段**：原 `r0_noise_from` 在 R0 消费核验之后、P 的 t0 与
+  running/reservation 登记之前直接解码 `noise_schedule.npz`。受控反例中 R0 已记账
+  90s、解码耗时 1000s 后 P 才以 1090s 为起点登记，1000s 完全未入账。现 R0 只向后续
+  阶段传递封口工件中的路径与摘要：`frozen_noise_source` 从 sealed `artifacts` 读取
+  路径与摘要，不在阶段间重新哈希或解码；P/I 各自在 `run_p_stage`/`run_i_stage` 内、
+  `materialize` 前调用 `_decode_r0_noise`，先按封口摘要核验文件，再由阶段同一 `check`
+  （deadline + unit admission）在解码前、解码后分别守卫，解码耗时进入该阶段
+  `finish_attempt` 的 `measured_wall_s` 与 `_charge_stage_consumption`。P 解码越界时
+  以实际耗时封口 incomplete，I 不再启动；F 继续在其 worker 进程内解码并由 F 阶段计费。
+  阶段间不传递解码后的噪声对象。
+- **测试**：审计 **64 passed**（新增 P/I 解码先于 `materialize` 且同一 guard 在
+  `r0_noise_decoded` 拒绝后 `materialize` 未执行；摘要漂移在解码前拒绝；封口摘要只取自
+  sealed `artifacts`、不重新哈希文件），provider **40 passed**、六个相关文件
+  **263 passed**，合并 **367 passed（393.93s）**；另 `test_geometry` **8 passed**、
+  `test_omniretarget_w1_review` **40 passed**。
+
+**Gate B 最终产物（attempt_012）**
+
+- 校准 `derived/audit/w1_real_training_update_audit/calibration/attempt_012/`：
+  `tolerance_contract.json` SHA
+  `f77824e5609ad120702132e58872984d84ac48e7eb9088152d9d6ff08c8707d4`、evidence
+  `28bb66259d12dd224bef34064cef2419efd02aed847175a487abdd403237bfc6`、fp32 canonical
+  `a9513ca311d530c8554844a474080aefd1359e300b1f0790c7aa256756f44f3e`；
+  `calibration_verification.json` 文件 SHA
+  `49a359ec3d82daed686eacec5da81a1ce522148686ce14979afc9a0f52bfbd90`、canonical
+  `d2ea697783ae475507c1d16d63fde46fd0b25b3d48a3190cd2cf10ec7ebcf7a7`；
+  `recompute_problems=[]`、`four_x_ok=true`，最大 4× `delta_same_input=0.925540`，阈值/
+  规则/零底与 v0.9 逐项相同；`cpu_threads=20`。
+- 完整合成链 `derived/audit/w1_real_training_update_audit/synthetic/attempt_012/`：
+  `audit_result.json` SHA `3ded65b1d18ee71660bc2940110d7d39d026aa591f6e57ac39e64bd11ed7e73d`、
+  final `1fb8075c8ceb58139e88a3fb80fc866bb47c725065bcbe35335355af64786515`、
+  registration `358f7d0c205354599a2e25656e013199bad92cfb01cd3a919f542ce05c50d3bf`；
+  四 stage done/sealed、consumer problems 均空、264 tensor/3864 行、调用矩阵精确
+  （8 loads、64/64 forwards、48 draw units、32/32 VJP、64 production FK、16/16 updates、
+  15840/115200 reference FK、64 micro、0 synthetic scene）、`training_updates=16`；结论
+  **`audit_incomplete`**（`complete_evidence=true`、`failures=[]`、`problems=[]`、
+  **582** gap：392 precision + 190 sensitivity + 0 bound-unverifiable）。F 新进程
+  pid 3959223/ppid 3955521、exit `ok`、`verification_problems=[]`；成本
+  R0 1.1719/P 17.3034/I 67.7256/F 158.0184 = **244.2193s**；阶段消费核验墙钟
+  R0 0.0067/P 4.2455/I 12.4193/F 16.7836s，P/I/F 均按 `cost_floor` 重封口计入对应成本；
+  工件 7,404,795,428 bytes。P/I 的 NPZ 与 rows 与 attempt_011 逐位相同，证明合成数值
+  路径未因本修复变化。`synthetic_acceptance.json` SHA
+  `58dc92455eaf8f6fa266a833a7b63462d42ad0e554efd9aa1bc1c1d0368d7a4a`、
+  `passed=true/problems=[]`、`run_sha256=cd890107e3e30b93bfc7599f42c6d8dc05d1bb46580e6a86b52f1012cccda3f6`；
+  阶段文件数 R0 3/P 5/I 5/F 12、fixture 6、run 3，消费校验 `[]`。
+- 真实 metadata-only admission
+  `derived/audit/w1_real_training_update_audit/admission_real/attempt_012/admission_package.json`
+  SHA **`8d4ec09e6f51015f3985b0539da9d7e9b962042141f67ddc53660edc012292ab`**（452,490 bytes），
+  `passed=true/problems=[]`、validator `[]`，绑定 acceptance `58dc9245…`、校准 canonical
+  `d2ea6977…`、evidence `28bb6625…`、fp32 `a9513ca3…`；实现闭包 **25 文件**且与当前树
+  逐位一致（plan `e66cd8a9…`、audit `91f228e2…`、provider `65a5549e…`、
+  distance_adapter `efcc80b4…`、provider tests `e3999870…`、audit tests `5bda56a0…`）；
+  父锚 10/10、checkpoint 2/2、资产闭包 `checked=true`/37 引用/problems 空；read scope
+  全零；`runtime_identity.cpu_threads=20` 且与校准记录逐项一致；状态保持
+  `authorized=false/registered=false/run=not_run/section_10_2_checked=false`。
+- 被取代证据：`synthetic/attempt_011` 与 `admission_real/attempt_011` 在噪声解码计费修复
+  后被 attempt_012 取代并保留为历史；更早 attempt 未删除。当前余盘约 **164.18 GiB**，
+  满足 R0 的 20 GiB 门。
 - 边界不变：未读取真实 checkpoint payload/父 NPZ 数值、未编译真实资产、未构造真实模型/
   优化器、未执行真实前向/反向/FK/AdamW、未创建真实 cohort/授权/注册；Gate C/D/E 仍未运行。
   `objective_coverage=partial`、`full_objective_contract_passed=null`、

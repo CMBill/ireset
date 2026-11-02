@@ -1,10 +1,10 @@
 # W1 真实网络参数梯度与优化更新链路——真实 provider 接入与执行计划
 
-日期：2026-10-31。版本：v0.10。状态：**`gate_a_implemented / gate_b_acceptance_passed / gate_c_not_authorized / gate_d_e_not_run`**。
+日期：2026-11-02。版本：v0.11。状态：**`gate_a_implemented / gate_b_acceptance_passed / gate_c_not_authorized / gate_d_e_not_run`**。
 
-本计划承接 v0.9 的纯合成 I/C 交付，目标是实现真实 provider、完成只读准入和 R0 元数据登记，并在取得新的 §10.2 明确授权后执行一次真实 **R0→P→I→F**。v0.10 承接 v0.9 的 Gate A/B 实现并按独立审阅修复 1 P1+1 P2，重新冻结校准、完整合成、合成接受与真实 metadata-only admission：真实 provider 与参考后端、续跑/显式 attempt 选择、F 候选预检/结算后终检/封口后最终选择、真实 admission schema、CLI 分派均已落地。Gate C（新的明确授权）、Gate D（真实 R0）与 Gate E（真实 P→I→F）仍未执行；本轮不读取真实 checkpoint payload 或源 NPZ 数值，不编译真实资产，不创建真实 cohort/reservation/experiment run，也不改变 v0.9 的历史工件。
+本计划承接 v0.10 的纯合成 I/C 交付，目标是实现真实 provider、完成只读准入和 R0 元数据登记，并在取得新的 §10.2 明确授权后执行一次真实 **R0→P→I→F**。v0.11 承接 v0.10 的 Gate A/B 实现并按独立审阅修复 1 P2，重新冻结校准、完整合成、合成接受与真实 metadata-only admission：真实 provider 与参考后端、续跑/显式 attempt 选择、F 候选预检/结算后终检/封口后最终选择、真实 admission schema、CLI 分派均已落地。Gate C（新的明确授权）、Gate D（真实 R0）与 Gate E（真实 P→I→F）仍未执行；本轮不读取真实 checkpoint payload 或源 NPZ 数值，不编译真实资产，不创建真实 cohort/reservation/experiment run，也不改变 v0.9 的历史工件。
 
-下文 Gate A–E、测试、校准、准入及真实运行中的已执行部分以 §6 的 v0.6–v0.10 记录为准；未执行部分仍为后续待办。文档状态不代表真实授权或真实链已通过。
+下文 Gate A–E、测试、校准、准入及真实运行中的已执行部分以 §6 的 v0.6–v0.11 记录为准；未执行部分仍为后续待办。文档状态不代表真实授权或真实链已通过。
 
 ## 1. 固定依据与边界
 
@@ -360,3 +360,7 @@ v0.5 文档静态检查：版本/索引、链接/代码围栏/空白、两段命
 - **P1 场景构造内部守卫**：`largebox_static_frame` 新增 `check` 回调，在 `G1Spec()`（含其 plain 编译）、`load_scene()` 第二次编译、`MjData` 分配和 `mj_forward` 前分别检查同一 deadline+guard。provider 传入 `production_*` 单元包装；受控时钟首次 plain 编译返回即过期时，场景编译、`MjData` 与 forward 均不启动，`scene_setup_mj_forward` 不增加。
 - **P2 阶段间消费核验计费**：新增 `_charge_stage_consumption`，在 R0/P/I 封口后的 `stage_state` 调用之后，以实际耗时重封口（`cost_floor`）；若超出该阶段预算，撤回完成声明与报告中的 complete 字段并返回 `post_consumption_verification_budget_exceeded`，调用方在进入下游阶段前停止。F 尾部继续使用 `_charge_final_verification`；受控 P 预算 900s、封口 90s、核验 1000s 的反例不再保持 complete 或启动 I。
 - **测试**：provider **40 passed**（新增场景 helper 内部守卫反例）、审计 **60 passed**（新增阶段消费核验计费反例）、六个相关文件 **263 passed**，合并 **363 passed（383.70s）**；另 `test_geometry` 8 passed 与 `test_omniretarget_w1_review` 40 passed。Gate B 重新执行写入 `calibration/attempt_011`、`synthetic/attempt_011`、`admission_real/attempt_011`；最终 SHA、调用矩阵、582 gap、16 次更新、F 新进程与工件大小以验证记录 §10.10 为准。v0.9 方案/校准/合成/准入字节不变。
+
+**v0.11 复审修复与 Gate B 重新冻结（2026-11-02）：`1 P2` 修复，`gate_b_acceptance_passed` 重新成立，Gate C/D/E 仍未执行。** 本轮只修改审计器/测试与本计划；不读取真实 checkpoint payload、父 NPZ 数值或编译真实资产。
+- **P2 阶段间噪声解码计费**：`r0_noise_from` 原在 R0 消费核验后、P 的 t0 与 running/reservation 登记前直接解码 `noise_schedule.npz`；受控反例中 R0 已记账 90s、解码耗时 1000s 后 P 才以 1090s 起点登记，1000s 完全未入账。现阶段间只传 R0 封口工件中的路径与摘要（`frozen_noise_source` 从 sealed `artifacts` 读取，不重新哈希文件）；P/I 各自在已登记尝试内、`materialize` 前调用 `_decode_r0_noise`，先核验摘要，再由阶段同一 `check`（deadline + unit admission）在解码前、解码后分别守卫，解码耗时计入该阶段封口。R0 已消费但 P 解码越界时 P 以实际耗时封口 incomplete，I 不再启动；F 继续在其 worker 进程内解码并由 F 阶段计费。
+- **测试**：审计 **64 passed**（新增 P/I 解码先于 materialize 且受同一 guard、摘要漂移拒绝、封口摘要仅来自 sealed artifacts 三组反例），provider **40 passed**、六个相关文件 **263 passed**，合并 **367 passed（393.93s）**；另 `test_geometry` 8 passed 与 `test_omniretarget_w1_review` 40 passed。Gate B 重新执行写入 `calibration/attempt_012`、`synthetic/attempt_012`、`admission_real/attempt_012`；最终 SHA、调用矩阵、582 gap、16 次更新、F 新进程与工件大小以验证记录 §10.11 为准。v0.9 方案/校准/合成/准入字节不变。
