@@ -27,11 +27,13 @@ LARGEBOX_AABB_CENTER = np.array([2.810e-3, 3.0e-5, 7.030e-3])
 LARGEBOX_HALF_EXTENTS = np.array([0.22132, 0.21167, 0.20298])
 
 
-def largebox_static_frame() -> tuple[np.ndarray, np.ndarray]:
+def largebox_static_frame(*, observer=None) -> tuple[np.ndarray, np.ndarray]:
     """Static geom frame (R, x) of the largebox in its **body** frame.
 
     Cached after first compile of the locked scene: with the box body at
-    identity, ``geom_xmat/xpos`` give T_body_geom.
+    identity, ``geom_xmat/xpos`` give T_body_geom.  ``observer`` is called
+    immediately after the first successful ``mj_forward`` so callers can
+    record the completed compile even if later construction fails.
     """
     global _STATIC_FRAME
     if _STATIC_FRAME is None:
@@ -47,6 +49,8 @@ def largebox_static_frame() -> tuple[np.ndarray, np.ndarray]:
         qadr = m.jnt_qposadr[m.body_jntadr[bid]]
         d.qpos[qadr : qadr + 7] = [0, 0, 0, 1, 0, 0, 0]
         mujoco.mj_forward(m, d)
+        if observer is not None:
+            observer()
         _STATIC_FRAME = (d.geom_xmat[box].reshape(3, 3).copy(), d.geom_xpos[box].copy())
     return _STATIC_FRAME
 

@@ -47,14 +47,16 @@ def _zero_snapshot() -> dict:
 
 
 def _finish(root: Path, stage: str, attempt: str, complete: bool,
-            report: Path | None, t0: float | None = None) -> None:
+            report: Path | None, t0: float | None = None,
+            artifacts: dict | None = None) -> None:
     A.finish_attempt(
         root, stage, attempt, t0 if t0 is not None else A._now(),
         _budget(), {"complete": complete,
                     "report": A.path_for_record(report)
                     if report is not None else None,
                     "summary": A.path_for_record(report)
-                    if report is not None else None},
+                    if report is not None else None,
+                    "artifacts": dict(artifacts or {})},
         status="done" if complete else "incomplete",
         extra={"stage": stage, "call_balance": _zero_snapshot()})
 
@@ -231,7 +233,7 @@ def _fake_mujoco():
     return module, state
 
 
-def _fake_g1spec(monkeypatch):
+def _fake_g1spec(monkeypatch, calls=None):
     from ireset.embodied import g1_spec
 
     class Model:
@@ -249,8 +251,15 @@ def _fake_g1spec(monkeypatch):
         jnt_range = np.tile(np.array([-1.0, 1.0]), (29, 1))
 
     class Spec:
+        def __init__(self):
+            if calls is not None:
+                calls.append("first_compile")
+            self.model = Model()
+
         def load_plain(self):
-            return Model()
+            if calls is not None:
+                calls.append("second_compile")
+            return self.model
 
     bodies = {name: f"b{i}" for i, name in enumerate(A.SITE_NAMES)}
     monkeypatch.setattr(g1_spec, "G1Spec", Spec)
@@ -258,7 +267,95 @@ def _fake_g1spec(monkeypatch):
     monkeypatch.setattr(g1_spec, "JOINT_NAMES", [f"j{i}" for i in range(29)])
 
 
-def test_real_reference_backend_partial_counts_and_guards(monkeypatch):
+def test_reference_backend_guards_the_second_compile(monkeypatch):
+    fake, _state = _fake_mujoco()
+    monkeypatch.setitem(sys.modules, "mujoco", fake)
+    calls: list[str] = []
+    _fake_g1spec(monkeypatch, calls)
+
+    def guard(unit: str) -> None:
+        if unit == "reference_backend_recompile":
+            raise TimeoutError(unit)
+
+    with pytest.raises(TimeoutError):
+        P.RealReferenceBackend(
+            A.CallCounter(A.CALL_CAPS), deadline=None, guard=guard,
+            joint_lo=np.full(29, -1.0), joint_hi=np.full(29, 1.0))
+    assert calls == ["first_compile"]
+
+
+def test_trainer_internal_units_check_the_guard(tmp_path, monkeypatch):
+    calls: list[str] = []
+
+    class FakeTrainer:
+        def __init__(self, *args, **kwargs):
+            observer = kwargs["construction_observer"]
+            observer("model")
+            observer("conditioner")
+            observer("optimizer")
+
+    monkeypatch.setattr(P, "Trainer", FakeTrainer)
+    provider = P.RealTrainingProvider(tmp_path)
+    provider.tokenizer = StateTokenizer(
+        np.tile(np.array([-1.0, 1.0]), (29, 1)),
+        RootStats(mean=np.zeros(3), std=np.ones(3)))
+
+    def guard(unit: str) -> None:
+        calls.append(unit)
+        if unit == "trainer_conditioner_constructed":
+            raise TimeoutError(unit)
+
+    provider._guard = guard
+    counter = A.CallCounter(A.CALL_CAPS)
+    with pytest.raises(TimeoutError):
+        provider.build_trainer("deterministic", with_optimizer=True,
+                               counter=counter, loss_mode="forbidden")
+    assert calls == [
+        "trainer_construction", "trainer_construction",
+        "trainer_model_constructed", "trainer_conditioner_constructed"]
+    assert counter.counts["model_constructions"] == 1
+    assert counter.counts["conditioner_constructions"] == 1
+    assert counter.counts["native_optimizer_constructions"] == 0
+
+
+def test_scene_setup_is_counted_at_forward_not_assembler_completion(
+        tmp_path, monkeypatch):
+    import ireset.geometry.distance_adapter as D
+    import ireset.kinematics.torch_adapter as TA
+
+    calls: list[str] = []
+
+    class FakeFK:
+        def __init__(self, device="cpu", dtype=None):
+            calls.append("fk")
+
+    class OomAssembler:
+        def __init__(self, *args, static_frame=None, **kwargs):
+            calls.append("assembler")
+            raise RuntimeError("simulated tensor transfer oom")
+
+    def fake_scene(*, observer=None):
+        calls.append("scene")
+        if observer is not None:
+            observer()
+        return np.eye(3), np.zeros(3)
+
+    monkeypatch.setattr(P, "LossAssembler", OomAssembler)
+    monkeypatch.setattr(D, "largebox_static_frame", fake_scene)
+    monkeypatch.setattr(TA, "G1TorchFK", FakeFK)
+    provider = P.RealTrainingProvider(tmp_path)
+    provider.tokenizer = StateTokenizer(
+        np.tile(np.array([-1.0, 1.0]), (29, 1)),
+        RootStats(mean=np.zeros(3), std=np.ones(3)))
+    counter = A.CallCounter(A.CALL_CAPS)
+    with pytest.raises(RuntimeError, match="oom"):
+        provider._production_loss(counter)
+    assert calls == ["fk", "scene", "assembler"]
+    assert counter.counts["scene_setup_mj_forward"] == 1
+    assert provider._production_assembler is None
+
+
+
     fake, state = _fake_mujoco()
     monkeypatch.setitem(sys.modules, "mujoco", fake)
     _fake_g1spec(monkeypatch)
@@ -280,9 +377,10 @@ def test_real_reference_backend_partial_counts_and_guards(monkeypatch):
     assert counter.counts["reference_mj_forward"] == 1
     assert state["forward"] == 1
     # An absolute deadline is checked before every call.
-    backend = P.RealReferenceBackend(counter, deadline=A._now(),
+    backend = P.RealReferenceBackend(counter, deadline=None,
                                      joint_lo=np.full(29, -1.0),
                                      joint_hi=np.full(29, 1.0))
+    backend.deadline = A._now()
     with pytest.raises(TimeoutError):
         backend.positions(pos, R, q)
     assert counter.counts["reference_mj_forward"] == 1
@@ -444,6 +542,7 @@ def test_build_and_checkpoint_units_recheck_the_guard(tmp_path):
 
 
 def test_fk_deadline_stops_the_scene_compile(tmp_path, monkeypatch):
+    import ireset.geometry.distance_adapter as D
     import ireset.kinematics.torch_adapter as TA
 
     calls: list[str] = []
@@ -456,10 +555,17 @@ def test_fk_deadline_stops_the_scene_compile(tmp_path, monkeypatch):
             raise AssertionError("FK must not run during construction")
 
     class FakeAssembler:
-        def __init__(self, *args, **kwargs):
+        def __init__(self, *args, static_frame=None, **kwargs):
             calls.append("assembler")
 
+    def fake_scene(*, observer=None):
+        calls.append("scene")
+        if observer is not None:
+            observer()
+        return np.eye(3), np.zeros(3)
+
     monkeypatch.setattr(TA, "G1TorchFK", FakeFK)
+    monkeypatch.setattr(D, "largebox_static_frame", fake_scene)
     monkeypatch.setattr(P, "LossAssembler", FakeAssembler)
     provider = P.RealTrainingProvider(tmp_path)
     provider.tokenizer = StateTokenizer(
@@ -468,7 +574,7 @@ def test_fk_deadline_stops_the_scene_compile(tmp_path, monkeypatch):
     counter = A.CallCounter(A.CALL_CAPS)
 
     def expired(unit: str) -> None:
-        if unit == "production_scene_construction":
+        if unit == "production_scene_setup":
             raise TimeoutError(unit)
 
     provider._guard = expired
@@ -483,7 +589,7 @@ def test_fk_deadline_stops_the_scene_compile(tmp_path, monkeypatch):
     calls.clear()
     provider._guard = None
     provider._production_loss(counter)
-    assert calls == ["fk", "assembler"]
+    assert calls == ["fk", "scene", "assembler"]
     assert counter.counts["scene_setup_mj_forward"] == 1
 
 
@@ -765,9 +871,24 @@ def _manual_attempt(root: Path, stage: str, attempt: str, *,
     A.settle_stage_calls(root, stage, attempt,
                          {"counts": {kind: 0 for kind in A.CALL_KINDS}})
     directory = A.stage_dir(root, stage) / attempt
-    report = directory / "report.json"
-    A.write_json(report, {"complete_evidence": complete})
-    _finish(root, stage, attempt, complete, report)
+    prefix = "p" if stage == "P" else "i"
+    report = directory / f"{prefix}_report.json"
+    (directory / f"{prefix}_rows.json").write_text("[]")
+    models = {}
+    for model in ("deterministic", "diffusion"):
+        arrays = directory / f"{prefix}_{model}.npz"
+        arrays.write_bytes(f"{prefix}:{model}".encode())
+        models[model] = {"arrays_path": A.path_for_record(arrays),
+                         "arrays_sha256": A.sha256_file(arrays)}
+    report_data = {"complete_evidence": complete, "models": models}
+    if stage == "P":
+        report_data["input_admission"] = None
+    A.write_json(report, report_data)
+    artifacts = {
+        A.path_for_record(path): A.sha256_file(path)
+        for path in directory.rglob("*") if path.is_file()
+    }
+    _finish(root, stage, attempt, complete, report, artifacts=artifacts)
 
 
 def test_stage_state_rejects_multiple_consumable_attempts(tmp_path):
@@ -1038,6 +1159,59 @@ def test_synthetic_acceptance_binds_every_evidence_file(tmp_path):
     drifted["runtime_identity"]["torch"] = "0.0.0"
     assert any("acceptance_runtime:runtime_identity:torch" in p
                for p in P.synthetic_acceptance_problems(drifted))
+
+
+def test_worker_aborts_before_replay_when_source_evidence_drifted(
+        tmp_path, monkeypatch):
+    root = tmp_path / "cohort"
+    A.write_cohort(root, mode="real")
+    attempt = "attempt_001"
+    A.pre_register_attempt(root, "F", attempt, A._now(), scope={},
+                           budget=_budget())
+    A.reserve_stage_calls(
+        root, "F", attempt,
+        {"counts": A.stage_nominal_for_mode("real", "F")})
+    noise = tmp_path / "noise_schedule.npz"
+    noise.write_bytes(b"noise")
+    admission = tmp_path / "input_admission.json"
+    A.write_json(admission, {"passed": False})
+    spec_path = tmp_path / "worker_spec.json"
+    A.write_json(spec_path, {
+        "mode": "real", "run_root": str(root), "stage": "F",
+        "attempt": attempt, "deadline_perf_counter": A._now() + 60.0,
+        "reserve_s": 0.0, "remaining_caps": dict(A.CALL_CAPS),
+        "registration_sha256": None, "candidate_attempts": {},
+        "candidate_checks": False, "project_root": str(tmp_path),
+        "roster": {}, "config": TINY_CONFIG, "device": "cpu",
+        "provider": {"runtime_identity": A.runtime_identity_facts()},
+        "r0_noise_path": str(noise), "r0_noise_sha256": "0" * 64,
+        "p_input_admission_path": str(admission),
+        "p_input_admission_sha256": "1" * 64,
+    })
+
+    class FakeProvider:
+        roster: dict = {}
+        noise: list = []
+
+        def load_noise_schedule(self, path):
+            raise AssertionError("drifted noise must not be decoded")
+
+    monkeypatch.setattr(P.RealTrainingProvider, "from_spec",
+                        classmethod(lambda cls, *a, **k: FakeProvider()))
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("replay must not start")
+
+    monkeypatch.setattr(A, "run_p_stage", forbidden)
+    out = tmp_path / "worker"
+    assert A._worker_main(str(spec_path), str(out)) == 2
+    result = A.read_json(out / "worker_result.json")
+    assert {"schedule_source_sha", "p_input_admission_sha",
+            "p_input_admission_not_passed"} <= set(result["problems"])
+    counts = result["counts"]["counts"]
+    assert counts["cpu_draw_units"] == A.DRAW_UNITS_PER_PATH
+    assert all(int(value) == 0 for kind, value in counts.items()
+               if kind != "cpu_draw_units")
 
 
 def test_from_spec_restores_the_acceptance_identity(tmp_path):

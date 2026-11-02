@@ -243,10 +243,11 @@ v0.8 的第六轮 2 P1 修复与 54 项测试保留在历史（`synthetic/histor
 ## 10. Gate A/B 真实 provider 接入与执行计划实现（2026-10-31）
 
 执行计划：[W1 真实 provider 接入与执行计划](../plans/omniretarget_w1_real_training_update_provider_execution_plan.md)
-（v0.8，`gate_a_implemented / gate_b_acceptance_passed / gate_c_not_authorized /
+（v0.9，`gate_a_implemented / gate_b_acceptance_passed / gate_c_not_authorized /
 gate_d_e_not_run`）。§10.1–§10.4 记录 v0.6 初次 Gate A/B 实现；§10.6 记录 v0.7 的 5 P1+4 P2
-修复与 attempt_007；§10.7 记录 v0.8 的 4 P1+3 P2 修复与 attempt_008，为当前权威。Gate C
-（新的 §10.2 明确授权）、Gate D（真实 R0）与 Gate E（真实 P→I→F）未执行。
+修复与 attempt_007；§10.7 记录 v0.8 的 4 P1+3 P2 修复与 attempt_008；§10.8 记录 v0.9
+首次冻结与 attempt_009；§10.9 记录 P2-2 选择字段撤回补充后的最终 attempt_010，为当前
+权威。Gate C（新的 §10.2 明确授权）、Gate D（真实 R0）与 Gate E（真实 P→I→F）未执行。
 
 ### 10.1 Gate A 实现
 
@@ -351,8 +352,8 @@ gate_d_e_not_run`）。§10.1–§10.4 记录 v0.6 初次 Gate A/B 实现；§10
 
 ### 10.5 Gate B 后的下一步
 
-先由用户复阅本记录、执行计划 v0.8、`calibration/attempt_008`、`synthetic/attempt_008` 与
-`admission_real/attempt_008`（§10.7）；随后提供新的 §10.2 明确授权记录（10 项 checklist
+先由用户复阅本记录、执行计划 v0.9、`calibration/attempt_010`、`synthetic/attempt_010` 与
+`admission_real/attempt_010`（§10.9）；随后提供新的 §10.2 明确授权记录（10 项 checklist
 全 true，并绑定执行计划/校准验证/接受报告/准入包/实现哈希）。未取得授权前不得运行
 `--real`/`--resume`，不得创建真实 cohort 或消耗真实调用额度。
 
@@ -455,10 +456,11 @@ attempt_007 的历史事实；当前权威为 §10.7（v0.8/attempt_008）。att
   `factor_selected=false`、`auto_execute=false`、`final_interaction_method=not_ready`、
   `production_integration=false`。v0.9 方案/校准/合成/准入字节未改写。
 
-### 10.7 v0.8 审阅修复与 Gate B 重新冻结（2026-10-31）
+### 10.7 v0.8 审阅修复与 Gate B 重新冻结（2026-10-31；已被 §10.8 取代）
 
-独立审阅确认 **4 P1 + 3 P2**；全部按反例修复后，Gate B 以最终字节重新执行。本节是当前
-权威；§10.6（v0.7/attempt_007）及更早 attempt 仅作历史保留。
+独立审阅确认 **4 P1 + 3 P2**；全部按反例修复后，Gate B 以最终字节重新执行。本节保留
+attempt_008 的历史事实；当前权威为 §10.8（v0.9/attempt_009）。§10.6（v0.7/attempt_007）
+及更早 attempt 仅作历史保留。
 
 **修复项（均有新增反例）**
 
@@ -555,6 +557,172 @@ attempt_007 的历史事实；当前权威为 §10.7（v0.8/attempt_008）。att
   18.9 GiB < 20 GiB 在 R0 失败（`r0_disk_free`，无阶段计算），该临时输出与本轮 pytest
   临时目录（约 5.2 GiB）已删除后重跑。其余历史 attempt 未删除；恢复后磁盘余量约
   **3.45 GiB**。
+- 边界不变：未读取真实 checkpoint payload/父 NPZ 数值、未编译真实资产、未构造真实模型/
+  优化器、未执行真实前向/反向/FK/AdamW、未创建真实 cohort/授权/注册；Gate C/D/E 仍未运行。
+  `objective_coverage=partial`、`full_objective_contract_passed=null`、
+  `factor_selected=false`、`auto_execute=false`、`final_interaction_method=not_ready`、
+  `production_integration=false`。v0.9 方案/校准/合成/准入字节未改写。
+
+### 10.8 v0.9 复审修复与 Gate B 首次冻结（2026-10-31；已被 §10.9 取代）
+
+独立审阅确认 **4 P1 + 2 P2**；全部按反例修复后，Gate B 以最终字节重新执行。本节保留
+attempt_009 的历史事实；当前权威为 §10.9（同一 v0.9 计划，P2-2 选择字段撤回补充后的
+attempt_010）。§10.7（v0.8/attempt_008）、§10.6（v0.7/attempt_007）及更早 attempt 仅作
+历史保留。
+
+**修复项（均有新增反例）**
+
+- **P1 封口必需文件与报告引用闭包**：`_sealed_evidence_problems` 新增
+  `_required_stage_files` 与 `_report_reference_problems`。R0 要求
+  `registration.json`/`admission.json`/`call_reservations.json`（real 另加
+  `noise_schedule.npz`），P 要求 `p_report.json`/`p_rows.json`/两个模型数组/
+  `call_reservations.json`（real 另加 `input_admission.json`），I 要求对应五件，F 要求
+  final/`worker_spec.json`/`worker/worker_result.json`/`call_reservations.json`；同时核验
+  报告中的 registration/noise、模型 `arrays_path`/`arrays_sha256`、P `input_admission`
+  路径与 SHA。隔离反例：改写 R0 `registration.json`/`noise_schedule.npz`、P
+  `input_admission.json` 或模型数组后，`stage_state` 返回
+  `artifact_drifted`/`*_reference_drifted`，不再进入 `r0_noise_from`/I 构造。
+- **P1 Trainer 内部构造分项守卫**：`construction_observer` 在 model、conditioner、
+  optimizer 完成后分别执行同一 deadline+guard。受控时钟令 conditioner 后过期时，
+  optimizer 不再构造，已完成 model/conditioner 计数各为 1、optimizer 为 0。
+- **P1 参考后端第二次编译守卫**：`G1Spec()` 的 `__post_init__` 编译与随后
+  `load_plain()` 编译之间新增 `reference_backend_recompile` 检查，第二次编译后再检查
+  `reference_backend_attach` 才分配 `MjData`。受控反例中第一次编译返回时过期，第二次
+  编译不再启动；正常路径仍为单数据实例。
+- **P1 F 来源门阻断**：噪声来源 SHA、R0 回放一致性、P `input_admission` SHA 与 `passed`
+  收集完成后，在 `run_p_stage`/真实物化/构造/重放前以 `f_source_precheck_failed` 终止；
+  `finally` 保留实际计数（反例中仅 8 个 `cpu_draw_units`，其余 0），三项错误
+  `schedule_source_sha`/`p_input_admission_sha`/`p_input_admission_not_passed` 均上报。
+- **P2 场景完成即计数**：`largebox_static_frame` 新增可选 `observer`，在真实
+  `mj_forward` 成功返回后立即调用；provider 传入计数回调并把静态帧显式交给
+  `LossAssembler`。模拟 assembler 后续设备张量 OOM 时 `scene_setup_mj_forward=1`、
+  半成品不缓存，且不会二次调用场景缓存。
+- **P2 最终消费核验计费**：新增 `_charge_final_verification`；F 封口后的 P/I/F 消费核验
+  （重新哈希大工件）实际耗时超过账面成本时，以 `cost_floor` 重封口；越界则转
+  incomplete 并返回 `post_seal_verification_budget_exceeded`，外层撤回完整选择和完成声明。
+  本次全链核验墙钟 **17.4570s** 已重封口计入 F 成本，账面 `measured_wall_s=165.8239s`；
+  受控 100s/102.8s 反例不再保留 complete/selection。
+
+**测试（最终字节）**
+
+- `tests/test_w1_real_training_update_provider.py`：**39 passed**（新增第二次编译守卫、
+  Trainer 分项守卫、场景 forward 计数；扩展 F 来源反例）。
+- `tests/test_w1_real_training_update_audit.py`：**59 passed**（新增封口必需文件/报告引用、
+  R0 noise、P input_admission 与最终核验计费反例）。
+- 六个相关回归文件：**263 passed**；另跑 `tests/test_geometry.py` **8 passed**、
+  `tests/test_omniretarget_w1_review.py` **40 passed**。
+- 合并运行（2+6 文件）：**361 passed（386.36s）**；全项目套件未重跑。
+
+**Gate B 最终产物（attempt_009）**
+
+- 校准 `derived/audit/w1_real_training_update_audit/calibration/attempt_009/`：
+  `tolerance_contract.json` SHA
+  `47d529736be79740f62492fbce53704d7164bb356d243b7fdf8b9d813f99f229`、evidence
+  `28bb66259d12dd224bef34064cef2419efd02aed847175a487abdd403237bfc6`、fp32 canonical
+  `a9513ca311d530c8554844a474080aefd1359e300b1f0790c7aa256756f44f3e`；
+  `calibration_verification.json` 文件 SHA
+  `a1b8f9ca926c94927b8a553f631d6c535ccdd5d38d2fbd867cbcb38ee2ef0090`、canonical
+  `0d3bcf4be163454ace81eeed65fc6fbc8b1a9fc00cab5317108723f033fbb842`；
+  `recompute_problems=[]`、`four_x_ok=true`，最大 4× 比值 `delta_same_input=0.925540`
+  （`alpha_x_t=0.867157`、`delta_cross_path=0.864409`、`state_cross_path=0.579252`），
+  阈值/规则/零底与 v0.9 逐项相同；`cpu_threads=20`。
+- 完整合成链 `derived/audit/w1_real_training_update_audit/synthetic/attempt_009/`：
+  `audit_result.json` SHA `4046b1bb9a8440ec57932a4c3e6f1b9aa17de04bb5f634b67fbc0c91897dfed7`、
+  final `9129eab81673ddb3ef8def98652ec091f351a47d9852a57f49c3af6916d9d030`、
+  registration `c5fc0afef591fecb80a4341515e3975ae125f8f428ab9fe4cb3949f7f466e527`；
+  四 stage done/sealed、consumer problems 均空、264 tensor/3864 行、调用矩阵精确
+  （8 loads、64/64 forwards、48 draw units、32/32 VJP、64 production FK、16/16 updates、
+  15840/115200 reference FK、64 micro、0 synthetic scene）、`training_updates=16`；结论
+  **`audit_incomplete`**（`complete_evidence=true`、`failures=[]`、`problems=[]`、
+  **582** gap：392 precision + 190 sensitivity + 0 bound-unverifiable）。F 新进程
+  pid 3505207/ppid 3501398（pid≠ppid、ppid=父）、exit `ok`、`verification_problems=[]`；
+  成本 R0 1.1774/P 13.2543/I 57.8275/F 165.8239 = **238.0830s**，各 1/2 次；工件
+  7,404,777,964 bytes（约 6.896 GiB）。`synthetic_acceptance.json` SHA
+  `45393f5c36b8100cfd875c11f456b33d07822397e519edc678ea6b2a5b6a8dd9`、
+  `passed=true/problems=[]`、`run_sha256=93af1d3a731d2afed16c5a0992bdbd676696e049137785c4f19df833e2999824`；
+  阶段文件数 R0 3/P 5/I 5/F 12、fixture 6、run 3，消费校验 `[]`。
+- 真实 metadata-only admission
+  `derived/audit/w1_real_training_update_audit/admission_real/attempt_009/admission_package.json`
+  SHA **`3e063f66f6a0a82230ecce1d7707c67d5d5ee86cab3919de20d8767e587db4f0`**（452,490 bytes），
+  `passed=true/problems=[]`、validator `[]`，绑定 acceptance `45393f5c…`、校准 canonical
+  `0d3bcf4b…`、evidence `28bb6625…`、fp32 `a9513ca3…`；实现闭包 **25 文件**且与当前树
+  逐位一致（plan `29451f6b…`、audit `084a3d35…`、provider `e088c1e3…`、
+  distance_adapter `bd1981d4…`、provider tests `9eb2cd98…`、audit tests `7696d76a…`）；
+  父锚 10/10、checkpoint 2/2、资产闭包 `checked=true`/37 引用/problems 空；read scope
+  `npz_values_read/checkpoint_payload_read/torch_load_calls/model_constructor_calls/
+  muJoCo_compile_calls/conditioner_forward/model_forward/vjp_calls/optimizer_steps=0`，
+  `asset_closure_verified=true`、`cohort_created=false/registered_attempt_created=false`；
+  `runtime_identity.cpu_threads=20` 且与校准记录逐项一致；状态保持
+  `authorized=false/registered=false/run=not_run/section_10_2_checked=false`。
+- 被取代证据：`synthetic/attempt_008` 与 `admission_real/attempt_008` 在本轮实现/plan
+  字节更新后被 attempt_009 取代并保留为历史。为运行全链测试与 Gate B，本轮曾将已冻结且
+  被取代的 `synthetic/final` 与 `synthetic/attempt_006` 临时移至 `/dev/shm`，完成后原样
+  移回；未删除任何历史 attempt。当前余盘约 **150.96 GiB**，满足 R0 的 20 GiB 门。
+- 边界不变：未读取真实 checkpoint payload/父 NPZ 数值、未编译真实资产、未构造真实模型/
+  优化器、未执行真实前向/反向/FK/AdamW、未创建真实 cohort/授权/注册；Gate C/D/E 仍未运行。
+  `objective_coverage=partial`、`full_objective_contract_passed=null`、
+  `factor_selected=false`、`auto_execute=false`、`final_interaction_method=not_ready`、
+  `production_integration=false`。v0.9 方案/校准/合成/准入字节未改写。
+
+### 10.9 v0.9 P2-2 选择字段撤回补充与最终 Gate B 冻结（2026-10-31）
+
+§10.8 的 P2-2 已使越界核验把 row 转为 incomplete 并使返回值 `selected_attempts=None`；
+补充审阅发现磁盘 final summary 仍保留 `selected_attempts`/`selected_chain_counts`/
+`selected_chain_training_updates`。现 `_amend_final_report` 在撤回完成声明时同步把三项
+置 null，matrix-veto 反例新增对应断言。该补充只修改审计器的一处撤回字段与测试；其余
+4 P1+2 P2 修复、容差、调用矩阵与零底不变。Gate B 以最终字节重新执行，本节为当前权威；
+§10.8（attempt_009）及更早 attempt 仅作历史保留。
+
+**测试（最终字节）**
+
+- provider **39 passed**、审计 **59 passed**、六个相关文件 **263 passed**；合并
+  **361 passed（386.67s）**；`tests/test_geometry.py` **8 passed**、
+  `tests/test_omniretarget_w1_review.py` **40 passed**。
+
+**Gate B 最终产物（attempt_010）**
+
+- 校准 `derived/audit/w1_real_training_update_audit/calibration/attempt_010/`：
+  `tolerance_contract.json` SHA
+  `c6b8ab1e48913ec8584da11485a4c29c7511c4967acdf84d1ee7b29a2f4dfd6b`、evidence
+  `28bb66259d12dd224bef34064cef2419efd02aed847175a487abdd403237bfc6`、fp32 canonical
+  `a9513ca311d530c8554844a474080aefd1359e300b1f0790c7aa256756f44f3e`；
+  `calibration_verification.json` 文件 SHA
+  `0615eaa95a9826f271eca2161bf84bc55f4438ce9f8420119c93b7c2752ccdaa`、canonical
+  `afeb494b63964a94824234ed4c5af7679b9cf189129d4af19ea429e2d7573e54`；
+  `recompute_problems=[]`、`four_x_ok=true`，最大 4× `delta_same_input=0.925540`，阈值/
+  规则/零底与 v0.9 逐项相同；`cpu_threads=20`。
+- 完整合成链 `derived/audit/w1_real_training_update_audit/synthetic/attempt_010/`：
+  `audit_result.json` SHA `fd4634ccf7b8780f2d8b91c05136e949859d969c0a3907a70fbcd08374a3a127`、
+  final `a14905df0cb028c0a4f12244fcc66f642203ec7b45a24cee5edf81babceebdcc`、
+  registration `0bd4124c657c8133627ce0f06af8deafaeb7fd6b01ecd802ba87f65ee8c85f92`；
+  四 stage done/sealed、consumer problems 均空、264 tensor/3864 行、调用矩阵精确
+  （8 loads、64/64 forwards、48 draw units、32/32 VJP、64 production FK、16/16 updates、
+  15840/115200 reference FK、64 micro、0 synthetic scene）、`training_updates=16`；结论
+  **`audit_incomplete`**（`complete_evidence=true`、`failures=[]`、`problems=[]`、
+  **582** gap：392 precision + 190 sensitivity + 0 bound-unverifiable）。F 新进程
+  pid 3562581/ppid 3558707、exit `ok`、`verification_problems=[]`；成本
+  R0 1.1858/P 13.6011/I 58.7056/F 164.6997 = **238.1923s**；最终消费核验墙钟
+  **17.3142s** 已由 cost-floor 重封口计入 F，账面 `measured_wall_s=164.6997s`；工件
+  7,404,777,952 bytes。`synthetic_acceptance.json` SHA
+  `c070b8df94d131e3df9620609e5413f4c54da56617ea4918b3b7b6d9cbfd1fab`、
+  `passed=true/problems=[]`、`run_sha256=a30c233b85a1d0303cdf1bb5b7bf439a79b3bcc8d357c55b700e1bd0a54a87ee`；
+  阶段文件数 R0 3/P 5/I 5/F 12、fixture 6、run 3，消费校验 `[]`。
+- 真实 metadata-only admission
+  `derived/audit/w1_real_training_update_audit/admission_real/attempt_010/admission_package.json`
+  SHA **`d4d9fe5a923246584f3121ba1da022a478033cd55a131eb8ec38e73840344968`**（452,490 bytes），
+  `passed=true/problems=[]`、validator `[]`，绑定 acceptance `c070b8df…`、校准 canonical
+  `afeb494b…`、evidence `28bb6625…`、fp32 `a9513ca3…`；实现闭包 **25 文件**且与当前树
+  逐位一致（plan `48b81fb2…`、audit `1d3fe858…`、provider `e088c1e3…`、
+  distance_adapter `bd1981d4…`、provider tests `9eb2cd98…`、audit tests `bc11a068…`）；
+  父锚 10/10、checkpoint 2/2、资产闭包 `checked=true`/37 引用/problems 空；read scope
+  `npz_values_read/checkpoint_payload_read/torch_load_calls/model_constructor_calls/
+  muJoCo_compile_calls/conditioner_forward/model_forward/vjp_calls/optimizer_steps=0`，
+  `asset_closure_verified=true`、`cohort_created=false/registered_attempt_created=false`；
+  `runtime_identity.cpu_threads=20` 且与校准记录逐项一致；状态保持
+  `authorized=false/registered=false/run=not_run/section_10_2_checked=false`。
+- 被取代证据：`synthetic/attempt_009` 与 `admission_real/attempt_009` 在撤回字段补充后
+  被 attempt_010 取代并保留为历史；更早 attempt 未删除。当前余盘约 **146.08 GiB**，
+  满足 R0 的 20 GiB 门。
 - 边界不变：未读取真实 checkpoint payload/父 NPZ 数值、未编译真实资产、未构造真实模型/
   优化器、未执行真实前向/反向/FK/AdamW、未创建真实 cohort/授权/注册；Gate C/D/E 仍未运行。
   `objective_coverage=partial`、`full_objective_contract_passed=null`、

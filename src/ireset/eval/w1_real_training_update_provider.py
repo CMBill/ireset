@@ -283,7 +283,13 @@ class RealReferenceBackend:
         self.counter = counter
         self.deadline = None if deadline is None else float(deadline)
         self._guard = guard
-        self.model = G1Spec().load_plain()
+        # ``G1Spec()`` already compiles once in ``__post_init__``; guard that
+        # compile and the second compile before any construction continues.
+        self._check("reference_backend_compile")
+        spec = G1Spec()
+        self._check("reference_backend_recompile")
+        self.model = spec.load_plain()
+        self._check("reference_backend_attach")
         self.data = mujoco.MjData(self.model)
         if self.model.nq != 7 + N_JOINTS or self.model.nv != 6 + N_JOINTS:
             raise ValueError(
@@ -1513,21 +1519,26 @@ class RealTrainingProvider:
 
     def _production_loss(self, counter: CallCounter) -> LossAssembler:
         if self._production_assembler is None:
+            from ireset.geometry.distance_adapter import largebox_static_frame
             from ireset.kinematics.torch_adapter import G1TorchFK
 
             self._check("production_fk_construction")
             fk = G1TorchFK(device=self.device, dtype=torch.float32)
+
+            def scene_landed() -> None:
+                if not self._scene_setup_counted:
+                    counter.add("scene_setup_mj_forward", 1)
+                    self._scene_setup_counted = True
+
             # The scene compile is an independent real-asset operation; a
             # deadline crossed during FK construction must stop it here.
-            self._check("production_scene_construction")
+            self._check("production_scene_setup")
+            frame = largebox_static_frame(observer=scene_landed)
+            self._check("production_scene_ready")
             assembler = LossAssembler(
                 self.tokenizer, LOSS_WEIGHTS, self.device,
-                fk=CountingFk(_GuardedFk(fk, self), counter))
-            if not self._scene_setup_counted:
-                # Count the compile that actually completed, even if a later
-                # unit then refuses to continue.
-                counter.add("scene_setup_mj_forward", 1)
-                self._scene_setup_counted = True
+                fk=CountingFk(_GuardedFk(fk, self), counter),
+                static_frame=frame)
             self._production_assembler = assembler
         return self._production_assembler
 
@@ -1626,10 +1637,13 @@ class RealTrainingProvider:
         def construction(unit: str) -> None:
             if unit == "model":
                 counter.add("model_constructions", 1)
+                self._check("trainer_model_constructed")
             elif unit == "conditioner":
                 counter.add("conditioner_constructions", 1)
+                self._check("trainer_conditioner_constructed")
             elif unit == "optimizer" and with_optimizer:
                 counter.add("native_optimizer_constructions", 1)
+                self._check("trainer_optimizer_constructed")
 
         self._check("trainer_construction")
         with torch.random.fork_rng(devices=[]):

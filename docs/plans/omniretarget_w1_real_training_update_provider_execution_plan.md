@@ -1,10 +1,10 @@
 # W1 真实网络参数梯度与优化更新链路——真实 provider 接入与执行计划
 
-日期：2026-10-31。版本：v0.8。状态：**`gate_a_implemented / gate_b_acceptance_passed / gate_c_not_authorized / gate_d_e_not_run`**。
+日期：2026-10-31。版本：v0.9。状态：**`gate_a_implemented / gate_b_acceptance_passed / gate_c_not_authorized / gate_d_e_not_run`**。
 
-本计划承接 v0.9 的纯合成 I/C 交付，目标是实现真实 provider、完成只读准入和 R0 元数据登记，并在取得新的 §10.2 明确授权后执行一次真实 **R0→P→I→F**。v0.8 承接 v0.7 的 Gate A/B 实现并按独立审阅修复 4 P1+3 P2，重新冻结校准、完整合成、合成接受与真实 metadata-only admission：真实 provider 与参考后端、续跑/显式 attempt 选择、F 候选预检/结算后终检/封口后最终选择、真实 admission schema、CLI 分派均已落地。Gate C（新的明确授权）、Gate D（真实 R0）与 Gate E（真实 P→I→F）仍未执行；本轮不读取真实 checkpoint payload 或源 NPZ 数值，不编译真实资产，不创建真实 cohort/reservation/experiment run，也不改变 v0.9 的历史工件。
+本计划承接 v0.9 的纯合成 I/C 交付，目标是实现真实 provider、完成只读准入和 R0 元数据登记，并在取得新的 §10.2 明确授权后执行一次真实 **R0→P→I→F**。v0.9 承接 v0.8 的 Gate A/B 实现并按独立审阅修复 4 P1+2 P2，重新冻结校准、完整合成、合成接受与真实 metadata-only admission：真实 provider 与参考后端、续跑/显式 attempt 选择、F 候选预检/结算后终检/封口后最终选择、真实 admission schema、CLI 分派均已落地。Gate C（新的明确授权）、Gate D（真实 R0）与 Gate E（真实 P→I→F）仍未执行；本轮不读取真实 checkpoint payload 或源 NPZ 数值，不编译真实资产，不创建真实 cohort/reservation/experiment run，也不改变 v0.9 的历史工件。
 
-下文 Gate A–E、测试、校准、准入及真实运行中的已执行部分以 §6 的 v0.6/v0.7/v0.8 记录为准；未执行部分仍为后续待办。文档状态不代表真实授权或真实链已通过。
+下文 Gate A–E、测试、校准、准入及真实运行中的已执行部分以 §6 的 v0.6/v0.7/v0.8/v0.9 记录为准；未执行部分仍为后续待办。文档状态不代表真实授权或真实链已通过。
 
 ## 1. 固定依据与边界
 
@@ -92,7 +92,7 @@ Gate A 的完成条件：接口与上述接线齐备，provider 单元测试、�
 
 ### Gate B：合成回归与只读 admission
 
-先以新实现重新验证数值契约，再生成新的 admission attempt；完整绑定范围见 §1.2，不能继续消费 `attempt_012` 的旧实现哈希。provider 测试文件、`--real-admission`、`--synthetic-acceptance` 及验收报告输出已在 v0.6 实现，v0.7/v0.8 修复后重新冻结。
+先以新实现重新验证数值契约，再生成新的 admission attempt；完整绑定范围见 §1.2，不能继续消费 `attempt_012` 的旧实现哈希。provider 测试文件、`--real-admission`、`--synthetic-acceptance` 及验收报告输出已在 v0.6 实现，v0.7/v0.8/v0.9 修复后重新冻结。
 
 以下为复现/重新冻结命令。所有 `<fresh-...>` 路径需先换成未占用的新目录，输出入口须拒绝覆盖已有校准/合成运行：
 
@@ -346,3 +346,12 @@ v0.5 文档静态检查：版本/索引、链接/代码围栏/空白、两段命
 - **P2 payload dtype 契约**：`load_state_dict(strict=True)` 前新增逐张量键集、dtype、shape 与有限性检查；float64 权重、静默 dtype 转换、坏形状/缺失键/非有限值均在复制前拒绝，`strict=True` 仍保留。
 - **P2 文档订正**：v0.9 冻结校准 evidence 为 `aa4bd831…`，attempt_007 为 `8fc90e39…`；两者数值门/校准数值相同，但 `calibration.fp32_contract_sha256` 已变化，故 evidence 摘要不同，不能表述为“与 v0.9 相同”。本版及验证记录给出新旧摘要的明确区分。
 - **测试**：provider 模块 **36 passed**（新增 5 项：FK→场景截止、payload dtype/shape/finite、资产闭包复验、from_spec acceptance、worker 身份先于真实构造），审计模块 **56 passed**（新增封口摘要/工件反例），六个相关文件 **263 passed**，合并 **355 passed（379.25s）**。Gate B 重新执行写入 `calibration/attempt_008`、`synthetic/attempt_008`、`admission_real/attempt_008`；最终 SHA、调用矩阵、582 gap、16 次更新、F 新进程与工件大小以验证记录 §10.7 为准。v0.9 方案/校准/合成/准入字节不变。
+
+**v0.9 复审修复与 Gate B 重新冻结（2026-10-31）：`4 P1 + 2 P2` 全部修复，`gate_b_acceptance_passed` 重新成立，Gate C/D/E 仍未执行。** 本轮只修改审计器/provider/`distance_adapter`/测试与本计划；不读取真实 checkpoint payload、父 NPZ 数值或编译真实资产。
+- **P1 封口必需文件与报告引用闭包**：`_sealed_evidence_problems` 新增 `_required_stage_files` 与 `_report_reference_problems`；R0 绑定 `registration.json`/`admission.json`/`call_reservations.json`（real 另加 `noise_schedule.npz`），P 绑定 `p_report.json`/`p_rows.json`/两个数组/`call_reservations.json`（real 另加 `input_admission.json`），I 绑定 `i_report.json`/`i_rows.json`/两个数组/`call_reservations.json`，F 绑定 final/`worker_spec.json`/`worker/worker_result.json`/`call_reservations.json`。同时核验报告中的 registration/noise、模型 arrays、P input_admission 的路径与保存 SHA；任一文件被改写、删除或未纳入 artifacts 均不可消费，且在下游 `r0_noise_from`/I 构造前拒绝。
+- **P1 Trainer 内部构造分项守卫**：`construction_observer` 在 model/conditioner/optimizer 完成后立即执行同一 deadline+guard；模型构造越界不再启动 conditioner，conditioner 越界不再启动 loss/AdamW，且已完成计数保留。
+- **P1 参考后端第二次编译守卫**：`G1Spec()` 的 `__post_init__` 编译与随后 `load_plain()` 编译之间新增 `reference_backend_recompile` 检查，第二次编译后再检查后才分配 `MjData`；受控反例中第一次编译返回时过期，第二次编译不再启动。真实运行仍保持单次 `MjData` 与逐状态/site 截止计数。
+- **P1 F 来源门阻断**：噪声来源 SHA、R0 回放一致性、P `input_admission` SHA 与 `passed` 全部收集后，在 `run_p_stage`/真实物化/构造/重放前终止；`finally` 仍上报实际已完成计数（本次反例只有 8 个 `cpu_draw_units`）。
+- **P2 场景完成即计数**：`largebox_static_frame` 新增可选 `observer`，在 `mj_forward` 成功返回后立即调用；provider 传入计数回调并把返回的静态帧显式交给 `LossAssembler`，不再依赖整个 assembler（含后续设备张量创建）成功，也不会二次调用场景缓存。模拟 assembler OOM 时 `scene_setup_mj_forward=1` 且半成品不缓存。
+- **P2 最终消费核验计费**：F 封口后的 P/I/F 消费核验（含新增大工件哈希）纳入 `_charge_final_verification`：实际耗时超过账面成本即按 `cost_floor` 重封口；若因此越界，row 转为 incomplete 并返回 `post_seal_verification_budget_exceeded`，外层随后撤回完整选择和完成声明；`_amend_final_report` 同步清空报告中的 `selected_attempts/selected_chain_counts/selected_chain_training_updates`。受控 100s 预算反例中 102.8s 的核验不再保留 complete/selection。
+- **测试**：provider **39 passed**（新增 3 项：第二次编译守卫、Trainer 分项守卫、场景 forward 计数；并扩展 F 来源反例）、审计 **59 passed**（新增 3 项：封口必需文件/报告引用、R0 noise、P input_admission；另加最终核验计费反例），六个相关文件 **263 passed**，合并 **361 passed（386.67s）**；另跑 `test_geometry` 8 passed 与 `test_omniretarget_w1_review` 40 passed。Gate B 重新执行写入 `calibration/attempt_010`、`synthetic/attempt_010`、`admission_real/attempt_010`；最终 SHA、调用矩阵、582 gap、16 次更新、F 新进程与工件大小以验证记录 §10.9 为准。v0.9 方案/校准/合成/准入字节不变。

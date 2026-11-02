@@ -375,17 +375,30 @@ def test_stage_state_rejects_running_publishing_and_unsettled(tmp_path):
     _row, problems = A.stage_state(root, "P")
     assert "stage_not_terminal" in problems
     assert any(p.startswith("reservation_unsettled") for p in problems)
-    report = A.stage_dir(root, "P") / attempt / "p_report.json"
-    A.write_json(report, {"complete_evidence": True})
+    A.settle_stage_calls(root, "P", attempt,
+                         {"counts": A.CallCounter(A.CALL_CAPS).snapshot()["counts"]})
+    directory = A.stage_dir(root, "P") / attempt
+    (directory / "p_rows.json").write_text("[]")
+    models = {}
+    for model in ("deterministic", "diffusion"):
+        arrays = directory / f"p_{model}.npz"
+        arrays.write_bytes(f"p:{model}".encode())
+        models[model] = {"arrays_path": A.path_for_record(arrays),
+                         "arrays_sha256": A.sha256_file(arrays)}
+    report = directory / "p_report.json"
+    A.write_json(report, {"complete_evidence": True, "models": models,
+                          "input_admission": None})
+    artifacts = {
+        A.path_for_record(path): A.sha256_file(path)
+        for path in directory.rglob("*") if path.is_file()
+    }
     row = {"complete": True, "report": A.path_for_record(report),
-           "summary": A.path_for_record(report)}
+           "summary": A.path_for_record(report), "artifacts": artifacts}
     seal = A.finish_attempt(root, "P", attempt, A._now(), budget, row,
                             status="done",
                             extra={"call_balance": A.CallCounter(
                                 A.CALL_CAPS).snapshot()})
     assert seal.terminal and seal.sealed
-    A.settle_stage_calls(root, "P", attempt,
-                         {"counts": A.CallCounter(A.CALL_CAPS).snapshot()["counts"]})
     _row, problems = A.stage_state(root, "P")
     assert problems == []
 
@@ -396,11 +409,6 @@ def test_stage_state_rejects_evidence_changed_after_seal(tmp_path):
     attempt = "attempt_001"
     directory = A.stage_dir(root, "P") / attempt
     directory.mkdir(parents=True)
-    report = directory / "p_report.json"
-    artifact = directory / "p_arrays.npz"
-    A.write_json(report, {"complete_evidence": True})
-    artifact.write_bytes(b"arrays")
-    report_bytes = report.read_bytes()
     budget = {"remaining_s": 10.0, "reserve_s": 1.0, "attempts": 2,
               "attempts_used": 0}
     A.pre_register_attempt(root, "P", attempt, A._now(), scope={},
@@ -408,17 +416,30 @@ def test_stage_state_rejects_evidence_changed_after_seal(tmp_path):
                            call_balance=A.CallCounter(A.CALL_CAPS).snapshot())
     A.reserve_stage_calls(root, "P", attempt,
                           {"counts": A.STAGE_NOMINAL["P"]})
+    report = directory / "p_report.json"
+    (directory / "p_rows.json").write_text("[]")
+    models = {}
+    artifacts = {}
+    for model in ("deterministic", "diffusion"):
+        arrays = directory / f"p_{model}.npz"
+        arrays.write_bytes(f"p:{model}".encode())
+        models[model] = {"arrays_path": A.path_for_record(arrays),
+                         "arrays_sha256": A.sha256_file(arrays)}
+    A.write_json(report, {"complete_evidence": True, "models": models,
+                          "input_admission": None})
+    A.settle_stage_calls(root, "P", attempt,
+                         {"counts": A.CallCounter(A.CALL_CAPS).snapshot()["counts"]})
+    for path in directory.rglob("*"):
+        if path.is_file():
+            artifacts[A.path_for_record(path)] = A.sha256_file(path)
+    report_bytes = report.read_bytes()
     seal = A.finish_attempt(
         root, "P", attempt, A._now(), budget,
         {"complete": True, "report": A.path_for_record(report),
-         "summary": A.path_for_record(report),
-         "artifacts": {A.path_for_record(artifact):
-                       A.sha256_file(artifact)}},
+         "summary": A.path_for_record(report), "artifacts": artifacts},
         status="done",
         extra={"call_balance": A.CallCounter(A.CALL_CAPS).snapshot()})
     assert seal.sealed
-    A.settle_stage_calls(root, "P", attempt,
-                         {"counts": A.CallCounter(A.CALL_CAPS).snapshot()["counts"]})
     assert A.stage_state(root, "P")[1] == []
 
     report.write_text('{"complete_evidence": false}')
@@ -427,9 +448,101 @@ def test_stage_state_rejects_evidence_changed_after_seal(tmp_path):
     report.write_bytes(report_bytes)
     assert A.stage_state(root, "P")[1] == []
 
-    artifact.write_bytes(b"tampered")
+    (directory / "p_deterministic.npz").write_bytes(b"tampered")
     _row, problems = A.stage_state(root, "P")
-    assert "artifact_drifted:p_arrays.npz" in problems
+    assert "artifact_drifted:p_deterministic.npz" in problems
+    assert "models.deterministic.arrays_reference_drifted" in problems
+
+
+def test_r0_registration_and_noise_schedule_are_consumed(tmp_path):
+    root = tmp_path / "r0_real"
+    directory = A.stage_dir(root, "R0") / "attempt_001"
+    directory.mkdir(parents=True)
+    (root / "cohort.json").write_text(
+        '{"cohort_id": "' + A.COHORT_ID + '", "mode": "real"}')
+    budget = {"remaining_s": 10.0, "reserve_s": 1.0, "attempts": 2,
+              "attempts_used": 0}
+    A.pre_register_attempt(root, "R0", "attempt_001", A._now(), scope={},
+                           budget=budget,
+                           call_balance=A.CallCounter(A.CALL_CAPS).snapshot())
+    A.reserve_stage_calls(root, "R0", "attempt_001",
+                          {"counts": A.stage_nominal_for_mode("real", "R0")})
+    registration = directory / "registration.json"
+    noise = directory / "noise_schedule.npz"
+    admission = directory / "admission.json"
+    noise.write_bytes(b"noise")
+    A.write_json(registration, {"noise": {
+        "schedule_path": A.path_for_record(noise),
+        "schedule_sha256": A.sha256_file(noise)}})
+    A.write_json(admission, {
+        "complete_evidence": True,
+        "registration": A.path_for_record(registration),
+        "registration_sha256": A.sha256_file(registration)})
+    A.settle_stage_calls(root, "R0", "attempt_001",
+                         {"counts": A.CallCounter(A.CALL_CAPS).snapshot()["counts"]})
+    artifacts = {
+        A.path_for_record(path): A.sha256_file(path)
+        for path in directory.rglob("*") if path.is_file()
+    }
+    A.finish_attempt(
+        root, "R0", "attempt_001", A._now(), budget,
+        {"complete": True, "report": A.path_for_record(admission),
+         "summary": A.path_for_record(admission),
+         "artifacts": artifacts}, status="done",
+        extra={"call_balance": A.CallCounter(A.CALL_CAPS).snapshot()})
+    assert A.stage_state(root, "R0")[1] == []
+
+    noise.write_bytes(b"tampered")
+    _row, problems = A.stage_state(root, "R0")
+    assert "artifact_drifted:noise_schedule.npz" in problems
+    assert "noise_schedule_reference_drifted" in problems
+
+
+def test_p_input_admission_reference_is_checked_before_i(tmp_path):
+    root = tmp_path / "p_real"
+    directory = A.stage_dir(root, "P") / "attempt_001"
+    directory.mkdir(parents=True)
+    (root / "cohort.json").write_text(
+        '{"cohort_id": "' + A.COHORT_ID + '", "mode": "real"}')
+    budget = {"remaining_s": 10.0, "reserve_s": 1.0, "attempts": 2,
+              "attempts_used": 0}
+    A.pre_register_attempt(root, "P", "attempt_001", A._now(), scope={},
+                           budget=budget,
+                           call_balance=A.CallCounter(A.CALL_CAPS).snapshot())
+    A.reserve_stage_calls(root, "P", "attempt_001",
+                          {"counts": A.stage_nominal_for_mode("real", "P")})
+    admission = directory / "input_admission.json"
+    admission.write_text("{}")
+    models = {}
+    for model in ("deterministic", "diffusion"):
+        arrays = directory / f"p_{model}.npz"
+        arrays.write_bytes(f"p:{model}".encode())
+        models[model] = {"arrays_path": A.path_for_record(arrays),
+                         "arrays_sha256": A.sha256_file(arrays)}
+    (directory / "p_rows.json").write_text("[]")
+    report = directory / "p_report.json"
+    A.write_json(report, {"complete_evidence": True, "models": models,
+                          "input_admission": {
+                              "path": A.path_for_record(admission),
+                              "sha256": A.sha256_file(admission)}})
+    A.settle_stage_calls(root, "P", "attempt_001",
+                         {"counts": A.CallCounter(A.CALL_CAPS).snapshot()["counts"]})
+    artifacts = {
+        A.path_for_record(path): A.sha256_file(path)
+        for path in directory.rglob("*") if path.is_file()
+    }
+    A.finish_attempt(
+        root, "P", "attempt_001", A._now(), budget,
+        {"complete": True, "report": A.path_for_record(report),
+         "summary": A.path_for_record(report),
+         "artifacts": artifacts}, status="done",
+        extra={"call_balance": A.CallCounter(A.CALL_CAPS).snapshot()})
+    assert A.stage_state(root, "P")[1] == []
+
+    admission.write_text('{"passed": false}')
+    _row, problems = A.stage_state(root, "P")
+    assert "artifact_drifted:input_admission.json" in problems
+    assert "input_admission_reference_drifted" in problems
 
 
 def test_authorization_template_is_refused_and_faithful_record_accepted(
@@ -902,6 +1015,9 @@ def test_matrix_veto_retracts_the_disk_claim(tmp_path, monkeypatch):
     summary = A.read_json(Path(result["summary_path"]))
     assert summary["complete_evidence"] is False
     assert summary["conclusion"] == "audit_incomplete"
+    assert summary.get("selected_attempts") is None
+    assert summary.get("selected_chain_counts") is None
+    assert summary.get("selected_chain_training_updates") is None
     problems = summary.get("verification_problems") or []
     assert any("full_chain_calls" in p for p in problems)
     assert any("full_chain_calls" in r
@@ -1449,3 +1565,46 @@ def test_reference_context_target_fk_obeys_the_deadline(chain, tmp_path,
     assert counter.counts["reference_mj_forward"] == first_states
     assert counter.counts["reference_mj_jac_site"] == 0
     assert counter.counts["independent_output_vjp"] == 0
+
+
+def test_final_verification_cost_is_charged_and_overrun_revokes(tmp_path):
+    root = tmp_path / "verify_cost"
+    A.write_cohort(root, mode="synthetic")
+    attempt = "attempt_001"
+    directory = A.stage_dir(root, "F") / attempt
+    directory.mkdir(parents=True)
+    report = directory / "training_update_final.json"
+    A.write_json(report, {"complete_evidence": True})
+    budget = {"remaining_s": 200.0, "reserve_s": 0.0, "attempts": 2,
+              "attempts_used": 0}
+    t0 = A._now() - 90.0
+    first = A.finish_attempt(
+        root, "F", attempt, t0, budget,
+        {"complete": True, "report": A.path_for_record(report),
+         "summary": A.path_for_record(report)},
+        status="done",
+        extra={"call_balance": A.CallCounter(A.CALL_CAPS).snapshot()})
+    assert first.sealed and first.row["complete"] is True
+    seals = {"row": first.row, "sealed": True, "terminal": True,
+             "problems": []}
+    charged, revoke = A._charge_final_verification(
+        root, "F", attempt, t0,
+        {"remaining_s": 200.0, "reserve_s": 0.0, "attempts": 2,
+         "attempts_used": 0},
+        first, seals, scope={}, counter=A.CallCounter(A.CALL_CAPS),
+        actual_cost=95.0)
+    assert revoke is None
+    assert charged.sealed and charged.row["complete"] is True
+    assert charged.row["measured_wall_s"] >= 95.0
+
+    overrun, revoke = A._charge_final_verification(
+        root, "F", attempt, t0,
+        {"remaining_s": 100.0, "reserve_s": 0.0, "attempts": 2,
+         "attempts_used": 0},
+        charged, seals, scope={},
+        counter=A.CallCounter(A.CALL_CAPS), actual_cost=102.8)
+    assert revoke == "post_seal_verification_budget_exceeded"
+    assert overrun.sealed is False
+    assert overrun.row["complete"] is False
+    assert overrun.row["incomplete_reason"]
+    assert overrun.row["measured_wall_s"] >= 102.8

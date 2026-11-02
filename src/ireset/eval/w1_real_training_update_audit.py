@@ -3994,20 +3994,24 @@ def _worker_main(spec_path: str, out_dir: str) -> int:
         schedule = draw_noise_path(NOISE_SEED)
         counter.add("cpu_draw_units", DRAW_UNITS_PER_PATH)
         schedule_ok = True
+        source_problems: list[str] = []
         if mode == "real":
-            stored = provider.load_noise_schedule(Path(spec["r0_noise_path"]))
-            if sha256_file(Path(spec["r0_noise_path"])) != spec.get(
-                    "r0_noise_sha256"):
-                problems.append("schedule_source_sha")
-            for a, b in zip(schedule, stored):
-                if (not torch.equal(a["t"], b["t"])
-                        or not torch.equal(a["epsilon"], b["epsilon"])
-                        or not torch.equal(a["generator_state_before"],
-                                           b["generator_state_before"])
-                        or not torch.equal(a["generator_state_after"],
-                                           b["generator_state_after"])):
-                    schedule_ok = False
-            provider.noise = schedule
+            noise_path = Path(spec.get("r0_noise_path") or "")
+            if not noise_path.is_file():
+                source_problems.append("schedule_source_missing")
+            elif sha256_file(noise_path) != spec.get("r0_noise_sha256"):
+                source_problems.append("schedule_source_sha")
+            else:
+                stored = provider.load_noise_schedule(noise_path)
+                for a, b in zip(schedule, stored):
+                    if (not torch.equal(a["t"], b["t"])
+                            or not torch.equal(a["epsilon"], b["epsilon"])
+                            or not torch.equal(a["generator_state_before"],
+                                               b["generator_state_before"])
+                            or not torch.equal(a["generator_state_after"],
+                                               b["generator_state_after"])):
+                        schedule_ok = False
+                provider.noise = schedule
         else:
             fixture_noise = provider.noise
             for a, b in zip(schedule, fixture_noise):
@@ -4015,16 +4019,23 @@ def _worker_main(spec_path: str, out_dir: str) -> int:
                         or not torch.equal(a["epsilon"], b["epsilon"])):
                     schedule_ok = False
         if not schedule_ok:
-            problems.append("schedule_rebuild_mismatch")
+            source_problems.append("schedule_rebuild_mismatch")
         main_admission = None
         if mode == "real":
-            admission_path = Path(spec["p_input_admission_path"])
-            if sha256_file(admission_path) != spec.get(
-                    "p_input_admission_sha256"):
-                problems.append("p_input_admission_sha")
-            main_admission = read_json(admission_path)
-            if main_admission.get("passed") is not True:
-                problems.append("p_input_admission_not_passed")
+            admission_path = Path(spec.get("p_input_admission_path") or "")
+            if not admission_path.is_file():
+                source_problems.append("p_input_admission_missing")
+            else:
+                actual_sha = sha256_file(admission_path)
+                main_admission = read_json(admission_path)
+                if actual_sha != spec.get("p_input_admission_sha256"):
+                    source_problems.append("p_input_admission_sha")
+                if not isinstance(main_admission, Mapping) or \
+                        main_admission.get("passed") is not True:
+                    source_problems.append("p_input_admission_not_passed")
+        if source_problems:
+            problems += source_problems
+            raise TimeoutError("f_source_precheck_failed")
         p_dir = out / "production_replay"
         i_dir = out / "independent_replay"
         guard("p_replay_start")
@@ -5254,8 +5265,115 @@ def finish_attempt(root: Path, stage: str, attempt: str, t0: float,
     return SealResult(ok, row, problems, terminal_state)
 
 
-def _sealed_evidence_problems(index_row: Mapping[str, Any]) -> list[str]:
-    """Verify the sealed report/summary/artifact digests on disk.
+def _cohort_mode(root: Path) -> str | None:
+    path = _cohort_path(root)
+    if not path.is_file():
+        return None
+    try:
+        data = read_json(path)
+    except (OSError, ValueError, TypeError):
+        return None
+    return data.get("mode") if isinstance(data, Mapping) else None
+
+
+def _required_stage_files(root: Path, stage: str) -> list[str]:
+    from ireset.eval.w1_real_training_update_provider import (
+        STAGE_REQUIRED_FILES,
+    )
+    names = list(STAGE_REQUIRED_FILES[stage])
+    if _cohort_mode(root) == "real":
+        if stage == "R0":
+            names.append("noise_schedule.npz")
+        elif stage == "P":
+            names.append("input_admission.json")
+    return names
+
+
+def _artifact_covers(artifacts: Mapping[str, Any], name: str) -> bool:
+    for rel in artifacts:
+        posix = Path(str(rel)).as_posix()
+        if posix == name or posix.endswith("/" + name):
+            return True
+    return False
+
+
+def _reference_path(value: Any) -> Path | None:
+    if not isinstance(value, str) or not value:
+        return None
+    path = Path(value)
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def _reference_problems(label: str, path_value: Any,
+                        sha_value: Any) -> list[str]:
+    path = _reference_path(path_value)
+    if path is None or not path.is_file():
+        return [f"{label}_reference_missing"]
+    if not isinstance(sha_value, str) or sha256_file(path) != sha_value:
+        return [f"{label}_reference_drifted"]
+    return []
+
+
+def _report_reference_problems(root: Path, stage: str,
+                               report_path: Path | None) -> list[str]:
+    """Check the file references embedded in a sealed stage report."""
+    if stage == "F":
+        return []
+    if report_path is None or not Path(report_path).is_file():
+        return ["report_missing"]
+    try:
+        data = read_json(Path(report_path))
+    except (OSError, ValueError, TypeError):
+        return ["report_unreadable"]
+    if not isinstance(data, Mapping):
+        return ["report_not_mapping"]
+    problems: list[str] = []
+    if stage == "R0":
+        problems += _reference_problems(
+            "registration", data.get("registration"),
+            data.get("registration_sha256"))
+        registration_path = _reference_path(data.get("registration"))
+        if registration_path is None or not registration_path.is_file():
+            return problems
+        try:
+            registration = read_json(registration_path)
+        except (OSError, ValueError, TypeError):
+            return problems + ["registration_unreadable"]
+        if _cohort_mode(root) == "real" and isinstance(registration, Mapping):
+            noise = registration.get("noise")
+            noise = noise if isinstance(noise, Mapping) else {}
+            problems += _reference_problems(
+                "noise_schedule", noise.get("schedule_path"),
+                noise.get("schedule_sha256"))
+        return problems
+    models = data.get("models")
+    if not isinstance(models, Mapping) or not models:
+        return ["report_models"]
+    for model in ("deterministic", "diffusion"):
+        rec = models.get(model)
+        if not isinstance(rec, Mapping):
+            problems.append(f"report_model:{model}")
+            continue
+        problems += _reference_problems(
+            f"models.{model}.arrays", rec.get("arrays_path"),
+            rec.get("arrays_sha256"))
+    if stage == "P":
+        admission = data.get("input_admission")
+        if admission is None:
+            if _cohort_mode(root) == "real":
+                problems.append("input_admission_reference_missing")
+        elif not isinstance(admission, Mapping):
+            problems.append("input_admission_reference")
+        else:
+            problems += _reference_problems(
+                "input_admission", admission.get("path"),
+                admission.get("sha256"))
+    return problems
+
+
+def _sealed_evidence_problems(root: Path, stage: str,
+                              index_row: Mapping[str, Any]) -> list[str]:
+    """Verify the sealed report/summary/artifact/file reference closure.
 
     A consumer must never accept evidence that changed after sealing; the
     recorded digests are the only binding between the row and its files.
@@ -5277,18 +5395,68 @@ def _sealed_evidence_problems(index_row: Mapping[str, Any]) -> list[str]:
         elif sha256_file(path) != expected:
             problems.append(f"{key}_drifted")
     artifacts = index_row.get("artifacts")
-    if artifacts is not None:
-        if not isinstance(artifacts, Mapping):
-            problems.append("artifacts_invalid")
-        else:
-            for rel, expected in artifacts.items():
-                path = PROJECT_ROOT / str(rel)
-                name = Path(str(rel)).name
-                if not path.is_file():
-                    problems.append(f"artifact_missing:{name}")
-                elif not isinstance(expected, str) or sha256_file(path) != expected:
-                    problems.append(f"artifact_drifted:{name}")
+    if isinstance(artifacts, Mapping):
+        for rel, expected in artifacts.items():
+            path = PROJECT_ROOT / str(rel)
+            name = Path(str(rel)).name
+            if not path.is_file():
+                problems.append(f"artifact_missing:{name}")
+            elif not isinstance(expected, str) or sha256_file(path) != expected:
+                problems.append(f"artifact_drifted:{name}")
+        for name in _required_stage_files(root, stage):
+            if not _artifact_covers(artifacts, name):
+                problems.append(f"required_file_missing:{name}")
+    else:
+        problems.append("artifacts_invalid")
+    report = index_row.get("report")
+    report_path = (PROJECT_ROOT / str(report)) if report else None
+    problems += _report_reference_problems(root, stage, report_path)
     return problems
+
+
+def _charge_final_verification(
+        root: Path, stage: str, attempt: str, t0: float,
+        budget: Mapping[str, Any], seal: SealResult, seals: dict,
+        *, scope: Mapping[str, Any], counter: CallCounter,
+        actual_cost: float) -> tuple[SealResult, str | None]:
+    """Charge post-seal consumer verification and revoke on overrun.
+
+    The final consumer checks re-hash every sealed artifact.  That work
+    happens after the last ``finish_attempt``, so it must be covered by a
+    cost re-seal; otherwise a budget can be exceeded while the on-disk cost
+    and completion claim stay unchanged.
+    """
+    row = seals.get("row")
+    if not isinstance(row, Mapping) or str(row.get("status")) not in (
+            "done", "incomplete", "crashed", "timeout"):
+        return seal, None
+    recorded_cost = float(row.get("measured_wall_s", 0.0) or 0.0)
+    if actual_cost <= recorded_cost:
+        return seal, None
+    was_complete = row.get("complete") is True
+    status = str(row.get("status"))
+    extra = {"stage": stage, "scope": dict(scope),
+             "call_balance": counter.snapshot()}
+    if "selection" in row:
+        extra["selection"] = row["selection"]
+    sealed = finish_attempt(root, stage, attempt, t0, budget, dict(row),
+                            status=status, extra=extra,
+                            cost_floor=actual_cost)
+    seals["verification_reseal"] = {
+        "sealed": sealed.sealed, "terminal": sealed.terminal,
+        "problems": sealed.problems, "row": sealed.row,
+    }
+    combined = list(seal.problems) + list(sealed.problems)
+    updated = SealResult(sealed.sealed, sealed.row, combined,
+                         sealed.terminal)
+    seals.update({"sealed": sealed.sealed, "terminal": sealed.terminal,
+                  "problems": combined, "row": sealed.row})
+    revoke = None
+    if was_complete and not (
+            sealed.sealed and sealed.terminal
+            and sealed.row.get("complete") is True):
+        revoke = "post_seal_verification_budget_exceeded"
+    return updated, revoke
 
 
 def _attempt_consumable(root: Path, stage: str, attempt: str,
@@ -5305,7 +5473,7 @@ def _attempt_consumable(root: Path, stage: str, attempt: str,
     if index_row.get("status") != "done" \
             or ledger_row.get("status") != "done":
         problems.append("attempt_status_not_done")
-    problems += _sealed_evidence_problems(index_row)
+    problems += _sealed_evidence_problems(root, stage, index_row)
     deltas = stage_attempt_deltas(root, stage, current=allow_current)
     if deltas is None or attempt not in deltas:
         problems.append("attempt_call_delta_unknown")
@@ -5503,6 +5671,8 @@ def _amend_final_report(report_path: Path | None,
                 merged.append(item)
         data.update(conclusion="audit_incomplete", complete_evidence=False,
                     covered_contract_passed=False,
+                    selected_attempts=None, selected_chain_counts=None,
+                    selected_chain_training_updates=None,
                     verification_problems=merged)
         write_json(Path(report_path), data)
         return True
@@ -7711,12 +7881,20 @@ def run_registered_audit(run_root: Path, provider: Any,
         settle_stage_calls(run_root, "R0", attempt, r0_delta)
         results["R0"] = r0
         admission_path = run_root / STAGE_DIRS["R0"] / attempt / "admission.json"
+        r0_dir = stage_dir(run_root, "R0") / attempt
+        r0_artifacts = [
+            r0_dir / "registration.json", admission_path,
+            r0_dir / "call_reservations.json",
+        ]
+        if mode == "real":
+            r0_artifacts.append(r0_dir / "noise_schedule.npz")
         seal = finish_attempt(
             run_root, "R0", attempt, t0, budget,
             {"complete": bool(r0["passed"]),
              "report": path_for_record(admission_path),
              "summary": path_for_record(admission_path),
-             "registration_sha256": r0["registration_sha256"]},
+             "registration_sha256": r0["registration_sha256"],
+             "artifacts": _artifact_hashes(r0_artifacts)},
             status="done" if r0["passed"] else "incomplete",
             extra={"stage": "R0", "scope": scope,
                    "call_balance": counter.snapshot()})
@@ -7789,14 +7967,20 @@ def run_registered_audit(run_root: Path, provider: Any,
         results["P"] = p
         p_complete = bool(p.get("complete_evidence"))
         p_report = Path(p["report"]) if p.get("report") else None
+        p_base = stage_dir(run_root, "P") / attempt
+        p_artifacts = [Path(path)
+                       for path in (p.get("paths") or {}).values()]
+        p_artifacts += [p_report, p_base / "p_rows.json",
+                        p_base / "call_reservations.json"]
+        if mode == "real":
+            p_artifacts.append(p_base / "input_admission.json")
         seal = finish_attempt(
             run_root, "P", attempt, t0, budget,
             {"complete": p_complete,
              "report": path_for_record(p_report) if p_report else None,
              "summary": path_for_record(p_report) if p_report else None,
              "registration_sha256": registration_sha,
-             "artifacts": _artifact_hashes(
-                 Path(path) for path in (p.get("paths") or {}).values())},
+             "artifacts": _artifact_hashes(p_artifacts)},
             status="done" if p_complete else "incomplete",
             extra={"stage": "P", "scope": scope,
                    "numeric_passed": bool(p.get("numeric_passed")),
@@ -7884,14 +8068,18 @@ def run_registered_audit(run_root: Path, provider: Any,
         results["I"] = i
         i_complete = bool(i.get("complete_evidence"))
         i_report = Path(i["report"]) if i.get("report") else None
+        i_base = stage_dir(run_root, "I") / attempt
+        i_artifacts = [Path(path)
+                       for path in (i.get("paths") or {}).values()]
+        i_artifacts += [i_report, i_base / "i_rows.json",
+                        i_base / "call_reservations.json"]
         seal = finish_attempt(
             run_root, "I", attempt, t0, budget,
             {"complete": i_complete,
              "report": path_for_record(i_report) if i_report else None,
              "summary": path_for_record(i_report) if i_report else None,
              "registration_sha256": registration_sha,
-             "artifacts": _artifact_hashes(
-                 Path(path) for path in (i.get("paths") or {}).values())},
+             "artifacts": _artifact_hashes(i_artifacts)},
             status="done" if i_complete else "incomplete",
             extra={"stage": "I", "scope": scope,
                    "numeric_passed": bool(i.get("numeric_passed")),
@@ -8057,6 +8245,12 @@ def run_registered_audit(run_root: Path, provider: Any,
         f["covered_contract_passed"] = False
         f["conclusion"] = "audit_incomplete"
     f_report = Path(f["report"]) if f.get("report") else None
+    f_base = stage_dir(run_root, "F") / attempt
+    f_artifacts = _artifact_hashes([
+        f_report, f_base / "worker_spec.json",
+        f_base / "worker" / "worker_result.json",
+        f_base / "call_reservations.json",
+    ])
     if pre_seal_veto:
         _amend_final_report(f_report, pre_seal_veto)
         wrow, wprobs, proven = withdraw_attempt_claim(
@@ -8074,7 +8268,7 @@ def run_registered_audit(run_root: Path, provider: Any,
              "report": path_for_record(f_report) if f_report else None,
              "summary": path_for_record(f_report) if f_report else None,
              "registration_sha256": registration_sha,
-             "artifacts": _artifact_hashes([f_report])},
+             "artifacts": dict(f_artifacts)},
             status="done" if f["complete_evidence"] else "incomplete",
             extra={"stage": "F", "scope": scope,
                    "call_balance": counter.snapshot()})
@@ -8158,6 +8352,11 @@ def run_registered_audit(run_root: Path, provider: Any,
                 write_json(f_report, data)
             except (OSError, ValueError, TypeError):
                 selection_problems.append("selection_report_rewrite")
+        f_artifacts = _artifact_hashes([
+            f_report, f_base / "worker_spec.json",
+            f_base / "worker" / "worker_result.json",
+            f_base / "call_reservations.json",
+        ])
         previous_cost = float(
             seals["F"].get("row", {}).get("measured_wall_s", 0.0) or 0.0)
         reseal = finish_attempt(
@@ -8166,7 +8365,7 @@ def run_registered_audit(run_root: Path, provider: Any,
              "report": path_for_record(f_report) if f_report else None,
              "summary": path_for_record(f_report) if f_report else None,
              "registration_sha256": registration_sha,
-             "artifacts": _artifact_hashes([f_report]),
+             "artifacts": dict(f_artifacts),
              "selection": selection_record},
             status="done",
             extra={"stage": "F", "scope": scope,
@@ -8193,6 +8392,7 @@ def run_registered_audit(run_root: Path, provider: Any,
                 seals["F"].update({"sealed": False,
                                    "terminal": bool(proven),
                                    "problems": seal.problems, "row": wrow})
+    consumer_started = _now()
     consumer_row, consumer_problems = stage_state(run_root, "F", attempt)
     prerequisite = {}
     prerequisite_problems = []
@@ -8203,11 +8403,18 @@ def run_registered_audit(run_root: Path, provider: Any,
         prerequisite_problems += [
             f"prerequisite_not_consumable:{stage_name}:{p}"
             for p in state_problems if p != "attempt_not_complete"]
+    verification_wall = _now() - consumer_started
+    seals["F"]["verification_wall_s"] = verification_wall
     seals["F"]["consumer_problems"] = consumer_problems
     seals["F"]["prerequisite_consumer_problems"] = prerequisite
+    seal, cost_revoke = _charge_final_verification(
+        run_root, "F", attempt, t0, budget, seal, seals["F"],
+        scope=scope, counter=counter, actual_cost=_now() - t0)
     revoke = (list(seal.problems)
               + [p for p in consumer_problems if p != "attempt_not_complete"]
               + prerequisite_problems + selection_problems)
+    if cost_revoke is not None:
+        revoke.append(cost_revoke)
     if not settled:
         revoke.append("f_call_settlement_unknown")
     if revoke and _report_claims_complete(f_report):
