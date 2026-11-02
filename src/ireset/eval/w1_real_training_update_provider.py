@@ -1530,10 +1530,14 @@ class RealTrainingProvider:
                     counter.add("scene_setup_mj_forward", 1)
                     self._scene_setup_counted = True
 
+            def scene_check(unit: str) -> None:
+                self._check(f"production_{unit}")
+
             # The scene compile is an independent real-asset operation; a
             # deadline crossed during FK construction must stop it here.
             self._check("production_scene_setup")
-            frame = largebox_static_frame(observer=scene_landed)
+            frame = largebox_static_frame(observer=scene_landed,
+                                          check=scene_check)
             self._check("production_scene_ready")
             assembler = LossAssembler(
                 self.tokenizer, LOSS_WEIGHTS, self.device,

@@ -243,11 +243,12 @@ v0.8 的第六轮 2 P1 修复与 54 项测试保留在历史（`synthetic/histor
 ## 10. Gate A/B 真实 provider 接入与执行计划实现（2026-10-31）
 
 执行计划：[W1 真实 provider 接入与执行计划](../plans/omniretarget_w1_real_training_update_provider_execution_plan.md)
-（v0.9，`gate_a_implemented / gate_b_acceptance_passed / gate_c_not_authorized /
+（v0.10，`gate_a_implemented / gate_b_acceptance_passed / gate_c_not_authorized /
 gate_d_e_not_run`）。§10.1–§10.4 记录 v0.6 初次 Gate A/B 实现；§10.6 记录 v0.7 的 5 P1+4 P2
-修复与 attempt_007；§10.7 记录 v0.8 的 4 P1+3 P2 修复与 attempt_008；§10.8 记录 v0.9
-首次冻结与 attempt_009；§10.9 记录 P2-2 选择字段撤回补充后的最终 attempt_010，为当前
-权威。Gate C（新的 §10.2 明确授权）、Gate D（真实 R0）与 Gate E（真实 P→I→F）未执行。
+修复与 attempt_007；§10.7 记录 v0.8 的 4 P1+3 P2 修复与 attempt_008；§10.8–§10.9 记录
+v0.9 的 4 P1+2 P2 修复、选择字段撤回与 attempt_009/010；§10.10 记录 v0.10 的 1 P1+1 P2
+修复与 attempt_011，为当前权威。Gate C（新的 §10.2 明确授权）、Gate D（真实 R0）与 Gate E
+（真实 P→I→F）未执行。
 
 ### 10.1 Gate A 实现
 
@@ -352,8 +353,8 @@ gate_d_e_not_run`）。§10.1–§10.4 记录 v0.6 初次 Gate A/B 实现；§10
 
 ### 10.5 Gate B 后的下一步
 
-先由用户复阅本记录、执行计划 v0.9、`calibration/attempt_010`、`synthetic/attempt_010` 与
-`admission_real/attempt_010`（§10.9）；随后提供新的 §10.2 明确授权记录（10 项 checklist
+先由用户复阅本记录、执行计划 v0.10、`calibration/attempt_011`、`synthetic/attempt_011` 与
+`admission_real/attempt_011`（§10.10）；随后提供新的 §10.2 明确授权记录（10 项 checklist
 全 true，并绑定执行计划/校准验证/接受报告/准入包/实现哈希）。未取得授权前不得运行
 `--real`/`--resume`，不得创建真实 cohort 或消耗真实调用额度。
 
@@ -664,14 +665,14 @@ attempt_010）。§10.7（v0.8/attempt_008）、§10.6（v0.7/attempt_007）及�
   `factor_selected=false`、`auto_execute=false`、`final_interaction_method=not_ready`、
   `production_integration=false`。v0.9 方案/校准/合成/准入字节未改写。
 
-### 10.9 v0.9 P2-2 选择字段撤回补充与最终 Gate B 冻结（2026-10-31）
+### 10.9 v0.9 P2-2 选择字段撤回补充与最终 Gate B 冻结（2026-10-31；已被 §10.10 取代）
 
 §10.8 的 P2-2 已使越界核验把 row 转为 incomplete 并使返回值 `selected_attempts=None`；
 补充审阅发现磁盘 final summary 仍保留 `selected_attempts`/`selected_chain_counts`/
 `selected_chain_training_updates`。现 `_amend_final_report` 在撤回完成声明时同步把三项
 置 null，matrix-veto 反例新增对应断言。该补充只修改审计器的一处撤回字段与测试；其余
-4 P1+2 P2 修复、容差、调用矩阵与零底不变。Gate B 以最终字节重新执行，本节为当前权威；
-§10.8（attempt_009）及更早 attempt 仅作历史保留。
+4 P1+2 P2 修复、容差、调用矩阵与零底不变。本节保留 attempt_010 的历史事实；当前权威为
+§10.10（v0.10/attempt_011）。
 
 **测试（最终字节）**
 
@@ -723,6 +724,79 @@ attempt_010）。§10.7（v0.8/attempt_008）、§10.6（v0.7/attempt_007）及�
 - 被取代证据：`synthetic/attempt_009` 与 `admission_real/attempt_009` 在撤回字段补充后
   被 attempt_010 取代并保留为历史；更早 attempt 未删除。当前余盘约 **146.08 GiB**，
   满足 R0 的 20 GiB 门。
+- 边界不变：未读取真实 checkpoint payload/父 NPZ 数值、未编译真实资产、未构造真实模型/
+  优化器、未执行真实前向/反向/FK/AdamW、未创建真实 cohort/授权/注册；Gate C/D/E 仍未运行。
+  `objective_coverage=partial`、`full_objective_contract_passed=null`、
+  `factor_selected=false`、`auto_execute=false`、`final_interaction_method=not_ready`、
+  `production_integration=false`。v0.9 方案/校准/合成/准入字节未改写。
+
+### 10.10 v0.10 场景内部守卫与阶段消费计费修复（2026-10-31）
+
+独立审阅确认 **1 P1 + 1 P2**；全部按反例修复后，Gate B 以最终字节重新执行。本节为当前
+权威；§10.8–§10.9（v0.9/attempt_009/010）及更早 attempt 仅作历史保留。
+
+**修复项（均有新增反例）**
+
+- **P1 场景构造内部守卫**：`largebox_static_frame` 新增 `check` 回调，在 `G1Spec()`
+  （含 plain 编译）、`load_scene()` 第二次编译、`MjData` 分配和 `mj_forward` 前分别执行
+  同一 deadline+guard；provider 传入 `production_scene_plain_spec/compile/data/forward`
+  包装。受控反例中首次 plain 编译返回即过期：`scene_compile` 检查立即失败，
+  `load_scene`/`MjData`/`forward` 均未启动、`scene_setup_mj_forward` 不增加；另一反例在
+  `scene_forward` 前失败时 forward 未执行。
+- **P2 阶段间消费核验计费**：新增 `_charge_stage_consumption`，在 R0/P/I 封口后的
+  `stage_state` 消费核验完成后，以实际耗时 `cost_floor` 重封口；若超过该阶段预算，撤回
+  完成声明与报告 complete 字段并返回 `post_consumption_verification_budget_exceeded`，
+  调用方在进入下游阶段前停止。P 预算 900s、封口 90s、核验 1000s 的受控反例中 row 转
+  incomplete、报告 `complete_evidence=false`，不再启动 I。
+- **测试**：provider **40 passed**（新增场景 helper 内部守卫反例）、审计 **60 passed**
+  （新增阶段消费核验计费反例）、六个相关文件 **263 passed**；合并 **363 passed
+  （383.70s）**；另 `test_geometry` **8 passed**、`test_omniretarget_w1_review`
+  **40 passed**。
+
+**Gate B 最终产物（attempt_011）**
+
+- 校准 `derived/audit/w1_real_training_update_audit/calibration/attempt_011/`：
+  `tolerance_contract.json` SHA
+  `657c381330f473543f4561787ed00a654f5167ff394a4a5587b82d04c740dc8c`、evidence
+  `28bb66259d12dd224bef34064cef2419efd02aed847175a487abdd403237bfc6`、fp32 canonical
+  `a9513ca311d530c8554844a474080aefd1359e300b1f0790c7aa256756f44f3e`；
+  `calibration_verification.json` 文件 SHA
+  `83ae286ad50250ca08984003a1912de896b8837f3f8ef77c6fc3337ace63cda6`、canonical
+  `d882d2931270982ad1c0ccfd11d2ea88c9eef30ff24ce3dc9e41e7dd64a3ae91`；
+  `recompute_problems=[]`、`four_x_ok=true`，最大 4× `delta_same_input=0.925540`，阈值/
+  规则/零底与 v0.9 逐项相同；`cpu_threads=20`。
+- 完整合成链 `derived/audit/w1_real_training_update_audit/synthetic/attempt_011/`：
+  `audit_result.json` SHA `18f79c48d02154a4517fb3e4e6d772b21af361f307e6a12efd5985a0f2e504d0`、
+  final `e08307be88a90f5aa6856c71ed14b63ca0bb66b90c93df9a30c59a7e80587a48`、
+  registration `f191f6279c78f54ca81eb992532a3d7d4b1d7931ec982d5a8d76397c64ba2cac`；
+  四 stage done/sealed、consumer problems 均空、264 tensor/3864 行、调用矩阵精确
+  （8 loads、64/64 forwards、48 draw units、32/32 VJP、64 production FK、16/16 updates、
+  15840/115200 reference FK、64 micro、0 synthetic scene）、`training_updates=16`；结论
+  **`audit_incomplete`**（`complete_evidence=true`、`failures=[]`、`problems=[]`、
+  **582** gap：392 precision + 190 sensitivity + 0 bound-unverifiable）。F 新进程
+  pid 3819064/ppid 3815196、exit `ok`、`verification_problems=[]`；成本
+  R0 1.1763/P 17.7981/I 71.3107/F 164.7421 = **255.0271s**；阶段消费核验墙钟
+  R0 0.0196/P 4.4059/I 12.8267/F 17.3649s，P/I/F 均按 `cost_floor` 重封口计入对应成本；
+  工件 7,404,795,448 bytes。`synthetic_acceptance.json` SHA
+  `f379c3a8be1d5a81349092037585230c2cb65b3d4ef48a421a2709acf95ecf29`、
+  `passed=true/problems=[]`、`run_sha256=832c7adebc29437c4327f985e1f46d5e06cc8f20cf232930fc71f23509162547`；
+  阶段文件数 R0 3/P 5/I 5/F 12、fixture 6、run 3，消费校验 `[]`。
+- 真实 metadata-only admission
+  `derived/audit/w1_real_training_update_audit/admission_real/attempt_011/admission_package.json`
+  SHA **`3a30b8d61fdd2fa9989a2eb28ec40e14b8bec6a8f0e264d1adc9564453047b05`**（452,490 bytes），
+  `passed=true/problems=[]`、validator `[]`，绑定 acceptance `f379c3a8…`、校准 canonical
+  `d882d293…`、evidence `28bb6625…`、fp32 `a9513ca3…`；实现闭包 **25 文件**且与当前树
+  逐位一致（plan `5f82ebde…`、audit `66c02a4a…`、provider `65a5549e…`、
+  distance_adapter `efcc80b4…`、provider tests `e3999870…`、audit tests `5d7ac3e1…`）；
+  父锚 10/10、checkpoint 2/2、资产闭包 `checked=true`/37 引用/problems 空；read scope
+  `npz_values_read/checkpoint_payload_read/torch_load_calls/model_constructor_calls/
+  muJoCo_compile_calls/conditioner_forward/model_forward/vjp_calls/optimizer_steps=0`，
+  `asset_closure_verified=true`、`cohort_created=false/registered_attempt_created=false`；
+  `runtime_identity.cpu_threads=20` 且与校准记录逐项一致；状态保持
+  `authorized=false/registered=false/run=not_run/section_10_2_checked=false`。
+- 被取代证据：`synthetic/attempt_010` 与 `admission_real/attempt_010` 在场景内部守卫与
+  阶段消费计费修复后被 attempt_011 取代并保留为历史；更早 attempt 未删除。当前余盘约
+  **171.11 GiB**，满足 R0 的 20 GiB 门。
 - 边界不变：未读取真实 checkpoint payload/父 NPZ 数值、未编译真实资产、未构造真实模型/
   优化器、未执行真实前向/反向/FK/AdamW、未创建真实 cohort/授权/注册；Gate C/D/E 仍未运行。
   `objective_coverage=partial`、`full_objective_contract_passed=null`、

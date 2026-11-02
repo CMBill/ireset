@@ -1608,3 +1608,44 @@ def test_final_verification_cost_is_charged_and_overrun_revokes(tmp_path):
     assert overrun.row["complete"] is False
     assert overrun.row["incomplete_reason"]
     assert overrun.row["measured_wall_s"] >= 102.8
+
+
+def test_stage_consumption_cost_is_charged_and_overrun_revokes(tmp_path):
+    root = tmp_path / "stage_cost"
+    A.write_cohort(root, mode="synthetic")
+    attempt = "attempt_001"
+    directory = A.stage_dir(root, "P") / attempt
+    directory.mkdir(parents=True)
+    report = directory / "p_report.json"
+    A.write_json(report, {"complete_evidence": True})
+    budget = {"remaining_s": 900.0, "reserve_s": 0.0, "attempts": 2,
+              "attempts_used": 0}
+    t0 = A._now() - 90.0
+    first = A.finish_attempt(
+        root, "P", attempt, t0, budget,
+        {"complete": True, "report": A.path_for_record(report),
+         "summary": A.path_for_record(report), "artifacts": {}},
+        status="done",
+        extra={"call_balance": A.CallCounter(A.CALL_CAPS).snapshot()})
+    assert first.sealed and first.row["complete"] is True
+    seals = {"row": first.row, "sealed": True, "terminal": True,
+             "problems": []}
+    charged, problems = A._charge_stage_consumption(
+        root, "P", attempt, t0, budget, first, seals, scope={},
+        counter=A.CallCounter(A.CALL_CAPS), actual_cost=100.0,
+        verification_wall=10.0)
+    assert problems == []
+    assert charged.sealed and charged.row["complete"] is True
+    assert charged.row["measured_wall_s"] >= 100.0
+
+    overrun, problems = A._charge_stage_consumption(
+        root, "P", attempt, t0, budget, charged, seals, scope={},
+        counter=A.CallCounter(A.CALL_CAPS), actual_cost=1090.0,
+        verification_wall=1000.0)
+    assert "post_consumption_verification_budget_exceeded" in problems
+    assert overrun.sealed is False
+    assert overrun.row["complete"] is False
+    assert overrun.row["measured_wall_s"] >= 1090.0
+    disk = A.read_json(report)
+    assert disk["complete_evidence"] is False
+    assert disk["conclusion"] == "audit_incomplete"

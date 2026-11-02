@@ -334,8 +334,10 @@ def test_scene_setup_is_counted_at_forward_not_assembler_completion(
             calls.append("assembler")
             raise RuntimeError("simulated tensor transfer oom")
 
-    def fake_scene(*, observer=None):
+    def fake_scene(*, observer=None, check=None):
         calls.append("scene")
+        if check is not None:
+            check("scene")
         if observer is not None:
             observer()
         return np.eye(3), np.zeros(3)
@@ -541,6 +543,67 @@ def test_build_and_checkpoint_units_recheck_the_guard(tmp_path):
     assert counter.counts["checkpoint_loads"] == 0
 
 
+def test_scene_helper_checks_before_each_internal_operation(monkeypatch):
+    import ireset.embodied.g1_spec as G
+    import ireset.geometry.distance_adapter as D
+
+    calls: list[str] = []
+
+    class Model:
+        geom_bodyid = np.array([0])
+        body_jntadr = np.array([0])
+        jnt_qposadr = np.array([0])
+
+    class Data:
+        def __init__(self, model):
+            self.geom_xmat = np.zeros((1, 9))
+            self.geom_xpos = np.zeros((1, 3))
+            self.qpos = np.zeros(10)
+
+    fake = types.SimpleNamespace(
+        MjData=Data, mj_resetData=lambda model, data: None,
+        mj_name2id=lambda model, kind, name: 0,
+        mjtObj=types.SimpleNamespace(mjOBJ_GEOM=1),
+        mj_forward=lambda model, data: calls.append("forward"))
+    monkeypatch.setitem(sys.modules, "mujoco", fake)
+
+    class Spec:
+        def __init__(self):
+            calls.append("plain_compile")
+
+        def load_scene(self):
+            calls.append("scene_compile")
+            return Model()
+
+    monkeypatch.setattr(G, "G1Spec", Spec)
+    monkeypatch.setattr(D, "_STATIC_FRAME", None)
+
+    def stops_before_scene(unit: str) -> None:
+        calls.append(unit)
+        if unit == "scene_compile":
+            raise TimeoutError(unit)
+
+    with pytest.raises(TimeoutError):
+        D.largebox_static_frame(check=stops_before_scene)
+    assert calls == ["scene_plain_spec", "plain_compile", "scene_compile"]
+    assert D._STATIC_FRAME is None
+
+    calls.clear()
+
+    def stops_before_forward(unit: str) -> None:
+        calls.append(unit)
+        if unit == "scene_forward":
+            raise TimeoutError(unit)
+
+    with pytest.raises(TimeoutError):
+        D.largebox_static_frame(check=stops_before_forward)
+    assert "forward" not in calls
+    assert calls == [
+        "scene_plain_spec", "plain_compile", "scene_compile",
+        "scene_compile", "scene_data", "scene_forward"]
+    assert D._STATIC_FRAME is None
+
+
 def test_fk_deadline_stops_the_scene_compile(tmp_path, monkeypatch):
     import ireset.geometry.distance_adapter as D
     import ireset.kinematics.torch_adapter as TA
@@ -558,8 +621,10 @@ def test_fk_deadline_stops_the_scene_compile(tmp_path, monkeypatch):
         def __init__(self, *args, static_frame=None, **kwargs):
             calls.append("assembler")
 
-    def fake_scene(*, observer=None):
+    def fake_scene(*, observer=None, check=None):
         calls.append("scene")
+        if check is not None:
+            check("scene")
         if observer is not None:
             observer()
         return np.eye(3), np.zeros(3)

@@ -5459,6 +5459,64 @@ def _charge_final_verification(
     return updated, revoke
 
 
+def _charge_stage_consumption(
+        root: Path, stage: str, attempt: str, t0: float,
+        budget: Mapping[str, Any], seal: SealResult, seals: dict,
+        *, scope: Mapping[str, Any], counter: CallCounter,
+        actual_cost: float, verification_wall: float
+        ) -> tuple[SealResult, list[str]]:
+    """Charge R0/P/I post-seal consumption before entering downstream.
+
+    ``stage_state`` re-hashes the sealed artifacts.  That time is not part
+    of the stage's recorded cost yet, so an expensive consumer check could
+    exhaust the budget while the stage still claims completion and the next
+    stage starts.  The stage is re-sealed from the actual elapsed time; an
+    overrun withdraws its completion claim before the caller continues.
+    """
+    seals["verification_wall_s"] = verification_wall
+    row = seals.get("row")
+    if not isinstance(row, Mapping) or str(row.get("status")) not in (
+            "done", "incomplete", "crashed", "timeout"):
+        return seal, []
+    recorded_cost = float(row.get("measured_wall_s", 0.0) or 0.0)
+    if actual_cost <= recorded_cost:
+        return seal, []
+    status = str(row.get("status"))
+    extra = {"stage": stage, "scope": dict(scope),
+             "call_balance": counter.snapshot()}
+    if "numeric_passed" in row:
+        extra["numeric_passed"] = row["numeric_passed"]
+    resealed = finish_attempt(root, stage, attempt, t0, budget, dict(row),
+                              status=status, extra=extra,
+                              cost_floor=actual_cost)
+    seals["verification_reseal"] = {
+        "sealed": resealed.sealed, "terminal": resealed.terminal,
+        "problems": resealed.problems, "row": resealed.row,
+        "verification_wall_s": verification_wall,
+    }
+    combined = list(seal.problems) + list(resealed.problems)
+    updated = SealResult(resealed.sealed, resealed.row, combined,
+                         resealed.terminal)
+    seals.update({"sealed": resealed.sealed, "terminal": resealed.terminal,
+                  "problems": combined, "row": resealed.row})
+    if resealed.sealed and resealed.terminal \
+            and resealed.row.get("complete") is True:
+        return updated, []
+    reason = "post_consumption_verification_budget_exceeded"
+    problems = [reason]
+    report_path = _reference_path(row.get("report"))
+    if report_path is not None and _report_claims_complete(report_path):
+        wrow, wprobs, proven = withdraw_attempt_claim(
+            root, stage, attempt, report_path, resealed.row, [reason],
+            reason=reason, t0=t0, budget=budget,
+            call_balance=counter.snapshot())
+        problems += wprobs
+        seals.update({"sealed": False, "terminal": bool(proven),
+                      "problems": problems, "row": wrow})
+        return SealResult(False, wrow, problems, bool(proven)), problems
+    return updated, problems
+
+
 def _attempt_consumable(root: Path, stage: str, attempt: str,
                         index_row: Mapping[str, Any],
                         ledger_row: Mapping[str, Any], *,
@@ -7900,7 +7958,14 @@ def run_registered_audit(run_root: Path, provider: Any,
                    "call_balance": counter.snapshot()})
         seals["R0"] = {"sealed": seal.sealed, "terminal": seal.terminal,
                        "problems": seal.problems, "row": seal.row}
+        r0_consumer_started = _now()
         _row, r0_consumer = stage_state(run_root, "R0")
+        r0_verification_wall = _now() - r0_consumer_started
+        seal, r0_cost_problems = _charge_stage_consumption(
+            run_root, "R0", attempt, t0, budget, seal, seals["R0"],
+            scope=scope, counter=counter, actual_cost=_now() - t0,
+            verification_wall=r0_verification_wall)
+        r0_consumer += r0_cost_problems
         seals["R0"]["consumer_problems"] = r0_consumer
         if not seal.sealed or not r0["passed"] or r0_consumer:
             blockers = r0["problems"] + seal.problems + r0_consumer
@@ -7987,7 +8052,14 @@ def run_registered_audit(run_root: Path, provider: Any,
                    "call_balance": counter.snapshot()})
         seals["P"] = {"sealed": seal.sealed, "terminal": seal.terminal,
                       "problems": seal.problems, "row": seal.row}
+        p_consumer_started = _now()
         p_row, p_consumer = stage_state(run_root, "P", attempt)
+        p_verification_wall = _now() - p_consumer_started
+        seal, p_cost_problems = _charge_stage_consumption(
+            run_root, "P", attempt, t0, budget, seal, seals["P"],
+            scope=scope, counter=counter, actual_cost=_now() - t0,
+            verification_wall=p_verification_wall)
+        p_consumer += p_cost_problems
         seals["P"]["consumer_problems"] = p_consumer
         if (not seal.terminal or not seal.sealed or p_consumer
                 or not p.get("paths")):
@@ -8086,7 +8158,14 @@ def run_registered_audit(run_root: Path, provider: Any,
                    "call_balance": counter.snapshot()})
         seals["I"] = {"sealed": seal.sealed, "terminal": seal.terminal,
                       "problems": seal.problems, "row": seal.row}
+        i_consumer_started = _now()
         i_row, i_consumer = stage_state(run_root, "I", attempt)
+        i_verification_wall = _now() - i_consumer_started
+        seal, i_cost_problems = _charge_stage_consumption(
+            run_root, "I", attempt, t0, budget, seal, seals["I"],
+            scope=scope, counter=counter, actual_cost=_now() - t0,
+            verification_wall=i_verification_wall)
+        i_consumer += i_cost_problems
         seals["I"]["consumer_problems"] = i_consumer
         if (not seal.terminal or not seal.sealed or i_consumer
                 or not i.get("paths")):
