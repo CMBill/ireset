@@ -706,9 +706,40 @@ def alpha_cumprod_reference(config: Mapping[str, Any] | None = None) -> np.ndarr
     return np.cumprod(1.0 - betas)
 
 
-def effective_alpha(alpha_cumprod: np.ndarray) -> np.ndarray:
-    """Production scheduler stores alpha_cumprod in binary32; upcast it."""
-    return np.asarray(alpha_cumprod, dtype=np.float32).astype(np.float64)
+ALPHA_EVALUATION = "torch_cpu_float32_scaled_linear_v1"
+
+
+def effective_alpha_reference(
+        config: Mapping[str, Any] | None = None) -> np.ndarray:
+    """Rebuild the scheduler's effective constants without reading its buffer.
+
+    Diffusers evaluates linspace, square, subtraction and cumprod in CPU
+    float32.  Computing the whole schedule in float64 and rounding only the
+    result is a different graph.  Keep ``alpha_cumprod_reference`` for the
+    raw parent/source check; independent x_t uses these effective constants
+    promoted to float64, as required by preregistration section 3.2.
+    """
+    config = MODEL_CONFIG if config is None else config
+    if config["beta_schedule"] != "scaled_linear":
+        raise ValueError("effective alpha requires the frozen scaled_linear schedule")
+    betas = torch.linspace(float(config["beta_start"]) ** 0.5,
+                           float(config["beta_end"]) ** 0.5,
+                           int(config["num_train_timesteps"]),
+                           dtype=torch.float32, device="cpu") ** 2
+    return torch.cumprod(1.0 - betas, dim=0).numpy().astype(np.float64)
+
+
+def verify_production_alpha(alpha: torch.Tensor,
+                            config: Mapping[str, Any]) -> None:
+    """Require the native buffer's storage and values before any forward."""
+    if not isinstance(alpha, torch.Tensor) or alpha.dtype != torch.float32:
+        raise ValueError("production diffusion alpha dtype differs")
+    expected = effective_alpha_reference(config)
+    actual = alpha.detach().cpu().numpy()
+    if actual.shape != expected.shape:
+        raise ValueError("production diffusion alpha shape differs")
+    if not np.array_equal(actual.astype(np.float64), expected):
+        raise ValueError("production diffusion alpha schedule differs")
 
 
 def independent_x_t(x0: np.ndarray, epsilon: np.ndarray, t: np.ndarray,
@@ -1057,6 +1088,7 @@ class SyntheticTrainingProvider:
             det_cond = ConditionEncoder(int(self.config["d_model"]))
             torch.manual_seed(self.seed + 1)
             diff = _model_factory("diffusion", self.config, "cpu")
+            verify_production_alpha(diff.ddpm.alphas_cumprod, self.config)
             _controlled_head_init(diff)
             diff_cond = ConditionEncoder(int(self.config["d_model"]))
             states = {
@@ -1100,13 +1132,14 @@ class SyntheticTrainingProvider:
         # registered noise matrix and independent x_t
         noise = draw_noise_path(NOISE_SEED)
         alpha = alpha_cumprod_reference(self.config)
+        alpha_effective = effective_alpha_reference(self.config)
         x_t_ref: list[np.ndarray] = []
         for unit in noise:
             slots = MICRO_SCHEDULE[unit["update"]][unit["micro"]]
             x0 = np.stack([window_arrays[w]["x0"] for w in slots], axis=0)
             x_t_ref.append(independent_x_t(x0, unit["epsilon"].numpy(),
                                            unit["t"].numpy(),
-                                           effective_alpha(alpha)))
+                                           alpha_effective))
         # diffusion pre-check: predictions must stay in the rotation domain
         diff.eval(); diff_cond.eval()
         max_angle = 0.0
@@ -1198,6 +1231,8 @@ class SyntheticTrainingProvider:
             "noise_protocol": NOISE_PROTOCOL,
             "draw_units": len(noise),
             "alpha_cumprod_sha256": _hash_array(alpha),
+            "alpha_effective_sha256": _hash_array(alpha_effective),
+            "alpha_evaluation": ALPHA_EVALUATION,
             "x_t_reference_sha256": [_hash_array(a) for a in x_t_ref],
             "target_source": ("deterministic_fixture_forward_plus_registered_"
                               "perturbation"),
@@ -1337,6 +1372,9 @@ class SyntheticTrainingProvider:
         trainer.model.load_state_dict(state["model"], strict=True)
         trainer.conditioner.load_state_dict(state["conditioner"],
                                             strict=True)
+        if model_type == "diffusion":
+            verify_production_alpha(trainer.model.ddpm.alphas_cumprod,
+                                    self.config)
         trainer.model.train(); trainer.conditioner.train()
         return trainer
 
@@ -1995,14 +2033,12 @@ def run_p_stage(root: Path, stage: str, attempt: str, t0: float,
                         model_arrays[f"t/u{u}/m{m}"] = _to_np(cap["t"])
                         model_arrays[f"noise/u{u}/m{m}"] = _to_np(cap["noise"])
                         model_arrays[f"x_t/u{u}/m{m}"] = _to_np(cap["x_t"])
-                        x0_ref = provider.window_arrays  # documentation only
                         slots = MICRO_SCHEDULE[u][m]
                         x0 = np.stack([provider.window_arrays[w]["x0"]
                                        for w in slots], axis=0)
-                        alpha = provider.alpha_cumprod
                         x_t_ref = independent_x_t(
                             x0, unit["epsilon"].numpy(), unit["t"].numpy(),
-                            effective_alpha(alpha))
+                            effective_alpha_reference(provider.config))
                         diff = np.abs(cap["x_t"].detach().cpu().numpy().astype(
                             np.float64) - x_t_ref)
                         bound = (TOLERANCE_PROPOSALS["alpha_x_t"]["atol"]
@@ -3232,10 +3268,9 @@ def run_i_stage(root: Path, stage: str, attempt: str, t0: float,
                         slots = MICRO_SCHEDULE[u][m]
                         x0 = np.stack([provider.window_arrays[w]["x0"]
                                        for w in slots], axis=0)
-                        alpha = provider.alpha_cumprod
                         x_t_ref = independent_x_t(
                             x0, unit["epsilon"].numpy(), unit["t"].numpy(),
-                            effective_alpha(alpha))
+                            effective_alpha_reference(provider.config))
                         cmp_alpha = compare_numeric(
                             cap["x_t"].detach().cpu().numpy().astype(np.float64),
                             x_t_ref, tol["alpha_x_t"],
@@ -6016,12 +6051,13 @@ IMPLEMENTATION_FILES = (
     "uv.lock",
     "configs/train/omniretarget_motion.yaml",
     "docs/plans/omniretarget_w1_real_training_update_provider_execution_plan.md",
+    "docs/plans/omniretarget_w1_real_training_update_alpha_fix_plan.md",
     "docs/plans/omniretarget_w1_real_training_update_audit_prereg_draft.md",
 )
 PREREG_DRAFT = (
     "docs/plans/omniretarget_w1_real_training_update_audit_prereg_draft.md")
 EXECUTION_PLAN = (
-    "docs/plans/omniretarget_w1_real_training_update_provider_execution_plan.md")
+    "docs/plans/omniretarget_w1_real_training_update_alpha_fix_plan.md")
 
 
 def _git_identity(project_root: Path) -> dict:
@@ -6057,14 +6093,27 @@ def implementation_identity(project_root: Path) -> dict:
 #: check is metadata/source-hash only; it never runs a numeric probe.
 RUNTIME_IDENTITY_KEYS = (
     "python", "torch", "numpy", "scipy", "cuda_available",
-    "cuda_device_count", "cuda_version", "cpu_threads",
+    "cuda_device_count", "cuda_version", "cpu_threads", "diffusers",
 )
 ADAM_SOURCE_MODULES = ("torch.optim.adam", "torch.optim.adamw")
+SCHEDULER_SOURCE_MODULES = ("diffusers.schedulers.scheduling_ddpm",
+                          "diffusers.schedulers.scheduling_ddim")
 
 
 def _adamw_source_sha256() -> dict:
     source = {}
     for name in ADAM_SOURCE_MODULES:
+        try:
+            mod = __import__(name, fromlist=["x"])
+            source[name] = sha256_file(Path(mod.__file__))
+        except (ImportError, OSError, TypeError):
+            source[name] = None
+    return source
+
+
+def _scheduler_source_sha256() -> dict:
+    source = {}
+    for name in SCHEDULER_SOURCE_MODULES:
         try:
             mod = __import__(name, fromlist=["x"])
             source[name] = sha256_file(Path(mod.__file__))
@@ -6083,6 +6132,11 @@ def runtime_identity_facts() -> dict:
     except importlib.metadata.PackageNotFoundError:
         facts["mujoco"] = None
     facts["adamw_source_sha256"] = _adamw_source_sha256()
+    try:
+        facts["diffusers"] = importlib.metadata.version("diffusers")
+    except importlib.metadata.PackageNotFoundError:
+        facts["diffusers"] = None
+    facts["scheduler_source_sha256"] = _scheduler_source_sha256()
     return facts
 
 
@@ -6104,6 +6158,15 @@ def runtime_identity_problems(reference: Mapping[str, Any] | None,
         for name in ADAM_SOURCE_MODULES:
             if reference_sources.get(name) != current_sources.get(name):
                 problems.append(f"runtime_identity:source:{name}")
+    reference_schedulers = reference.get("scheduler_source_sha256")
+    current_schedulers = current.get("scheduler_source_sha256") or {}
+    for name in SCHEDULER_SOURCE_MODULES:
+        expected = ((reference_schedulers or {}).get(name)
+                    if isinstance(reference_schedulers, Mapping) else None)
+        if not isinstance(expected, str) or not re.fullmatch(
+                r"[0-9a-f]{64}", expected) \
+                or expected != current_schedulers.get(name):
+            problems.append(f"runtime_identity:source:{name}")
     return problems
 
 
@@ -6121,6 +6184,11 @@ def _fixture_schema_problems(provider: SyntheticTrainingProvider) -> list[str]:
         problems.append("fixture_schedule")
     if fixture.get("noise_seed") != NOISE_SEED:
         problems.append("fixture_noise_seed")
+    if fixture.get("alpha_evaluation") != ALPHA_EVALUATION:
+        problems.append("fixture_alpha_evaluation")
+    if fixture.get("alpha_effective_sha256") != _hash_array(
+            effective_alpha_reference(provider.config)):
+        problems.append("fixture_alpha_effective_sha256")
     for key in WINDOW_IDS:
         arrays = provider.window_arrays[key]
         problems += _array_shape_problems(arrays["x0"], name=f"{key}.x0",

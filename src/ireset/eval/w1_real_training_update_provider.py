@@ -80,7 +80,9 @@ from ireset.eval.w1_real_training_update_audit import (
     build_parameter_roster,
     configure_production_runtime,
     draw_noise_path,
-    effective_alpha,
+    ALPHA_EVALUATION,
+    effective_alpha_reference,
+    verify_production_alpha,
     environment_facts,
     implementation_identity,
     independent_x_t,
@@ -1335,7 +1337,7 @@ class RealTrainingProvider:
             problems.append("input_alpha_shape")
         elif not np.array_equal(alpha, alpha_ref):
             problems.append("input_alpha_schedule")
-        effective = effective_alpha(alpha)
+        effective = effective_alpha_reference(self.config)
         if not (np.isfinite(effective).all()
                 and (effective > 0).all() and (effective <= 1).all()):
             problems.append("input_alpha_domain")
@@ -1387,6 +1389,7 @@ class RealTrainingProvider:
             "alpha_cumprod_sha256": _hash_array(alpha),
             "alpha_effective_sha256": _hash_array(
                 np.asarray(effective, np.float64)),
+            "alpha_evaluation": ALPHA_EVALUATION,
             "x_t_reference_sha256": x_t_hashes,
             "x_t_reference_max_abs": x_t_max,
             "noise_units": len(self.noise),
@@ -1455,6 +1458,7 @@ class RealTrainingProvider:
         if isinstance(parent_input_admission, Mapping):
             binding = [
                 "source_sha256", "alpha_cumprod_sha256",
+                "alpha_effective_sha256", "alpha_evaluation",
                 "x_t_reference_sha256", "noise_units",
                 "r0_registration_sha256",
             ]
@@ -1669,12 +1673,9 @@ class RealTrainingProvider:
                              *trainer.conditioner.parameters())):
             raise ValueError("checkpoint contains non-finite parameters")
         if model_type == "diffusion":
-            production_alpha = np.asarray(
-                trainer.model.ddpm.alphas_cumprod.detach().cpu().numpy(),
-                np.float64)
-            expected = effective_alpha(self.alpha)
-            if not np.array_equal(production_alpha, expected):
-                raise ValueError("production diffusion alpha schedule differs")
+            self._check("trainer_alpha_schedule")
+            verify_production_alpha(trainer.model.ddpm.alphas_cumprod,
+                                    self.config)
         trainer.model.train(); trainer.conditioner.train()
         return trainer
 

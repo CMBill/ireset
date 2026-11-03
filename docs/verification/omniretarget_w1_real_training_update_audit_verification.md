@@ -1,10 +1,9 @@
-# W1 真实网络参数梯度与优化更新链路审计 —— I/C 工程与纯合成验收记录
+# W1 真实网络参数梯度与优化更新链路审计 —— I/C 验证与真实执行记录
 
-日期：2026-10-29。方案：[omniretarget_w1_real_training_update_audit_prereg_draft.md](../plans/omniretarget_w1_real_training_update_audit_prereg_draft.md)
-（v0.9）。状态：**I/C 实现、第七轮审阅修复与纯合成验收完成；真实 provider/授权/注册/真实 R0→P→I→F 未实施**。
+日期：2026-11-03。冻结方案：[预注册 v0.9](/home/c112/codes/bill/ireset/docs/plans/omniretarget_w1_real_training_update_audit_prereg_draft.md)、[执行计划 v0.11](/home/c112/codes/bill/ireset/docs/plans/omniretarget_w1_real_training_update_provider_execution_plan.md)及[alpha 修正补充计划 v0.12](/home/c112/codes/bill/ireset/docs/plans/omniretarget_w1_real_training_update_alpha_fix_plan.md)。
+状态：**alpha 有效常数修复完成，Gate B 已重冻结为 attempt_013；首次真实结果仍为 R0 完成、P incomplete、I/F 未启动、实际更新 2 次。本轮未真实续跑，新实现未获真实恢复授权。**
 
-本记录只覆盖合成证据与冻结准入材料。没有读取真实 checkpoint 张量、真实 NPZ 数值、数据集或 G1 资产，
-没有执行真实网络前向/反向、真实 FK、真实参数更新或生产 checkpoint 写入。
+当前 Gate B 权威见 §12 / attempt_013；真实执行事实见 §11 与[首次执行报告](/home/c112/codes/bill/ireset/docs/verification/omniretarget_w1_real_training_update_audit_report.md)。§1–10.11 保留原 I/C、合成、准入及未授权时点的历史记录；其中“真实未读/未运行”仅适用于各节原记录时点。旧方案与 attempt_012 工件保留原字节。
 
 ## 1. 交付文件
 
@@ -875,3 +874,95 @@ attempt_011 的历史事实；当前权威为 §10.11（v0.11/attempt_012），�
   `objective_coverage=partial`、`full_objective_contract_passed=null`、
   `factor_selected=false`、`auto_execute=false`、`final_interaction_method=not_ready`、
   `production_integration=false`。v0.9 方案/校准/合成/准入字节未改写。
+
+## 11. 用户明确授权后的首次真实执行（2026-11-02）
+
+用户确认“同意草案十项，授权按固定预算执行一次真实 R0→P→I→F（3240 秒、16 次诊断更新），不自动重试。”。新的 §10.2 [正式授权](/home/c112/codes/bill/ireset/derived/audit/w1_real_training_update_audit/authorization/attempt_012/authorization.json) SHA **`199bfb30f11502aaf57acf38f1c49525ac58e511f870f230f223cb12b8525d78`**，十项全 true，绑定 v0.11 / attempt_012 和授权草案 `66d1261d…`；`authorization_problems=[]`。未改动冻结预注册、执行计划、25 文件实现清单或 Gate B 工件。
+
+首次运行根为 `derived/experiments/omniretarget_first/20261102_2704709_w1_real_training_update_audit`。启动时钟在 uv/import 前记录并传入原 CLI，首次入口仅一次，无 `--resume` 或自动重试。Gate D 的 R0 `attempt_001` done/complete=true，metadata admission passed/problems=[]，R0 的 checkpoint payload/数组数值/模型/编译为 0，CPU draw=8；R0 registration `6abab029…`。
+
+Gate E 的 P `attempt_001` 在登记后完成四窗物化、input_admission passed（`b1dbefcf…`）、两份 checkpoint strict load、两套模型/conditioner/optimizer 构造及 deterministic 的两次原生更新；随后在 diffusion trainer 返回前触发 **`production diffusion alpha schedule differs`**。扩散首次 forward 未启动，P 封为 incomplete/complete=false；I/F 均未创建 attempt，未重试。结论 **`audit_incomplete`、exit 3、complete_evidence=false、covered_contract_passed=false**；全链 16 次未完成，实际 training_updates=2。
+
+两份 reservation 均已结算，index/ledger 的 status/complete/测量成本/调用余额一致；逐类核对 `after-before=consumed`，未超预留/caps，没有本地 running/publishing 或 consumed=null。登记成本 R0 **58.599905234s**、P **8.502827990s**，合计 **67.102733224/3240s**（含保守 seal-tail）；外层实测 66.205312315s，单列不替换账本。
+
+实际累计：checkpoint/model/conditioner/native optimizer 构造各2，conditioner/backbone/loss assembler/parameter backward/micro 各8，生产 FK batch16，clip/native AdamW/diagnostic update各2，scene setup1，CPU draw8（全部归 R0），native add_noise/独立 VJP/显式参考更新/参考 mj_forward+jacSite 均0。当前完整选择与 selected-chain 计数未确认；两次更新未经过 I/F，不能声明参数链路通过。
+
+P 的 p_report/p_rows/p_diffusion 缺失，已写出的 p_deterministic 部分 NPZ 未列入 P 封口 artifacts，保留且不可消费。P 提前返回没有生成 audit_result.json 或 F final，未事后补造。异常与返回事实见[已哈希输出](/home/c112/codes/bill/ireset/derived/audit/w1_real_training_update_audit/authorization/attempt_012/execution_stdout.log)（`24c3c31a…`）及[退出记录](/home/c112/codes/bill/ireset/derived/audit/w1_real_training_update_audit/authorization/attempt_012/execution_exit.json)；[只读执行观察](/home/c112/codes/bill/ireset/derived/audit/w1_real_training_update_audit/authorization/attempt_012/execution_observation.json) SHA **`54ca9d2ad155fdac77c1d4d60acd3037cfb8ec289af3d31f492ebd72ab1394e4`** 标明并非正式 stage report，保存原运行10文件/共466,350,106 bytes 的摘要与完整调用/成本事实。
+
+执行后只读 JSON/源码/文件字节摘要，没有重载真实 checkpoint/NPZ 值、重建模型或追加数值探针；未重跑 pytest、校准或合成链。25 个实现文件和6份主要冻结材料摘要不变。下一步先纯合成定位 alpha 求值语义并重新冻结受影响 Gate B；真实恢复必须处理旧 cohort 的实现/授权绑定，保留已消耗的调用、attempt 与成本，不能更名重获额度。本次一次运行已结束，不自动续跑。
+
+`objective_coverage=partial/full_objective_contract_passed=null/factor_selected=false/auto_execute=false/final_interaction_method=not_ready/production_integration=false` 与旧质量结论保持。详见[首次真实执行报告](/home/c112/codes/bill/ireset/docs/verification/omniretarget_w1_real_training_update_audit_report.md)。
+
+## 12. alpha 有效常数修正与 Gate B attempt_013（2026-11-03）
+
+本轮依据[补充计划 v0.12](/home/c112/codes/bill/ireset/docs/plans/omniretarget_w1_real_training_update_alpha_fix_plan.md)，SHA **`9b49e673d975fdd1fd61ea80e7926618d328750af6054b312827ca97fac646a0`**，仅修复既有预注册 §3.2 的有效常数实现，并重新冻结 Gate B。原预注册 v0.9、执行计划 v0.11、attempt_012 校准/合成/准入、首次真实根及授权目录保留原字节；未真实重试或续跑。
+
+### 12.1 复现与实现
+
+固定原配置、Diffusers 0.40.0、Torch 2.14.0+cu126 的纯合成 scheduler 探针确认：原生 alpha 与“float64 完整计算后末尾转 float32”有 **767/1000** 个位置不同，最大 **11 ULP**、绝对差 `1.7881393432617188e-7`。首个不同坐标 t=2：原生 `0.9996920824050903`，旧参考 `0.9996920228004456`。独立 CPU float32 `linspace → square → 1-betas → cumprod` 与原生结果逐位一致。
+
+诊断位于 `derived/audit/w1_real_training_update_audit/alpha_schedule_fix/attempt_001/`：`alpha_schedule_diagnosis.json`、`alpha_schedule_arrays.npz`、`preserved_files.json`。探针仅构造 scheduler，checkpoint payload、父数组数值、模型/优化器、forward/update 均为0；它不是对真实失败 attempt 的补算或补造报告。
+
+- `effective_alpha_reference(config)` 从配置独立重建生产有效 binary32 常数后提升到 float64；`alpha_cumprod_reference` 的父 raw float64 来源门保持。fixture、P/I/F 的独立 x_t 和真实 input admission 统一使用新 helper，生产 scheduler 与生产输入不改。
+- `verify_production_alpha` 在真实/合成 provider 以及 fixture 的 diffusion 首次 forward 前核对 float32 dtype、shape 和严格逐位值；1 ULP、旧末尾舍入结果、错 schedule、dtype、shape、NaN 均拒绝。真实构造保留 deadline/unit guard。
+- input admission 分别冻结 raw/effective alpha 摘要和 `torch_cpu_float32_scaled_linear_v1` 协议；I/F 将有效摘要与协议也列为消费硬门。
+- runtime identity 增加 Diffusers 版本和 DDPM/DDIM 两个实际导入源码 SHA；各 metadata 消费端仍仅核对版本/字节，不执行数值探针。`cpu_threads=20`。
+- 实现闭包 **26 文件**：两份审计源码、两份测试发生本轮改动，新增 v0.12 补充计划；旧 v0.11 与 v0.9 仍在清单中，`EXECUTION_PLAN` 指向补充计划，`PREREG_DRAFT` 保持原路径。audit `006e942b…`、provider `d08ba01d…`、audit tests `980bc098…`、provider tests `bf934a6b…`。
+
+### 12.2 回归与数值校准
+
+修复前两个新增合成用例按预期失败，分别复现原生 scheduler 被误拒、input admission 的有效 alpha 摘要错误；保存 `baseline_alpha_regression.log`。修复后定向 **16 passed（7.44s）**；最终字节合并执行 provider **45** + audit **72** + 六个既有相关文件 **263** = **380 passed（373.02s）**，较旧版新增13个用例。六文件为 `test_omniretarget_w1`、`test_w1_de_numerics`、`test_w1_training_objective_audit`、`test_w1_real_objective_audit`、`test_w1_real_admission`、`test_w1_real_fk_audit`。全项目套件未重跑。命令和日志摘要见同目录 `regression_summary.json`。
+
+校准目录：`derived/audit/w1_real_training_update_audit/calibration/attempt_013/`。
+
+| 项目 | SHA-256 |
+| --- | --- |
+| tolerance contract 文件 | `d8515d2f51f966da7324e8c0f385d9b12d034fcbe79fc160d82b6939bd65b649` |
+| calibration evidence | `b848cbb4e54553dd19daf69a471076ddfc3bd2c6030c55608413d746d0c096b2` |
+| fp32 canonical | `574d9a0a2115e3619aa260f3eef4ef83c8ff85e377e2f23eebc078434a0d441e` |
+| adamw_fp32_contract.json 文件 | `2c4ddba84d43a2264eca94b603b400af8be764de97352e3cf933e569822c44b2` |
+| calibration_verification.json 文件 | `ac66dd8b15fa60885b8f6488316f3aed469584b78318197d5eb833d06426bd63` |
+| verification canonical | `49ffc21ba57283c1614b9070dbd07560a32065fc71b5878625b6c1519771cbeb` |
+
+实际重算 `recompute_problems=[]`、`four_x_ok=true`。阈值、规则、零底与 attempt_012 逐项相同；仅 `alpha_x_t` 观测变化：比值 `0.21678926013164576 → 0.04576622897692079`，4× `0.867157040526583 → 0.18306491590768317`。其余门的观测逐项相同，最大4×仍为 `delta_same_input=0.9255398370845472`，`delta_cross_path=0.8644089322616761`、`state_cross_path=0.5792524288194545`。fp32 数值探针、节点图、host constants 与旧版相同，canonical 变化仅来自新增 runtime identity；没有放宽阈值。
+
+### 12.3 完整合成链与新旧对比
+
+目录：`derived/audit/w1_real_training_update_audit/synthetic/attempt_013/`。
+
+| 工件 | SHA-256 |
+| --- | --- |
+| audit_result.json | `10dc7f364a090d58e870ee52087998dcd47a7bf4650f98cee719b752170ce4a8` |
+| final | `0ba1babef620b4a726dabb40cfbb0f109727cdeff22c862a4a38f1729349427d` |
+| R0 registration | `34d9a769f2c537708e51109f7c1b6cdaf5ff2a49d29e1ed89d71233309facf39` |
+| synthetic_acceptance.json | `8f655f41184234a61536f5bfb058609538d7d5381fff05b7b3775576838686d5` |
+
+四阶段均 `attempt_001`、done/sealed、消费 problems 为空；**264 tensor/3864 行**齐全。选中链/阶段/cohort 调用精确相等，`training_updates=16`，零计数保持。结论 **`audit_incomplete` / exit 3**：`complete_evidence=true`、`covered_contract_passed=false`、`failures=[]`、`problems=[]`，**582** gap（392 `parameter_delta_precision_gap` + 190 `cross_path_sensitivity_gap` + 0 bound-unverifiable）。F 独立进程 pid **1749699** / ppid **1746039**、exit0/`ok`，`verification_problems=[]`。
+
+| 阶段 | 已封口成本（秒） | 消费核验墙钟（秒） |
+| --- | ---: | ---: |
+| R0 | 1.190880829 | 0.007949325 |
+| P | 17.504695744 | 4.262634910 |
+| I | 68.774587591 | 12.406381461 |
+| F | 160.340700071 | 16.772381485 |
+| 合计 | **247.810864235** | — |
+
+P/I/F 消费核验已按 `cost_floor` 重封口入账。工件 **7,404,799,802 bytes**。acceptance `passed=true/problems=[]`、消费 validator `[]`；阶段文件数 R0/P/I/F = **3/5/5/12**，fixture6、run3，`run_sha256=f827d86c3c5ea78eb03645e1f2bd36863d2b3b08212a93f5814b788911f45135`。
+
+[逐项比较证据](/home/c112/codes/bill/ireset/derived/audit/w1_real_training_update_audit/alpha_schedule_fix/attempt_001/gate_b_comparison.json) SHA **`7893d74b0417c8c1d2a527e75d3cadca3ada013ec8bf544c47a05a05dc77516b`**，`passed=true`：
+
+- P/I 及 F-P/F-I 两模型共 **8 个 NPZ 与 attempt_012 字节完全相同**，覆盖原生 x_t、prediction、梯度、参数及优化器数组；四份 rows 的内容也全部相同。gap 集合、行级数值判定、调用与覆盖边界不变。
+- 去除运行路径差异后，P 和 F-P 报告各仅8个 `x_t_max_ratio` 变化，I/F-I 报告无其他变化。fixture 的8份独立 x_t 数组变化，逐份按新有效常数重推相等；raw alpha、t/epsilon、windows、两份合成权重和 roster 不变。
+- 阈值/规则/零底逐项相同；其余校准数值证据相同。**62 个受保护文件全部保持原字节**，包括旧方案、Gate B attempt_012、首次真实10文件、原授权目录和生产 generator。保护清单 SHA `03eba72eb291cfb6b3c2b8108752ad8fb3cb68b99633a6218734c3a705a84d53`。
+
+### 12.4 真实 metadata-only admission 与后续边界
+
+CLI 输出新包为 `derived/audit/w1_real_training_update_audit/admission_real/attempt_013/attempt_001/admission_package.json`（`--out` 指定 attempt_013 容器，写包器按包 attempt 追加）。SHA **`53de1b1e03d2928803a6140b10342d642e87f95d85fd52dd0d863f174e4073b2`**、**455,723 bytes**，`passed=true/problems=[]`、validator `[]`。父锚10/10、checkpoint2/2、资产37引用及26个实现文件均匹配，runtime identity 与校准/接受一致。
+
+scope 为 `metadata_only`：记录13次文件字节摘要和36键 NPZ 头部；checkpoint payload/NPZ values/torch.load/模型构造/MuJoCo 编译/forward/VJP/optimizer steps 均为0，`cohort_created=false`、`registered_attempt_created=false`，资产闭包 `asset_closure_verified=true`。新包状态 `authorized=false/registered=false/run=not_run/section_10_2_checked=false`。
+
+本轮未读取真实 checkpoint payload 或父 NPZ 数值、未编译真实资产、未执行真实 forward/backward/FK/更新，未创建新真实授权/cohort/注册；未提交。首次真实历史仍为 **2 次更新、67.10273322396097 秒**，原 R0/P attempt、reservation、未封口部分数组与账本全部保留。Gate B 的16次是合成更新，不增加真实额度。
+
+旧授权绑定旧实现且“一次执行、不自动重试”已执行完毕；现有 resume 仍要求旧 cohort 的实现及授权身份不变。本轮未修改此硬门。后续先制定保留原消耗的身份/授权绑定迁移方案，完成复审并取得针对新绑定的明确授权；不得更名重置消耗，不直接用旧授权运行新实现。
+
+`objective_coverage=partial/full_objective_contract_passed=null/factor_selected=false/auto_execute=false/final_interaction_method=not_ready/production_integration=false` 与旧质量结论保持。

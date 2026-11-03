@@ -46,6 +46,121 @@ def _zero_snapshot() -> dict:
     return A.CallCounter(A.CALL_CAPS).snapshot()
 
 
+@pytest.mark.parametrize("mutate_alpha", [False, True])
+def test_real_provider_alpha_gate_with_synthetic_weights(
+        tmp_path, monkeypatch, mutate_alpha):
+    provider = P.RealTrainingProvider(tmp_path, TINY_CONFIG, device="cpu")
+    provider.tokenizer = StateTokenizer(
+        np.tile(np.array([-1.0, 1.0]), (29, 1)),
+        RootStats(mean=np.zeros(3), std=np.ones(3)))
+    provider.alpha = A.alpha_cumprod_reference(TINY_CONFIG)
+    native_trainer = P.Trainer
+    forwards = []
+
+    def construct(*args, **kwargs):
+        trainer = native_trainer(*args, **kwargs)
+        trainer.model.register_forward_pre_hook(
+            lambda *_args: forwards.append("forward"))
+        if mutate_alpha:
+            alpha = trainer.model.ddpm.alphas_cumprod
+            alpha[2] = torch.nextafter(alpha[2], torch.tensor(float("inf")))
+        return trainer
+
+    monkeypatch.setattr(P, "Trainer", construct)
+
+    def synthetic_payload(model_type, counter):
+        counter.add("checkpoint_loads", 1)
+        model = A._model_factory(model_type, TINY_CONFIG, "cpu")
+        conditioner = A.ConditionEncoder(TINY_CONFIG["d_model"])
+        return {"model": model.state_dict(),
+                "conditioner": conditioner.state_dict()}
+
+    monkeypatch.setattr(provider, "_load_checkpoint", synthetic_payload)
+    counter = A.CallCounter(A.CALL_CAPS)
+    if mutate_alpha:
+        with pytest.raises(ValueError, match="production diffusion alpha"):
+            provider.build_trainer("diffusion", with_optimizer=False,
+                                   counter=counter, loss_mode="forbidden")
+    else:
+        trainer = provider.build_trainer(
+            "diffusion", with_optimizer=False, counter=counter,
+            loss_mode="forbidden")
+        assert trainer.model.ddpm.alphas_cumprod.dtype == torch.float32
+    assert forwards == []
+    assert counter.counts["checkpoint_loads"] == 1
+    assert counter.counts["model_constructions"] == 1
+    assert counter.counts["native_optimizer_constructions"] == 0
+
+
+def _synthetic_input_provider(tmp_path):
+    provider = P.RealTrainingProvider(tmp_path, TINY_CONFIG, device="cpu")
+    arrays = {key: np.zeros(shape, dtype=dtype)
+              for key, (dtype, shape) in P.REQUIRED_WINDOW_HEADERS.items()}
+    arrays["root_std"][:] = 1.0
+    arrays["joint_lo"][:] = -1.0
+    arrays["joint_hi"][:] = 1.0
+    arrays["raw_root"][..., 3] = 1.0
+    arrays["raw_wfc"][:] = np.eye(4)
+    arrays["box_quat"][..., 0] = 1.0
+    arrays["alpha_cumprod"] = A.alpha_cumprod_reference(TINY_CONFIG)
+    provider._build_tokenizer(arrays)
+    arrays["x0"] = np.stack([
+        provider.tokenizer.encode(arrays["raw_root"][i], arrays["raw_q"][i],
+                                  arrays["raw_wfc"][i]) for i in range(4)
+    ]).astype(np.float32)
+    provider.window_arrays = {key: {"x0": arrays["x0"][i]}
+                              for i, key in enumerate(A.WINDOW_IDS)}
+    provider.noise = A.draw_noise_path()
+    return provider, arrays
+
+
+def test_input_admission_uses_native_effective_alpha_and_keeps_raw_gate(tmp_path):
+    from diffusers import DDPMScheduler
+
+    provider, arrays = _synthetic_input_provider(tmp_path)
+    counter = A.CallCounter(A.CALL_CAPS)
+    result = provider._input_admission(arrays, counter=counter)
+    assert result["passed"], result["problems"]
+    scheduler = DDPMScheduler(
+        **{k: TINY_CONFIG[k] for k in ("num_train_timesteps", "beta_schedule",
+                                      "beta_start", "beta_end")},
+        prediction_type="sample", clip_sample=False)
+    native = scheduler.alphas_cumprod.numpy().astype(np.float64)
+    assert result["alpha_effective_sha256"] == A._hash_array(native)
+    assert result["alpha_evaluation"] == A.ALPHA_EVALUATION
+    for unit in provider.noise:
+        slots = A.MICRO_SCHEDULE[unit["update"]][unit["micro"]]
+        x0 = np.stack([provider.window_arrays[w]["x0"] for w in slots])
+        expected = A.independent_x_t(
+            x0, unit["epsilon"].numpy(), unit["t"].numpy(), native)
+        key = f"u{unit['update']}m{unit['micro']}"
+        assert result["x_t_reference_sha256"][key] == A._hash_array(expected)
+    arrays["alpha_cumprod"][2] = np.nextafter(
+        arrays["alpha_cumprod"][2], np.inf)
+    bad = provider._input_admission(arrays, counter=counter)
+    assert not bad["passed"]
+    assert "input_alpha_schedule" in bad["problems"]
+
+
+@pytest.mark.parametrize("field", ["alpha_effective_sha256", "alpha_evaluation"])
+def test_independent_materialize_binds_effective_alpha_before_backend(
+        tmp_path, monkeypatch, field):
+    provider, arrays = _synthetic_input_provider(tmp_path)
+    counter = A.CallCounter(A.CALL_CAPS)
+    parent = provider._input_admission(arrays, counter=counter)
+    parent[field] = "drift"
+    monkeypatch.setattr(provider, "_load_arrays", lambda: arrays)
+    monkeypatch.setattr(provider, "_verify_asset_closure", lambda: None)
+
+    def forbidden_backend(*args, **kwargs):
+        raise AssertionError("backend construction must not start")
+
+    monkeypatch.setattr(P, "RealReferenceBackend", forbidden_backend)
+    with pytest.raises(ValueError, match=f"input admission drift: {field}"):
+        provider.materialize(stage="I", r0_noise=A.draw_noise_path(),
+                             counter=counter, parent_input_admission=parent)
+
+
 def _finish(root: Path, stage: str, attempt: str, complete: bool,
             report: Path | None, t0: float | None = None,
             artifacts: dict | None = None) -> None:
@@ -1110,6 +1225,20 @@ def test_runtime_identity_drift_is_refused():
     assert "runtime_identity:cpu_threads" in A.runtime_identity_problems(
         tampered, current)
     tampered = copy.deepcopy(current)
+    tampered["diffusers"] = "0.0.0"
+    assert "runtime_identity:diffusers" in A.runtime_identity_problems(
+        tampered, current)
+    for name in A.SCHEDULER_SOURCE_MODULES:
+        tampered = copy.deepcopy(current)
+        tampered["scheduler_source_sha256"][name] = "0" * 64
+        assert f"runtime_identity:source:{name}" in A.runtime_identity_problems(
+            tampered, current)
+    tampered = copy.deepcopy(current)
+    tampered.pop("scheduler_source_sha256")
+    assert all(f"runtime_identity:source:{name}" in
+               A.runtime_identity_problems(tampered, current)
+               for name in A.SCHEDULER_SOURCE_MODULES)
+    tampered = copy.deepcopy(current)
     tampered["adamw_source_sha256"]["torch.optim.adam"] = "0" * 64
     assert "runtime_identity:source:torch.optim.adam" in \
         A.runtime_identity_problems(tampered, current)
@@ -1135,6 +1264,7 @@ def test_implementation_files_cover_calculation_dependencies():
         "src/ireset/eval/training_objective_audit.py",
         "pyproject.toml",
         "uv.lock",
+        "docs/plans/omniretarget_w1_real_training_update_alpha_fix_plan.md",
     }
     assert required <= set(A.IMPLEMENTATION_FILES)
     identity = A.implementation_identity(Path(__file__).resolve().parents[1])

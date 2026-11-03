@@ -30,6 +30,57 @@ TINY_CONFIG.update(d_model=8, n_layers=1, n_heads=2, ffn_mult=2,
                    time_window=3)
 
 
+def _native_alpha(config=None):
+    from diffusers import DDPMScheduler
+
+    config = A.MODEL_CONFIG if config is None else config
+    return DDPMScheduler(**{key: config[key] for key in
+                           ("num_train_timesteps", "beta_schedule",
+                            "beta_start", "beta_end")},
+                         prediction_type="sample", clip_sample=False
+                         ).alphas_cumprod
+
+
+def test_effective_alpha_reference_matches_native_nodes_and_uses_config():
+    native = _native_alpha().numpy().astype(np.float64)
+    reference = A.effective_alpha_reference(A.MODEL_CONFIG)
+    assert reference.dtype == np.float64
+    assert np.array_equal(reference, native)
+    rounded_raw = A.alpha_cumprod_reference().astype(np.float32).astype(np.float64)
+    # Final-only rounding loses intermediate float32 linspace/square/cumprod.
+    assert native[2] != rounded_raw[2]
+    assert not np.array_equal(reference, rounded_raw)
+    changed = dict(A.MODEL_CONFIG, beta_end=0.03)
+    assert np.array_equal(A.effective_alpha_reference(changed),
+                          _native_alpha(changed).numpy().astype(np.float64))
+    assert not np.array_equal(reference, A.effective_alpha_reference(changed))
+    with pytest.raises(ValueError, match="scaled_linear"):
+        A.effective_alpha_reference(dict(changed, beta_schedule="linear"))
+
+
+@pytest.mark.parametrize("mutation", [
+    "one_ulp", "rounded_raw64", "dtype", "shape", "nan", "wrong_config",
+])
+def test_production_alpha_strict_gate_rejects_drift(mutation):
+    native = _native_alpha()
+    A.verify_production_alpha(native, A.MODEL_CONFIG)
+    bad = native.clone()
+    if mutation == "one_ulp":
+        bad[2] = torch.nextafter(bad[2], torch.tensor(float("inf")))
+    elif mutation == "rounded_raw64":
+        bad = torch.tensor(A.alpha_cumprod_reference(), dtype=torch.float32)
+    elif mutation == "dtype":
+        bad = bad.double()
+    elif mutation == "shape":
+        bad = bad.unsqueeze(0)
+    elif mutation == "nan":
+        bad[2] = float("nan")
+    else:
+        bad = _native_alpha(dict(A.MODEL_CONFIG, beta_end=0.03))
+    with pytest.raises(ValueError, match="production diffusion alpha"):
+        A.verify_production_alpha(bad, A.MODEL_CONFIG)
+
+
 @pytest.fixture(scope="module")
 def tiny_provider(tmp_path_factory):
     root = tmp_path_factory.mktemp("w1_update_fixture")
@@ -39,6 +90,23 @@ def tiny_provider(tmp_path_factory):
     provider.load_fixture()
     assert not provider.fixture["problems"], provider.fixture["problems"]
     return provider
+
+
+def test_fixture_x_t_uses_native_effective_alpha(tiny_provider):
+    provider = tiny_provider
+    effective = _native_alpha(provider.config).numpy().astype(np.float64)
+    assert provider.fixture["alpha_effective_sha256"] == A._hash_array(effective)
+    assert provider.fixture["alpha_evaluation"] == A.ALPHA_EVALUATION
+    with np.load(provider.fixture_dir / "noise.npz") as arrays:
+        for index, unit in enumerate(provider.noise):
+            slots = A.MICRO_SCHEDULE[unit["update"]][unit["micro"]]
+            x0 = np.stack([provider.window_arrays[w]["x0"] for w in slots])
+            expected = A.independent_x_t(
+                x0, unit["epsilon"].numpy(), unit["t"].numpy(), effective)
+            key = f"u{unit['update']}m{unit['micro']}__x_t"
+            assert np.array_equal(arrays[key], expected)
+            assert provider.fixture["x_t_reference_sha256"][index] == \
+                A._hash_array(expected)
 
 
 @pytest.fixture(scope="module")
