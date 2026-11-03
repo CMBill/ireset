@@ -112,6 +112,8 @@ PROVIDER_SCHEMA = "w1_real_training_update_provider_v1"
 REFERENCE_SCHEMA = "w1_real_training_update_reference_backend_v1"
 SYNTHETIC_ACCEPTANCE_SCHEMA = (
     "w1_real_training_update_synthetic_acceptance_v1")
+SYNTHETIC_ACCEPTANCE_SCHEMA_V2 = (
+    "w1_real_training_update_synthetic_acceptance_v2")
 CALIBRATION_VERIFICATION_SCHEMA = (
     "w1_real_training_update_calibration_verification_v1")
 REAL_ADMISSION_SCHEMA = "w1_real_training_update_real_admission_v1"
@@ -781,6 +783,8 @@ def synthetic_acceptance(
 def synthetic_acceptance_problems(record: Mapping[str, Any] | None) -> list[str]:
     if not isinstance(record, Mapping):
         return ["acceptance_not_a_mapping"]
+    if record.get("schema") == SYNTHETIC_ACCEPTANCE_SCHEMA_V2:
+        return synthetic_acceptance_v2_problems(record)
     problems: list[str] = []
     if record.get("schema") != SYNTHETIC_ACCEPTANCE_SCHEMA:
         problems.append("acceptance_schema")
@@ -888,6 +892,103 @@ def synthetic_acceptance_problems(record: Mapping[str, Any] | None) -> list[str]
 # ---------------------------------------------------------------------------
 # metadata lifecycle
 # ---------------------------------------------------------------------------
+
+
+def synthetic_acceptance_v2(
+        *, ordinary: Mapping[str, Any], ordinary_path: Path,
+        ordinary_sha256: str, migration: Mapping[str, Any],
+        migration_path: Path, migration_sha256: str,
+        spec_sha256: str, snapshot_sha256: str,
+        legacy_head_sha256: str) -> dict:
+    """Bind the ordinary and migration synthetic chains into one Gate B.
+
+    The two child records keep the frozen v1 acceptance schemas; this wrapper
+    adds the migration identity and cohort accounting link.  It is metadata,
+    not a substitute for either child run.
+    """
+    problems: list[str] = []
+    if Path(ordinary_path).is_file():
+        if sha256_file(Path(ordinary_path)) != ordinary_sha256:
+            problems.append("ordinary_path_sha")
+    else:
+        problems.append("ordinary_path_missing")
+    if Path(migration_path).is_file():
+        if sha256_file(Path(migration_path)) != migration_sha256:
+            problems.append("migration_path_sha")
+    else:
+        problems.append("migration_path_missing")
+    problems += [f"ordinary:{p}" for p in
+                 synthetic_acceptance_problems(ordinary)]
+    problems += [f"migration:{p}" for p in
+                 synthetic_acceptance_problems(migration)]
+    for key in ("spec_sha256", "snapshot_sha256", "legacy_head_sha256"):
+        value = locals()[key]
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}",
+                                                          value):
+            problems.append(key)
+    migration_sel = migration.get("selected_chain_training_updates")
+    migration_cohort = migration.get("cohort_training_updates")
+    if migration_sel != 16 or migration_cohort != 18:
+        problems.append("migration_update_accounting")
+    if migration.get("generation") != "generation_002":
+        problems.append("migration_generation")
+    record = {
+        "schema": SYNTHETIC_ACCEPTANCE_SCHEMA_V2,
+        "mode": "synthetic",
+        "passed": not problems,
+        "problems": problems,
+        "ordinary": {"path": path_for_record(Path(ordinary_path)),
+                     "sha256": ordinary_sha256,
+                     "record": dict(ordinary)},
+        "migration": {"path": path_for_record(Path(migration_path)),
+                      "sha256": migration_sha256,
+                      "record": dict(migration),
+                      "spec_sha256": spec_sha256,
+                      "snapshot_sha256": snapshot_sha256,
+                      "legacy_head_sha256": legacy_head_sha256,
+                      "incremental_training_updates": 16,
+                      "cohort_training_updates": 18,
+                      "prior_training_updates": 2},
+        "runtime_identity": runtime_identity_facts(),
+        "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    return record
+
+
+def synthetic_acceptance_v2_problems(
+        record: Mapping[str, Any] | None) -> list[str]:
+    if not isinstance(record, Mapping):
+        return ["acceptance_v2_not_a_mapping"]
+    problems: list[str] = []
+    if record.get("schema") != SYNTHETIC_ACCEPTANCE_SCHEMA_V2:
+        problems.append("acceptance_v2_schema")
+    if record.get("mode") != "synthetic":
+        problems.append("acceptance_v2_mode")
+    if record.get("passed") is not True or record.get("problems"):
+        problems.append("acceptance_v2_not_passed")
+    for name in ("ordinary", "migration"):
+        part = record.get(name)
+        if not isinstance(part, Mapping):
+            problems.append(f"acceptance_v2_{name}")
+            continue
+        path = _record_path(part.get("path"))
+        if path is None or not path.is_file():
+            problems.append(f"acceptance_v2_{name}_path")
+        elif sha256_file(path) != part.get("sha256"):
+            problems.append(f"acceptance_v2_{name}_sha")
+        problems += [f"acceptance_v2_{name}:{p}" for p in
+                     synthetic_acceptance_problems(part.get("record"))]
+    migration = record.get("migration") or {}
+    if migration.get("incremental_training_updates") != 16 or \
+            migration.get("cohort_training_updates") != 18 or \
+            migration.get("prior_training_updates") != 2:
+        problems.append("acceptance_v2_update_accounting")
+    for key in ("spec_sha256", "snapshot_sha256", "legacy_head_sha256"):
+        value = migration.get(key)
+        if not isinstance(value, str) or not re.fullmatch(
+                r"[0-9a-f]{64}", value):
+            problems.append(f"acceptance_v2_{key}")
+    return problems
 
 
 def _checkpoint_config_problems(
@@ -1088,7 +1189,12 @@ class RealTrainingProvider:
         if problems:
             raise ValueError(f"synthetic acceptance refused: {problems}")
         self.acceptance = record
-        roster = ((record.get("roster") or {}).get("parameter_roster"))
+        roster_source = record
+        if record.get("schema") == SYNTHETIC_ACCEPTANCE_SCHEMA_V2:
+            roster_source = ((record.get("ordinary") or {}).get("record")
+                             or {})
+        roster = ((roster_source.get("roster") or {}).get(
+            "parameter_roster"))
         if not isinstance(roster, Mapping):
             raise ValueError("synthetic acceptance roster missing")
         self.roster = copy.deepcopy(dict(roster))

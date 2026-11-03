@@ -1,9 +1,9 @@
 # W1 真实网络参数梯度与优化更新链路审计 —— I/C 验证与真实执行记录
 
 日期：2026-11-03。冻结方案：[预注册 v0.9](/home/c112/codes/bill/ireset/docs/plans/omniretarget_w1_real_training_update_audit_prereg_draft.md)、[执行计划 v0.11](/home/c112/codes/bill/ireset/docs/plans/omniretarget_w1_real_training_update_provider_execution_plan.md)及[alpha 修正补充计划 v0.12](/home/c112/codes/bill/ireset/docs/plans/omniretarget_w1_real_training_update_alpha_fix_plan.md)。
-状态：**alpha 有效常数修复完成，Gate B 已重冻结为 attempt_013；首次真实结果仍为 R0 完成、P incomplete、I/F 未启动、实际更新 2 次。本轮未真实续跑，新实现未获真实恢复授权。**
+状态：**alpha 有效常数修复完成，Gate B 已重冻结为 attempt_013；v0.13 绑定迁移与有限恢复方案修订2补齐1 P1写后计费问题、尚未实施，修订1的2 P1+2 P2方案修复保留。首次真实结果仍为 R0 完成、P incomplete、I/F 未启动、实际更新 2 次，未真实续跑，新实现未获真实恢复授权。**
 
-当前 Gate B 权威见 §12 / attempt_013；真实执行事实见 §11 与[首次执行报告](/home/c112/codes/bill/ireset/docs/verification/omniretarget_w1_real_training_update_audit_report.md)。§1–10.11 保留原 I/C、合成、准入及未授权时点的历史记录；其中“真实未读/未运行”仅适用于各节原记录时点。旧方案与 attempt_012 工件保留原字节。
+当前 Gate B 权威见 §12 / attempt_013，迁移初稿/修订1历史见 §13/13.1、当前方案修订见 §13.2；真实执行事实见 §11 与[首次执行报告](/home/c112/codes/bill/ireset/docs/verification/omniretarget_w1_real_training_update_audit_report.md)。§1–10.11 保留原 I/C、合成、准入及未授权时点的历史记录；其中“真实未读/未运行”仅适用于各节原记录时点。旧方案与 attempt_012 工件保留原字节。
 
 ## 1. 交付文件
 
@@ -966,3 +966,58 @@ scope 为 `metadata_only`：记录13次文件字节摘要和36键 NPZ 头部；c
 旧授权绑定旧实现且“一次执行、不自动重试”已执行完毕；现有 resume 仍要求旧 cohort 的实现及授权身份不变。本轮未修改此硬门。后续先制定保留原消耗的身份/授权绑定迁移方案，完成复审并取得针对新绑定的明确授权；不得更名重置消耗，不直接用旧授权运行新实现。
 
 `objective_coverage=partial/full_objective_contract_passed=null/factor_selected=false/auto_execute=false/final_interaction_method=not_ready/production_integration=false` 与旧质量结论保持。
+
+## 13. 既有 cohort 绑定迁移方案制定（2026-11-03，仅文档）
+
+本节保留[绑定迁移与有限恢复方案 v0.13](/home/c112/codes/bill/ireset/docs/plans/omniretarget_w1_real_training_update_binding_migration_plan.md)初稿制定时点：初稿SHA **`721a585707e9c904e6e85ff3db7961b3023410d395851ed26c6582f3f66545ad`**，不是当前方案文件摘要；当前修订见§13.1。初稿状态为 `plan_only/not_implemented/real_resume_not_authorized`，当轮仅制定方案、核对JSON/源码/文件字节摘要并同步文档入口；没有新增迁移执行记录。
+
+方案决定沿用原根和cohort身份，追加第二代绑定，按新R0 attempt_002→P attempt_002→I attempt_001→F attempt_001恢复。旧marker、两条终态行及原attempt工件保留；未来index/ledger可追加新行，旧行canonical内容不变。新执行序号解决R0_001→P_001后追加R0_002的累计前态排序问题，按代次唯一选链解决两个done R0共存，完整历史仍参与预算和调用核验。F预检/父结算/封口终检继承同一身份与余额契约。
+
+原真实根仍10文件/466,350,106 bytes、R0 done与P incomplete各一次、两份reservation已结算、I/F未创建；实际消耗仍为2次更新和67.10273322396097秒。原3240秒上限余 **3172.897266776039秒**；R0余181.40009476602427秒、P余891.4971720100148秒、I/F余900/1200秒，R0/P各只剩原第二次attempt。计划将迁移复核与发布计入新R0；完整恢复最多新增16次、累计最多18次，而非重领16次或3240秒额度。
+
+v0.13列出原始摘要锚点、单向身份依赖、schema与事件提交、未知/中断处理、24类调用矩阵、读取/计费守卫、反例、实施M0–M5及另行明确授权后的单次M6。当前26文件实现闭包、`EXECUTION_PLAN`与v0.12冻结材料不变；实施后必须重新回归并冻结新校准/普通及迁移合成接受/metadata准入，attempt_013不能直接替代新实现证据。
+
+文档核验通过：`git diff --check` 无问题；24类矩阵与原观察/nominal/caps逐项一致，阶段/总余量按原账本重算一致，18处新增或修改的本地链接有效。26个关键文件（原3份冻结方案、真实根10文件、原授权目录9文件、当前Gate B的4份关键材料）与本轮事前SHA/bytes一致，26文件实现闭包也与attempt_013候选清单一致，mismatches均为空。改动仅为新方案及AGENTS/README/本验证记录。
+
+本轮仅做文档验证，不重跑pytest、校准或合成数值链；**380 passed仍是§12既有结果**。未读取真实checkpoint payload/父NPZ数值、未构造真实模型/优化器或编译资产，未新增真实授权/cohort/注册，未运行真实`--real`/`--resume`。所有partial/null/false/not_ready/不接入及旧质量结论保持。
+
+### 13.1 修订1：2 P1+2 P2方案修复（2026-11-03，仅文档）
+
+本节保留[v0.13 修订1方案](/home/c112/codes/bill/ireset/docs/plans/omniretarget_w1_real_training_update_binding_migration_plan.md)制定时点：修订1文件SHA **`28dc72745d5b85ef56a136a4d4541d33350e5c74c2b6ba4ed112ab79a60de405`**、45,389 bytes是历史摘要，不代表当前文件；当前修订见§13.2。该时点状态为`plan_only/not_implemented/real_resume_not_authorized`。
+
+| 审阅问题 | 本轮方案修复 |
+| --- | --- |
+| P1 消费核验与不可变commit循环 | §6.2定义内部准备态核验；全量核验/选择、cost_floor及有界重封口稳定后冻结行摘要，再写唯一finish/commit。公开消费要求commit、stage_closed、terminal及无撤销，执行中仅允许已验证持锁上下文；成功闭合前完成对应尾部检查。提交后异常追加revoke/成本负债，不改已提交行；撤销写入失败仍因缺闭合链拒绝 |
+| P1 登记前成本负债不可发现 | §6.1把唯一权威日志固定为原根launch_journal，uv/import及实质预检前持久化claim；即使原根仍只有旧v1账本，所有历史/准入/预算读取器也扫描。换授权目录或invocation不能隐藏负债，按invocation/stage/seq关联已结算成本去重；未结清即unknown |
+| P2 旧v1缺首个前驱头 | §4.1精确定义legacy_head_payload、canonical字节及seq=3专用承接。独立从两条旧行、两份reservation和原文件摘要重算头为`b499a6ce7e5ef8fac06821cc063f27bd109374d9673791551fe92ad56302a424`；seq≥4必须接前一commit，不为旧seq=1/2补造提交 |
+| P2 未结算小计冒充总更新数 | §11将调用/时间known分别报告；缺完整结算时training_updates/cohort_training_updates/cohort_call_counts及selected字段为null，单列已证明下界与unsettled_attempts。旧2+新P4+新I4而F快照缺失时下界10、实际总数未知；F部分执行但完整结算6次时精确总数16，仍不宣称链完成 |
+
+§8补入对应的未来合成反例，M0/M1/M5、F身份传递和新版授权绑定同步上述要求。**这些是后续实施与测试要求，本轮未实现迁移代码或执行这些反例。**
+
+文档核验通过：`git diff --check`及新方案空白检查无问题，本地链接/源码行号有效；24类矩阵与原观察、attempt_013 nominal及原caps逐项一致，四阶段与总预算按原账本重算一致，legacy_head独立重算一致。26个受保护关键文件的SHA/bytes与本轮事前基线全部相同；当前26文件实现闭包与attempt_013候选清单相同。原真实根仍10文件、466,350,106 bytes，无launch_journal或迁移事件；旧消耗仍为2次更新/67.10273322396097秒，剩余3172.897266776039秒。
+
+改动仅限本方案及AGENTS/README/本验证记录；未运行pytest、校准或数值链，**380 passed仍是§12历史结果**。未解码真实checkpoint/父NPZ、未构造模型/优化器或编译资产，未新增真实授权/cohort/注册，未运行真实`--real`/`--resume`。当前实现/证据权威仍v0.12/attempt_013，后续按M0–M5准备，再按M6要求取得绑定最终字节的新明确授权；partial/null/false/not_ready/不接入及旧质量结论保持。
+
+### 13.2 修订2：成功收据写后耗时与失败闭合（2026-11-03，仅文档）
+
+[v0.13 修订2方案](/home/c112/codes/bill/ireset/docs/plans/omniretarget_w1_real_training_update_binding_migration_plan.md)当前文件SHA **`1b27a41462c4d40fb3e0f54b240c3ac6669e4871062191d470dc734721142b17`**，53,647 bytes。状态仍为`plan_only/not_implemented/real_resume_not_authorized`。
+
+本轮修复复审的1项P1：原流程只有成功收据写前检查，不能证明其自身write/fsync耗时被尾部计费覆盖。§6.2将stage_closed/terminal改为候选，写入、文件/目录fsync及回读返回后，实际耗时必须同时不超过已计费floor、严格小于阶段remaining_s，身份/摘要也一致，才允许持锁上下文放行；R0慢写后不得提前启动P。
+
+§6.3要求先在内存中否决并阻断下游，再追加不可覆盖revoke/failure及已知未覆盖成本下界；同一阶段的重复时间观测取最大覆盖区间，不重复收费，不改写已提交行/finish/commit。撤销记录无法写入也不能继续。公开闭合还须有外层实际wait/exec返回来源及覆盖证明，不能凭done候选、锁释放或无revoke推断成功；证明缺失/失败即成本unknown，公开selected/complete按有效状态撤回。
+
+新增return_observation仅为未来接口，本轮未创建该记录。方案明确执行窗口包含候选收据发布、fsync、回读和清理，截止于外层实际返回；执行后观察存档仅复制既有返回事实、单列墙钟。该边界及证明门必须绑定到新spec/授权，不能借存档开展项目核验、模型/资产读取或更新。已有v1历史不补造证明、不重新计费。
+
+§8补充“尾部1秒、stage_closed实际5秒”应阻断P且未覆盖下界至少4秒、独立阶段预算越界、terminal慢写、最后清理延迟、撤销写入失败、缺/假返回来源及正常audit_incomplete/exit3闭合的未来反例；M1/M2、F传递、接受闭包与授权要求同步。**这些是实施验收要求，本轮未实现或执行这些反例，未运行pytest/校准/数值链，380 passed仍为§12既有结果。**
+
+文档检查通过：`git diff --check`、新方案空白、本地链接及源码行号核验无问题；24类矩阵与原观察/attempt_013 nominal/原caps逐项相同，四阶段预算及总余量重算一致，legacy_head仍为`b499a6ce…`。26个关键文件SHA/bytes与事前保护清单一致，当前26文件实现闭包与attempt_013候选清单一致。真实根仍10文件/466,350,106 bytes，无launch_journal或迁移/返回观察记录；原消耗2次更新/67.10273322396097秒、剩余3172.897266776039秒保持。
+
+改动仅限方案、AGENTS、docs/README与本验证记录。未解码真实checkpoint/父NPZ、未构造模型/优化器或编译资产，未新增真实授权/cohort/注册，未运行真实`--real`/`--resume`；当前实现证据仍v0.12/attempt_013，partial/null/false/not_ready/不接入与旧质量结论保持。
+
+### 13.3 M0/M1 开始实现（2026-11-03，未真实续跑）
+
+按 v0.13 修订2 开始实现，详细结果见[绑定迁移实现验证记录](omniretarget_w1_real_training_update_binding_migration_verification.md)。M0 已在原根之外生成 history snapshot（`28a542e6…`）和 protected manifest（`a033e856…`），独立重算 legacy head 为 `b499a6ce…`；原真实根仍 10 文件/466,350,106 bytes，未写入 launch journal/binding/attempt。
+
+M1 已实现：规范 JSON/重复键拒绝、legacy head 与 source copy 校验、执行序号/前驱头重推、generation 显式选链、准备态内部核验、一次性 finish/commit、提交后禁改写、固定 launch journal 扫描、stage_closed/terminal 写后实际耗时门、外层 return observation、v2 授权/迁移准入/草案 CLI。普通 resume 遇到 v2 授权明确拒绝，不会自动升级旧身份。
+
+本轮新增 9 项迁移合成反例（含 seq/legacy head/缺返回观察/慢写 revoke/授权额度重置）；`test_w1_real_training_update_audit.py`+迁移测试 **81 passed（116.10s）**、provider **45 passed（149.10s）**。全项目套件未重跑。M3 新 Gate B、M4 校准/普通+迁移双合成接受、M5 最终迁移准入与新授权草案、M6 真实 R0_002→P_002→I_001→F_001 仍未执行；本轮不创建真实授权/注册/返回观察，不改变原 2 次更新/67.10273322396097 秒与 3172.897266776039 秒剩余。`objective_coverage=partial`、`full_objective_contract_passed=null`、`factor_selected=false`、`auto_execute=false`、`final_interaction_method=not_ready`、`production_integration=false` 及旧质量结论保持。

@@ -104,15 +104,75 @@ from ireset.train.trainer import (
 # ---------------------------------------------------------------------------
 
 AUDIT_SCHEMA = "w1_real_training_update_audit_v1"
+AUDIT_SCHEMA_V2 = "w1_real_training_update_audit_v2"
 COHORT_ID = "w1_real_training_update_audit_v1"
 EXECUTION_ID = "w1_real_training_update_audit_v1"
 AUTHORIZATION_SCHEMA = "w1_real_training_update_authorization_v1"
+AUTHORIZATION_SCHEMA_V2 = "w1_real_training_update_authorization_v2"
 FP32_SCHEMA = "w1_real_training_update_fp32_contract_v1"
 TOLERANCE_SCHEMA = "w1_real_training_update_tolerance_contract_v1"
 CALIBRATION_SCHEMA = "w1_real_training_update_synthetic_calibration_v1"
 ADMISSION_SCHEMA = "w1_real_training_update_admission_package_v1"
 REGISTRATION_SCHEMA = "w1_real_training_update_registration_v1"
+REGISTRATION_SCHEMA_V2 = "w1_real_training_update_registration_v2"
 ACCOUNTING_SCHEMA = "pre_registered_v1"
+ACCOUNTING_SCHEMA_V2 = "pre_registered_binding_v2"
+
+#: The existing real cohort is migrated in place.  The binding generation is
+#: a second identity over the same run root and the same fixed history root;
+#: it does not create a fresh cohort or a fresh budget.
+GENERATION_001 = "generation_001"
+GENERATION_002 = "generation_002"
+BINDING_SPEC_SCHEMA = "w1_real_training_update_binding_spec_v1"
+HISTORY_SNAPSHOT_SCHEMA = "w1_real_training_update_history_snapshot_v1"
+MIGRATION_ADMISSION_SCHEMA = (
+    "w1_real_training_update_migration_admission_v1")
+LEGACY_HEAD_SCHEMA = "w1_real_training_update_legacy_head_v1"
+LAUNCH_CLAIM_SCHEMA = "w1_real_training_update_launch_claim_v1"
+RETURN_OBSERVATION_SCHEMA = (
+    "w1_real_training_update_return_observation_v1")
+EVENT_SCHEMA = "w1_real_training_update_execution_event_v1"
+BINDING_INTENT_SCHEMA = "w1_real_training_update_binding_intent_v1"
+BINDING_ACTIVATION_SCHEMA = "w1_real_training_update_binding_activation_v1"
+
+MIGRATION_SOURCE_RUN = Path(
+    "derived/experiments/omniretarget_first/"
+    "20261102_2704709_w1_real_training_update_audit")
+MIGRATION_SOURCE_MARKER_SHA256 = (
+    "79f42f5fc2bb205a4f8327b7897644e4759ff60bf189f4dd6054cb980e9f3f6b")
+MIGRATION_SOURCE_INDEX_SHA256 = (
+    "78a2f97dc42545c21f2200a9353b4e1ce9f4dea3fde9cf88f27c29548932b950")
+MIGRATION_SOURCE_LEDGER_SHA256 = (
+    "92773314541bec3b3d751c1627fb8cf78b331ea21303b8c753b8d4a447aa0f34")
+MIGRATION_SOURCE_AUTHORIZATION_SHA256 = (
+    "199bfb30f11502aaf57acf38f1c49525ac58e511f870f230f223cb12b8525d78")
+MIGRATION_SOURCE_REGISTRATION_SHA256 = (
+    "6abab029788f0e87859a560e3e9866c9958758f5a8765b7092f34ca5d53848aa")
+MIGRATION_SOURCE_COST_S = 67.10273322396097
+MIGRATION_SOURCE_UPDATES = 2
+MIGRATION_LEGACY_HEAD_SHA256 = (
+    "b499a6ce7e5ef8fac06821cc063f27bd109374d9673791551fe92ad56302a424")
+MIGRATION_STAGE_PLAN = (
+    {"execution_seq": 3, "generation": GENERATION_002,
+     "stage": "R0", "attempt": "attempt_002"},
+    {"execution_seq": 4, "generation": GENERATION_002,
+     "stage": "P", "attempt": "attempt_002"},
+    {"execution_seq": 5, "generation": GENERATION_002,
+     "stage": "I", "attempt": "attempt_001"},
+    {"execution_seq": 6, "generation": GENERATION_002,
+     "stage": "F", "attempt": "attempt_001"},
+)
+MIGRATION_PRIOR_UPDATES = 2
+MIGRATION_INCREMENTAL_UPDATE_LIMIT = 16
+MIGRATION_COHORT_UPDATE_LIMIT = 18
+MIGRATION_STAGE_ATTEMPTS = {"R0": 1, "P": 1, "I": 1, "F": 1}
+MIGRATION_METADATA_BYTES_LIMIT = 32 * 2 ** 20
+MIGRATION_PLAN = Path(
+    "docs/plans/"
+    "omniretarget_w1_real_training_update_binding_migration_plan.md")
+LAUNCH_JOURNAL_DIR = "launch_journal"
+BINDINGS_DIR = "bindings"
+EXECUTION_EVENTS_DIR = "execution_events"
 
 WINDOW = 60
 STRIDE = 30
@@ -424,6 +484,141 @@ def _call_counts_from_balance(balance: Any) -> dict[str, int] | None:
     if balance.get("within_caps") is not True:
         return None
     return out
+
+
+# ---------------------------------------------------------------------------
+# binding migration: canonical JSON, exclusive publication and manifests
+# ---------------------------------------------------------------------------
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict:
+    out: dict = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError(f"duplicate JSON key: {key}")
+        out[key] = value
+    return out
+
+
+def strict_json_loads(data: str) -> Any:
+    """Parse JSON without accepting duplicate keys.
+
+    The migration documents are hash-bound.  ``json.loads`` silently keeps the
+    last duplicate key, which would let two readers disagree about the bytes
+    that produced a SHA.  The regular v1 readers keep their historical
+    ``read_json`` behaviour; only binding/migration records use this parser.
+    """
+    return json.loads(data, object_pairs_hook=_reject_duplicate_keys)
+
+
+def strict_read_json(path: Path) -> Any:
+    return strict_json_loads(Path(path).read_text(encoding="utf-8"))
+
+
+def canonical_json_bytes(value: Any) -> bytes:
+    """The single canonical ``H()`` encoding from the migration plan."""
+    return json.dumps(_jsonable(value), sort_keys=True, ensure_ascii=False,
+                      separators=(",", ":"), allow_nan=False).encode("utf-8")
+
+
+def canonical_sha256(value: Any) -> str:
+    return sha256_bytes(canonical_json_bytes(value))
+
+
+def _fsync_directory(path: Path) -> None:
+    fd = os.open(str(Path(path)), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write_bytes_exclusive(path: Path, payload: bytes) -> str:
+    """Atomically publish exact bytes once, never overwriting."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + f".tmp.{os.getpid()}.{time.time_ns()}")
+    fd = os.open(str(tmp), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(tmp, path)
+        except FileExistsError as exc:
+            raise FileExistsError(f"refusing to overwrite {path}") from exc
+        _fsync_directory(path.parent)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+    return sha256_file(path)
+
+
+def write_json_exclusive(path: Path, data: Any) -> str:
+    """Atomically publish a JSON file once, never overwriting.
+
+    The bytes are written to a sibling temporary file, fsynced, linked into
+    place without overwrite, and the directory is fsynced.  A crash therefore
+    leaves either no target, a complete target, or an observable ``.tmp``
+    sibling; the latter is treated as an unsettled launch/event liability by
+    the readers rather than being silently cleaned up.
+    """
+    payload = (json.dumps(_jsonable(data), indent=2, sort_keys=True,
+                          ensure_ascii=False, allow_nan=False) + "\n").encode(
+                              "utf-8")
+    return write_bytes_exclusive(Path(path), payload)
+
+
+def _manifest_files(base: Path, *, skip: Sequence[str] = ()) -> tuple[dict, list[str]]:
+    """Return ``{relative_path: {sha256, bytes}}`` for regular files."""
+    base = Path(base)
+    manifest: dict = {}
+    problems: list[str] = []
+    if not base.is_dir():
+        return manifest, problems
+    skip_set = {str(Path(s)) for s in skip}
+    for path in sorted(base.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(base).as_posix()
+        if rel in skip_set:
+            continue
+        try:
+            manifest[rel] = {"sha256": sha256_file(path),
+                             "bytes": int(path.stat().st_size)}
+        except OSError as exc:
+            problems.append(f"manifest_unreadable:{rel}:{type(exc).__name__}")
+    return manifest, problems
+
+
+def _manifest_problems(base: Path, manifest: Any, *, require_exact: bool = True
+                       ) -> list[str]:
+    if not isinstance(manifest, Mapping):
+        return ["manifest_not_a_mapping"]
+    actual, problems = _manifest_files(base)
+    if require_exact and set(actual) != set(manifest):
+        problems.append("manifest_file_set")
+    for rel, rec in manifest.items():
+        if not isinstance(rec, Mapping):
+            problems.append(f"manifest_entry_invalid:{rel}")
+            continue
+        path = Path(base) / str(rel)
+        if not path.is_file():
+            problems.append(f"manifest_missing:{rel}")
+            continue
+        if rec.get("sha256") != sha256_file(path):
+            problems.append(f"manifest_sha:{rel}")
+        try:
+            size = int(path.stat().st_size)
+        except OSError:
+            problems.append(f"manifest_unreadable:{rel}")
+            continue
+        if type(rec.get("bytes")) is not int or int(rec["bytes"]) != size:
+            problems.append(f"manifest_bytes:{rel}")
+    return problems
 
 
 class CallCounter:
@@ -3912,6 +4107,17 @@ def _worker_main(spec_path: str, out_dir: str) -> int:
     root = Path(spec["run_root"])
     attempt = str(spec["attempt"])
     mode = str(spec.get("mode", "synthetic"))
+    use_binding = bool(spec.get("use_binding"))
+    binding = None
+    if use_binding:
+        binding, binding_problems = load_binding(
+            root, generation=str(spec.get("generation") or GENERATION_002),
+            require_active=True)
+        if binding is None:
+            raise SystemExit(f"F worker binding refused: {binding_problems}")
+        if spec.get("binding_spec_sha256") != binding.spec_sha256:
+            raise SystemExit("F worker binding spec drifted")
+    generation = binding.generation if binding is not None else None
     parent_record = {"registration_sha256": spec.get("registration_sha256"),
                      "reserve_s": reserve}
     problems: list[str] = []
@@ -3951,17 +4157,23 @@ def _worker_main(spec_path: str, out_dir: str) -> int:
 
     def precheck_candidates() -> list[str]:
         found: list[str] = []
-        history = verify_history(root, allow_current=("F", attempt))
+        history = verify_history(root, allow_current=("F", attempt),
+                                 generation=generation, binding=binding)
         found += [f"f_candidate_history:{p}" for p in history]
         if set(candidate_attempts) != set(STAGE_BUDGETS):
             found.append("f_candidate_keys")
+        internal = ({"invocation_id": spec.get("invocation_id"),
+                     "allow_current": True}
+                    if use_binding else None)
         for name in ("R0", "P", "I"):
             selected = candidate_attempts.get(name)
             if not isinstance(selected, str):
                 found.append(f"f_candidate_missing:{name}")
                 continue
-            row, state = stage_state(root, name, selected,
-                                     allow_current=("F", attempt))
+            row, state = stage_state(
+                root, name, selected, allow_current=("F", attempt),
+                generation=generation, binding=binding,
+                internal_context=internal)
             precheck[name] = {"attempt": selected, "problems": state,
                               "report": (row or {}).get("report")}
             if state:
@@ -3986,7 +4198,8 @@ def _worker_main(spec_path: str, out_dir: str) -> int:
         deltas: dict[str, dict] = {}
         for name in ("R0", "P", "I"):
             stage_deltas = stage_attempt_deltas(
-                root, name, current=("F", attempt))
+                root, name, current=("F", attempt), generation=generation,
+                binding=binding)
             if stage_deltas is None or candidate_attempts.get(name) not in \
                     stage_deltas:
                 found.append(f"f_provisional_delta:{name}")
@@ -4034,6 +4247,9 @@ def _worker_main(spec_path: str, out_dir: str) -> int:
                     found.append(f"f_stage_cap:{stage}:{kind}")
             if stage == "F":
                 used = len(stage_deltas) + 1
+                if stage == "F" and binding is not None:
+                    used = len([r for r in stage_deltas.values()
+                                if r.get("generation") == generation]) + 1
                 if used > STAGE_BUDGETS["F"]["attempts"]:
                     found.append("f_attempt_cap")
         cohort = {kind: 0 for kind in CALL_KINDS}
@@ -4264,7 +4480,9 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float,
                 r0_noise_path: Path | None = None,
                 r0_noise_sha256: str | None = None,
                 p_input_admission_path: Path | None = None,
-                p_input_admission_sha256: str | None = None) -> dict:
+                p_input_admission_sha256: str | None = None,
+                execution: Mapping[str, Any] | None = None) -> dict:
+    execution = dict(execution or {})
     base = Path(out_dir or (stage_dir(root, stage) / attempt))
     base.mkdir(parents=True, exist_ok=True)
     deadline = t0 + float(budget["remaining_s"]) - float(budget["reserve_s"])
@@ -4290,6 +4508,14 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float,
         "candidate_checks": candidate_attempts is not None,
         "project_root": path_for_record(Path(project_root)),
         "roster": dict(roster),
+        "generation": execution.get("generation") or GENERATION_001,
+        "binding_spec_sha256": execution.get("binding_spec_sha256"),
+        "execution_seq": execution.get("execution_seq"),
+        "invocation_id": execution.get("invocation_id"),
+        "legacy_head_sha256": execution.get("legacy_head_sha256"),
+        "claim_path": execution.get("claim_path"),
+        "claim_sha256": execution.get("claim_sha256"),
+        "use_binding": bool(execution),
     }
     if mode == "real":
         spec["provider"] = provider.spec()
@@ -4461,6 +4687,1207 @@ def run_f_stage(root: Path, stage: str, attempt: str, t0: float,
     }
 
 # ---------------------------------------------------------------------------
+# binding migration: history snapshot, legacy head and binding identity
+# ---------------------------------------------------------------------------
+
+
+def _legacy_reference_rows(index_rows: Sequence[Mapping[str, Any]],
+                           ledger_rows: Sequence[Mapping[str, Any]]
+                           ) -> tuple[Mapping[str, Any], Mapping[str, Any],
+                                      Mapping[str, Any], Mapping[str, Any]]:
+    def one(rows: Sequence[Mapping[str, Any]], stage: str
+            ) -> Mapping[str, Any]:
+        hits = [r for r in rows
+                if r.get("stage") == stage
+                and r.get("attempt") == "attempt_001"]
+        if len(hits) != 1:
+            raise ValueError(
+                f"legacy head requires exactly one {stage}/attempt_001 row")
+        return hits[0]
+
+    r0_index = one(index_rows, "R0")
+    p_index = one(index_rows, "P")
+    r0_ledger = one(ledger_rows, "R0")
+    p_ledger = one(ledger_rows, "P")
+    for row in (r0_index, p_index, r0_ledger, p_ledger):
+        if row.get("accounting_schema") != ACCOUNTING_SCHEMA:
+            raise ValueError("legacy head rows must use pre_registered_v1")
+        if row.get("cohort_id") != COHORT_ID:
+            raise ValueError("legacy head cohort mismatch")
+    return r0_index, p_index, r0_ledger, p_ledger
+
+
+def build_legacy_head_payload(
+        root: Path, *, index_rows: Sequence[Mapping[str, Any]] | None = None,
+        ledger_rows: Sequence[Mapping[str, Any]] | None = None,
+        marker: Mapping[str, Any] | None = None,
+        run_root: Path | None = None,
+        marker_sha256: str | None = None,
+        source_index_sha256: str | None = None,
+        source_ledger_sha256: str | None = None,
+        reservation_sha256: Mapping[str, str] | None = None) -> dict:
+    """Build the immutable seq=1/2 head from the original v1 records.
+
+    The current index/ledger are append-only views, so their whole-file SHA
+    changes as soon as seq=3 is registered.  Callers building a snapshot pass
+    the source copies' whole-file hashes; callers validating a snapshot pass
+    the frozen values.  Row hashes are always recomputed from canonical JSON.
+    """
+    root = Path(root)
+    marker = (dict(marker) if marker is not None
+              else strict_read_json(_cohort_path(root)))
+    if index_rows is None:
+        index_rows = load_index(root)
+    if ledger_rows is None:
+        ledger_rows = load_ledger(root)
+    r0_index, p_index, r0_ledger, p_ledger = _legacy_reference_rows(
+        index_rows, ledger_rows)
+    if marker_sha256 is None:
+        marker_sha256 = sha256_file(_cohort_path(root))
+    if source_index_sha256 is None:
+        source_index_sha256 = sha256_file(_index_path(root))
+    if source_ledger_sha256 is None:
+        source_ledger_sha256 = sha256_file(_ledger_path(root))
+    records = []
+    for seq, (stage, attempt, index_row, ledger_row) in enumerate((
+            ("R0", "attempt_001", r0_index, r0_ledger),
+            ("P", "attempt_001", p_index, p_ledger)), start=1):
+        if reservation_sha256 is not None:
+            reservation_sha = reservation_sha256.get(stage)
+        else:
+            path = stage_dir(root, stage) / attempt / "call_reservations.json"
+            reservation_sha = sha256_file(path) if path.is_file() else None
+        if not isinstance(reservation_sha, str) or not re.fullmatch(
+                r"[0-9a-f]{64}", reservation_sha):
+            raise ValueError(f"legacy reservation hash missing: {stage}")
+        records.append({
+            "execution_seq": seq,
+            "stage": stage,
+            "attempt": attempt,
+            "index_row_sha256": canonical_sha256(index_row),
+            "ledger_row_sha256": canonical_sha256(ledger_row),
+            "reservation_sha256": reservation_sha,
+        })
+    after = _call_counts_from_balance(p_ledger.get("call_balance"))
+    if after is None:
+        raise ValueError("legacy P ledger call_balance is invalid")
+    index_after = _call_counts_from_balance(p_index.get("call_balance"))
+    if index_after != after:
+        raise ValueError("legacy P index/ledger call_balance disagree")
+    marker_cohort = marker.get("cohort_id")
+    marker_execution = marker.get("execution_id")
+    if marker_cohort != COHORT_ID or marker_execution != EXECUTION_ID:
+        raise ValueError("legacy marker identity mismatch")
+    authorization = marker.get("authorization_sha256")
+    if not isinstance(authorization, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", authorization):
+        raise ValueError("legacy authorization hash missing")
+    return {
+        "schema": LEGACY_HEAD_SCHEMA,
+        "cohort_id": marker_cohort,
+        "execution_id": marker_execution,
+        "run_root": str(Path(run_root or root).resolve()),
+        "marker_sha256": marker_sha256,
+        "authorization_sha256": authorization,
+        "source_index_sha256": source_index_sha256,
+        "source_ledger_sha256": source_ledger_sha256,
+        "last_execution_seq": 2,
+        "records": records,
+        "call_balance_after": after,
+    }
+
+
+def legacy_head_sha256(payload: Mapping[str, Any]) -> str:
+    return canonical_sha256(payload)
+
+
+def _legacy_payload_problems(payload: Any, *, run_root: Path | None = None,
+                             expected_sha256: str | None = None
+                             ) -> list[str]:
+    problems: list[str] = []
+    if not isinstance(payload, Mapping):
+        return ["legacy_head_not_a_mapping"]
+    if payload.get("schema") != LEGACY_HEAD_SCHEMA:
+        problems.append("legacy_head_schema")
+    if payload.get("cohort_id") != COHORT_ID:
+        problems.append("legacy_head_cohort")
+    if payload.get("execution_id") != EXECUTION_ID:
+        problems.append("legacy_head_execution")
+    if run_root is not None:
+        try:
+            if Path(str(payload.get("run_root"))).resolve() != \
+                    Path(run_root).resolve():
+                problems.append("legacy_head_run_root")
+        except OSError:
+            problems.append("legacy_head_run_root")
+    if payload.get("last_execution_seq") != 2:
+        problems.append("legacy_head_last_seq")
+    records = payload.get("records")
+    if not isinstance(records, list) or len(records) != 2:
+        problems.append("legacy_head_records")
+    else:
+        for index, want_stage in enumerate(("R0", "P"), start=1):
+            rec = records[index - 1]
+            if not isinstance(rec, Mapping):
+                problems.append(f"legacy_head_record:{index}")
+                continue
+            if rec.get("execution_seq") != index:
+                problems.append(f"legacy_head_seq:{index}")
+            if rec.get("stage") != want_stage or \
+                    rec.get("attempt") != "attempt_001":
+                problems.append(f"legacy_head_stage:{index}")
+            for key in ("index_row_sha256", "ledger_row_sha256",
+                        "reservation_sha256"):
+                if not isinstance(rec.get(key), str) or not re.fullmatch(
+                        r"[0-9a-f]{64}", rec[key]):
+                    problems.append(f"legacy_head_hash:{index}:{key}")
+    after = _call_counts_from_balance({
+        "schema": "w1_real_training_update_call_budget_v1",
+        "counts": payload.get("call_balance_after"),
+        "within_caps": True,
+    }) if isinstance(payload.get("call_balance_after"), Mapping) else None
+    if after is None:
+        problems.append("legacy_head_call_balance")
+    if expected_sha256 is not None and \
+            legacy_head_sha256(payload) != expected_sha256:
+        problems.append("legacy_head_sha256")
+    return problems
+
+
+def _current_legacy_rows_match(snapshot: Mapping[str, Any],
+                               index_rows: Sequence[Mapping[str, Any]],
+                               ledger_rows: Sequence[Mapping[str, Any]]
+                               ) -> list[str]:
+    payload = snapshot.get("legacy_head_payload")
+    if not isinstance(payload, Mapping):
+        return ["snapshot_legacy_head_missing"]
+    records = payload.get("records")
+    if not isinstance(records, list):
+        return ["snapshot_legacy_head_records"]
+    index_by = {(r.get("stage"), r.get("attempt")): r for r in index_rows}
+    ledger_by = {(r.get("stage"), r.get("attempt")): r for r in ledger_rows}
+    problems: list[str] = []
+    for rec in records:
+        if not isinstance(rec, Mapping):
+            problems.append("snapshot_legacy_record")
+            continue
+        key = (rec.get("stage"), rec.get("attempt"))
+        row = index_by.get(key)
+        entry = ledger_by.get(key)
+        if row is None or entry is None:
+            problems.append(f"legacy_record_missing:{key[0]}")
+            continue
+        if canonical_sha256(row) != rec.get("index_row_sha256"):
+            problems.append(f"legacy_index_row_changed:{key[0]}")
+        if canonical_sha256(entry) != rec.get("ledger_row_sha256"):
+            problems.append(f"legacy_ledger_row_changed:{key[0]}")
+    return problems
+
+
+def _unsealed_artifacts(root: Path, index_rows: Sequence[Mapping[str, Any]]
+                        ) -> list[dict]:
+    sealed: set[str] = set()
+    for row in index_rows:
+        artifacts = row.get("artifacts")
+        if isinstance(artifacts, Mapping):
+            for rel in artifacts:
+                try:
+                    sealed.add(str((PROJECT_ROOT / str(rel)).resolve()))
+                except OSError:
+                    continue
+    out = []
+    for stage in STAGE_BUDGETS:
+        base = stage_dir(root, stage)
+        if not base.is_dir():
+            continue
+        for path in sorted(base.rglob("*")):
+            if not path.is_file():
+                continue
+            try:
+                absolute = str(path.resolve())
+            except OSError:
+                continue
+            if absolute not in sealed:
+                out.append({
+                    "path": path_for_record(path),
+                    "sha256": sha256_file(path),
+                    "bytes": int(path.stat().st_size),
+                })
+    return out
+
+
+def build_history_snapshot(root: Path, *, project_root: Path = PROJECT_ROOT,
+                           run_root: Path | None = None) -> dict:
+    """Freeze the original v1 prefix and the pre-migration launch liabilities."""
+    root = Path(root)
+    source_index_bytes = _index_path(root).read_bytes()
+    source_ledger_bytes = _ledger_path(root).read_bytes()
+    source_marker_bytes = _cohort_path(root).read_bytes()
+    index_rows = strict_json_loads(source_index_bytes.decode("utf-8")).get(
+        "attempts")
+    ledger_rows = strict_json_loads(source_ledger_bytes.decode("utf-8")).get(
+        "invocations")
+    if not isinstance(index_rows, list) or not isinstance(ledger_rows, list):
+        raise ValueError("legacy index/ledger row lists missing")
+    marker = strict_json_loads(source_marker_bytes.decode("utf-8"))
+    if not isinstance(marker, dict):
+        raise ValueError("legacy cohort marker is not an object")
+    legacy = build_legacy_head_payload(
+        root, index_rows=index_rows, ledger_rows=ledger_rows, marker=marker,
+        run_root=run_root or root,
+        marker_sha256=sha256_bytes(source_marker_bytes),
+        source_index_sha256=sha256_bytes(source_index_bytes),
+        source_ledger_sha256=sha256_bytes(source_ledger_bytes))
+    journal_dir = root / LAUNCH_JOURNAL_DIR
+    journal_manifest, journal_problems = _manifest_files(journal_dir)
+    files, file_problems = _manifest_files(
+        root, skip=(LAUNCH_JOURNAL_DIR, BINDINGS_DIR, EXECUTION_EVENTS_DIR))
+    stage_costs = {}
+    for stage in STAGE_BUDGETS:
+        rows = [r for r in ledger_rows if r.get("stage") == stage]
+        stage_costs[stage] = float(sum(
+            float(r.get("measured_wall_s", 0.0)) for r in rows))
+    total_cost = float(sum(stage_costs.values()))
+    attempts = {
+        stage: sorted(str(r.get("attempt")) for r in index_rows
+                      if r.get("stage") == stage)
+        for stage in STAGE_BUDGETS
+    }
+    return {
+        "schema": HISTORY_SNAPSHOT_SCHEMA,
+        "run_root": str(root.resolve()),
+        "run_root_realpath": str(root.resolve()),
+        "cohort_id": marker.get("cohort_id"),
+        "execution_id": marker.get("execution_id"),
+        "marker_sha256": sha256_bytes(source_marker_bytes),
+        "authorization_sha256": marker.get("authorization_sha256"),
+        "source_index_sha256": sha256_bytes(source_index_bytes),
+        "source_ledger_sha256": sha256_bytes(source_ledger_bytes),
+        "source_marker_sha256": sha256_bytes(source_marker_bytes),
+        "source_copies": {
+            "index.json": {"sha256": sha256_bytes(source_index_bytes),
+                            "bytes": len(source_index_bytes)},
+            "ledger.json": {"sha256": sha256_bytes(source_ledger_bytes),
+                             "bytes": len(source_ledger_bytes)},
+            "cohort.json": {"sha256": sha256_bytes(source_marker_bytes),
+                             "bytes": len(source_marker_bytes)},
+        },
+        "files": files,
+        "files_problems": file_problems,
+        "launch_journal": {
+            "relative_path": LAUNCH_JOURNAL_DIR,
+            "files": journal_manifest,
+            "manifest_sha256": canonical_sha256(journal_manifest),
+            "problems": journal_problems,
+        },
+        "index_rows": [{
+            "stage": r.get("stage"), "attempt": r.get("attempt"),
+            "canonical_sha256": canonical_sha256(r),
+        } for r in index_rows],
+        "ledger_rows": [{
+            "stage": r.get("stage"), "attempt": r.get("attempt"),
+            "canonical_sha256": canonical_sha256(r),
+        } for r in ledger_rows],
+        "execution_order": [
+            {"execution_seq": rec["execution_seq"], "stage": rec["stage"],
+             "attempt": rec["attempt"]}
+            for rec in legacy["records"]
+        ],
+        "legacy_head_payload": legacy,
+        "legacy_head_sha256": legacy_head_sha256(legacy),
+        "cost_s": {"stages": stage_costs, "total": total_cost},
+        "attempts": attempts,
+        "updates": {
+            "native_adamw_steps": int(sum(
+                int(r.get("call_balance", {}).get("counts", {}).get(
+                    "native_adamw_steps", 0))
+                for r in ledger_rows[-1:])),
+            "diagnostic_parameter_update_events": int(sum(
+                int(r.get("call_balance", {}).get("counts", {}).get(
+                    "diagnostic_parameter_update_events", 0))
+                for r in ledger_rows[-1:])),
+        },
+        "call_balance_after": legacy["call_balance_after"],
+        "unsealed_files": _unsealed_artifacts(root, index_rows),
+        "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+
+
+def write_history_snapshot(out_dir: Path, root: Path
+                           ) -> tuple[Path, str, dict]:
+    out_dir = Path(out_dir)
+    snapshot_path = out_dir / "history_snapshot.json"
+    if snapshot_path.exists():
+        raise FileExistsError(f"history snapshot already exists: {snapshot_path}")
+    snapshot = build_history_snapshot(root)
+    source = out_dir / "source"
+    source.mkdir(parents=True, exist_ok=True)
+    write_bytes_exclusive(source / "index.json", _index_path(root).read_bytes())
+    write_bytes_exclusive(source / "ledger.json",
+                          _ledger_path(root).read_bytes())
+    write_bytes_exclusive(source / "cohort.json", _cohort_path(root).read_bytes())
+    sha = write_json_exclusive(snapshot_path, snapshot)
+    return snapshot_path, sha, snapshot
+
+
+def _git_blob_sha256(project_root: Path, rel: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(project_root), "show", f"HEAD:{rel}"],
+            capture_output=True, check=True)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return sha256_bytes(result.stdout)
+
+
+def build_protected_manifest(project_root: Path, run_root: Path,
+                             *, synthetic_attempt: str = "attempt_013",
+                             admission_attempt: str = "attempt_013"
+                             ) -> dict:
+    root = Path(project_root)
+    entries: dict[str, dict] = {}
+
+    def add(path: Path) -> None:
+        path = Path(path)
+        if not path.is_file():
+            return
+        rel = path_for_record(path)
+        if rel in entries:
+            return
+        entries[rel] = {"sha256": sha256_file(path),
+                        "bytes": int(path.stat().st_size)}
+
+    for path in (Path(run_root).rglob("*")):
+        if path.is_file():
+            add(path)
+    audit = root / "derived/audit/w1_real_training_update_audit"
+    for rel in ("authorization/attempt_012", "calibration/attempt_013",
+                "admission_real/attempt_013"):
+        for path in (audit / rel).rglob("*"):
+            if path.is_file():
+                add(path)
+    synthetic = audit / "synthetic" / synthetic_attempt
+    for path in synthetic.rglob("*"):
+        if path.is_file() and path.suffix not in (
+                ".npz", ".pt", ".png", ".log") and path.stat().st_size <= 8 * 2 ** 20:
+            add(path)
+    for rel in (
+            "docs/plans/omniretarget_w1_real_training_update_audit_prereg_draft.md",
+            "docs/plans/omniretarget_w1_real_training_update_provider_execution_plan.md",
+            "docs/plans/omniretarget_w1_real_training_update_alpha_fix_plan.md",
+            str(MIGRATION_PLAN)):
+        add(root / rel)
+    preserved_path = (
+        audit / "alpha_schedule_fix/attempt_001/preserved_files.json")
+    preserved_62 = {}
+    if preserved_path.is_file():
+        try:
+            preserved_record = strict_read_json(preserved_path)
+        except (OSError, ValueError, TypeError):
+            preserved_record = {}
+        raw = preserved_record.get("protected_files")
+        if isinstance(raw, Mapping):
+            for rel in raw:
+                preserved_62[rel] = raw[rel]
+                add(root / str(rel))
+    expected = [
+        "src/ireset/eval/w1_real_training_update_audit.py",
+        "src/ireset/eval/w1_real_training_update_provider.py",
+        "scripts/audit_w1_real_training_update.py",
+        "tests/test_w1_real_training_update_audit.py",
+        "tests/test_w1_real_training_update_provider.py",
+        "docs/plans/omniretarget_w1_real_training_update_binding_migration_plan.md",
+    ]
+    baseline = {}
+    for rel in expected:
+        path = root / rel
+        baseline[rel] = {
+            "head_sha256": _git_blob_sha256(root, rel),
+            "current_sha256": sha256_file(path) if path.is_file() else None,
+            "exists": path.is_file(),
+        }
+    return {
+        "schema": "w1_real_training_update_protected_manifest_v1",
+        "entries": entries,
+        "entry_count": len(entries),
+        "manifest_sha256": canonical_sha256(entries),
+        "preserved_62": {
+            "path": (path_for_record(preserved_path)
+                     if preserved_path.is_file() else None),
+            "sha256": (sha256_file(preserved_path)
+                       if preserved_path.is_file() else None),
+            "count": len(preserved_62),
+            "covered": bool(preserved_62) and all(
+                path_for_record(root / rel) in entries for rel in preserved_62),
+        },
+        "implementation_baseline": {
+            "source_baseline_head": "f808aa975ba2ccbabdddba348f9cbeb2b85b9dfb",
+            "expected_changed_files": expected,
+            "files": baseline,
+        },
+        "large_artifact_policy": (
+            "NPZ/PT/log bytes are protected by their owning sealed stage/row "
+            "hashes; this manifest records metadata and small JSON only."),
+        "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+
+
+def write_migration_baseline(out_dir: Path, project_root: Path,
+                             run_root: Path) -> tuple[Path, str, dict]:
+    out_dir = Path(out_dir)
+    path = out_dir / "protected_manifest.json"
+    if path.exists():
+        raise FileExistsError(f"protected manifest already exists: {path}")
+    record = build_protected_manifest(project_root, run_root)
+    sha = write_json_exclusive(path, record)
+    return path, sha, record
+
+
+def _snapshot_problems(snapshot: Mapping[str, Any] | None, *,
+                       run_root: Path | None = None,
+                       root: Path | None = None) -> list[str]:
+    if not isinstance(snapshot, Mapping):
+        return ["snapshot_not_a_mapping"]
+    problems: list[str] = []
+    if snapshot.get("schema") != HISTORY_SNAPSHOT_SCHEMA:
+        problems.append("snapshot_schema")
+    if snapshot.get("cohort_id") != COHORT_ID:
+        problems.append("snapshot_cohort")
+    if snapshot.get("execution_id") != EXECUTION_ID:
+        problems.append("snapshot_execution")
+    if run_root is not None:
+        try:
+            if Path(str(snapshot.get("run_root"))).resolve() != \
+                    Path(run_root).resolve():
+                problems.append("snapshot_run_root")
+        except OSError:
+            problems.append("snapshot_run_root")
+    payload = snapshot.get("legacy_head_payload")
+    problems += _legacy_payload_problems(
+        payload, run_root=run_root,
+        expected_sha256=snapshot.get("legacy_head_sha256"))
+    if isinstance(payload, Mapping) and snapshot.get("legacy_head_sha256") != \
+            legacy_head_sha256(payload):
+        problems.append("snapshot_legacy_head_binding")
+    copies = snapshot.get("source_copies")
+    copies = copies if isinstance(copies, Mapping) else {}
+
+    def copy_sha(name: str) -> Any:
+        rec = copies.get(name)
+        return rec.get("sha256") if isinstance(rec, Mapping) else None
+
+    if snapshot.get("marker_sha256") != copy_sha("cohort.json"):
+        problems.append("snapshot_marker_binding")
+    if snapshot.get("source_index_sha256") != copy_sha("index.json"):
+        problems.append("snapshot_index_binding")
+    if snapshot.get("source_ledger_sha256") != copy_sha("ledger.json"):
+        problems.append("snapshot_ledger_binding")
+    if root is not None:
+        try:
+            problems += _current_legacy_rows_match(
+                snapshot, load_index(root), load_ledger(root))
+        except (OSError, ValueError, TypeError):
+            problems.append("snapshot_current_rows_unreadable")
+        if isinstance(payload, Mapping):
+            attempts_record = snapshot.get("attempts")
+            attempts_record = (attempts_record
+                               if isinstance(attempts_record, Mapping) else {})
+            for stage in STAGE_BUDGETS:
+                attempts_for_stage = attempts_record.get(stage, [])
+                if not isinstance(attempts_for_stage, list):
+                    problems.append(f"snapshot_attempts:{stage}")
+                    continue
+                for attempt in attempts_for_stage:
+                    path = stage_dir(root, stage) / attempt / \
+                        "call_reservations.json"
+                    if not path.is_file():
+                        problems.append(f"snapshot_reservation_missing:{stage}")
+                        continue
+                    rec = next((r for r in payload.get("records", [])
+                                if r.get("stage") == stage
+                                and r.get("attempt") == attempt), None)
+                    if rec is not None and sha256_file(path) != rec.get(
+                            "reservation_sha256"):
+                        problems.append(
+                            f"snapshot_reservation_changed:{stage}")
+    return problems
+
+
+def _budget_from_snapshot(snapshot: Mapping[str, Any], stage: str) -> dict:
+    if stage not in STAGE_BUDGETS:
+        raise ValueError(f"unknown stage {stage}")
+    costs = (snapshot.get("cost_s") or {}).get("stages") or {}
+    used_s = float(costs.get(stage, 0.0))
+    used_n = len((snapshot.get("attempts") or {}).get(stage) or [])
+    spec = STAGE_BUDGETS[stage]
+    remaining = float(spec["budget_s"]) - used_s
+    return {
+        "stage": stage, "budget_s": float(spec["budget_s"]),
+        "reserve_s": float(spec["reserve_s"]),
+        "attempts": int(spec["attempts"]), "attempts_used": used_n,
+        "local_stage_s": used_s, "prior_stage_s": 0.0, "prior_total_s": 0.0,
+        "remaining_s": remaining,
+    }
+
+
+def build_binding_spec(project_root: Path, snapshot_path: Path,
+                       snapshot_sha256: str, snapshot: Mapping[str, Any],
+                       *, generation: str = GENERATION_002,
+                       invocation_id: str | None = None,
+                       plan_path: Path = MIGRATION_PLAN,
+                       gate_b: Mapping[str, Any] | None = None,
+                       admission: Mapping[str, Any] | None = None,
+                       implementation: Mapping[str, Any] | None = None,
+                       runtime: Mapping[str, Any] | None = None) -> dict:
+    root = Path(project_root)
+    plan = Path(plan_path)
+    if not plan.is_absolute():
+        plan = root / plan
+    impl = dict(implementation or implementation_identity(root))
+    runtime_record = dict(runtime or {
+        "identity": runtime_identity_facts(),
+        "requirements": dict(RUNTIME_REQUIREMENTS),
+    })
+    journal = snapshot.get("launch_journal") or {}
+    budgets = {stage: _budget_from_snapshot(snapshot, stage)
+               for stage in STAGE_BUDGETS}
+    return {
+        "schema": BINDING_SPEC_SCHEMA,
+        "generation": generation,
+        "cohort_id": COHORT_ID,
+        "execution_id": EXECUTION_ID,
+        "run_root": str(Path(str(snapshot.get("run_root"))).resolve()),
+        "run_root_realpath": str(Path(str(snapshot.get("run_root"))).resolve()),
+        "history_snapshot": {
+            "path": path_for_record(snapshot_path),
+            "sha256": snapshot_sha256,
+        },
+        "legacy_head_sha256": snapshot.get("legacy_head_sha256"),
+        "first_generation": {
+            "generation": GENERATION_001,
+            "marker_sha256": snapshot.get("marker_sha256"),
+            "authorization_sha256": snapshot.get("authorization_sha256"),
+            "last_execution_seq": 2,
+        },
+        "target_generation": {
+            "generation": generation,
+            "cohort_id": COHORT_ID,
+            "execution_id": EXECUTION_ID,
+            "run_root_realpath": str(Path(str(
+                snapshot.get("run_root"))).resolve()),
+        },
+        "stage_plan": [dict(item) for item in MIGRATION_STAGE_PLAN],
+        "accounting": {
+            "schema": ACCOUNTING_SCHEMA_V2,
+            "prior_updates": MIGRATION_PRIOR_UPDATES,
+            "incremental_update_limit": MIGRATION_INCREMENTAL_UPDATE_LIMIT,
+            "cohort_update_limit_for_this_authorization":
+                MIGRATION_COHORT_UPDATE_LIMIT,
+            "stage_attempts": dict(MIGRATION_STAGE_ATTEMPTS),
+        },
+        "budgets": budgets,
+        "launch_journal": {
+            "relative_path": LAUNCH_JOURNAL_DIR,
+            "manifest_sha256": journal.get("manifest_sha256"),
+            "files": dict(journal.get("files") or {}),
+            "fixed": True,
+        },
+        "bindings": {
+            "plan": {"path": path_for_record(plan),
+                     "sha256": sha256_file(plan) if plan.is_file() else None},
+            "implementation": impl,
+            "runtime": runtime_record,
+            "gate_b": dict(gate_b or {}),
+            "real_admission": dict(admission or {}),
+        },
+        "protocol": {
+            "publication": ("prepare_revision -> internal prepared verification "
+                            "-> stable cost -> one finish + commit -> "
+                            "stage_closed candidate -> actual write-after gate"),
+            "write_after": {
+                "sample": "post_publish_perf_counter - stage_t0",
+                "requires": ["finite", "non_negative", "elapsed<remaining_s",
+                              "elapsed<=committed_measured_wall_s"],
+            },
+            "return_observation": {
+                "schema": RETURN_OBSERVATION_SCHEMA,
+                "source": "outer_wait_or_exec_actual_return",
+                "scope": "post_execution_observation",
+                "required_for_public_consumption": True,
+            },
+            "execution_window": {
+                "starts_at": "launch_claim.t0",
+                "ends_at": "outer actual process return",
+                "post_return_observation_can_execute_work": False,
+            },
+        },
+        "invocation": {"invocation_id": invocation_id},
+        "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+
+
+def binding_spec_problems(spec: Mapping[str, Any] | None, *, root: Path,
+                          snapshot: Mapping[str, Any] | None = None,
+                          require_current_implementation: bool = False,
+                          project_root: Path = PROJECT_ROOT
+                          ) -> list[str]:
+    if not isinstance(spec, Mapping):
+        return ["binding_spec_not_a_mapping"]
+    problems: list[str] = []
+    if spec.get("schema") != BINDING_SPEC_SCHEMA:
+        problems.append("binding_spec_schema")
+    if spec.get("generation") != GENERATION_002:
+        problems.append("binding_spec_generation")
+    if spec.get("cohort_id") != COHORT_ID:
+        problems.append("binding_spec_cohort")
+    if spec.get("execution_id") != EXECUTION_ID:
+        problems.append("binding_spec_execution")
+    try:
+        if Path(str(spec.get("run_root_realpath"))).resolve() != \
+                Path(root).resolve():
+            problems.append("binding_spec_run_root")
+    except OSError:
+        problems.append("binding_spec_run_root")
+    if spec.get("stage_plan") != list(MIGRATION_STAGE_PLAN):
+        problems.append("binding_spec_stage_plan")
+    accounting = spec.get("accounting") or {}
+    expected_accounting = {
+        "schema": ACCOUNTING_SCHEMA_V2,
+        "prior_updates": MIGRATION_PRIOR_UPDATES,
+        "incremental_update_limit": MIGRATION_INCREMENTAL_UPDATE_LIMIT,
+        "cohort_update_limit_for_this_authorization":
+            MIGRATION_COHORT_UPDATE_LIMIT,
+        "stage_attempts": dict(MIGRATION_STAGE_ATTEMPTS),
+    }
+    if _jsonable(accounting) != _jsonable(expected_accounting):
+        problems.append("binding_spec_accounting")
+    journal = spec.get("launch_journal") or {}
+    if journal.get("relative_path") != LAUNCH_JOURNAL_DIR or not \
+            journal.get("fixed"):
+        problems.append("binding_spec_launch_journal")
+    if not isinstance(journal.get("manifest_sha256"), str):
+        problems.append("binding_spec_launch_manifest")
+    bindings = spec.get("bindings") or {}
+    plan = bindings.get("plan") or {}
+    if not isinstance(plan.get("sha256"), str) or not re.fullmatch(
+            r"[0-9a-f]{64}", plan["sha256"]):
+        problems.append("binding_spec_plan")
+    impl = bindings.get("implementation") or {}
+    if not isinstance(impl.get("files"), Mapping) or not impl["files"]:
+        problems.append("binding_spec_implementation")
+    elif require_current_implementation:
+        if impl.get("files") != implementation_identity(
+                project_root).get("files"):
+            problems.append("binding_spec_implementation_drift")
+    if not isinstance(bindings.get("gate_b"), Mapping):
+        problems.append("binding_spec_gate_b")
+    if not isinstance(bindings.get("real_admission"), Mapping):
+        problems.append("binding_spec_admission")
+    runtime = bindings.get("runtime") or {}
+    if not runtime.get("identity") or not runtime.get("requirements"):
+        problems.append("binding_spec_runtime")
+    if snapshot is not None:
+        if spec.get("legacy_head_sha256") != snapshot.get("legacy_head_sha256"):
+            problems.append("binding_spec_legacy_head")
+        for stage, budget in (spec.get("budgets") or {}).items():
+            want = _budget_from_snapshot(snapshot, stage)
+            if _jsonable(budget) != _jsonable(want):
+                problems.append(f"binding_spec_budget:{stage}")
+    return problems
+
+
+@dataclass(frozen=True)
+class BindingContext:
+    generation: str
+    spec: dict
+    spec_sha256: str
+    snapshot: dict
+    snapshot_sha256: str
+    snapshot_path: Path
+    binding_dir: Path
+    legacy_head: dict
+    legacy_head_sha256: str
+    activation: dict | None = None
+    activation_sha256: str | None = None
+
+
+def _binding_dir(root: Path, generation: str = GENERATION_002) -> Path:
+    return Path(root) / BINDINGS_DIR / generation
+
+
+def load_binding(root: Path, *, generation: str = GENERATION_002,
+                 require_active: bool = False) -> tuple[BindingContext | None,
+                                                        list[str]]:
+    root = Path(root)
+    directory = _binding_dir(root, generation)
+    intent_path = directory / "intent.json"
+    spec_path = directory / "binding_spec.json"
+    if not intent_path.is_file() or not spec_path.is_file():
+        if require_active:
+            return None, ["binding_missing"]
+        return None, []
+    problems: list[str] = []
+    try:
+        intent = strict_read_json(intent_path)
+        spec = strict_read_json(spec_path)
+    except (OSError, ValueError, TypeError) as exc:
+        return None, [f"binding_unreadable:{type(exc).__name__}"]
+    if intent.get("schema") != BINDING_INTENT_SCHEMA:
+        problems.append("binding_intent_schema")
+    if intent.get("generation") != generation:
+        problems.append("binding_intent_generation")
+    spec_sha = sha256_file(spec_path)
+    if intent.get("spec_sha256") != spec_sha:
+        problems.append("binding_spec_sha")
+    snapshot = spec.get("history_snapshot") or {}
+    snapshot_path = _reference_path(snapshot.get("path"))
+    if snapshot_path is None or not snapshot_path.is_file():
+        return None, problems + ["binding_snapshot_missing"]
+    snapshot_sha = sha256_file(snapshot_path)
+    if snapshot.get("sha256") != snapshot_sha or \
+            intent.get("snapshot_sha256") != snapshot_sha:
+        problems.append("binding_snapshot_sha")
+    try:
+        snapshot_data = strict_read_json(snapshot_path)
+    except (OSError, ValueError, TypeError) as exc:
+        return None, problems + [f"binding_snapshot_unreadable:"
+                                 f"{type(exc).__name__}"]
+    problems += _snapshot_problems(snapshot_data, run_root=root, root=root)
+    source_dir = snapshot_path.parent / "source"
+    for name in ("index.json", "ledger.json", "cohort.json"):
+        expected = ((snapshot_data.get("source_copies") or {}).get(name)
+                    or {}).get("sha256")
+        path = source_dir / name
+        if not path.is_file():
+            problems.append(f"binding_source_copy_missing:{name}")
+        elif sha256_file(path) != expected:
+            problems.append(f"binding_source_copy_sha:{name}")
+    problems += binding_spec_problems(spec, root=root, snapshot=snapshot_data)
+    payload = snapshot_data.get("legacy_head_payload")
+    if not isinstance(payload, Mapping):
+        return None, problems + ["binding_legacy_head_missing"]
+    activation = None
+    activation_sha = None
+    activation_path = directory / "activation.json"
+    if activation_path.is_file():
+        try:
+            activation = strict_read_json(activation_path)
+        except (OSError, ValueError, TypeError) as exc:
+            problems.append(f"binding_activation_unreadable:"
+                            f"{type(exc).__name__}")
+        else:
+            activation_sha = sha256_file(activation_path)
+            problems += _activation_problems(
+                activation, root=root, spec_sha256=spec_sha,
+                snapshot_sha256=snapshot_sha,
+                legacy_head_sha256=snapshot_data.get("legacy_head_sha256"),
+                generation=generation)
+    elif require_active:
+        problems.append("binding_activation_missing")
+    if problems:
+        return None, problems
+    return BindingContext(
+        generation=generation, spec=spec, spec_sha256=spec_sha,
+        snapshot=snapshot_data, snapshot_sha256=snapshot_sha,
+        snapshot_path=snapshot_path, binding_dir=directory,
+        legacy_head=dict(payload),
+        legacy_head_sha256=str(snapshot_data.get("legacy_head_sha256")),
+        activation=activation, activation_sha256=activation_sha), []
+
+
+def _activation_problems(activation: Mapping[str, Any], *, root: Path,
+                         spec_sha256: str, snapshot_sha256: str,
+                         legacy_head_sha256: str | None,
+                         generation: str) -> list[str]:
+    problems: list[str] = []
+    if activation.get("schema") != BINDING_ACTIVATION_SCHEMA:
+        problems.append("activation_schema")
+    if activation.get("generation") != generation:
+        problems.append("activation_generation")
+    if activation.get("spec_sha256") != spec_sha256:
+        problems.append("activation_spec")
+    if activation.get("snapshot_sha256") != snapshot_sha256:
+        problems.append("activation_snapshot")
+    if activation.get("legacy_head_sha256") != legacy_head_sha256:
+        problems.append("activation_legacy_head")
+    try:
+        if Path(str(activation.get("run_root_realpath"))).resolve() != \
+                Path(root).resolve():
+            problems.append("activation_run_root")
+    except OSError:
+        problems.append("activation_run_root")
+    commit = activation.get("commit") or {}
+    if not isinstance(commit, Mapping):
+        problems.append("activation_commit")
+        return problems
+    path = _reference_path(commit.get("path"))
+    if path is None or not path.is_file():
+        problems.append("activation_commit_missing")
+    elif sha256_file(path) != commit.get("sha256"):
+        problems.append("activation_commit_sha")
+    r0 = activation.get("r0") or {}
+    for key in ("registration_sha256", "admission_sha256",
+                "noise_schedule_sha256", "reservation_sha256"):
+        if not isinstance(r0.get(key), str) or not re.fullmatch(
+                r"[0-9a-f]{64}", r0[key]):
+            problems.append(f"activation_r0:{key}")
+    if activation.get("effective") is not True:
+        problems.append("activation_not_effective")
+    return problems
+
+
+def stage_binding(root: Path, *, spec_path: Path, spec_sha256: str,
+                  snapshot_sha256: str, invocation_id: str,
+                  generation: str = GENERATION_002) -> Path:
+    """Publish the byte-exact spec copy and intent; no activation yet."""
+    directory = _binding_dir(root, generation)
+    if directory.exists() and any(directory.iterdir()):
+        raise FileExistsError(f"binding directory is not fresh: {directory}")
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / "binding_spec.json"
+    source = Path(spec_path)
+    target.write_bytes(source.read_bytes())
+    if sha256_file(target) != spec_sha256:
+        raise ValueError("binding spec copy sha mismatch")
+    _fsync_directory(directory)
+    write_json_exclusive(directory / "intent.json", {
+        "schema": BINDING_INTENT_SCHEMA,
+        "generation": generation,
+        "run_root_realpath": str(Path(root).resolve()),
+        "spec_sha256": spec_sha256,
+        "snapshot_sha256": snapshot_sha256,
+        "invocation_id": invocation_id,
+        "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    })
+    return target
+
+
+def activate_binding(root: Path, *, generation: str, commit_path: Path,
+                     commit_sha256: str, r0: Mapping[str, Any],
+                     invocation_id: str) -> Path:
+    directory = _binding_dir(root, generation)
+    intent = strict_read_json(directory / "intent.json")
+    spec_path = directory / "binding_spec.json"
+    activation_path = directory / "activation.json"
+    payload = {
+        "schema": BINDING_ACTIVATION_SCHEMA,
+        "generation": generation,
+        "run_root_realpath": str(Path(root).resolve()),
+        "spec_sha256": sha256_file(spec_path),
+        "snapshot_sha256": intent.get("snapshot_sha256"),
+        "legacy_head_sha256": (strict_read_json(
+            _reference_path((strict_read_json(spec_path).get(
+                "history_snapshot") or {}).get("path"))).get(
+                    "legacy_head_sha256")),
+        "invocation_id": invocation_id,
+        "commit": {"path": path_for_record(Path(commit_path)),
+                   "sha256": commit_sha256},
+        "r0": {k: r0[k] for k in ("registration_sha256",
+                                   "admission_sha256",
+                                   "noise_schedule_sha256",
+                                   "reservation_sha256")},
+        "effective": True,
+        "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    write_json_exclusive(activation_path, payload)
+    return activation_path
+
+
+# ---------------------------------------------------------------------------
+# launch journal and return observation
+# ---------------------------------------------------------------------------
+
+
+def launch_journal_dir(root: Path) -> Path:
+    return Path(root) / LAUNCH_JOURNAL_DIR
+
+
+def _claim_problems(claim: Mapping[str, Any], *, invocation_id: str,
+                    root: Path) -> list[str]:
+    problems: list[str] = []
+    if claim.get("schema") != LAUNCH_CLAIM_SCHEMA:
+        problems.append("claim_schema")
+    if claim.get("invocation_id") != invocation_id:
+        problems.append("claim_invocation")
+    if claim.get("cohort_id") != COHORT_ID or \
+            claim.get("execution_id") != EXECUTION_ID:
+        problems.append("claim_cohort")
+    try:
+        if Path(str(claim.get("run_root_realpath"))).resolve() != \
+                Path(root).resolve():
+            problems.append("claim_run_root")
+    except OSError:
+        problems.append("claim_run_root")
+    for key in ("authorization_sha256", "spec_sha256",
+                "legacy_head_sha256", "marker_sha256"):
+        if not isinstance(claim.get(key), str) or not re.fullmatch(
+                r"[0-9a-f]{64}", claim[key]):
+            problems.append(f"claim_hash:{key}")
+    if not _nonneg(claim.get("t0_perf_counter")):
+        problems.append("claim_t0")
+    target = claim.get("target") or {}
+    if target.get("stage") != "R0" or \
+            target.get("attempt") != "attempt_002" or \
+            target.get("execution_seq") != 3:
+        problems.append("claim_target")
+    if type(claim.get("pid")) is not int or int(claim.get("pid")) <= 0:
+        problems.append("claim_pid")
+    if type(claim.get("ppid")) is not int or int(claim.get("ppid")) < 0:
+        problems.append("claim_ppid")
+    return problems
+
+
+def return_observation_problems(record: Mapping[str, Any] | None, *,
+                                invocation_id: str | None = None,
+                                claim: Mapping[str, Any] | None = None
+                                ) -> list[str]:
+    if not isinstance(record, Mapping):
+        return ["return_observation_missing"]
+    problems: list[str] = []
+    if record.get("schema") != RETURN_OBSERVATION_SCHEMA:
+        problems.append("return_schema")
+    if record.get("scope") != "post_execution_observation":
+        problems.append("return_scope")
+    if record.get("process_returned") is not True:
+        problems.append("return_process_not_returned")
+    if invocation_id is not None and \
+            record.get("invocation_id") != invocation_id:
+        problems.append("return_invocation")
+    source = record.get("source")
+    if not isinstance(source, Mapping) or source.get("kind") not in (
+            "outer_wait", "outer_exec"):
+        problems.append("return_source")
+    else:
+        if type(source.get("exit_code")) is not int:
+            problems.append("return_exit_code")
+        if source.get("signal") is not None and type(source.get("signal")) is not int:
+            problems.append("return_signal")
+        if source.get("pid") != record.get("pid"):
+            problems.append("return_pid")
+        if source.get("ppid") != record.get("ppid"):
+            problems.append("return_ppid")
+        if record.get("expected_exit_code") is not None:
+            if type(record.get("expected_exit_code")) is not int or \
+                    source.get("exit_code") != record["expected_exit_code"]:
+                problems.append("return_expected_exit_code")
+    expected_by_conclusion = {
+        "real_training_update_covered_contract_passed": 0,
+        "real_training_update_mismatch": 2,
+        "audit_incomplete": 3,
+    }
+    if record.get("conclusion") in expected_by_conclusion and \
+            isinstance(source, Mapping) and \
+            source.get("exit_code") != expected_by_conclusion[
+                record["conclusion"]]:
+        problems.append("return_conclusion_exit_code")
+    for key in ("started_perf_counter", "finished_perf_counter",
+                "last_stage_end_perf_counter", "total_wall_s"):
+        if not _nonneg(record.get(key)):
+            problems.append(f"return_time:{key}")
+    if _nonneg(record.get("finished_perf_counter")) and _nonneg(
+            record.get("last_stage_end_perf_counter")) and float(
+                record["finished_perf_counter"]) + 1e-9 < float(
+                    record["last_stage_end_perf_counter"]):
+        problems.append("return_time_order")
+    if _nonneg(record.get("finished_perf_counter")) and _nonneg(
+            record.get("started_perf_counter")) and float(
+                record["finished_perf_counter"]) + 1e-9 < float(
+                    record["started_perf_counter"]):
+        problems.append("return_time_reverse")
+    write_after = record.get("write_after")
+    if not isinstance(write_after, Mapping) or not write_after:
+        problems.append("return_write_after_missing")
+    else:
+        if set(STAGE_BUDGETS) - set(write_after) or \
+                "terminal" not in write_after:
+            problems.append("return_write_after_scope")
+        if not all(value is True for value in write_after.values()):
+            problems.append("return_write_after_failed")
+    for label in ("commits", "candidate_receipts"):
+        refs = record.get(label)
+        if not isinstance(refs, Mapping) or set(STAGE_BUDGETS) - set(refs):
+            problems.append(f"return_{label}_scope")
+            continue
+        for stage, ref in refs.items():
+            if not isinstance(ref, Mapping):
+                problems.append(f"return_{label}:{stage}")
+                continue
+            path = _reference_path(ref.get("path"))
+            if path is None or not path.is_file():
+                problems.append(f"return_{label}_missing:{stage}")
+            elif sha256_file(path) != ref.get("sha256"):
+                problems.append(f"return_{label}_sha:{stage}")
+    if record.get("coverage_ok") is not True:
+        problems.append("return_coverage")
+    if record.get("post_return_work_performed") is not False:
+        problems.append("return_post_work")
+    if claim is not None:
+        for key in ("authorization_sha256", "spec_sha256",
+                    "legacy_head_sha256"):
+            if record.get(key) != claim.get(key):
+                problems.append(f"return_claim_binding:{key}")
+        if record.get("claim_sha256") != claim.get("_sha256"):
+            problems.append("return_claim_sha")
+    return problems
+
+
+def scan_launch_journals(fixed_root: Path, *,
+                         allow_invocation: str | None = None
+                         ) -> dict:
+    """Scan every attributable cohort root's fixed launch journal.
+
+    A claim is a liability until a valid outer return observation closes the
+    invocation.  The current execution may name exactly one invocation whose
+    final return is not available yet; no other claim is exempt.
+    """
+    records: list[dict] = []
+    problems: list[str] = []
+    debts: list[dict] = []
+    for sibling in _cohort_roots(Path(fixed_root)):
+        journal = launch_journal_dir(sibling)
+        try:
+            rows_for_migration = (load_index(sibling)
+                                  if _index_path(sibling).is_file() else [])
+        except (OSError, ValueError, TypeError):
+            rows_for_migration = []
+        has_v2 = (sibling / BINDINGS_DIR).exists() or any(
+            r.get("accounting_schema") == ACCOUNTING_SCHEMA_V2
+            for r in rows_for_migration)
+        if not journal.is_dir():
+            if has_v2:
+                problems.append(f"launch_journal_missing:{sibling.name}")
+            continue
+        try:
+            children = sorted(p for p in journal.iterdir() if p.is_dir())
+        except OSError:
+            problems.append(f"launch_journal_unreadable:{sibling.name}")
+            continue
+        for directory in children:
+            if any(p.name.endswith(".tmp") for p in directory.iterdir()
+                   if p.is_file()):
+                problems.append(f"launch_journal_temp:{sibling.name}:"
+                                f"{directory.name}")
+                continue
+            claim_path = directory / "claim.json"
+            if not claim_path.is_file():
+                problems.append(f"launch_claim_missing:{sibling.name}:"
+                                f"{directory.name}")
+                continue
+            try:
+                claim = strict_read_json(claim_path)
+            except (OSError, ValueError, TypeError) as exc:
+                problems.append(f"launch_claim_unreadable:{sibling.name}:"
+                                f"{directory.name}:{type(exc).__name__}")
+                continue
+            claim["_sha256"] = sha256_file(claim_path)
+            found = _claim_problems(claim, invocation_id=directory.name,
+                                    root=sibling)
+            if found:
+                problems += [f"launch_claim:{sibling.name}:{p}" for p in found]
+                continue
+            entry = {"run": path_for_record(sibling),
+                     "invocation_id": directory.name,
+                     "claim": claim, "claim_sha256": claim["_sha256"]}
+            failure_paths = sorted(directory.glob("failure*.json"))
+            revoke_paths = sorted(directory.glob("revoke*.json"))
+            if failure_paths or revoke_paths:
+                entry["unsettled"] = [path_for_record(p)
+                                      for p in failure_paths + revoke_paths]
+                debts.append(entry)
+                if directory.name != allow_invocation:
+                    problems.append(f"launch_debt:{sibling.name}:"
+                                    f"{directory.name}")
+            observation_path = directory / "return_observation.json"
+            return_problems: list[str] = []
+            if not failure_paths and not revoke_paths:
+                registered_path = directory / "registered.json"
+                if not registered_path.is_file():
+                    return_problems.append("registered_missing")
+                else:
+                    try:
+                        registered = strict_read_json(registered_path)
+                    except (OSError, ValueError, TypeError):
+                        return_problems.append("registered_unreadable")
+                    else:
+                        if (registered.get("schema") != EVENT_SCHEMA or
+                                registered.get("kind") != "registered" or
+                                registered.get("invocation_id") !=
+                                directory.name or
+                                registered.get("execution_seq") != 3 or
+                                registered.get("stage") != "R0" or
+                                registered.get("attempt") != "attempt_002"):
+                            return_problems.append("registered_binding")
+                        start = registered.get("start") or {}
+                        start_path = _reference_path(start.get("path"))
+                        if start_path is None or not start_path.is_file() or \
+                                sha256_file(start_path) != start.get("sha256"):
+                            return_problems.append("registered_start")
+                if not (directory / "terminal_candidate.json").is_file():
+                    return_problems.append("terminal_candidate_missing")
+                for candidate_path in sorted(
+                        directory.glob("stage_closed_*.json")):
+                    if candidate_path.name.endswith("_write_after.json"):
+                        continue
+                    try:
+                        candidate = strict_read_json(candidate_path)
+                        seq = int(candidate_path.stem.split("_")[-1])
+                    except (OSError, ValueError, TypeError):
+                        return_problems.append(
+                            f"stage_closed_unreadable:{candidate_path.name}")
+                        continue
+                    if candidate.get("schema") != EVENT_SCHEMA or \
+                            candidate.get("kind") != "stage_closed_candidate" or \
+                            candidate.get("invocation_id") != directory.name or \
+                            candidate.get("execution_seq") != seq:
+                        return_problems.append(
+                            f"stage_closed_binding:{seq}")
+                    commit = candidate.get("commit") or {}
+                    commit_path = _reference_path(commit.get("path"))
+                    if commit_path is None or not commit_path.is_file() or \
+                            sha256_file(commit_path) != commit.get("sha256"):
+                        return_problems.append(
+                            f"stage_closed_commit:{seq}")
+                    after_path = directory / (
+                        f"stage_closed_{seq:06d}_write_after.json")
+                    if not after_path.is_file():
+                        return_problems.append(
+                            f"stage_closed_write_after:{seq}")
+                    else:
+                        try:
+                            after = strict_read_json(after_path)
+                        except (OSError, ValueError, TypeError):
+                            return_problems.append(
+                                f"stage_closed_write_after_unreadable:{seq}")
+                        else:
+                            if after.get("passed") is not True or \
+                                    after.get("candidate_sha256") != \
+                                    sha256_file(candidate_path):
+                                return_problems.append(
+                                    f"stage_closed_write_after_failed:{seq}")
+            if observation_path.is_file():
+                try:
+                    observation = strict_read_json(observation_path)
+                except (OSError, ValueError, TypeError) as exc:
+                    return_problems = [f"return_unreadable:"
+                                       f"{type(exc).__name__}"]
+                else:
+                    return_problems = return_observation_problems(
+                        observation, invocation_id=directory.name, claim=claim)
+                    entry["return_observation"] = observation
+            else:
+                return_problems = ["return_observation_missing"]
+            entry["return_problems"] = return_problems
+            records.append(entry)
+            if return_problems and directory.name != allow_invocation:
+                problems.append(f"launch_unsettled:{sibling.name}:"
+                                f"{directory.name}:"
+                                f"{return_problems[0]}")
+                debts.append(entry)
+    return {"known": not problems, "records": records, "debts": debts,
+            "problems": problems}
+
+
+# ---------------------------------------------------------------------------
 # cohort/attempt accounting (semantics carried from the audited ledger)
 # ---------------------------------------------------------------------------
 
@@ -4597,8 +6024,29 @@ def allocate_attempt(root: Path, stage: str) -> str:
 
 def _row_identity_problems(row: Mapping[str, Any], *, kind: str) -> list[str]:
     problems: list[str] = []
-    if row.get("accounting_schema") != ACCOUNTING_SCHEMA:
+    schema = row.get("accounting_schema")
+    if schema not in (ACCOUNTING_SCHEMA, ACCOUNTING_SCHEMA_V2):
         problems.append(f"{kind}_schema_missing")
+    if schema == ACCOUNTING_SCHEMA_V2:
+        if row.get("generation") != GENERATION_002:
+            problems.append(f"{kind}_generation")
+        if not isinstance(row.get("binding_spec_sha256"), str) or not \
+                re.fullmatch(r"[0-9a-f]{64}",
+                             str(row.get("binding_spec_sha256"))):
+            problems.append(f"{kind}_binding_spec")
+        if type(row.get("execution_seq")) is not int or \
+                int(row["execution_seq"]) < 3:
+            problems.append(f"{kind}_execution_seq")
+        if row.get("predecessor_kind") not in ("legacy_head", "attempt_commit"):
+            problems.append(f"{kind}_predecessor_kind")
+        if not isinstance(row.get("previous_head_sha256"), str) or not \
+                re.fullmatch(r"[0-9a-f]{64}",
+                             str(row.get("previous_head_sha256"))):
+            problems.append(f"{kind}_previous_head")
+        if not isinstance(row.get("invocation_id"), str) or not \
+                re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}",
+                             str(row.get("invocation_id"))):
+            problems.append(f"{kind}_invocation")
     if row.get("cohort_id") != COHORT_ID:
         problems.append(f"{kind}_cohort_missing")
     if not isinstance(row.get("complete"), bool):
@@ -4765,12 +6213,292 @@ def _reservation_consumed(root: Path, stage: str, attempt: str
     return {kind: int(counts[kind]) for kind in CALL_KINDS}
 
 
-def _cohort_chain(root: Path, *, allow_current: tuple[str, str] | None = None
+def _migration_present(root: Path) -> bool:
+    bindings = Path(root) / BINDINGS_DIR
+    if bindings.is_dir() and any(
+            p.is_dir() for p in bindings.iterdir()):
+        return True
+    try:
+        return any(r.get("accounting_schema") == ACCOUNTING_SCHEMA_V2
+                   for r in load_index(root))
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _event_dir(root: Path, execution_seq: int) -> Path:
+    return Path(root) / EXECUTION_EVENTS_DIR / f"{int(execution_seq):06d}"
+
+
+def _stage_plan_for_seq(execution_seq: int) -> dict | None:
+    for item in MIGRATION_STAGE_PLAN:
+        if item["execution_seq"] == execution_seq:
+            return dict(item)
+    return None
+
+
+def _commit_path(root: Path, execution_seq: int) -> Path:
+    return _event_dir(root, execution_seq) / "commit.json"
+
+
+def _commit_problems(root: Path, execution_seq: int, *,
+                     binding: BindingContext | None = None,
+                     stage: str | None = None,
+                     attempt: str | None = None) -> tuple[dict | None,
+                                                          list[str]]:
+    path = _commit_path(root, execution_seq)
+    if not path.is_file():
+        return None, [f"commit_missing:{execution_seq}"]
+    try:
+        commit = strict_read_json(path)
+    except (OSError, ValueError, TypeError) as exc:
+        return None, [f"commit_unreadable:{execution_seq}:"
+                      f"{type(exc).__name__}"]
+    problems: list[str] = []
+    if commit.get("schema") != EVENT_SCHEMA or \
+            commit.get("kind") != "commit":
+        problems.append(f"commit_schema:{execution_seq}")
+    if commit.get("execution_seq") != execution_seq:
+        problems.append(f"commit_seq:{execution_seq}")
+    plan = _stage_plan_for_seq(execution_seq)
+    if plan is None:
+        problems.append(f"commit_plan:{execution_seq}")
+    else:
+        if stage is not None and commit.get("stage") != stage:
+            problems.append(f"commit_stage:{execution_seq}")
+        if attempt is not None and commit.get("attempt") != attempt:
+            problems.append(f"commit_attempt:{execution_seq}")
+        if commit.get("stage") != plan["stage"] or \
+                commit.get("attempt") != plan["attempt"]:
+            problems.append(f"commit_plan_stage:{execution_seq}")
+    if binding is not None:
+        if commit.get("generation") != binding.generation:
+            problems.append(f"commit_generation:{execution_seq}")
+        if commit.get("binding_spec_sha256") != binding.spec_sha256:
+            problems.append(f"commit_spec:{execution_seq}")
+        if commit.get("legacy_head_sha256") != binding.legacy_head_sha256:
+            problems.append(f"commit_legacy:{execution_seq}")
+        if not isinstance(commit.get("invocation_id"), str):
+            problems.append(f"commit_invocation:{execution_seq}")
+    finish = commit.get("finish") or {}
+    finish_path = _reference_path(finish.get("path")) if isinstance(
+        finish, Mapping) else None
+    if finish_path is None or not finish_path.is_file():
+        problems.append(f"commit_finish_missing:{execution_seq}")
+    elif sha256_file(finish_path) != finish.get("sha256"):
+        problems.append(f"commit_finish_sha:{execution_seq}")
+    for key in ("index_row_sha256", "ledger_row_sha256",
+                "reservation_sha256"):
+        if not isinstance(commit.get(key), str) or not re.fullmatch(
+                r"[0-9a-f]{64}", commit[key]):
+            problems.append(f"commit_row:{execution_seq}:{key}")
+    if not isinstance(commit.get("previous_head_sha256"), str):
+        problems.append(f"commit_previous:{execution_seq}")
+    if execution_seq == 3:
+        if commit.get("predecessor_kind") != "legacy_head":
+            problems.append("commit_predecessor_kind:3")
+    else:
+        if commit.get("predecessor_kind") != "attempt_commit":
+            problems.append(f"commit_predecessor_kind:{execution_seq}")
+        prev = _commit_path(root, execution_seq - 1)
+        if not prev.is_file() or sha256_file(prev) != \
+                commit.get("previous_head_sha256"):
+            problems.append(f"commit_previous_sha:{execution_seq}")
+    if stage is not None and attempt is not None:
+        try:
+            index = load_index(root)
+            ledger = load_ledger(root)
+        except (OSError, ValueError, TypeError):
+            problems.append(f"commit_rows_unreadable:{execution_seq}")
+        else:
+            row = next((r for r in index if r.get("stage") == stage
+                        and r.get("attempt") == attempt), None)
+            entry = next((e for e in ledger if e.get("stage") == stage
+                          and e.get("attempt") == attempt), None)
+            if row is None or entry is None:
+                problems.append(f"commit_row_missing:{execution_seq}")
+            else:
+                if canonical_sha256(row) != commit.get("index_row_sha256"):
+                    problems.append(f"commit_row_changed:{execution_seq}")
+                if canonical_sha256(entry) != commit.get("ledger_row_sha256"):
+                    problems.append(f"commit_ledger_changed:{execution_seq}")
+                reservation = stage_dir(root, stage) / attempt / \
+                    "call_reservations.json"
+                if not reservation.is_file() or sha256_file(
+                        reservation) != commit.get("reservation_sha256"):
+                    problems.append(f"commit_reservation:{execution_seq}")
+    return commit, problems
+
+
+def _start_event_problems(root: Path, execution_seq: int,
+                          row: Mapping[str, Any],
+                          binding: BindingContext | None
+                          ) -> list[str]:
+    path = _event_dir(root, execution_seq) / "start.json"
+    if not path.is_file():
+        return [f"start_event_missing:{execution_seq}"]
+    try:
+        event = strict_read_json(path)
+    except (OSError, ValueError, TypeError) as exc:
+        return [f"start_event_unreadable:{execution_seq}:"
+                f"{type(exc).__name__}"]
+    problems: list[str] = []
+    if event.get("schema") != EVENT_SCHEMA or event.get("kind") != "start":
+        problems.append(f"start_event_schema:{execution_seq}")
+    for key, want in (("execution_seq", execution_seq),
+                      ("stage", row.get("stage")),
+                      ("attempt", row.get("attempt")),
+                      ("generation", row.get("generation")),
+                      ("binding_spec_sha256", row.get("binding_spec_sha256")),
+                      ("predecessor_kind", row.get("predecessor_kind")),
+                      ("previous_head_sha256",
+                       row.get("previous_head_sha256")),
+                      ("invocation_id", row.get("invocation_id"))):
+        if event.get(key) != want:
+            problems.append(f"start_event_{key}:{execution_seq}")
+    snapshot = event.get("row_snapshot")
+    if not isinstance(snapshot, Mapping):
+        problems.append(f"start_event_row_snapshot:{execution_seq}")
+    elif canonical_sha256(snapshot) != event.get("row_sha256"):
+        problems.append(f"start_event_row:{execution_seq}")
+    elif any(snapshot.get(key) != row.get(key) for key in (
+            "stage", "attempt", "generation", "binding_spec_sha256",
+            "execution_seq", "predecessor_kind", "previous_head_sha256",
+            "invocation_id", "call_balance_before")):
+        problems.append(f"start_event_row_binding:{execution_seq}")
+    if binding is not None and event.get("legacy_head_sha256") != \
+            binding.legacy_head_sha256:
+        problems.append(f"start_event_legacy:{execution_seq}")
+    return problems
+
+
+def _execution_records(root: Path, *,
+                       binding: BindingContext | None = None,
+                       allow_current: tuple[str, str] | None = None,
+                       require_commits: bool = True
+                       ) -> tuple[list[dict] | None, BindingContext | None,
+                                  list[str]]:
+    """Return records in actual execution order, not stage/attempt order."""
+    root = Path(root)
+    try:
+        index = load_index(root)
+        ledger = load_ledger(root)
+        disk = {stage: _disk_attempts(root, stage) for stage in STAGE_BUDGETS}
+    except (OSError, ValueError, TypeError):
+        return None, binding, ["execution_rows_unreadable"]
+    index_by = {(r.get("stage"), r.get("attempt")): r for r in index}
+    ledger_by = {(e.get("stage"), e.get("attempt")): e for e in ledger}
+    if len(index_by) != len(index) or len(ledger_by) != len(ledger):
+        return None, binding, ["execution_duplicate_rows"]
+    if set(index_by) != set(ledger_by):
+        return None, binding, ["execution_row_sets"]
+    for stage in STAGE_BUDGETS:
+        want = {key for key in index_by if key[0] == stage}
+        if {a for a in disk[stage]} != {key[1] for key in want}:
+            return None, binding, [f"execution_disk_set:{stage}"]
+    present = _migration_present(root)
+    if not present:
+        return None, None, []
+    if binding is None:
+        binding, problems = load_binding(root, require_active=False)
+        if binding is None:
+            return None, None, problems or ["binding_missing"]
+    # Verify the frozen seq=1/2 prefix and its reservations.
+    prefix_problems = _snapshot_problems(binding.snapshot, run_root=root,
+                                         root=root)
+    if prefix_problems:
+        return None, binding, prefix_problems
+    legacy_records = binding.legacy_head.get("records")
+    if not isinstance(legacy_records, list):
+        return None, binding, ["legacy_records_missing"]
+    records: list[dict] = []
+    for rec in legacy_records:
+        key = (rec.get("stage"), rec.get("attempt"))
+        row = index_by.get(key)
+        entry = ledger_by.get(key)
+        if row is None or entry is None:
+            return None, binding, [f"legacy_record_missing:{key[0]}"]
+        if canonical_sha256(row) != rec.get("index_row_sha256") or \
+                canonical_sha256(entry) != rec.get("ledger_row_sha256"):
+            return None, binding, [f"legacy_record_changed:{key[0]}"]
+        reservation = stage_dir(root, key[0]) / key[1] / \
+            "call_reservations.json"
+        if not reservation.is_file() or sha256_file(reservation) != rec.get(
+                "reservation_sha256"):
+            return None, binding, [f"legacy_reservation_changed:{key[0]}"]
+        records.append({
+            "execution_seq": int(rec["execution_seq"]),
+            "generation": GENERATION_001,
+            "stage": key[0], "attempt": key[1], "index_row": row,
+            "ledger_row": entry, "v2": False,
+        })
+    v2_rows = []
+    for key, row in index_by.items():
+        if row.get("accounting_schema") != ACCOUNTING_SCHEMA_V2:
+            continue
+        seq = row.get("execution_seq")
+        if type(seq) is not int:
+            return None, binding, [f"v2_sequence_invalid:{key[0]}"]
+        if row.get("generation") != binding.generation:
+            return None, binding, [f"v2_generation:{key[0]}"]
+        if row.get("binding_spec_sha256") != binding.spec_sha256:
+            return None, binding, [f"v2_spec:{key[0]}"]
+        v2_rows.append((seq, key, row))
+    v2_rows.sort(key=lambda item: item[0])
+    expected_seq = 3
+    previous_commit_sha = binding.legacy_head_sha256
+    for seq, key, row in v2_rows:
+        if seq != expected_seq:
+            return None, binding, [f"v2_sequence_gap:{seq}!={expected_seq}"]
+        plan = _stage_plan_for_seq(seq)
+        if plan is None or key != (plan["stage"], plan["attempt"]) or \
+                row.get("generation") != plan["generation"]:
+            return None, binding, [f"v2_plan_mismatch:{seq}"]
+        if seq == 3:
+            if row.get("predecessor_kind") != "legacy_head":
+                return None, binding, ["v2_predecessor_kind:3"]
+        else:
+            if row.get("predecessor_kind") != "attempt_commit":
+                return None, binding, [f"v2_predecessor_kind:{seq}"]
+        if row.get("previous_head_sha256") != previous_commit_sha:
+            return None, binding, [f"v2_previous_head:{seq}"]
+        record_problems = _start_event_problems(root, seq, row, binding)
+        if record_problems:
+            return None, binding, record_problems
+        entry = ledger_by[key]
+        current = allow_current == key
+        if current:
+            if row.get("status") not in (
+                    "running", "publishing", "done", "incomplete",
+                    "crashed", "timeout"):
+                return None, binding, [f"v2_current_state:{seq}"]
+        elif require_commits:
+            commit, commit_problems = _commit_problems(
+                root, seq, binding=binding, stage=key[0], attempt=key[1])
+            if commit_problems:
+                return None, binding, commit_problems
+        commit_file = _commit_path(root, seq)
+        if commit_file.is_file():
+            previous_commit_sha = sha256_file(commit_file)
+        elif seq + 1 < 3 + len(v2_rows):
+            return None, binding, [f"v2_previous_commit_missing:{seq}"]
+        records.append({
+            "execution_seq": seq, "generation": binding.generation,
+            "stage": key[0], "attempt": key[1], "index_row": row,
+            "ledger_row": entry, "v2": True,
+        })
+        expected_seq += 1
+    return records, binding, []
+
+
+def _cohort_chain(root: Path, *, allow_current: tuple[str, str] | None = None,
+                  generation: str | None = None,
+                  binding: BindingContext | None = None,
+                  require_commits: bool = True
                   ) -> tuple[dict[str, dict[str, dict]], dict[str, int]] | None:
     """Reconstruct per-attempt increments from the cumulative balance chain.
 
-    The index/ledger snapshots are cohort-wide; process stages in execution
-    order (R0, P, I, F) and attempts by number.  An explicit
+    A migrated root is replayed in execution-sequence order: the frozen v1
+    prefix first, then each committed v2 attempt.  An explicit
     ``call_balance_before`` must equal the running cumulative and
     ``after == before + reservation.consumed``.  Legacy rows without the
     explicit field use the uniquely determined ``before = after - consumed``
@@ -4800,71 +6528,158 @@ def _cohort_chain(root: Path, *, allow_current: tuple[str, str] | None = None
         if set(index_by[stage]) != set(ledger_by[stage]) \
                 or set(index_by[stage]) != disk[stage]:
             return None
+    records, binding, record_problems = _execution_records(
+        root, binding=binding, allow_current=allow_current,
+        require_commits=require_commits)
+    if records is None:
+        if record_problems:
+            return None
+        # Historical v1 root without a migration record.
+        records = []
+        for stage in STAGE_BUDGETS:
+            for attempt in sorted(index_by[stage], key=_attempt_number):
+                records.append({
+                    "execution_seq": None, "generation": GENERATION_001,
+                    "stage": stage, "attempt": attempt,
+                    "index_row": index_by[stage][attempt],
+                    "ledger_row": ledger_by[stage][attempt], "v2": False,
+                })
     cumulative = {kind: 0 for kind in CALL_KINDS}
     out: dict[str, dict[str, dict]] = {stage: {} for stage in STAGE_BUDGETS}
-    for stage in STAGE_BUDGETS:
-        for attempt in sorted(index_by[stage], key=_attempt_number):
-            if allow_current == (stage, attempt):
-                continue
-            row = index_by[stage][attempt]
-            entry = ledger_by[stage][attempt]
-            after = _call_counts_from_balance(row.get("call_balance"))
-            ledger_after = _call_counts_from_balance(entry.get("call_balance"))
-            if after is None or ledger_after != after:
+    for record in records:
+        stage = record["stage"]
+        attempt = record["attempt"]
+        if allow_current == (stage, attempt):
+            continue
+        row = record["index_row"]
+        entry = record["ledger_row"]
+        after = _call_counts_from_balance(row.get("call_balance"))
+        ledger_after = _call_counts_from_balance(entry.get("call_balance"))
+        if after is None or ledger_after != after:
+            return None
+        consumed = _reservation_consumed(root, stage, attempt)
+        if consumed is None:
+            return None
+        explicit = row.get("call_balance_before")
+        if explicit is not None:
+            before = _call_counts_from_balance(explicit)
+            if before is None or before != cumulative:
                 return None
-            consumed = _reservation_consumed(root, stage, attempt)
-            if consumed is None:
+        else:
+            before = {kind: after[kind] - consumed[kind]
+                      for kind in CALL_KINDS}
+            if any(before[kind] < 0 for kind in CALL_KINDS):
                 return None
-            explicit = row.get("call_balance_before")
-            if explicit is not None:
-                before = _call_counts_from_balance(explicit)
-                if before is None or before != cumulative:
-                    return None
-            else:
-                before = {kind: after[kind] - consumed[kind]
-                          for kind in CALL_KINDS}
-                if any(before[kind] < 0 for kind in CALL_KINDS):
-                    return None
-                if before != cumulative:
-                    return None
-            expected = {kind: cumulative[kind] + consumed[kind]
-                        for kind in CALL_KINDS}
-            if after != expected:
+            if before != cumulative:
                 return None
+        expected = {kind: cumulative[kind] + consumed[kind]
+                    for kind in CALL_KINDS}
+        if after != expected:
+            return None
+        if generation is None or record["generation"] == generation:
             out[stage][attempt] = {
                 "before": dict(before), "after": dict(after),
                 "counts": {kind: int(consumed[kind]) for kind in CALL_KINDS},
+                "generation": record["generation"],
+                "execution_seq": record["execution_seq"],
             }
-            cumulative = after
+        cumulative = after
     return out, cumulative
 
 
 def stage_attempt_deltas(root: Path, stage: str,
                          *, allow_current: str | None = None,
-                         current: tuple[str, str] | None = None
+                         current: tuple[str, str] | None = None,
+                         generation: str | None = None,
+                         binding: BindingContext | None = None,
+                         require_commits: bool = True
                          ) -> dict[str, dict] | None:
     skip = current if current is not None else (
         (stage, allow_current) if allow_current is not None else None)
-    chain = _cohort_chain(root, allow_current=skip)
+    chain = _cohort_chain(root, allow_current=skip, generation=generation,
+                          binding=binding, require_commits=require_commits)
     if chain is None:
         return None
     return chain[0].get(stage, {})
 
 
-def _stage_deltas(root: Path) -> dict[str, dict[str, dict]] | None:
+def _stage_deltas(root: Path, *, require_commits: bool = True
+                  ) -> dict[str, dict[str, dict]] | None:
     out: dict[str, dict[str, dict]] = {}
     for stage in STAGE_BUDGETS:
-        deltas = stage_attempt_deltas(root, stage)
+        deltas = stage_attempt_deltas(root, stage,
+                                      require_commits=require_commits)
         if deltas is None:
             return None
         out[stage] = deltas
     return out
 
 
+def _settled_deltas_with_unsettled_tail(
+        root: Path, *, binding: BindingContext | None = None
+        ) -> tuple[dict[str, dict[str, dict]] | None, str | None]:
+    """Return the settled prefix when a current attempt is still unknown.
+
+    The unsettled row is excluded from both the increment chain and the
+    reported totals; callers must expose the result as a known lower bound,
+    never as the cohort total.
+    """
+    full = _stage_deltas(root)
+    if full is not None:
+        return full, None
+    try:
+        rows = load_index(root)
+    except (OSError, ValueError, TypeError):
+        return None, None
+    for row in rows:
+        if row.get("status") not in ("running", "publishing"):
+            continue
+        stage = row.get("stage")
+        attempt = row.get("attempt")
+        if stage not in STAGE_BUDGETS or not isinstance(attempt, str):
+            continue
+        skip = (stage, attempt)
+        out: dict[str, dict[str, dict]] = {}
+        failed = False
+        for name in STAGE_BUDGETS:
+            deltas = stage_attempt_deltas(
+                root, name, current=skip, binding=binding,
+                require_commits=False)
+            if deltas is None:
+                failed = True
+                break
+            out[name] = deltas
+        if not failed:
+            return out, f"{stage}/{attempt}"
+    return None, None
+
+
 def verify_history(root: Path, *,
-                   allow_current: tuple[str, str] | None = None) -> list[str]:
+                   allow_current: tuple[str, str] | None = None,
+                   generation: str | None = None,
+                   binding: BindingContext | None = None,
+                   allow_invocation: str | None = None,
+                   scan_journal: bool = False) -> list[str]:
     """Full-history gate before any resume/selection decision."""
     problems: list[str] = []
+    if _migration_present(root):
+        records, loaded, record_problems = _execution_records(
+            root, binding=binding, allow_current=allow_current)
+        if records is None:
+            return record_problems or ["history_migration_unknown"]
+        binding = loaded
+        if generation is not None and generation not in (
+                GENERATION_001, GENERATION_002):
+            problems.append(f"history_generation:{generation}")
+        if scan_journal:
+            journal = scan_launch_journals(
+                Path(root).parent, allow_invocation=allow_invocation)
+            for problem in journal.get("problems") or []:
+                if str(problem).startswith(
+                        f"launch_journal_missing:{Path(root).name}") or \
+                        f":{Path(root).name}:" in str(problem) or \
+                        str(problem).endswith(f":{Path(root).name}"):
+                    problems.append(f"history_journal:{problem}")
     for stage in STAGE_BUDGETS:
         try:
             index = [r for r in load_index(root) if r.get("stage") == stage]
@@ -4882,8 +6697,10 @@ def verify_history(root: Path, *,
             continue
         for attempt, row in index_by.items():
             if allow_current == (stage, attempt):
-                if row.get("status") != "running":
-                    problems.append(f"history_current_not_running:{stage}")
+                if row.get("status") not in (
+                        "running", "publishing", "done", "incomplete",
+                        "crashed", "timeout"):
+                    problems.append(f"history_current_not_terminal:{stage}")
                 continue
             entry = ledger_by[attempt]
             for problem in (_row_identity_problems(row, kind="index")
@@ -4911,9 +6728,11 @@ def verify_history(root: Path, *,
         deltas = stage_attempt_deltas(
             root, stage,
             current=(allow_current if allow_current
-                     and allow_current[0] == stage else None))
+                     and allow_current[0] == stage else None),
+            binding=binding)
         if deltas is None:
-            chain = _cohort_chain(root, allow_current=allow_current)
+            chain = _cohort_chain(root, allow_current=allow_current,
+                                  binding=binding)
             if chain is None:
                 problems.append(f"history_deltas:{stage}")
             elif stage not in chain[0]:
@@ -4957,6 +6776,9 @@ def cohort_call_totals_from_deltas(
 
 def cohort_call_totals(fixed_root: Path, *, exclude_root: Path | None = None
                        ) -> dict[str, int] | None:
+    journal = scan_launch_journals(Path(fixed_root))
+    if not journal.get("known"):
+        return None
     totals = {kind: 0 for kind in CALL_KINDS}
     for sibling in _cohort_roots(fixed_root):
         if exclude_root is not None \
@@ -5037,6 +6859,10 @@ def _attribution(marker: Mapping[str, Any], index, ledger,
 
 def cohort_history(fixed_root: Path, *, exclude_root: Path | None = None,
                    allow_current: tuple[str, str] | None = None) -> dict:
+    journal = scan_launch_journals(Path(fixed_root))
+    if not journal.get("known"):
+        return {"known": False, "reason": "launch_journal_unknown",
+                "runs": [], "journal_problems": journal.get("problems")}
     runs: list[dict] = []
     by_stage = {stage: 0.0 for stage in STAGE_BUDGETS}
     total = 0.0
@@ -5092,6 +6918,9 @@ def _read_registration(root: Path, which: str) -> tuple[list[dict] | None, str |
 
 def cohort_attempts(fixed_root: Path, stage: str, *,
                     exclude_root: Path | None = None) -> int | None:
+    journal = scan_launch_journals(Path(fixed_root))
+    if not journal.get("known"):
+        return None
     count = 0
     for sibling in _cohort_roots(fixed_root):
         if exclude_root is not None and sibling.resolve() == Path(exclude_root).resolve():
@@ -5128,10 +6957,62 @@ def prior_call_counts(root: Path, *, fixed_root: Path,
     return _prior_call_counts_impl(root, fixed_root=fixed_root, mode=mode)
 
 
+def _migration_budget_for(root: Path, stage: str, *,
+                          binding: BindingContext | None = None,
+                          allow_invocation: str | None = None) -> dict:
+    if binding is None:
+        binding, problems = load_binding(root, require_active=False)
+        if binding is None:
+            raise SystemExit(f"migration binding unknown: {problems}")
+    snapshot = binding.snapshot
+    base = _budget_from_snapshot(snapshot, stage)
+    journal = scan_launch_journals(Path(root).parent,
+                                   allow_invocation=allow_invocation)
+    if not journal.get("known"):
+        raise SystemExit(f"launch journal unknown: "
+                         f"{journal.get('problems')}")
+    try:
+        index = load_index(root)
+        ledger = load_ledger(root)
+    except (OSError, ValueError, TypeError):
+        raise SystemExit("migration cost rows unreadable")
+    v2_rows = [r for r in index
+               if r.get("generation") == GENERATION_002
+               and r.get("accounting_schema") == ACCOUNTING_SCHEMA_V2]
+    v2_ledger = [e for e in ledger
+                 if e.get("generation") == GENERATION_002
+                 and e.get("accounting_schema") == ACCOUNTING_SCHEMA_V2]
+    used_attempts = len([r for r in v2_rows if r.get("stage") == stage])
+    used_stage = sum(float(e.get("measured_wall_s", 0.0)) for e in v2_ledger
+                     if e.get("stage") == stage)
+    used_total = sum(float(e.get("measured_wall_s", 0.0)) for e in v2_ledger)
+    remaining_stage = (float(STAGE_BUDGETS[stage]["budget_s"])
+                       - float(base["local_stage_s"]) - used_stage)
+    remaining_total = (TOTAL_BUDGET_S
+                       - float((snapshot.get("cost_s") or {}).get(
+                           "total", 0.0)) - used_total)
+    remaining = min(remaining_stage, remaining_total)
+    attempts_used = int(base["attempts_used"]) + used_attempts
+    if attempts_used >= int(STAGE_BUDGETS[stage]["attempts"]):
+        raise SystemExit(f"{stage} attempt limit reached: {attempts_used}")
+    if remaining <= float(STAGE_BUDGETS[stage]["reserve_s"]):
+        raise SystemExit(f"{stage} budget exhausted: {remaining:.6f}s")
+    return {
+        **base, "local_stage_s": float(base["local_stage_s"]) + used_stage,
+        "prior_stage_s": 0.0, "prior_total_s": 0.0,
+        "attempts_used": attempts_used, "remaining_s": remaining,
+    }
+
+
 def budget_for(root: Path, stage: str, *, fixed_root: Path,
-               mode: str = "real") -> dict:
+               mode: str = "real",
+               binding: BindingContext | None = None,
+               allow_invocation: str | None = None) -> dict:
     if stage not in STAGE_BUDGETS:
         raise ValueError(f"unknown stage {stage}")
+    if _migration_present(root):
+        return _migration_budget_for(root, stage, binding=binding,
+                                     allow_invocation=allow_invocation)
     spec = STAGE_BUDGETS[stage]
     local = stage_history(root, stage)
     local_total = total_history(root)
@@ -5170,10 +7051,59 @@ def budget_for(root: Path, stage: str, *, fixed_root: Path,
     }
 
 
+def _execution_fields(execution: Mapping[str, Any] | None, *,
+                      root: Path, stage: str, attempt: str) -> dict:
+    if execution is None:
+        return {}
+    if not isinstance(execution, Mapping):
+        raise ValueError("execution context must be a mapping")
+    seq = execution.get("execution_seq")
+    generation = execution.get("generation")
+    spec_sha = execution.get("binding_spec_sha256")
+    invocation = execution.get("invocation_id")
+    if type(seq) is not int or seq < 3:
+        raise ValueError("execution_seq must be an integer >= 3")
+    plan = _stage_plan_for_seq(seq)
+    if plan is None or plan["stage"] != stage or plan["attempt"] != attempt:
+        raise ValueError(f"execution_seq {seq} does not match {stage}/{attempt}")
+    if generation != plan["generation"]:
+        raise ValueError("execution generation mismatch")
+    if not isinstance(spec_sha, str) or not re.fullmatch(r"[0-9a-f]{64}",
+                                                         spec_sha):
+        raise ValueError("execution binding spec hash missing")
+    if not isinstance(invocation, str) or not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", invocation):
+        raise ValueError("execution invocation id missing")
+    predecessor = "legacy_head" if seq == 3 else "attempt_commit"
+    if seq == 3:
+        previous = execution.get("legacy_head_sha256")
+        if not isinstance(previous, str) or not re.fullmatch(
+                r"[0-9a-f]{64}", previous):
+            raise ValueError("execution legacy head hash missing")
+    else:
+        previous_path = _commit_path(root, seq - 1)
+        if not previous_path.is_file():
+            raise ValueError(f"previous commit missing for seq {seq}")
+        previous = sha256_file(previous_path)
+    return {
+        "accounting_schema": ACCOUNTING_SCHEMA_V2,
+        "generation": generation,
+        "binding_spec_sha256": spec_sha,
+        "execution_seq": seq,
+        "predecessor_kind": predecessor,
+        "previous_head_sha256": previous,
+        "invocation_id": invocation,
+        **({"claim_path": execution.get("claim_path"),
+            "claim_sha256": execution.get("claim_sha256")}
+           if execution.get("claim_path") is not None else {}),
+    }
+
+
 def pre_register_attempt(root: Path, stage: str, attempt: str, t0: float,
                          *, scope: dict, budget: dict,
                          registration_sha: str | None = None,
-                         call_balance: Mapping[str, Any] | None = None) -> dict:
+                         call_balance: Mapping[str, Any] | None = None,
+                         execution: Mapping[str, Any] | None = None) -> dict:
     if int(budget.get("attempts_used", 0)) >= int(budget.get("attempts", 0)):
         raise SystemExit(f"{stage} attempt limit reached before registration")
     marker = _cohort_path(root)
@@ -5181,10 +7111,13 @@ def pre_register_attempt(root: Path, stage: str, attempt: str, t0: float,
         raise ValueError("cohort marker mismatch")
     elapsed = max(0.0, time.perf_counter() - t0)
     balance = dict(call_balance) if call_balance else None
+    execution_fields = _execution_fields(
+        execution, root=root, stage=stage, attempt=attempt)
     entry = {
         "status": "running", "complete": False,
         "measured_wall_s": elapsed,
-        "accounting_schema": ACCOUNTING_SCHEMA,
+        "accounting_schema": (ACCOUNTING_SCHEMA_V2 if execution_fields
+                              else ACCOUNTING_SCHEMA),
         "cohort_id": COHORT_ID,
         "execution_registration_sha256": registration_sha,
         "scope": scope, "budget": budget,
@@ -5192,12 +7125,38 @@ def pre_register_attempt(root: Path, stage: str, attempt: str, t0: float,
         "call_balance_before": balance,
         "deadline_perf_counter": t0 + float(budget["remaining_s"]),
         "allocated_wall_s": time.time(),
+        **execution_fields,
     }
+    if execution_fields:
+        row_snapshot = {**entry, "stage": stage, "attempt": attempt}
+        event = {
+            "schema": EVENT_SCHEMA,
+            "kind": "start",
+            "execution_seq": execution_fields["execution_seq"],
+            "generation": execution_fields["generation"],
+            "stage": stage,
+            "attempt": attempt,
+            "binding_spec_sha256": execution_fields["binding_spec_sha256"],
+            "predecessor_kind": execution_fields["predecessor_kind"],
+            "previous_head_sha256": execution_fields["previous_head_sha256"],
+            "invocation_id": execution_fields["invocation_id"],
+            "claim_path": execution_fields.get("claim_path"),
+            "claim_sha256": execution_fields.get("claim_sha256"),
+            "legacy_head_sha256": execution.get("legacy_head_sha256"),
+            "row_snapshot": row_snapshot,
+            "row_sha256": canonical_sha256(row_snapshot),
+            "t0_perf_counter": float(t0),
+            "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        }
+        write_json_exclusive(
+            _event_dir(root, execution_fields["execution_seq"]) / "start.json",
+            event)
     upsert_index(root, stage, attempt, entry)
     upsert_cost(root, stage, attempt, elapsed,
                 {"complete": False, "scope": scope, "budget": budget,
                  "call_balance": balance,
-                 "call_balance_before": balance},
+                 "call_balance_before": balance,
+                 **execution_fields},
                 "running")
     return entry
 
@@ -5238,8 +7197,24 @@ def finish_attempt(root: Path, stage: str, attempt: str, t0: float,
         raise ValueError("cost floor must be finite and non-negative")
     (stage_dir(root, stage) / attempt).mkdir(parents=True, exist_ok=True)
     existing = _attempt_row(root, stage, attempt)
+    if type(existing.get("execution_seq")) is int and \
+            _commit_path(root, int(existing["execution_seq"])).is_file():
+        raise ValueError(
+            "committed attempt cannot be resealed or withdrawn; append a "
+            "revoke/failure record instead")
+    schema = (ACCOUNTING_SCHEMA_V2
+              if existing.get("accounting_schema") == ACCOUNTING_SCHEMA_V2
+              else ACCOUNTING_SCHEMA)
     row = {**existing, **row, "stage": stage, "attempt": attempt,
-           "accounting_schema": ACCOUNTING_SCHEMA, "cohort_id": COHORT_ID}
+           "accounting_schema": schema, "cohort_id": COHORT_ID}
+    for key in ("generation", "binding_spec_sha256", "execution_seq",
+                "predecessor_kind", "previous_head_sha256",
+                "invocation_id", "claim_path", "claim_sha256"):
+        if key in existing:
+            row[key] = existing[key]
+            extra.setdefault(key, existing[key])
+    if schema == ACCOUNTING_SCHEMA_V2:
+        extra["accounting_schema"] = ACCOUNTING_SCHEMA_V2
     balance = extra.get("call_balance")
     if isinstance(balance, Mapping):
         row["call_balance"] = dict(balance)
@@ -5353,6 +7328,620 @@ def finish_attempt(root: Path, stage: str, attempt: str, t0: float,
     terminal_state = row.get("status") in ("done", "crashed", "timeout",
                                            "incomplete")
     return SealResult(ok, row, problems, terminal_state)
+
+
+@dataclass
+class CommitResult:
+    committed: bool
+    finish_path: Path | None
+    finish_sha256: str | None
+    commit_path: Path | None
+    commit_sha256: str | None
+    problems: list[str] = field(default_factory=list)
+    observed_elapsed: float | None = None
+
+
+def _launch_invocation_dir(root: Path, invocation_id: str) -> Path:
+    return launch_journal_dir(root) / invocation_id
+
+
+def claim_launch(root: Path, *, authorization_sha256: str,
+                 spec_sha256: str, legacy_head_sha256: str,
+                 marker_sha256: str, invocation_id: str,
+                 t0_perf_counter: float, target: Mapping[str, Any],
+                 pid: int | None = None, ppid: int | None = None,
+                 ) -> tuple[Path, str]:
+    """Persist the one-shot launch claim before imports or real work."""
+    if not _nonneg(t0_perf_counter):
+        raise ValueError("launch t0 must be finite and non-negative")
+    directory = _launch_invocation_dir(root, invocation_id)
+    path = directory / "claim.json"
+    payload = {
+        "schema": LAUNCH_CLAIM_SCHEMA,
+        "invocation_id": invocation_id,
+        "cohort_id": COHORT_ID,
+        "execution_id": EXECUTION_ID,
+        "run_root_realpath": str(Path(root).resolve()),
+        "authorization_sha256": authorization_sha256,
+        "spec_sha256": spec_sha256,
+        "legacy_head_sha256": legacy_head_sha256,
+        "marker_sha256": marker_sha256,
+        "t0_perf_counter": float(t0_perf_counter),
+        "target": dict(target),
+        "pid": int(os.getpid() if pid is None else pid),
+        "ppid": int(os.getppid() if ppid is None else ppid),
+        "executable": sys.executable,
+        "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    sha = write_json_exclusive(path, payload)
+    return path, sha
+
+
+def _prepare_revision_number(directory: Path) -> int:
+    numbers = []
+    for path in directory.glob("prepare_revision_*.json"):
+        match = re.fullmatch(r"prepare_revision_(\d{4})\.json", path.name)
+        if match:
+            numbers.append(int(match.group(1)))
+    return max(numbers, default=0) + 1
+
+
+@dataclass
+class PreparedResult:
+    row: dict | None
+    ledger_row: dict | None
+    problems: list[str] = field(default_factory=list)
+    facts: dict = field(default_factory=dict)
+
+
+def _verify_prepared_attempt(root: Path, stage: str, attempt: str, *,
+                             binding: BindingContext,
+                             execution: Mapping[str, Any] | None = None,
+                             record: bool = True) -> PreparedResult:
+    """Internal candidate verification; never a public consumable row."""
+    execution = dict(execution or {})
+    seq = execution.get("execution_seq")
+    problems: list[str] = []
+    if type(seq) is not int:
+        return PreparedResult(None, None, ["prepared_execution_seq"])
+    plan = _stage_plan_for_seq(seq)
+    if plan is None or plan["stage"] != stage or plan["attempt"] != attempt:
+        return PreparedResult(None, None, ["prepared_plan"])
+    try:
+        rows = [r for r in load_index(root)
+                if r.get("stage") == stage and r.get("attempt") == attempt]
+        ledger = [r for r in load_ledger(root)
+                  if r.get("stage") == stage and r.get("attempt") == attempt]
+    except (OSError, ValueError, TypeError):
+        return PreparedResult(None, None, ["prepared_rows_unreadable"])
+    if len(rows) != 1 or len(ledger) != 1:
+        return PreparedResult(None, None, ["prepared_row_missing"])
+    row, entry = rows[0], ledger[0]
+    problems += _row_identity_problems(row, kind="index")
+    problems += _row_identity_problems(entry, kind="ledger")
+    problems += _call_balance_problems(row, entry)
+    for key, want in (("generation", binding.generation),
+                      ("binding_spec_sha256", binding.spec_sha256),
+                      ("execution_seq", seq)):
+        if row.get(key) != want:
+            problems.append(f"prepared_binding:{key}")
+    if row.get("status") not in ("done", "incomplete", "crashed",
+                                 "timeout"):
+        problems.append("prepared_not_terminal")
+    if row.get("complete") is True and row.get("status") != "done":
+        problems.append("prepared_complete_state")
+    reservation = stage_dir(root, stage) / attempt / \
+        "call_reservations.json"
+    if not reservation.is_file():
+        problems.append("prepared_reservation_missing")
+    else:
+        try:
+            reservation_data = read_json(reservation)
+        except (OSError, ValueError, TypeError):
+            problems.append("prepared_reservation_unreadable")
+        else:
+            if reservation_data.get("consumed") is None:
+                problems.append("prepared_reservation_unsettled")
+    problems += _sealed_evidence_problems(root, stage, row)
+    history = verify_history(root, allow_current=(stage, attempt),
+                             binding=binding, generation=binding.generation)
+    problems += history
+    consumed = _reservation_consumed(root, stage, attempt)
+    if consumed is None:
+        problems.append("prepared_call_delta")
+    facts = {
+        "stage": stage, "attempt": attempt, "execution_seq": seq,
+        "generation": binding.generation,
+        "binding_spec_sha256": binding.spec_sha256,
+        "index_row_sha256": canonical_sha256(row),
+        "ledger_row_sha256": canonical_sha256(entry),
+        "reservation_sha256": (sha256_file(reservation)
+                               if reservation.is_file() else None),
+        "complete": bool(row.get("complete") is True),
+        "status": row.get("status"),
+        "call_balance": entry.get("call_balance"),
+        "call_delta": consumed,
+    }
+    if record:
+        directory = _event_dir(root, seq)
+        number = _prepare_revision_number(directory)
+        payload = {
+            "schema": EVENT_SCHEMA,
+            "kind": "prepare_revision",
+            "revision": number,
+            "stage": stage,
+            "attempt": attempt,
+            "execution_seq": seq,
+            "generation": binding.generation,
+            "binding_spec_sha256": binding.spec_sha256,
+            "facts": facts,
+            "problems": list(problems),
+            "public_consumable": False,
+            "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        }
+        try:
+            write_json_exclusive(
+                directory / f"prepare_revision_{number:04d}.json", payload)
+        except (OSError, ValueError, TypeError) as exc:
+            problems.append(f"prepared_revision_write:{type(exc).__name__}")
+    return PreparedResult(row, entry, problems, facts)
+
+
+def commit_attempt(root: Path, stage: str, attempt: str, *, t0: float,
+                   budget: Mapping[str, Any], binding: BindingContext,
+                   execution: Mapping[str, Any] | None = None,
+                   cost_floor: float | None = None,
+                   candidate_problems: Sequence[str] = ()) -> CommitResult:
+    """Write the single finish/commit pair after internal verification."""
+    execution = dict(execution or {})
+    seq = execution.get("execution_seq")
+    problems: list[str] = list(candidate_problems)
+    if type(seq) is not int:
+        return CommitResult(False, None, None, None, None,
+                            problems + ["commit_execution_seq"])
+    plan = _stage_plan_for_seq(seq)
+    if plan is None or plan["stage"] != stage or plan["attempt"] != attempt:
+        return CommitResult(False, None, None, None, None,
+                            problems + ["commit_plan"])
+    prepared = _verify_prepared_attempt(
+        root, stage, attempt, binding=binding, execution=execution)
+    problems += prepared.problems
+    row = prepared.row
+    entry = prepared.ledger_row
+    if row is None or entry is None:
+        return CommitResult(False, None, None, None, None, problems)
+    if problems and row.get("complete") is True:
+        return CommitResult(False, None, None, None, None, problems)
+    committed_wall = float(row.get("measured_wall_s", 0.0) or 0.0)
+    floor = 0.0 if cost_floor is None else float(cost_floor)
+    committed_wall = max(committed_wall, floor)
+    if not _nonneg(committed_wall):
+        return CommitResult(False, None, None, None, None,
+                            problems + ["commit_cost_invalid"])
+    remaining = float(budget["remaining_s"])
+    directory = _event_dir(root, seq)
+    finish_path = directory / "finish.json"
+    finish = {
+        "schema": EVENT_SCHEMA,
+        "kind": "finish",
+        "execution_seq": seq,
+        "stage": stage,
+        "attempt": attempt,
+        "generation": binding.generation,
+        "binding_spec_sha256": binding.spec_sha256,
+        "legacy_head_sha256": binding.legacy_head_sha256,
+        "invocation_id": execution.get("invocation_id"),
+        "predecessor_kind": row.get("predecessor_kind"),
+        "previous_head_sha256": row.get("previous_head_sha256"),
+        "index_row_snapshot": row,
+        "ledger_row_snapshot": entry,
+        "index_row_sha256": canonical_sha256(row),
+        "ledger_row_sha256": canonical_sha256(entry),
+        "reservation_sha256": prepared.facts.get("reservation_sha256"),
+        "prepared_facts": prepared.facts,
+        "committed_measured_wall_s": committed_wall,
+        "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    try:
+        finish_sha = write_json_exclusive(finish_path, finish)
+    except (OSError, ValueError, TypeError) as exc:
+        return CommitResult(False, finish_path, None, None, None,
+                            problems + [f"commit_finish_write:"
+                                        f"{type(exc).__name__}"])
+    commit_path = _commit_path(root, seq)
+    commit = {
+        "schema": EVENT_SCHEMA,
+        "kind": "commit",
+        "execution_seq": seq,
+        "stage": stage,
+        "attempt": attempt,
+        "generation": binding.generation,
+        "binding_spec_sha256": binding.spec_sha256,
+        "legacy_head_sha256": binding.legacy_head_sha256,
+        "invocation_id": execution.get("invocation_id"),
+        "claim_path": execution.get("claim_path"),
+        "claim_sha256": execution.get("claim_sha256"),
+        "predecessor_kind": row.get("predecessor_kind"),
+        "previous_head_sha256": row.get("previous_head_sha256"),
+        "finish": {"path": path_for_record(finish_path),
+                   "sha256": finish_sha},
+        "index_row_sha256": canonical_sha256(row),
+        "ledger_row_sha256": canonical_sha256(entry),
+        "reservation_sha256": prepared.facts.get("reservation_sha256"),
+        "committed_measured_wall_s": committed_wall,
+        "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    try:
+        commit_sha = write_json_exclusive(commit_path, commit)
+    except (OSError, ValueError, TypeError) as exc:
+        return CommitResult(False, finish_path, finish_sha, None, None,
+                            problems + [f"commit_write:{type(exc).__name__}"])
+    observed = max(floor, time.perf_counter() - float(t0))
+    if not _nonneg(observed) or observed >= remaining or \
+            observed > committed_wall:
+        problems.append("commit_write_after_gate")
+        append_launch_revoke(
+            root, invocation_id=str(execution.get("invocation_id")),
+            stage=stage, execution_seq=seq, commit_path=commit_path,
+            commit_sha256=commit_sha, candidate_sha256=None,
+            observed_elapsed=observed, committed_wall=committed_wall,
+            remaining_s=remaining, reason="commit_write_after_gate")
+        return CommitResult(False, finish_path, finish_sha, commit_path,
+                            commit_sha, problems, observed)
+    return CommitResult(True, finish_path, finish_sha, commit_path,
+                        commit_sha, problems, observed)
+
+
+def append_launch_revoke(root: Path, *, invocation_id: str,
+                         stage: str, execution_seq: int, commit_path: Path,
+                         commit_sha256: str, candidate_sha256: str | None,
+                         observed_elapsed: float, committed_wall: float,
+                         remaining_s: float, reason: str,
+                         candidate_path: Path | None = None) -> Path | None:
+    if not isinstance(invocation_id, str) or not invocation_id:
+        return None
+    directory = _launch_invocation_dir(root, invocation_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    observed = float(observed_elapsed)
+    committed = float(committed_wall)
+    payload = {
+        "schema": EVENT_SCHEMA,
+        "kind": "revoke",
+        "reason": reason,
+        "invocation_id": invocation_id,
+        "cohort_id": COHORT_ID,
+        "execution_id": EXECUTION_ID,
+        "stage": stage,
+        "execution_seq": int(execution_seq),
+        "commit": {"path": path_for_record(Path(commit_path)),
+                   "sha256": commit_sha256},
+        "candidate_sha256": candidate_sha256,
+        "observed_elapsed_s": observed,
+        "committed_measured_wall_s": committed,
+        "remaining_s": float(remaining_s),
+        "uncovered_wall_s_lower_bound": max(0.0, observed - committed),
+        "post_return_work_performed": False,
+        "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    if candidate_path is not None:
+        payload["candidate"] = {"path": path_for_record(candidate_path),
+                                "sha256": sha256_file(candidate_path)
+                                if candidate_path.is_file() else None}
+    stem = f"revoke_{int(execution_seq):06d}_{reason}"
+    path = directory / f"{stem}.json"
+    suffix = 1
+    while path.exists():
+        path = directory / f"{stem}_{suffix:03d}.json"
+        suffix += 1
+    try:
+        write_json_exclusive(path, payload)
+    except (OSError, ValueError, TypeError):
+        return None
+    return path
+
+
+def write_stage_closed_candidate(
+        root: Path, *, stage: str, attempt: str, binding: BindingContext,
+        execution: Mapping[str, Any], commit: CommitResult, t0: float,
+        remaining_s: float, committed_measured_wall_s: float
+        ) -> tuple[Path | None, str | None, list[str]]:
+    """Write and then actually re-sample after the success-receipt write."""
+    seq = int(execution.get("execution_seq"))
+    directory = _event_dir(root, seq)
+    problems: list[str] = []
+    if not commit.committed or commit.commit_path is None:
+        return None, None, ["stage_closed_without_commit"]
+    payload = {
+        "schema": EVENT_SCHEMA,
+        "kind": "stage_closed_candidate",
+        "candidate": True,
+        "stage": stage,
+        "attempt": attempt,
+        "execution_seq": seq,
+        "generation": binding.generation,
+        "binding_spec_sha256": binding.spec_sha256,
+        "invocation_id": execution.get("invocation_id"),
+        "commit": {"path": path_for_record(commit.commit_path),
+                   "sha256": commit.commit_sha256},
+        "committed_measured_wall_s": float(committed_measured_wall_s),
+        "write_after": {"passed": True},
+        "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    path = directory / "stage_closed.json"
+    try:
+        sha = write_json_exclusive(path, payload)
+    except (OSError, ValueError, TypeError) as exc:
+        return None, None, [f"stage_closed_write:{type(exc).__name__}"]
+    observed = max(0.0, time.perf_counter() - float(t0))
+    if not _nonneg(observed) or observed >= float(remaining_s) or \
+            observed > float(committed_measured_wall_s):
+        problems.append("stage_closed_write_after_gate")
+        append_launch_revoke(
+            root, invocation_id=str(execution.get("invocation_id")),
+            stage=stage, execution_seq=seq, commit_path=commit.commit_path,
+            commit_sha256=str(commit.commit_sha256), candidate_sha256=sha,
+            candidate_path=path, observed_elapsed=observed,
+            committed_wall=float(committed_measured_wall_s),
+            remaining_s=float(remaining_s),
+            reason="stage_closed_write_after_gate")
+        return path, sha, problems
+    # The candidate records the intent; the actual gate result is persisted
+    # separately so the receipt itself is not mistaken for its own proof.
+    result = {
+        "schema": EVENT_SCHEMA,
+        "kind": "stage_closed_write_after",
+        "candidate_sha256": sha,
+        "observed_elapsed_s": observed,
+        "committed_measured_wall_s": float(committed_measured_wall_s),
+        "remaining_s": float(remaining_s),
+        "passed": True,
+        "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    write_json_exclusive(directory / "stage_closed_write_after.json", result)
+    return path, sha, problems
+
+
+def write_launch_stage_closed_candidate(
+        root: Path, *, invocation_id: str, stage: str, execution_seq: int,
+        commit: CommitResult, event_candidate: Path | None,
+        event_candidate_sha256: str | None, t0: float, remaining_s: float,
+        committed_measured_wall_s: float
+        ) -> tuple[Path | None, list[str]]:
+    directory = _launch_invocation_dir(root, invocation_id)
+    path = directory / f"stage_closed_{int(execution_seq):06d}.json"
+    payload = {
+        "schema": EVENT_SCHEMA,
+        "kind": "stage_closed_candidate",
+        "candidate": True,
+        "invocation_id": invocation_id,
+        "stage": stage,
+        "execution_seq": int(execution_seq),
+        "commit": {"path": path_for_record(commit.commit_path),
+                   "sha256": commit.commit_sha256},
+        "event_candidate": (
+            {"path": path_for_record(event_candidate),
+             "sha256": event_candidate_sha256}
+            if event_candidate is not None else None),
+        "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    try:
+        sha = write_json_exclusive(path, payload)
+    except (OSError, ValueError, TypeError) as exc:
+        return None, [f"launch_stage_closed_write:{type(exc).__name__}"]
+    observed = max(0.0, time.perf_counter() - float(t0))
+    if not _nonneg(observed) or observed >= float(remaining_s) or \
+            observed > float(committed_measured_wall_s):
+        append_launch_revoke(
+            root, invocation_id=invocation_id, stage=stage,
+            execution_seq=execution_seq, commit_path=commit.commit_path,
+            commit_sha256=str(commit.commit_sha256), candidate_sha256=sha,
+            candidate_path=path, observed_elapsed=observed,
+            committed_wall=float(committed_measured_wall_s),
+            remaining_s=float(remaining_s),
+            reason="launch_stage_closed_write_after_gate")
+        return path, ["launch_stage_closed_write_after_gate"]
+    result = {
+        "schema": EVENT_SCHEMA,
+        "kind": "stage_closed_write_after",
+        "candidate_sha256": sha,
+        "observed_elapsed_s": observed,
+        "committed_measured_wall_s": float(committed_measured_wall_s),
+        "remaining_s": float(remaining_s),
+        "passed": True,
+        "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    write_json_exclusive(
+        directory / f"stage_closed_{int(execution_seq):06d}_write_after.json",
+        result)
+    return path, []
+
+
+def write_launch_terminal_candidate(
+        root: Path, *, invocation_id: str, commit: CommitResult,
+        event_candidate: Path | None, event_candidate_sha256: str | None,
+        t0: float, remaining_s: float, committed_measured_wall_s: float
+        ) -> tuple[Path | None, list[str]]:
+    directory = _launch_invocation_dir(root, invocation_id)
+    path = directory / "terminal_candidate.json"
+    payload = {
+        "schema": EVENT_SCHEMA,
+        "kind": "terminal_candidate",
+        "candidate": True,
+        "invocation_id": invocation_id,
+        "commit": {"path": path_for_record(commit.commit_path),
+                   "sha256": commit.commit_sha256},
+        "event_candidate": (
+            {"path": path_for_record(event_candidate),
+             "sha256": event_candidate_sha256}
+            if event_candidate is not None else None),
+        "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    try:
+        sha = write_json_exclusive(path, payload)
+    except (OSError, ValueError, TypeError) as exc:
+        return None, [f"launch_terminal_write:{type(exc).__name__}"]
+    observed = max(0.0, time.perf_counter() - float(t0))
+    if not _nonneg(observed) or observed >= float(remaining_s) or \
+            observed > float(committed_measured_wall_s):
+        append_launch_revoke(
+            root, invocation_id=invocation_id, stage="F",
+            execution_seq=int(commit.commit_path.parent.name), commit_path=commit.commit_path,
+            commit_sha256=str(commit.commit_sha256), candidate_sha256=sha,
+            candidate_path=path, observed_elapsed=observed,
+            committed_wall=float(committed_measured_wall_s),
+            remaining_s=float(remaining_s),
+            reason="launch_terminal_write_after_gate")
+        return path, ["launch_terminal_write_after_gate"]
+    write_json_exclusive(directory / "terminal_write_after.json", {
+        "schema": EVENT_SCHEMA,
+        "kind": "terminal_write_after",
+        "candidate_sha256": sha,
+        "observed_elapsed_s": observed,
+        "committed_measured_wall_s": float(committed_measured_wall_s),
+        "remaining_s": float(remaining_s),
+        "passed": True,
+        "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    })
+    return path, []
+
+
+def write_terminal_candidate(root: Path, *, binding: BindingContext,
+                             execution: Mapping[str, Any],
+                             commit: CommitResult, t0: float,
+                             remaining_s: float,
+                             committed_measured_wall_s: float
+                             ) -> tuple[Path | None, str | None, list[str]]:
+    seq = int(execution.get("execution_seq"))
+    directory = _event_dir(root, seq)
+    payload = {
+        "schema": EVENT_SCHEMA,
+        "kind": "terminal_candidate",
+        "candidate": True,
+        "execution_seq": seq,
+        "generation": binding.generation,
+        "binding_spec_sha256": binding.spec_sha256,
+        "invocation_id": execution.get("invocation_id"),
+        "commit": {"path": path_for_record(commit.commit_path),
+                   "sha256": commit.commit_sha256},
+        "committed_measured_wall_s": float(committed_measured_wall_s),
+        "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    path = directory / "terminal_candidate.json"
+    try:
+        sha = write_json_exclusive(path, payload)
+    except (OSError, ValueError, TypeError) as exc:
+        return None, None, [f"terminal_write:{type(exc).__name__}"]
+    observed = max(0.0, time.perf_counter() - float(t0))
+    problems: list[str] = []
+    if not _nonneg(observed) or observed >= float(remaining_s) or \
+            observed > float(committed_measured_wall_s):
+        problems.append("terminal_write_after_gate")
+        append_launch_revoke(
+            root, invocation_id=str(execution.get("invocation_id")),
+            stage=str(execution.get("stage", "F")), execution_seq=seq,
+            commit_path=commit.commit_path,
+            commit_sha256=str(commit.commit_sha256), candidate_sha256=sha,
+            candidate_path=path, observed_elapsed=observed,
+            committed_wall=float(committed_measured_wall_s),
+            remaining_s=float(remaining_s),
+            reason="terminal_write_after_gate")
+        return path, sha, problems
+    write_json_exclusive(directory / "terminal_write_after.json", {
+        "schema": EVENT_SCHEMA,
+        "kind": "terminal_write_after",
+        "candidate_sha256": sha,
+        "observed_elapsed_s": observed,
+        "committed_measured_wall_s": float(committed_measured_wall_s),
+        "remaining_s": float(remaining_s),
+        "passed": True,
+        "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    })
+    return path, sha, problems
+
+
+def record_return_observation(
+        root: Path, *, invocation_id: str, pid: int, ppid: int,
+        exit_code: int, signal: int | None, started_perf_counter: float,
+        finished_perf_counter: float, last_stage_end_perf_counter: float,
+        commits: Mapping[str, Mapping[str, Any]],
+        candidate_receipts: Mapping[str, Any],
+        write_after: Mapping[str, bool], coverage_ok: bool,
+        source_kind: str = "outer_wait",
+        expected_exit_code: int | None = None,
+        conclusion: str | None = None) -> tuple[Path, str, list[str]]:
+    """Store only facts observed by the outer caller after the process ends."""
+    directory = _launch_invocation_dir(root, invocation_id)
+    claim_path = directory / "claim.json"
+    if not claim_path.is_file():
+        raise FileNotFoundError("launch claim missing")
+    claim = strict_read_json(claim_path)
+    claim_sha = sha256_file(claim_path)
+    claim_problems = _claim_problems(claim, invocation_id=invocation_id,
+                                     root=root)
+    if claim_problems:
+        raise ValueError(f"return observation claim refused: "
+                         f"{claim_problems}")
+    problems: list[str] = []
+    if source_kind not in ("outer_wait", "outer_exec"):
+        problems.append("return_source_kind")
+    if type(exit_code) is not int:
+        problems.append("return_exit_code")
+    if signal is not None and type(signal) is not int:
+        problems.append("return_signal")
+    if not all((_nonneg(started_perf_counter), _nonneg(finished_perf_counter),
+                _nonneg(last_stage_end_perf_counter))):
+        problems.append("return_timing")
+    if _nonneg(started_perf_counter) and _nonneg(finished_perf_counter) and \
+            float(finished_perf_counter) + 1e-9 < float(started_perf_counter):
+        problems.append("return_time_reverse")
+    if _nonneg(last_stage_end_perf_counter) and _nonneg(finished_perf_counter) \
+            and float(finished_perf_counter) + 1e-9 < float(
+                last_stage_end_perf_counter):
+        problems.append("return_time_order")
+    if not coverage_ok:
+        problems.append("return_coverage")
+    if not write_after or not all(value is True for value in write_after.values()):
+        problems.append("return_write_after")
+    record = {
+        "schema": RETURN_OBSERVATION_SCHEMA,
+        "scope": "post_execution_observation",
+        "invocation_id": invocation_id,
+        "cohort_id": COHORT_ID,
+        "execution_id": EXECUTION_ID,
+        "run_root_realpath": str(Path(root).resolve()),
+        "authorization_sha256": claim.get("authorization_sha256"),
+        "spec_sha256": claim.get("spec_sha256"),
+        "legacy_head_sha256": claim.get("legacy_head_sha256"),
+        "claim_sha256": claim_sha,
+        "pid": int(pid), "ppid": int(ppid),
+        "source": {"kind": source_kind, "pid": int(pid),
+                   "ppid": int(ppid), "exit_code": int(exit_code),
+                   "signal": signal},
+        "process_returned": True,
+        "started_perf_counter": float(started_perf_counter),
+        "finished_perf_counter": float(finished_perf_counter),
+        "last_stage_end_perf_counter": float(last_stage_end_perf_counter),
+        "total_wall_s": max(0.0, float(finished_perf_counter)
+                            - float(started_perf_counter)),
+        "commits": {k: dict(v) for k, v in commits.items()},
+        "candidate_receipts": dict(candidate_receipts),
+        "write_after": {k: bool(v) for k, v in write_after.items()},
+        "coverage_ok": bool(coverage_ok),
+        "expected_exit_code": expected_exit_code,
+        "conclusion": conclusion,
+        "post_return_work_performed": False,
+        "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    path = directory / "return_observation.json"
+    try:
+        sha = write_json_exclusive(path, record)
+    except (OSError, ValueError, TypeError) as exc:
+        raise ValueError(f"return observation write failed: "
+                         f"{type(exc).__name__}") from exc
+    problems += return_observation_problems(record, invocation_id=invocation_id,
+                                            claim={**claim,
+                                                   "_sha256": claim_sha})
+    return path, sha, problems
 
 
 def _cohort_mode(root: Path) -> str | None:
@@ -5628,9 +8217,72 @@ def _attempt_consumable(root: Path, stage: str, attempt: str,
     return not problems, problems
 
 
+def _event_json(root: Path, execution_seq: int, name: str) -> Any:
+    path = _event_dir(root, execution_seq) / name
+    if not path.is_file():
+        return None
+    try:
+        return strict_read_json(path)
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _invocation_return_problems(root: Path, invocation_id: str) -> list[str]:
+    if not isinstance(invocation_id, str) or not invocation_id:
+        return ["return_invocation_missing"]
+    journal = scan_launch_journals(Path(root).parent)
+    if not journal.get("known"):
+        return [f"launch_journal:{p}" for p in journal.get("problems") or []]
+    for record in journal.get("records") or []:
+        if record.get("invocation_id") != invocation_id:
+            continue
+        p = record.get("return_problems") or []
+        return [f"return:{item}" for item in p]
+    return ["return_observation_invocation_missing"]
+
+
+def _v2_public_row_problems(root: Path, stage: str, attempt: str,
+                            row: Mapping[str, Any], binding: BindingContext,
+                            internal_context: Mapping[str, Any] | None
+                            ) -> list[str]:
+    seq = row.get("execution_seq")
+    if type(seq) is not int:
+        return ["v2_execution_seq"]
+    problems: list[str] = []
+    commit, commit_problems = _commit_problems(
+        root, seq, binding=binding, stage=stage, attempt=attempt)
+    problems += commit_problems
+    candidate = _event_json(root, seq, "stage_closed.json")
+    if not isinstance(candidate, Mapping):
+        problems.append("stage_closed_missing")
+    elif commit is not None:
+        if (candidate.get("commit") or {}).get("sha256") != \
+                sha256_file(_commit_path(root, seq)):
+            problems.append("stage_closed_commit")
+        if candidate.get("stage") != stage or \
+                candidate.get("attempt") != attempt:
+            problems.append("stage_closed_binding")
+    after = _event_json(root, seq, "stage_closed_write_after.json")
+    if not isinstance(after, Mapping) or after.get("passed") is not True:
+        problems.append("stage_closed_write_after_missing")
+    current_internal = (
+        isinstance(internal_context, Mapping)
+        and internal_context.get("invocation_id") == row.get("invocation_id")
+        and internal_context.get("stage") in (stage, None)
+        and internal_context.get("attempt") in (attempt, None)
+        and internal_context.get("allow_current") is True)
+    if not current_internal:
+        problems += _invocation_return_problems(root, str(
+            row.get("invocation_id")))
+    return problems
+
+
 def stage_state(root: Path, stage: str,
                 attempt: str | None = None, *,
-                allow_current: tuple[str, str] | None = None
+                allow_current: tuple[str, str] | None = None,
+                generation: str | None = None,
+                binding: BindingContext | None = None,
+                internal_context: Mapping[str, Any] | None = None,
                 ) -> tuple[dict | None, list[str]]:
     """Selected-attempt consumer.
 
@@ -5642,23 +8294,49 @@ def stage_state(root: Path, stage: str,
     refused.
     """
     problems: list[str] = []
+    migrated = _migration_present(root)
+    if migrated:
+        if generation is None:
+            return None, ["generation_ambiguous"]
+        if generation not in (GENERATION_001, GENERATION_002):
+            return None, [f"generation_unknown:{generation}"]
+        if binding is None:
+            binding, binding_problems = load_binding(
+                root, require_active=(generation == GENERATION_002))
+            if binding is None:
+                return None, binding_problems or ["binding_missing"]
+            problems += binding_problems
     try:
         index = [r for r in load_index(root) if r.get("stage") == stage]
         ledger = [r for r in load_ledger(root) if r.get("stage") == stage]
     except (OSError, ValueError, TypeError):
         return None, ["stage_registration_unreadable"]
+    if migrated:
+        index = [r for r in index
+                 if (r.get("generation", GENERATION_001) == generation)]
+        ledger = [e for e in ledger
+                  if (e.get("generation", GENERATION_001) == generation)]
     disk = _disk_attempts(root, stage)
+    all_index = [r for r in load_index(root) if r.get("stage") == stage]
+    all_ledger = [e for e in load_ledger(root) if e.get("stage") == stage]
     index_by = {r.get("attempt"): r for r in index}
     ledger_by = {e.get("attempt"): e for e in ledger}
+    all_index_by = {r.get("attempt"): r for r in all_index}
+    all_ledger_by = {e.get("attempt"): e for e in all_ledger}
     if (len(index_by) != len(index) or len(ledger_by) != len(ledger)
-            or set(index_by) != set(ledger_by) or set(disk) != set(index_by)):
+            or set(index_by) != set(ledger_by)
+            or set(all_index_by) != set(all_ledger_by)
+            or set(disk) != set(all_index_by)):
         return None, ["stage_attempt_sets_disagree"]
     if not index_by:
         return None, ["stage_not_registered"]
     problems += _reservation_problems(root, allow_current=allow_current)
     if attempt is not None and attempt not in index_by:
+        if attempt in all_index_by and migrated:
+            return None, [f"selected_attempt_generation:{attempt}"]
         return None, ["selected_attempt_missing"]
-    history = verify_history(root, allow_current=allow_current)
+    history = verify_history(root, allow_current=allow_current,
+                             binding=binding)
     if history:
         nonterminal = f"history_not_terminal:{stage}"
         if any(p.startswith(nonterminal) for p in history) and not any(
@@ -5672,6 +8350,11 @@ def stage_state(root: Path, stage: str,
             _allowed, attempt_problems = _attempt_consumable(
                 root, stage, name, index_by[name], ledger_by[name],
                 allow_current=allow_current)
+            if migrated and generation == GENERATION_002:
+                attempt_problems += _v2_public_row_problems(
+                    root, stage, name, index_by[name], binding,
+                    internal_context)
+                _allowed = not attempt_problems
             return index_by[name], attempt_problems + history
         return None, history
     terminal = [a for a, r in index_by.items()
@@ -5683,6 +8366,11 @@ def stage_state(root: Path, stage: str,
         allowed, attempt_problems = _attempt_consumable(
             root, stage, name, index_by[name], ledger_by[name],
             allow_current=allow_current)
+        if migrated and generation == GENERATION_002:
+            attempt_problems += _v2_public_row_problems(
+                root, stage, name, index_by[name], binding,
+                internal_context)
+            allowed = not attempt_problems
         per_attempt[name] = attempt_problems
         if allowed:
             consumable.append(name)
@@ -5745,7 +8433,8 @@ def _stage_unit_guard(root: Path, stage: str, attempt: str, *,
 
 
 def reserve_stage_calls(root: Path, stage: str, attempt: str,
-                        reserved: Mapping[str, Any]) -> Path:
+                        reserved: Mapping[str, Any],
+                        *, execution: Mapping[str, Any] | None = None) -> Path:
     path = stage_dir(root, stage) / attempt / "call_reservations.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     counts = reserved.get("counts") if isinstance(reserved, Mapping) else None
@@ -5754,9 +8443,12 @@ def reserve_stage_calls(root: Path, stage: str, attempt: str,
     for kind, value in counts.items():
         if not _json_int(value):
             raise ValueError(f"reservation {kind} is not a JSON integer")
+    execution_fields = _execution_fields(
+        execution, root=root, stage=stage, attempt=attempt)
     write_json(path, {"schema": "w1_real_training_update_reservation_v1",
                       "reserved": {k: int(v) for k, v in counts.items()},
-                      "consumed": None})
+                      "consumed": None,
+                      **execution_fields})
     return path
 
 
@@ -6304,7 +8996,10 @@ def run_r0(root: Path, stage: str, attempt: str, t0: float,
            *, mode: str, tolerance: Mapping[str, Any],
            project_root: Path = PROJECT_ROOT,
            admission_package: Mapping[str, Any] | None = None,
-           authorization: Mapping[str, Any] | None = None) -> dict:
+           authorization: Mapping[str, Any] | None = None,
+           execution: Mapping[str, Any] | None = None) -> dict:
+    execution = dict(execution or {})
+    v2 = bool(execution)
     base = stage_dir(root, stage) / attempt
     base.mkdir(parents=True, exist_ok=True)
     fixture = provider.fixture or {} if mode == "synthetic" else {}
@@ -6421,12 +9116,22 @@ def run_r0(root: Path, stage: str, attempt: str, t0: float,
         if expected_files != impl["files"]:
             problems.append("r0_implementation_drift")
     registration = {
-        "schema": REGISTRATION_SCHEMA,
+        "schema": (REGISTRATION_SCHEMA_V2 if v2 else REGISTRATION_SCHEMA),
         "mode": mode,
         "cohort_id": COHORT_ID,
         "execution_id": EXECUTION_ID,
         "stage": stage,
         "attempt": attempt,
+        **({"generation": execution.get("generation"),
+            "binding_spec_sha256": execution.get("binding_spec_sha256"),
+            "execution_seq": execution.get("execution_seq"),
+            "predecessor_kind": execution.get("predecessor_kind"),
+            "previous_head_sha256": execution.get("previous_head_sha256"),
+            "invocation_id": execution.get("invocation_id"),
+            "legacy_head_sha256": execution.get("legacy_head_sha256"),
+            "claim_path": execution.get("claim_path"),
+            "claim_sha256": execution.get("claim_sha256")}
+           if v2 else {}),
         "window_keys": [{"id": WINDOW_IDS[i], "demo": spec[0],
                          "start": spec[1], "end": spec[2], "T": spec[3]}
                         for i, spec in enumerate(WINDOW_SPECS)],
@@ -6474,8 +9179,13 @@ def run_r0(root: Path, stage: str, attempt: str, t0: float,
     write_json(registration_path, registration)
     registration_sha = sha256_file(registration_path)
     admission = {
-        "schema": "w1_real_training_update_r0_admission_v1",
+        "schema": ("w1_real_training_update_r0_admission_v2" if v2
+                   else "w1_real_training_update_r0_admission_v1"),
         "mode": mode,
+        "generation": execution.get("generation") if v2 else GENERATION_001,
+        "binding_spec_sha256": (execution.get("binding_spec_sha256")
+                                if v2 else None),
+        "execution_seq": execution.get("execution_seq") if v2 else None,
         "passed": not problems,
         "problems": problems,
         "gaps": gaps,
@@ -7326,11 +10036,245 @@ def authorization_template() -> dict:
     }
 
 
+MIGRATION_AUTHORIZATION_KEYS = (
+    "run_root_realpath", "source_marker_sha256",
+    "source_authorization_sha256", "snapshot_sha256", "spec_sha256",
+    "migration_admission_sha256", "legacy_head_sha256",
+    "launch_journal", "target_generation", "plan_sha256",
+    "implementation_sha256", "runtime_sha256", "gate_b_sha256",
+    "real_admission_sha256", "execution_plan_sha256", "prereg_sha256",
+    "stage_plan", "prior_updates", "incremental_update_limit",
+    "cohort_update_limit_for_this_authorization", "prior_cost_s",
+    "remaining_s", "invocation_id", "write_after_protocol",
+    "return_observation_required", "execution_window", "unique_entry",
+)
+
+
+def migration_authorization_template() -> dict:
+    return {
+        "schema": AUTHORIZATION_SCHEMA_V2,
+        "template_only": True,
+        "authorized": False,
+        "cohort_id": COHORT_ID,
+        "execution_id": EXECUTION_ID,
+        "granted_by": None,
+        "granted_wall": None,
+        **{key: 0 for key in ZERO_DECLARATIONS},
+        "checklist": {key: None for key in AUTHORIZATION_REQUIRED},
+        "budgets": {stage: {"budget_s": spec["budget_s"],
+                            "attempts": spec["attempts"]}
+                    for stage, spec in STAGE_BUDGETS.items()},
+        "call_caps": dict(CALL_CAPS),
+        "updates": {
+            **EXPECTED_UPDATES,
+            "prior_updates": MIGRATION_PRIOR_UPDATES,
+            "incremental_update_limit": MIGRATION_INCREMENTAL_UPDATE_LIMIT,
+            "cohort_update_limit_for_this_authorization":
+                MIGRATION_COHORT_UPDATE_LIMIT,
+        },
+        "resource_caps": dict(RESOURCE_CAPS),
+        "parent_registration_sha256": PARENT_FILES[
+            "objective_registration"][1],
+        "draft_sha256": None,
+        "execution_plan_sha256": None,
+        "calibration_verification_sha256": None,
+        "acceptance_sha256": None,
+        "tolerance_evidence_sha256": None,
+        "fp32_contract_sha256": None,
+        "admission_package_sha256": None,
+        "implementation_files": None,
+        "migration": {key: None for key in MIGRATION_AUTHORIZATION_KEYS},
+        "notes": ("Template only. This is a second-generation binding over "
+                  "the existing cohort; it does not reset budgets, attempts "
+                  "or the two already executed diagnostic updates."),
+    }
+
+
+def build_migration_authorization_draft(
+        project_root: Path, *, binding: BindingContext,
+        snapshot_path: Path, spec_path: Path,
+        migration_admission_path: Path,
+        migration_admission_sha256: str,
+        real_admission_path: Path | None = None,
+        real_admission_sha256: str | None = None,
+        gate_b_path: Path | None = None,
+        gate_b_sha256: str | None = None,
+        invocation_id: str | None = None,
+        authorized: bool = False) -> dict:
+    root = Path(project_root)
+    impl = implementation_identity(root)
+    runtime = runtime_identity_facts()
+    record = migration_authorization_template()
+    record.update(
+        template_only=not authorized,
+        authorized=bool(authorized),
+        granted_by=None if not authorized else "USER_REQUIRED",
+        granted_wall=None if not authorized else
+        time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        draft_sha256=sha256_file(root / PREREG_DRAFT),
+        execution_plan_sha256=sha256_file(root / MIGRATION_PLAN),
+        calibration_verification_sha256=(
+            (binding.spec.get("bindings") or {}).get("gate_b") or {}).get(
+                "calibration_verification_sha256"),
+        acceptance_sha256=((binding.spec.get("bindings") or {}).get(
+            "gate_b") or {}).get("acceptance_sha256"),
+        tolerance_evidence_sha256=((binding.spec.get("bindings") or {}).get(
+            "gate_b") or {}).get("tolerance_evidence_sha256"),
+        fp32_contract_sha256=((binding.spec.get("bindings") or {}).get(
+            "gate_b") or {}).get("fp32_contract_sha256"),
+        admission_package_sha256=real_admission_sha256,
+        implementation_files=impl["files"],
+    )
+    if authorized:
+        record["checklist"] = {key: True for key in AUTHORIZATION_REQUIRED}
+    record["updates"] = {
+        **EXPECTED_UPDATES,
+        "prior_updates": MIGRATION_PRIOR_UPDATES,
+        "incremental_update_limit": MIGRATION_INCREMENTAL_UPDATE_LIMIT,
+        "cohort_update_limit_for_this_authorization":
+            MIGRATION_COHORT_UPDATE_LIMIT,
+    }
+    record["migration"] = {
+        "run_root_realpath": str(Path(root / str(
+            binding.spec.get("run_root_realpath"))).resolve())
+        if not Path(str(binding.spec.get("run_root_realpath"))).is_absolute()
+        else str(Path(str(binding.spec.get("run_root_realpath"))).resolve()),
+        "source_marker_sha256": binding.snapshot.get("marker_sha256"),
+        "source_authorization_sha256": binding.snapshot.get(
+            "authorization_sha256"),
+        "snapshot_sha256": binding.snapshot_sha256,
+        "spec_sha256": binding.spec_sha256,
+        "migration_admission_sha256": migration_admission_sha256,
+        "legacy_head_sha256": binding.legacy_head_sha256,
+        "launch_journal": {
+            "relative_path": LAUNCH_JOURNAL_DIR,
+            "manifest_sha256": (binding.snapshot.get(
+                "launch_journal") or {}).get("manifest_sha256"),
+        },
+        "target_generation": binding.generation,
+        "plan_sha256": sha256_file(root / MIGRATION_PLAN),
+        "implementation_sha256": canonical_sha256(impl),
+        "runtime_sha256": canonical_sha256(runtime),
+        "gate_b_sha256": gate_b_sha256,
+        "real_admission_sha256": real_admission_sha256,
+        "execution_plan_sha256": sha256_file(root / MIGRATION_PLAN),
+        "prereg_sha256": sha256_file(root / PREREG_DRAFT),
+        "stage_plan": [dict(item) for item in MIGRATION_STAGE_PLAN],
+        "prior_updates": MIGRATION_PRIOR_UPDATES,
+        "incremental_update_limit": MIGRATION_INCREMENTAL_UPDATE_LIMIT,
+        "cohort_update_limit_for_this_authorization":
+            MIGRATION_COHORT_UPDATE_LIMIT,
+        "prior_cost_s": MIGRATION_SOURCE_COST_S,
+        "remaining_s": TOTAL_BUDGET_S - MIGRATION_SOURCE_COST_S,
+        "invocation_id": invocation_id,
+        "write_after_protocol": {
+            "sample": "post_publish_perf_counter - stage_t0",
+            "requires": ["finite", "non_negative", "elapsed<remaining_s",
+                          "elapsed<=committed_measured_wall_s"],
+        },
+        "return_observation_required": True,
+        "execution_window": {
+            "starts_at": "launch_claim.t0",
+            "ends_at": "outer_actual_process_return",
+            "post_return_observation_can_execute_work": False,
+        },
+        "unique_entry": True,
+    }
+    return record
+
+
+def _migration_authorization_problems(record: Mapping[str, Any],
+                                      *, expected: Mapping[str, Any] | None
+                                      ) -> list[str]:
+    problems: list[str] = []
+    migration = record.get("migration")
+    if not isinstance(migration, Mapping):
+        return ["authorization_migration_missing"]
+    unknown = set(migration) - set(MIGRATION_AUTHORIZATION_KEYS)
+    if unknown:
+        problems.append(f"authorization_migration_unknown:{sorted(unknown)}")
+    missing = [key for key in MIGRATION_AUTHORIZATION_KEYS
+               if key not in migration]
+    if missing:
+        problems.append(f"authorization_migration_missing_keys:{missing}")
+    for key in ("run_root_realpath", "source_marker_sha256",
+                "source_authorization_sha256", "snapshot_sha256",
+                "spec_sha256", "migration_admission_sha256",
+                "legacy_head_sha256", "plan_sha256", "implementation_sha256",
+                "runtime_sha256", "gate_b_sha256", "real_admission_sha256",
+                "execution_plan_sha256", "prereg_sha256",
+                "invocation_id"):
+        value = migration.get(key)
+        if not isinstance(value, str) or not value:
+            problems.append(f"authorization_migration_value:{key}")
+    for key in ("snapshot_sha256", "spec_sha256",
+                "migration_admission_sha256", "legacy_head_sha256",
+                "source_marker_sha256", "source_authorization_sha256",
+                "plan_sha256", "implementation_sha256", "runtime_sha256",
+                "gate_b_sha256", "real_admission_sha256",
+                "execution_plan_sha256", "prereg_sha256"):
+        value = migration.get(key)
+        if isinstance(value, str) and not re.fullmatch(r"[0-9a-f]{64}", value):
+            problems.append(f"authorization_migration_hash:{key}")
+    if migration.get("target_generation") != GENERATION_002:
+        problems.append("authorization_migration_generation")
+    if migration.get("stage_plan") != list(MIGRATION_STAGE_PLAN):
+        problems.append("authorization_migration_stage_plan")
+    if type(migration.get("prior_updates")) is not int or \
+            migration.get("prior_updates") != MIGRATION_PRIOR_UPDATES or \
+            type(migration.get("incremental_update_limit")) is not int or \
+            migration.get("incremental_update_limit") != \
+            MIGRATION_INCREMENTAL_UPDATE_LIMIT or \
+            type(migration.get(
+                "cohort_update_limit_for_this_authorization")) is not int or \
+            migration.get("cohort_update_limit_for_this_authorization") != \
+            MIGRATION_COHORT_UPDATE_LIMIT:
+        problems.append("authorization_migration_update_limits")
+    if migration.get("prior_updates") != record.get("updates", {}).get(
+            "prior_updates") or migration.get("incremental_update_limit") != \
+            record.get("updates", {}).get("incremental_update_limit"):
+        problems.append("authorization_migration_update_binding")
+    if not _nonneg(migration.get("remaining_s")) or abs(
+            float(migration.get("remaining_s", -1.0))
+            - (TOTAL_BUDGET_S - MIGRATION_SOURCE_COST_S)) > 1e-9:
+        problems.append("authorization_migration_remaining")
+    if not _nonneg(migration.get("prior_cost_s")) or abs(
+            float(migration.get("prior_cost_s", -1.0))
+            - MIGRATION_SOURCE_COST_S) > 1e-9:
+        problems.append("authorization_migration_prior_cost")
+    journal = migration.get("launch_journal")
+    if not isinstance(journal, Mapping) or \
+            journal.get("relative_path") != LAUNCH_JOURNAL_DIR or \
+            not isinstance(journal.get("manifest_sha256"), str):
+        problems.append("authorization_migration_launch_journal")
+    protocol = migration.get("write_after_protocol")
+    if not isinstance(protocol, Mapping) or \
+            protocol.get("sample") != "post_publish_perf_counter - stage_t0":
+        problems.append("authorization_migration_write_after")
+    window = migration.get("execution_window")
+    if not isinstance(window, Mapping) or \
+            window.get("ends_at") != "outer_actual_process_return":
+        problems.append("authorization_migration_window")
+    if migration.get("return_observation_required") is not True or \
+            migration.get("unique_entry") is not True:
+        problems.append("authorization_migration_return")
+    if expected is not None:
+        for key, want in expected.items():
+            if _jsonable(migration.get(key)) != _jsonable(want):
+                problems.append(f"authorization_migration_binding:{key}")
+    return problems
+
+
 def authorization_problems(record: Mapping[str, Any] | None) -> list[str]:
     problems: list[str] = []
     if not isinstance(record, Mapping):
         return ["authorization_not_a_mapping"]
-    if record.get("schema") != AUTHORIZATION_SCHEMA:
+    if record.get("schema") == AUTHORIZATION_SCHEMA_V2:
+        problems += _migration_authorization_problems(record, expected=None)
+        schema = AUTHORIZATION_SCHEMA_V2
+    else:
+        schema = AUTHORIZATION_SCHEMA
+    if record.get("schema") != schema:
         problems.append("authorization_schema")
     if record.get("authorized") is not True:
         problems.append("not_authorized")
@@ -7375,6 +10319,22 @@ def authorization_problems(record: Mapping[str, Any] | None) -> list[str]:
             updates.get("diagnostic_parameter_update_events") != 16 or \
             updates.get("cohort_hard_cap") != 32:
         problems.append("authorization_updates")
+    if schema == AUTHORIZATION_SCHEMA_V2 and isinstance(updates, Mapping):
+        if type(updates.get("prior_updates")) is not int or \
+                updates.get("prior_updates") != MIGRATION_PRIOR_UPDATES or \
+                type(updates.get("incremental_update_limit")) is not int or \
+                updates.get("incremental_update_limit") != \
+                MIGRATION_INCREMENTAL_UPDATE_LIMIT or \
+                type(updates.get(
+                    "cohort_update_limit_for_this_authorization")) is not int \
+                or updates.get(
+                    "cohort_update_limit_for_this_authorization") != \
+                MIGRATION_COHORT_UPDATE_LIMIT or \
+                int(updates.get("prior_updates", -1)) + int(
+                    updates.get("incremental_update_limit", -1)) != int(
+                        updates.get("cohort_update_limit_for_this_authorization",
+                                    -2)):
+            problems.append("authorization_updates_v2")
     if _jsonable(record.get("resource_caps")) != _jsonable(RESOURCE_CAPS):
         problems.append("authorization_resources")
     if record.get("parent_registration_sha256") != PARENT_FILES[
@@ -7684,6 +10644,232 @@ def build_admission_package(project_root: Path,
     return package
 
 
+MIGRATION_ADMISSION_KEYS = (
+    "passed", "problems", "status", "run_root", "snapshot", "spec",
+    "legacy_head_sha256", "call_balance_after", "budgets", "attempts",
+    "launch_journal", "implementation", "gate_b", "real_admission",
+    "read_scope", "authorization_required", "created_wall",
+)
+
+
+def migration_admission_problems(record: Mapping[str, Any] | None) -> list[str]:
+    if not isinstance(record, Mapping):
+        return ["migration_admission_not_a_mapping"]
+    problems: list[str] = []
+    if record.get("schema") != MIGRATION_ADMISSION_SCHEMA:
+        problems.append("migration_admission_schema")
+    if record.get("passed") is not True:
+        problems.append("migration_admission_not_passed")
+    if record.get("problems"):
+        problems.append("migration_admission_has_problems")
+    status = record.get("status")
+    if not isinstance(status, Mapping):
+        problems.append("migration_admission_status")
+    else:
+        if status.get("authorized") is not False or \
+                status.get("registered") is not False or \
+                status.get("run") != "not_run":
+            problems.append("migration_admission_must_be_readonly")
+    snapshot = record.get("snapshot") or {}
+    spec = record.get("spec") or {}
+    for label, rec in (("snapshot", snapshot), ("spec", spec)):
+        if not isinstance(rec, Mapping) or not isinstance(
+                rec.get("sha256"), str) or not re.fullmatch(
+                    r"[0-9a-f]{64}", rec["sha256"]):
+            problems.append(f"migration_admission_{label}")
+    if snapshot.get("legacy_head_sha256") != record.get("legacy_head_sha256"):
+        problems.append("migration_admission_legacy")
+    if (record.get("launch_journal") or {}).get("relative_path") != \
+            LAUNCH_JOURNAL_DIR:
+        problems.append("migration_admission_launch_journal")
+    scope = record.get("read_scope")
+    if not isinstance(scope, Mapping):
+        problems.append("migration_admission_read_scope")
+    else:
+        for key in ("checkpoint_payload_read", "npz_values_read",
+                    "model_constructor_calls", "mujoco_compile_calls",
+                    "forward_calls", "vjp_calls", "optimizer_steps",
+                    "cohort_created", "registered_attempt_created"):
+            if scope.get(key) not in (0, False):
+                problems.append(f"migration_admission_read_scope:{key}")
+    if record.get("authorization_required") is not True:
+        problems.append("migration_admission_authorization_required")
+    return problems
+
+
+def build_migration_admission(
+        project_root: Path, *, snapshot_path: Path, snapshot_sha256: str,
+        snapshot: Mapping[str, Any], spec_path: Path, spec_sha256: str,
+        spec: Mapping[str, Any], real_admission_path: Path | None = None,
+        real_admission_sha256: str | None = None,
+        real_admission: Mapping[str, Any] | None = None,
+        gate_b_path: Path | None = None,
+        gate_b_sha256: str | None = None) -> dict:
+    root = Path(project_root)
+    run_root = Path(str(snapshot.get("run_root"))).expanduser().resolve()
+    problems: list[str] = []
+    problems += _snapshot_problems(snapshot, run_root=run_root, root=run_root)
+    problems += binding_spec_problems(
+        spec, root=run_root, snapshot=snapshot,
+        require_current_implementation=True, project_root=root)
+    if sha256_file(snapshot_path) != snapshot_sha256:
+        problems.append("snapshot_file_sha")
+    if sha256_file(spec_path) != spec_sha256:
+        problems.append("spec_file_sha")
+    source_dir = Path(snapshot_path).parent / "source"
+    for name, raw_name in (("index.json", "index.json"),
+                           ("ledger.json", "ledger.json"),
+                           ("cohort.json", "cohort.json")):
+        expected = ((snapshot.get("source_copies") or {}).get(name) or {}).get(
+            "sha256")
+        path = source_dir / raw_name
+        if not path.is_file():
+            problems.append(f"source_copy_missing:{name}")
+        elif sha256_file(path) != expected:
+            problems.append(f"source_copy_sha:{name}")
+    # The head must be independently reproducible from the frozen copies and
+    # the current old rows, not merely trusted from the embedded summary.
+    try:
+        source_index = strict_read_json(source_dir / "index.json")
+        source_ledger = strict_read_json(source_dir / "ledger.json")
+        source_marker = strict_read_json(source_dir / "cohort.json")
+        source_rows = source_index.get("attempts")
+        source_entries = source_ledger.get("invocations")
+        if not isinstance(source_rows, list) or not isinstance(
+                source_entries, list):
+            problems.append("source_copy_rows")
+        else:
+            rebuilt = build_legacy_head_payload(
+                run_root, index_rows=source_rows,
+                ledger_rows=source_entries, marker=source_marker,
+                run_root=run_root,
+                marker_sha256=sha256_file(source_dir / "cohort.json"),
+                source_index_sha256=sha256_file(source_dir / "index.json"),
+                source_ledger_sha256=sha256_file(source_dir / "ledger.json"))
+            if legacy_head_sha256(rebuilt) != snapshot.get(
+                    "legacy_head_sha256"):
+                problems.append("legacy_head_not_reproducible")
+            if _jsonable(rebuilt) != _jsonable(snapshot.get(
+                    "legacy_head_payload")):
+                problems.append("legacy_head_values_not_reproducible")
+    except (OSError, ValueError, TypeError) as exc:
+        problems.append(f"source_copy_unreadable:{type(exc).__name__}")
+    journal = scan_launch_journals(run_root.parent)
+    if not journal.get("known"):
+        problems.append("launch_journal_unsettled")
+        problems += [f"launch:{p}" for p in journal.get("problems") or []]
+    # Exact remaining budget and attempts from the frozen original rows.
+    budgets = {stage: _budget_from_snapshot(snapshot, stage)
+               for stage in STAGE_BUDGETS}
+    remaining_total = TOTAL_BUDGET_S - float(
+        (snapshot.get("cost_s") or {}).get("total", 0.0))
+    if abs(remaining_total - (TOTAL_BUDGET_S - MIGRATION_SOURCE_COST_S)) > 1e-9:
+        problems.append("migration_budget_snapshot")
+    if (spec.get("budgets") or {}) != budgets:
+        problems.append("migration_budget_spec")
+    for stage in STAGE_BUDGETS:
+        if int(budgets[stage]["attempts_used"]) != len(
+                (snapshot.get("attempts") or {}).get(stage) or []):
+            problems.append(f"migration_attempts:{stage}")
+        if budgets[stage]["remaining_s"] <= STAGE_BUDGETS[stage]["reserve_s"]:
+            problems.append(f"migration_budget_exhausted:{stage}")
+    impl = implementation_identity(root)
+    if (spec.get("bindings") or {}).get("implementation", {}).get(
+            "files") != impl.get("files"):
+        problems.append("migration_implementation_drift")
+    if gate_b_path is not None:
+        if not Path(gate_b_path).is_file() or sha256_file(
+                Path(gate_b_path)) != gate_b_sha256:
+            problems.append("migration_gate_b")
+    if real_admission_path is not None:
+        if not Path(real_admission_path).is_file() or sha256_file(
+                Path(real_admission_path)) != real_admission_sha256:
+            problems.append("migration_real_admission")
+        if isinstance(real_admission, Mapping):
+            problems += [f"migration_real_admission:{p}" for p in
+                         _admission_problems_for(real_admission)]
+    elif real_admission_sha256 is not None:
+        problems.append("migration_real_admission_path")
+    record = {
+        "schema": MIGRATION_ADMISSION_SCHEMA,
+        "status": {
+            "mode": "pre_authorization_migration_readonly",
+            "authorized": False, "registered": False, "run": "not_run",
+            "section_10_2_checked": False,
+        },
+        "passed": not problems,
+        "problems": problems,
+        "run_root": str(run_root),
+        "snapshot": {"path": path_for_record(Path(snapshot_path)),
+                     "sha256": snapshot_sha256,
+                     "legacy_head_sha256": snapshot.get(
+                         "legacy_head_sha256")},
+        "spec": {"path": path_for_record(Path(spec_path)),
+                 "sha256": spec_sha256},
+        "legacy_head_sha256": snapshot.get("legacy_head_sha256"),
+        "call_balance_after": snapshot.get("call_balance_after"),
+        "budgets": budgets,
+        "remaining_total_s": remaining_total,
+        "attempts": snapshot.get("attempts"),
+        "launch_journal": snapshot.get("launch_journal"),
+        "implementation": impl,
+        "gate_b": ({"path": path_for_record(Path(gate_b_path)),
+                    "sha256": gate_b_sha256}
+                   if gate_b_path is not None else None),
+        "real_admission": ({"path": path_for_record(
+            Path(real_admission_path)), "sha256": real_admission_sha256}
+            if real_admission_path is not None else None),
+        "read_scope": {
+            "checkpoint_payload_read": False,
+            "npz_values_read": False,
+            "model_constructor_calls": 0,
+            "mujoco_compile_calls": 0,
+            "forward_calls": 0,
+            "vjp_calls": 0,
+            "optimizer_steps": 0,
+            "cohort_created": False,
+            "registered_attempt_created": False,
+        },
+        "authorization_required": True,
+        "notes": [
+            "same cohort and fixed history root; no budget or attempt reset",
+            "all migration cost is charged to the second-generation R0",
+            "public consumption additionally requires the outer return "
+            "observation",
+        ],
+        "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    return record
+
+
+def write_migration_admission(out_root: Path, package: Mapping[str, Any]
+                              ) -> tuple[Path, str]:
+    out_root = Path(out_root)
+    out_root.mkdir(parents=True, exist_ok=True)
+    index_path = out_root / "index.json"
+    rows = []
+    if index_path.is_file():
+        try:
+            data = read_json(index_path)
+            rows = [r for r in (data.get("attempts") or [])
+                    if isinstance(r, dict)]
+        except (OSError, ValueError, TypeError):
+            rows = []
+    numbers = [int(r["attempt"].split("_")[1]) for r in rows
+               if isinstance(r.get("attempt"), str)
+               and re.fullmatch(r"attempt_\d+", r["attempt"])]
+    attempt = f"attempt_{max(numbers, default=0) + 1:03d}"
+    directory = out_root / attempt
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "migration_admission.json"
+    write_json(path, package)
+    sha = sha256_file(path)
+    rows.append({"attempt": attempt, "path": path_for_record(path),
+                 "sha256": sha, "passed": bool(package.get("passed"))})
+    write_json(index_path, {"attempts": rows})
+    return path, sha
+
+
 def write_package(out_root: Path, package: Mapping[str, Any]
                   ) -> tuple[Path, str]:
     out_root = Path(out_root)
@@ -7857,6 +11043,11 @@ def run_registered_audit(run_root: Path, provider: Any,
     if contract_problems:
         raise SystemExit(f"tolerance contract refused: {contract_problems}")
     if mode == "real":
+        if isinstance(authorization, Mapping) and authorization.get(
+                "schema") == AUTHORIZATION_SCHEMA_V2:
+            raise SystemExit(
+                "authorization v2 is migration-bound; use the dedicated "
+                "binding migration entry, not ordinary resume")
         base = (Path(project_root) / fixed_root).resolve()
         if run_root.parent != base:
             raise SystemExit(
@@ -8693,6 +11884,793 @@ def run_registered_audit(run_root: Path, provider: Any,
         "coverage": dict(BOUNDARIES),
         "boundaries": dict(BOUNDARIES),
     }
+
+
+def _migration_execution(binding: BindingContext, *,
+                         invocation_id: str, claim_path: Path,
+                         claim_sha256: str, stage: str) -> dict:
+    plan = next((p for p in MIGRATION_STAGE_PLAN if p["stage"] == stage),
+                 None)
+    if plan is None:
+        raise ValueError(f"unknown migration stage {stage}")
+    return {
+        "generation": binding.generation,
+        "binding_spec_sha256": binding.spec_sha256,
+        "execution_seq": plan["execution_seq"],
+        "invocation_id": invocation_id,
+        "legacy_head_sha256": binding.legacy_head_sha256,
+        "claim_path": path_for_record(Path(claim_path)),
+        "claim_sha256": claim_sha256,
+        "stage": stage,
+    }
+
+
+def _migration_stage_seal(
+        root: Path, stage: str, attempt: str, t0: float,
+        budget: Mapping[str, Any], binding: BindingContext,
+        execution: Mapping[str, Any], row: Mapping[str, Any], *,
+        complete: bool, report: Path | None,
+        artifacts: Sequence[Path], counter: CallCounter,
+        scope: Mapping[str, Any], numeric_passed: bool | None = None,
+        final: bool = False, actual_cost: float | None = None,
+        extra_row: Mapping[str, Any] | None = None,
+        extra: Mapping[str, Any] | None = None
+        ) -> tuple[SealResult, CommitResult, Path | None, str | None,
+                   list[str]]:
+    """finish -> internal prepared verification -> stable cost -> commit."""
+    artifact_map = _artifact_hashes(artifacts)
+    status = "done" if complete else "incomplete"
+    seal = finish_attempt(
+        root, stage, attempt, t0, budget,
+        {"complete": bool(complete),
+         "report": path_for_record(report) if report else None,
+         "summary": path_for_record(report) if report else None,
+         "registration_sha256": execution.get("registration_sha256"),
+         "artifacts": dict(artifact_map),
+         **dict(extra_row or {})},
+        status=status,
+        extra={"stage": stage, "scope": dict(scope),
+               "call_balance": counter.snapshot(),
+               **dict(extra or {}),
+               **({"numeric_passed": bool(numeric_passed)}
+                  if numeric_passed is not None else {})})
+    if not seal.terminal:
+        return seal, CommitResult(False, None, None, None, None,
+                                  list(seal.problems)), None, None, []
+    prepared = _verify_prepared_attempt(
+        root, stage, attempt, binding=binding, execution=execution)
+    problems = list(prepared.problems)
+    if complete and problems:
+        return seal, CommitResult(False, None, None, None, None,
+                                  problems), None, None, problems
+    if actual_cost is None:
+        actual_cost = max(0.0, time.perf_counter() - float(t0))
+    if final:
+        seal, cost_revoke = _charge_final_verification(
+            root, stage, attempt, t0, budget, seal, {"row": seal.row},
+            scope=scope, counter=counter, actual_cost=actual_cost)
+        if cost_revoke:
+            problems.append(cost_revoke)
+    else:
+        seal, cost_problems = _charge_stage_consumption(
+            root, stage, attempt, t0, budget, seal, {"row": seal.row},
+            scope=scope, counter=counter, actual_cost=actual_cost,
+            verification_wall=0.0)
+        problems += list(cost_problems or [])
+    if not seal.sealed or seal.row.get("complete") is not True:
+        return seal, CommitResult(False, None, None, None, None,
+                                  problems or list(seal.problems)), None, None, \
+            problems
+    commit = commit_attempt(
+        root, stage, attempt, t0=t0, budget=budget, binding=binding,
+        execution=execution, cost_floor=float(
+            seal.row.get("measured_wall_s", 0.0) or 0.0),
+        candidate_problems=[])
+    problems += commit.problems
+    if not commit.committed:
+        return seal, commit, None, None, problems
+    closed, closed_sha, closed_problems = write_stage_closed_candidate(
+        root, stage=stage, attempt=attempt, binding=binding,
+        execution=execution, commit=commit, t0=t0,
+        remaining_s=float(budget["remaining_s"]),
+        committed_measured_wall_s=float(
+            seal.row.get("measured_wall_s", 0.0) or 0.0))
+    problems += closed_problems
+    return seal, commit, closed, closed_sha, problems
+
+
+def run_binding_migration_audit(
+        run_root: Path, provider: Any, *, mode: str,
+        tolerance: Mapping[str, Any], authorization_sha: str,
+        authorization: Mapping[str, Any],
+        admission_package: Mapping[str, Any] | None = None,
+        admission_sha: str | None = None,
+        binding_spec_path: Path | None = None,
+        invocation_id: str | None = None,
+        fixed_root: Path = HISTORY_ROOT,
+        project_root: Path = PROJECT_ROOT,
+        r0_started_perf: float | None = None) -> dict:
+    """One registered second-generation R0->P->I->F migration entry.
+
+    The function never creates the outer return observation.  It returns the
+    exact commits/candidates/write-after facts that an outer caller must bind
+    after the process actually returns.  Synthetic tests may call
+    ``record_return_observation`` explicitly; the real CLI does so from its
+    launcher.
+    """
+    run_root = Path(run_root).expanduser().resolve()
+    if mode not in ("synthetic", "real"):
+        raise ValueError("mode must be synthetic or real")
+    if mode == "real":
+        runtime = configure_production_runtime()
+        if runtime.get("problems"):
+            raise SystemExit(f"production runtime cannot be applied: "
+                             f"{runtime['problems']}")
+    if authorization.get("schema") != AUTHORIZATION_SCHEMA_V2:
+        raise SystemExit("migration execution requires authorization v2")
+    auth_problems = authorization_problems(authorization)
+    if auth_problems:
+        raise SystemExit(f"authorization refused: {auth_problems}")
+    migration_auth = authorization.get("migration") or {}
+    if migration_auth.get("run_root_realpath") != str(run_root):
+        raise SystemExit("authorization run root does not match")
+    if binding_spec_path is None:
+        raise SystemExit("migration execution requires --binding-spec")
+    binding_spec_path = Path(binding_spec_path).expanduser().resolve()
+    binding, binding_problems = load_binding(
+        run_root, generation=str(migration_auth.get("target_generation")))
+    if binding is None:
+        raise SystemExit(f"binding refused: {binding_problems}")
+    if sha256_file(binding_spec_path) != binding.spec_sha256 or \
+            (binding.binding_dir / "binding_spec.json").read_bytes() != \
+            binding_spec_path.read_bytes():
+        raise SystemExit("binding spec path is not the staged byte copy")
+    expected_auth = {
+        "run_root_realpath": str(run_root),
+        "source_marker_sha256": binding.snapshot.get("marker_sha256"),
+        "source_authorization_sha256": binding.snapshot.get(
+            "authorization_sha256"),
+        "snapshot_sha256": binding.snapshot_sha256,
+        "spec_sha256": binding.spec_sha256,
+        "legacy_head_sha256": binding.legacy_head_sha256,
+        "target_generation": binding.generation,
+        "stage_plan": list(MIGRATION_STAGE_PLAN),
+    }
+    for key, want in expected_auth.items():
+        if _jsonable(migration_auth.get(key)) != _jsonable(want):
+            raise SystemExit(f"authorization migration binding: {key}")
+    impl_now = implementation_identity(project_root)
+    plan_sha = sha256_file(Path(project_root) / MIGRATION_PLAN)
+    if migration_auth.get("implementation_sha256") != canonical_sha256(
+            impl_now):
+        raise SystemExit("authorization implementation identity drifted")
+    if migration_auth.get("execution_plan_sha256") != plan_sha or \
+            migration_auth.get("plan_sha256") != plan_sha:
+        raise SystemExit("authorization migration plan drifted")
+    if migration_auth.get("runtime_sha256") != canonical_sha256(
+            runtime_identity_facts()):
+        raise SystemExit("authorization runtime identity drifted")
+    if migration_auth.get("prereg_sha256") != sha256_file(
+            Path(project_root) / PREREG_DRAFT):
+        raise SystemExit("authorization prereg drifted")
+    spec_bindings = binding.spec.get("bindings") or {}
+    if (spec_bindings.get("plan") or {}).get("sha256") != plan_sha:
+        raise SystemExit("binding spec plan drifted")
+    if migration_auth.get("gate_b_sha256") != \
+            (spec_bindings.get("gate_b") or {}).get("sha256"):
+        raise SystemExit("authorization gate B binding")
+    if mode == "real":
+        if admission_package is None or admission_sha is None:
+            raise SystemExit("real migration requires a real admission package")
+        pkg_problems = _admission_problems_for(admission_package)
+        if pkg_problems:
+            raise SystemExit(f"admission package refused: {pkg_problems}")
+        if migration_auth.get("real_admission_sha256") != admission_sha:
+            raise SystemExit("authorization admission binding")
+        if authorization.get("admission_package_sha256") != admission_sha:
+            raise SystemExit("authorization admission package binding")
+        if authorization.get("implementation_files") != \
+                implementation_identity(project_root).get("files"):
+            raise SystemExit("authorization implementation files drifted")
+    if invocation_id is None:
+        invocation_id = migration_auth.get("invocation_id")
+    if not isinstance(invocation_id, str) or not invocation_id:
+        raise SystemExit("migration invocation id missing")
+    claim_path = _launch_invocation_dir(run_root, invocation_id) / "claim.json"
+    if not claim_path.is_file():
+        raise SystemExit("launch claim missing; register the one-shot invocation")
+    claim = strict_read_json(claim_path)
+    claim_sha = sha256_file(claim_path)
+    if claim.get("authorization_sha256") != authorization_sha:
+        raise SystemExit("claim authorization differs")
+    if claim.get("spec_sha256") != binding.spec_sha256 or \
+            claim.get("legacy_head_sha256") != binding.legacy_head_sha256:
+        raise SystemExit("claim binding differs")
+    if not _nonneg(claim.get("t0_perf_counter")) or \
+            float(claim["t0_perf_counter"]) > time.perf_counter():
+        raise SystemExit("launch claim clock is invalid")
+    journal = scan_launch_journals(
+        Path(fixed_root) if mode == "real" else run_root.parent,
+        allow_invocation=invocation_id)
+    if not journal.get("known"):
+        raise SystemExit(f"launch journal not settleable: "
+                         f"{journal.get('problems')}")
+    before_records, _binding, before_problems = _execution_records(
+        run_root, binding=binding)
+    if before_records is None:
+        raise SystemExit(f"migration history refused: {before_problems}")
+    if any(r.get("v2") for r in before_records):
+        raise SystemExit("migration has already started")
+    order = list(STAGE_BUDGETS)
+    results: dict[str, Any] = {}
+    commits: dict[str, Any] = {}
+    candidates: dict[str, Any] = {}
+    selected: dict[str, str] = {}
+    stage_totals: dict[str, Any] = {}
+    cohort_totals = None
+    selected_chain = None
+    scope = _stage_scope(provider, provider.roster)
+    initial_balance = binding.snapshot.get("call_balance_after")
+    if not isinstance(initial_balance, Mapping) or set(initial_balance) != \
+            set(CALL_KINDS) or not all(
+                _json_int(initial_balance[kind]) for kind in CALL_KINDS):
+        raise SystemExit("snapshot call balance is invalid")
+    counter = CallCounter(CALL_CAPS, initial_balance)
+    binder = getattr(provider, "bind_counter", None)
+    if callable(binder):
+        binder(counter)
+    if mode == "real":
+        provider.load_acceptance()
+    elif provider.fixture_dir is not None:
+        provider.load_fixture()
+    if r0_started_perf is None:
+        r0_started_perf = float(claim.get("t0_perf_counter"))
+    t_r0 = float(r0_started_perf)
+    claim_record = {"claim_path": claim_path, "claim_sha256": claim_sha}
+
+    def failed(problems: Sequence[str], gaps: Sequence[str] = (),
+               failures: Sequence[str] = ()) -> dict:
+        # Call accounting can be known even when publishing/commit evidence
+        # is incomplete, provided every started attempt has a settled
+        # reservation and a consistent cumulative balance.
+        deltas = _stage_deltas(run_root, require_commits=False)
+        known = deltas is not None
+        lower_deltas = None
+        unsettled: list[str] = []
+        if known:
+            cohort = cohort_call_totals_from_deltas(deltas)
+            lower_deltas = deltas
+        else:
+            lower_deltas, unsettled_attempt = \
+                _settled_deltas_with_unsettled_tail(run_root, binding=binding)
+            cohort = None
+            if unsettled_attempt:
+                unsettled.append(unsettled_attempt)
+        chain = (selected_chain_counts(deltas, selected)
+                 if known and set(selected) == set(STAGE_BUDGETS) else None)
+        exact = int((cohort or {}).get("native_adamw_steps", 0)
+                    + (cohort or {}).get("explicit_reference_updates", 0)) \
+            if cohort is not None else None
+        lower_counts = (cohort_call_totals_from_deltas(lower_deltas)
+                        if lower_deltas is not None else
+                        {"native_adamw_steps": MIGRATION_SOURCE_UPDATES,
+                         "explicit_reference_updates": 0})
+        lower = int(lower_counts.get("native_adamw_steps", 0)
+                    + lower_counts.get("explicit_reference_updates", 0))
+        return {
+            "mode": mode, "conclusion": "audit_incomplete",
+            "complete_evidence": False, "covered_contract_passed": False,
+            "problems": list(problems), "gaps": list(gaps),
+            "failures": list(failures), "stages": results,
+            "selected_attempts": None, "selected_chain_counts": None,
+            "selected_chain_training_updates": None,
+            "cohort_call_counts": cohort,
+            "cohort_call_counts_known_lower_bound": (
+                cohort_call_totals_from_deltas(lower_deltas)
+                if lower_deltas is not None else None),
+            "cohort_training_updates": exact,
+            "training_updates": exact,
+            "training_updates_known_lower_bound": lower,
+            "training_updates_scope": "cohort",
+            "call_accounting_known": known,
+            "unsettled_attempts": unsettled,
+            "stage_call_counts": (
+                {name: stage_call_totals(lower_deltas, name)
+                 for name in STAGE_BUDGETS}
+                if lower_deltas is not None else stage_totals),
+            "commits": commits, "candidates": candidates,
+            "invocation_id": invocation_id, "binding_spec_sha256":
+                binding.spec_sha256,
+        }
+
+    registration_sha = binding.snapshot.get("legacy_head_sha256")
+    noise_path = None
+    noise_sha = None
+    p_dir = None
+    p_input_admission = None
+    p_input_admission_path = None
+    p_input_admission_sha = None
+    i_dir = None
+    for stage in order:
+        attempt = next(p["attempt"] for p in MIGRATION_STAGE_PLAN
+                       if p["stage"] == stage)
+        try:
+            budget = _migration_budget_for(
+                run_root, stage, binding=binding,
+                allow_invocation=invocation_id)
+        except SystemExit as exc:
+            return failed([str(exc)], [str(exc)])
+        stage_t0 = (t_r0 if stage == "R0" else _now())
+        execution = _migration_execution(
+            binding, invocation_id=invocation_id, claim_path=claim_path,
+            claim_sha256=claim_sha, stage=stage)
+        if stage == "R0":
+            base_counts = dict(counter.counts)
+            try:
+                pre_register_attempt(
+                    run_root, stage, attempt, stage_t0, scope=scope,
+                    budget=budget, call_balance=counter.snapshot(),
+                    execution={**execution,
+                               "registration_sha256": registration_sha})
+                reserve_stage_calls(
+                    run_root, stage, attempt,
+                    {"counts": stage_nominal_for_mode(mode, "R0")},
+                    execution=execution)
+                start_path = _event_dir(
+                    run_root, execution["execution_seq"]) / "start.json"
+                write_json_exclusive(
+                    _launch_invocation_dir(run_root, invocation_id)
+                    / "registered.json",
+                    {"schema": EVENT_SCHEMA, "kind": "registered",
+                     "invocation_id": invocation_id,
+                     "execution_seq": execution["execution_seq"],
+                     "stage": stage, "attempt": attempt,
+                     "start": {"path": path_for_record(start_path),
+                               "sha256": sha256_file(start_path)},
+                     "created_wall": time.strftime(
+                         "%Y-%m-%dT%H:%M:%S%z")})
+                r0_provider = (provider.for_stage("R0")
+                               if callable(getattr(provider, "for_stage", None))
+                               else provider)
+                r0 = run_r0(
+                    run_root, stage, attempt, stage_t0, budget, r0_provider,
+                    counter, provider.roster, mode=mode, tolerance=tolerance,
+                    project_root=project_root,
+                    admission_package=admission_package,
+                    authorization=authorization, execution=execution)
+                settle_stage_calls(run_root, stage, attempt,
+                                   _stage_delta(counter, base_counts))
+                results[stage] = r0
+                r0_dir = stage_dir(run_root, stage) / attempt
+                artifacts = [r0_dir / "registration.json",
+                             r0_dir / "admission.json",
+                             r0_dir / "call_reservations.json"]
+                if mode == "real":
+                    artifacts.append(r0_dir / "noise_schedule.npz")
+                seal, commit, closed, closed_sha, problems = \
+                    _migration_stage_seal(
+                        run_root, stage, attempt, stage_t0, budget, binding,
+                        execution, {"complete": bool(r0["passed"])},
+                        complete=bool(r0["passed"]),
+                        report=Path(r0["admission"]), artifacts=artifacts,
+                        counter=counter, scope=scope)
+                if problems or not commit.committed:
+                    return failed(r0["problems"] + problems,
+                                  r0["gaps"] + problems)
+                _launch_closed, launch_problems = \
+                    write_launch_stage_closed_candidate(
+                        run_root, invocation_id=invocation_id, stage=stage,
+                        execution_seq=execution["execution_seq"],
+                        commit=commit, event_candidate=closed,
+                        event_candidate_sha256=closed_sha, t0=stage_t0,
+                        remaining_s=float(budget["remaining_s"]),
+                        committed_measured_wall_s=float(
+                            seal.row.get("measured_wall_s", 0.0) or 0.0))
+                if launch_problems:
+                    return failed(launch_problems, launch_problems)
+                registration_sha = r0["registration_sha256"]
+                noise_path = (Path(r0["noise_schedule"])
+                              if r0.get("noise_schedule") else None)
+                noise_sha = r0.get("noise_schedule_sha256")
+                if mode == "synthetic" and noise_path is None:
+                    # Synthetic migration exercises the same binding identity;
+                    # the real noise file is not part of the analytic fixture.
+                    noise_path = r0_dir / "noise_schedule.npz"
+                    np.savez(noise_path, synthetic_fixture=np.array([1], np.int8))
+                    noise_sha = sha256_file(noise_path)
+                reservation_sha = sha256_file(
+                    r0_dir / "call_reservations.json")
+                activate_binding(
+                    run_root, generation=binding.generation,
+                    commit_path=commit.commit_path,
+                    commit_sha256=commit.commit_sha256,
+                    r0={"registration_sha256": registration_sha,
+                        "admission_sha256": sha256_file(
+                            r0_dir / "admission.json"),
+                        "noise_schedule_sha256": noise_sha,
+                        "reservation_sha256": reservation_sha},
+                    invocation_id=invocation_id)
+                commits[stage] = {"path": path_for_record(commit.commit_path),
+                                  "sha256": commit.commit_sha256}
+                candidates[stage] = {"path": path_for_record(closed),
+                                     "sha256": closed_sha}
+                selected[stage] = attempt
+            except (TimeoutError, UpdateCallBudgetExceeded, OSError,
+                    ValueError, TypeError) as exc:
+                return failed([f"migration_r0:{type(exc).__name__}:{exc}"],
+                              [f"migration_r0:{type(exc).__name__}"])
+            continue
+        if stage == "P":
+            base_counts = dict(counter.counts)
+            stage_deadline = (stage_t0 + float(budget["remaining_s"])
+                              - float(budget["reserve_s"]))
+            try:
+                pre_register_attempt(
+                    run_root, stage, attempt, stage_t0, scope=scope,
+                    budget=budget, registration_sha=registration_sha,
+                    call_balance=counter.snapshot(),
+                    execution={**execution,
+                               "registration_sha256": registration_sha})
+                reserve_stage_calls(
+                    run_root, stage, attempt,
+                    {"counts": stage_nominal_for_mode(mode, "P")},
+                    execution=execution)
+                p_provider = (provider.for_stage("P")
+                              if callable(getattr(provider, "for_stage", None))
+                              else provider)
+                p = run_p_stage(
+                    run_root, stage, attempt, stage_t0, budget, p_provider,
+                    counter, provider.roster, guard=_stage_unit_guard(
+                        run_root, stage, attempt,
+                        registration_sha=registration_sha,
+                        deadline=stage_deadline),
+                    registered=True,
+                    r0_noise=(provider.noise if mode == "synthetic" else None),
+                    r0_noise_path=noise_path, r0_noise_sha256=noise_sha,
+                    write_input_admission=(mode == "real"),
+                    r0_registration_sha=registration_sha)
+                settle_stage_calls(run_root, stage, attempt,
+                                   _stage_delta(counter, base_counts))
+                results[stage] = p
+                p_dir = stage_dir(run_root, stage) / attempt
+                p_report = Path(p["report"]) if p.get("report") else None
+                artifacts = [Path(path) for path in
+                             (p.get("paths") or {}).values()]
+                artifacts += [p_report, p_dir / "p_rows.json",
+                              p_dir / "call_reservations.json"]
+                if mode == "real":
+                    artifacts.append(p_dir / "input_admission.json")
+                seal, commit, closed, closed_sha, problems = \
+                    _migration_stage_seal(
+                        run_root, stage, attempt, stage_t0, budget, binding,
+                        execution, {"complete": bool(
+                            p.get("complete_evidence"))},
+                        complete=bool(p.get("complete_evidence")),
+                        report=p_report, artifacts=artifacts, counter=counter,
+                        scope=scope, numeric_passed=bool(
+                            p.get("numeric_passed")))
+                if problems or not commit.committed:
+                    return failed(list(p.get("gaps") or []) + problems,
+                                  list(p.get("gaps") or []) + problems,
+                                  list(p.get("failures") or []))
+                _launch_closed, launch_problems = \
+                    write_launch_stage_closed_candidate(
+                        run_root, invocation_id=invocation_id, stage=stage,
+                        execution_seq=execution["execution_seq"],
+                        commit=commit, event_candidate=closed,
+                        event_candidate_sha256=closed_sha, t0=stage_t0,
+                        remaining_s=float(budget["remaining_s"]),
+                        committed_measured_wall_s=float(
+                            seal.row.get("measured_wall_s", 0.0) or 0.0))
+                if launch_problems:
+                    return failed(launch_problems, launch_problems,
+                                  list(p.get("failures") or []))
+                commits[stage] = {"path": path_for_record(commit.commit_path),
+                                  "sha256": commit.commit_sha256}
+                candidates[stage] = {"path": path_for_record(closed),
+                                     "sha256": closed_sha}
+                selected[stage] = attempt
+                p_input_admission_path = p_dir / "input_admission.json"
+                if mode == "real":
+                    p_input_admission = strict_read_json(
+                        p_input_admission_path)
+                    p_input_admission_sha = sha256_file(
+                        p_input_admission_path)
+            except (TimeoutError, UpdateCallBudgetExceeded, OSError,
+                    ValueError, TypeError) as exc:
+                return failed([f"migration_p:{type(exc).__name__}:{exc}"],
+                              [f"migration_p:{type(exc).__name__}"])
+            continue
+        if stage == "I":
+            base_counts = dict(counter.counts)
+            stage_deadline = (stage_t0 + float(budget["remaining_s"])
+                              - float(budget["reserve_s"]))
+            try:
+                pre_register_attempt(
+                    run_root, stage, attempt, stage_t0, scope=scope,
+                    budget=budget, registration_sha=registration_sha,
+                    call_balance=counter.snapshot(),
+                    execution={**execution,
+                               "registration_sha256": registration_sha})
+                reserve_stage_calls(
+                    run_root, stage, attempt,
+                    {"counts": stage_nominal_for_mode(mode, "I")},
+                    execution=execution)
+                i_provider = (provider.for_stage("I")
+                              if callable(getattr(provider, "for_stage", None))
+                              else provider)
+                i = run_i_stage(
+                    run_root, stage, attempt, stage_t0, budget, i_provider,
+                    counter, provider.roster, p_dir, tolerance=tolerance,
+                    guard=_stage_unit_guard(
+                        run_root, stage, attempt,
+                        registration_sha=registration_sha,
+                        deadline=stage_deadline),
+                    registered=True,
+                    r0_noise=(provider.noise if mode == "synthetic" else None),
+                    r0_noise_path=noise_path, r0_noise_sha256=noise_sha,
+                    parent_input_admission=p_input_admission,
+                    r0_registration_sha=registration_sha)
+                settle_stage_calls(run_root, stage, attempt,
+                                   _stage_delta(counter, base_counts))
+                results[stage] = i
+                i_dir = stage_dir(run_root, stage) / attempt
+                i_report = Path(i["report"]) if i.get("report") else None
+                artifacts = [Path(path) for path in
+                             (i.get("paths") or {}).values()]
+                artifacts += [i_report, i_dir / "i_rows.json",
+                              i_dir / "call_reservations.json"]
+                seal, commit, closed, closed_sha, problems = \
+                    _migration_stage_seal(
+                        run_root, stage, attempt, stage_t0, budget, binding,
+                        execution, {"complete": bool(
+                            i.get("complete_evidence"))},
+                        complete=bool(i.get("complete_evidence")),
+                        report=i_report, artifacts=artifacts, counter=counter,
+                        scope=scope, numeric_passed=bool(
+                            i.get("numeric_passed")))
+                if problems or not commit.committed:
+                    return failed(list(i.get("gaps") or []) + problems,
+                                  list(i.get("gaps") or []) + problems,
+                                  list(i.get("failures") or []))
+                _launch_closed, launch_problems = \
+                    write_launch_stage_closed_candidate(
+                        run_root, invocation_id=invocation_id, stage=stage,
+                        execution_seq=execution["execution_seq"],
+                        commit=commit, event_candidate=closed,
+                        event_candidate_sha256=closed_sha, t0=stage_t0,
+                        remaining_s=float(budget["remaining_s"]),
+                        committed_measured_wall_s=float(
+                            seal.row.get("measured_wall_s", 0.0) or 0.0))
+                if launch_problems:
+                    return failed(launch_problems, launch_problems,
+                                  list(i.get("failures") or []))
+                commits[stage] = {"path": path_for_record(commit.commit_path),
+                                  "sha256": commit.commit_sha256}
+                candidates[stage] = {"path": path_for_record(closed),
+                                     "sha256": closed_sha}
+                selected[stage] = attempt
+            except (TimeoutError, UpdateCallBudgetExceeded, OSError,
+                    ValueError, TypeError) as exc:
+                return failed([f"migration_i:{type(exc).__name__}:{exc}"],
+                              [f"migration_i:{type(exc).__name__}"])
+            continue
+        # F
+        base_counts = dict(counter.counts)
+        stage_deadline = (stage_t0 + float(budget["remaining_s"])
+                          - float(budget["reserve_s"]))
+        try:
+            pre_register_attempt(
+                run_root, stage, attempt, stage_t0, scope=scope,
+                budget=budget, registration_sha=registration_sha,
+                call_balance=counter.snapshot(),
+                execution={**execution,
+                           "registration_sha256": registration_sha})
+            reserve_stage_calls(
+                run_root, stage, attempt,
+                {"counts": stage_nominal_for_mode(mode, "F")},
+                execution=execution)
+            candidates_map = {"R0": selected["R0"], "P": selected["P"],
+                              "I": selected["I"], "F": attempt}
+            f_provider = (provider.for_stage("F")
+                          if callable(getattr(provider, "for_stage", None))
+                          else provider)
+            f = run_f_stage(
+                run_root, stage, attempt, stage_t0, budget, f_provider,
+                counter, provider.roster, p_dir, i_dir, tolerance=tolerance,
+                project_root=project_root, candidate_attempts=candidates_map,
+                r0_noise_path=noise_path, r0_noise_sha256=noise_sha,
+                p_input_admission_path=(p_input_admission_path
+                                        if mode == "real" else None),
+                p_input_admission_sha256=(p_input_admission_sha
+                                          if mode == "real" else None),
+                execution=execution)
+            snapshot = f.get("call_delta")
+            settled, settle_problems = _settle_f_calls(
+                run_root, stage, attempt, snapshot)
+            if settle_problems:
+                f.setdefault("verification_problems", []).extend(
+                    settle_problems)
+            if not settled:
+                return failed(["f_call_settlement_unknown"],
+                              ["f_call_settlement_unknown"])
+            final_balance = counter.snapshot()
+            final_counts = _call_counts_from_balance(final_balance)
+            if final_counts is None:
+                return failed(["f_call_balance_invalid"],
+                              ["f_call_balance_invalid"])
+            current = _attempt_row(run_root, stage, attempt)
+            upsert_index(run_root, stage, attempt, {
+                **current, "call_balance": final_balance,
+                "call_balance_after": final_balance})
+            upsert_cost(
+                run_root, stage, attempt,
+                float(current.get("measured_wall_s", 0.0)),
+                {"complete": False, "scope": scope,
+                 "call_balance": final_balance,
+                 "call_balance_before": current.get("call_balance_before"),
+                 "call_balance_after": final_balance,
+                 "accounting_schema": ACCOUNTING_SCHEMA_V2,
+                 "generation": binding.generation,
+                 "binding_spec_sha256": binding.spec_sha256,
+                 "execution_seq": execution["execution_seq"],
+                 "predecessor_kind": current.get("predecessor_kind"),
+                 "previous_head_sha256": current.get(
+                     "previous_head_sha256"),
+                 "invocation_id": invocation_id,
+                 "claim_path": path_for_record(claim_path),
+                 "claim_sha256": claim_sha},
+                "running")
+            results[stage] = f
+            f_dir = stage_dir(run_root, stage) / attempt
+            f_report = Path(f["report"]) if f.get("report") else None
+            pre_veto: list[str] = []
+            history = verify_history(
+                run_root, allow_current=(stage, attempt), binding=binding)
+            pre_veto += history
+            deltas = _stage_deltas(run_root, require_commits=False)
+            if deltas is None:
+                pre_veto.append("f_call_delta_unknown")
+            else:
+                current_rec = deltas.get(stage, {}).get(attempt)
+                if current_rec is None:
+                    pre_veto.append("f_current_delta_missing")
+                selected = {"R0": candidates_map["R0"],
+                            "P": candidates_map["P"],
+                            "I": candidates_map["I"], "F": attempt}
+                selected_chain = selected_chain_counts(deltas, selected)
+                pre_veto += _selected_stage_problems(deltas, selected, mode)
+                pre_veto += _selected_caps_problems(deltas, mode)
+                cohort_totals = cohort_call_totals_from_deltas(deltas)
+                stage_totals = {name: stage_call_totals(deltas, name)
+                                for name in STAGE_BUDGETS}
+                worker = f.get("worker_result") or {}
+                if worker.get("provisional_chain_counts") != selected_chain:
+                    pre_veto.append("f_provisional_chain")
+            if pre_veto:
+                _amend_final_report(f_report, pre_veto)
+                return failed(pre_veto, pre_veto, list(f.get("failures") or []))
+            selection_record = {
+                "schema": "w1_real_training_update_terminal_selection_v1",
+                "selected_attempts": selected,
+                "selected_chain_counts": selected_chain,
+                "selected_chain_training_updates": int(
+                    (selected_chain or {}).get("native_adamw_steps", 0)
+                    + (selected_chain or {}).get("explicit_reference_updates",
+                                                 0)),
+                "stage_call_counts": stage_totals,
+                "cohort_call_counts": cohort_totals,
+                "cohort_training_updates": int(
+                    (cohort_totals or {}).get("native_adamw_steps", 0)
+                    + (cohort_totals or {}).get("explicit_reference_updates",
+                                                0)),
+                "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            }
+            if f_report is not None and f_report.is_file():
+                data = strict_read_json(f_report)
+                data.update(
+                    selected_attempts=selected,
+                    selected_chain_counts=selected_chain,
+                    selected_chain_training_updates=selection_record[
+                        "selected_chain_training_updates"],
+                    stage_call_counts=stage_totals,
+                    cohort_call_counts=cohort_totals,
+                    cohort_training_updates=selection_record[
+                        "cohort_training_updates"],
+                    training_updates_scope="cohort",
+                    training_updates=selection_record[
+                        "cohort_training_updates"])
+                write_json(f_report, data)
+            f_artifacts = [f_report, f_dir / "worker_spec.json",
+                           f_dir / "worker" / "worker_result.json",
+                           f_dir / "call_reservations.json"]
+            seal, commit, closed, closed_sha, problems = \
+                _migration_stage_seal(
+                    run_root, stage, attempt, stage_t0, budget, binding,
+                    execution, {"complete": True}, complete=True,
+                    report=f_report, artifacts=f_artifacts, counter=counter,
+                    scope=scope, final=True,
+                    extra_row={"selection": selection_record},
+                    extra={"selection": selection_record})
+            if problems or not commit.committed:
+                return failed(problems, problems, list(f.get("failures") or []))
+            _launch_closed, launch_problems = \
+                write_launch_stage_closed_candidate(
+                    run_root, invocation_id=invocation_id, stage=stage,
+                    execution_seq=execution["execution_seq"], commit=commit,
+                    event_candidate=closed,
+                    event_candidate_sha256=closed_sha, t0=stage_t0,
+                    remaining_s=float(budget["remaining_s"]),
+                    committed_measured_wall_s=float(
+                        seal.row.get("measured_wall_s", 0.0) or 0.0))
+            if launch_problems:
+                return failed(launch_problems, launch_problems,
+                              list(f.get("failures") or []))
+            terminal_path, terminal_sha, terminal_problems = \
+                write_terminal_candidate(
+                    run_root, binding=binding, execution={**execution,
+                                                          "stage": stage},
+                    commit=commit, t0=stage_t0,
+                    remaining_s=float(budget["remaining_s"]),
+                    committed_measured_wall_s=float(
+                        seal.row.get("measured_wall_s", 0.0) or 0.0))
+            launch_terminal_path, launch_terminal_problems = \
+                write_launch_terminal_candidate(
+                    run_root, invocation_id=invocation_id, commit=commit,
+                    event_candidate=terminal_path,
+                    event_candidate_sha256=terminal_sha, t0=stage_t0,
+                    remaining_s=float(budget["remaining_s"]),
+                    committed_measured_wall_s=float(
+                        seal.row.get("measured_wall_s", 0.0) or 0.0))
+            terminal_problems += launch_terminal_problems
+            f_write_after = not terminal_problems
+            commits[stage] = {"path": path_for_record(commit.commit_path),
+                              "sha256": commit.commit_sha256}
+            candidates[stage] = {"path": path_for_record(closed),
+                                 "sha256": closed_sha}
+            selected[stage] = attempt
+            if terminal_problems:
+                return failed(terminal_problems, terminal_problems,
+                              list(f.get("failures") or []))
+            return {
+                "mode": mode,
+                "conclusion": ("real_training_update_covered_contract_passed"
+                               if f.get("covered_contract_passed")
+                               else "audit_incomplete"),
+                "complete_evidence": bool(f.get("complete_evidence")),
+                "covered_contract_passed": bool(
+                    f.get("covered_contract_passed")),
+                "problems": [], "failures": list(f.get("failures") or []),
+                "gaps": list(f.get("gaps") or []), "stages": results,
+                "selected_attempts": selected,
+                "selected_chain_counts": selected_chain,
+                "selected_chain_training_updates": selection_record[
+                    "selected_chain_training_updates"],
+                "cohort_call_counts": cohort_totals,
+                "cohort_training_updates": selection_record[
+                    "cohort_training_updates"],
+                "training_updates": selection_record[
+                    "cohort_training_updates"],
+                "training_updates_known_lower_bound": selection_record[
+                    "cohort_training_updates"],
+                "training_updates_scope": "cohort",
+                "call_accounting_known": True,
+                "stage_call_counts": stage_totals,
+                "commits": commits, "candidates": candidates,
+                "terminal_candidate": {
+                    "path": path_for_record(terminal_path),
+                    "sha256": terminal_sha},
+                "write_after": {**{name: True for name in STAGE_BUDGETS},
+                                "terminal": f_write_after},
+                "invocation_id": invocation_id,
+                "binding_spec_sha256": binding.spec_sha256,
+                "last_stage_end_perf_counter": _now(),
+            }
+        except (TimeoutError, UpdateCallBudgetExceeded, OSError,
+                ValueError, TypeError) as exc:
+            return failed([f"migration_f:{type(exc).__name__}:{exc}"],
+                          [f"migration_f:{type(exc).__name__}"])
+    return failed(["migration_incomplete"])
 
 
 def synthetic_self_test(out_root: Path, *, seed: int = FIXTURE_SEED,

@@ -42,15 +42,21 @@ from ireset.eval.w1_real_training_update_audit import (  # noqa: E402
     authorization_problems,
     build_admission_package,
     build_default_tolerance_contract,
+    build_migration_admission,
     configure_production_runtime,
     load_authorization,
     load_tolerance_contract,
+    run_binding_migration_audit,
     run_registered_audit,
     sha256_file,
+    strict_read_json,
     synthetic_calibration,
     synthetic_self_test,
     tolerance_contract_problems,
+    write_history_snapshot,
     write_json,
+    write_migration_admission,
+    write_migration_baseline,
     write_package,
 )
 
@@ -149,6 +155,13 @@ def main() -> int:
                            "package")
     mode.add_argument("--real-admission", action="store_true",
                       help="write the metadata-only real admission package")
+    mode.add_argument("--migration-snapshot", action="store_true",
+                      help="freeze the original v1 prefix and migration "
+                           "metadata outside the run root")
+    mode.add_argument("--migration-admission", action="store_true",
+                      help="write the read-only binding migration admission")
+    mode.add_argument("--migration-authorization-draft", action="store_true",
+                      help="write the non-authorized v2 migration draft")
     mode.add_argument("--real", action="store_true",
                       help="registered real audit (authorization + admission)")
     ap.add_argument("--out", type=Path, default=None)
@@ -158,6 +171,15 @@ def main() -> int:
     ap.add_argument("--admission-package", type=Path, default=None)
     ap.add_argument("--synthetic-acceptance", type=Path, default=None)
     ap.add_argument("--calibration-verification", type=Path, default=None)
+    ap.add_argument("--migration-root", type=Path, default=None,
+                    help="original v1 cohort run root (never written)")
+    ap.add_argument("--history-snapshot", type=Path, default=None)
+    ap.add_argument("--binding-spec", type=Path, default=None)
+    ap.add_argument("--gate-b", type=Path, default=None)
+    ap.add_argument("--migration-admission-package", type=Path, default=None)
+    ap.add_argument("--invocation-id", type=str, default=None)
+    ap.add_argument("--migration", action="store_true",
+                    help="use the dedicated second-generation binding entry")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--stage", type=str, default=None,
                     choices=("R0", "P", "I", "F"))
@@ -270,6 +292,134 @@ def main() -> int:
             print(f"[update-audit]   {problem}")
         return 0 if package["passed"] else 2
 
+    if args.migration_snapshot:
+        from ireset.eval.w1_real_training_update_audit import (
+            MIGRATION_SOURCE_RUN,
+        )
+        run_root = Path(args.migration_root or
+                        ROOT / MIGRATION_SOURCE_RUN).expanduser().resolve()
+        if not (run_root / "cohort.json").is_file():
+            raise SystemExit(f"migration run root missing: {run_root}")
+        out = (args.out or
+               ROOT / "derived/audit/w1_real_training_update_audit/"
+                      "binding_migration/attempt_001")
+        out = _guard(out)
+        path, sha, snapshot = write_history_snapshot(out, run_root)
+        print(f"[update-audit] history snapshot={path}")
+        print(f"[update-audit] sha256={sha}")
+        print(f"[update-audit] legacy_head_sha256="
+              f"{snapshot['legacy_head_sha256']}")
+        print(f"[update-audit] cost_s={snapshot['cost_s']}")
+        print(f"[update-audit] unsealed_files="
+              f"{len(snapshot['unsealed_files'])}")
+        baseline_path = out / "protected_manifest.json"
+        if not baseline_path.exists():
+            path, baseline_sha, baseline = write_migration_baseline(
+                out, ROOT, run_root)
+            print(f"[update-audit] protected manifest={path}")
+            print(f"[update-audit] protected_sha256={baseline_sha} "
+                  f"entries={baseline['entry_count']}")
+        return 0
+
+    if args.migration_admission:
+        from ireset.eval.w1_real_training_update_audit import (
+            MIGRATION_SOURCE_RUN,
+            build_migration_admission,
+            migration_admission_problems,
+        )
+        if args.history_snapshot is None or args.binding_spec is None:
+            raise SystemExit(
+                "--migration-admission requires --history-snapshot and "
+                "--binding-spec")
+        snapshot_path = Path(args.history_snapshot).expanduser().resolve()
+        spec_path = Path(args.binding_spec).expanduser().resolve()
+        if not snapshot_path.is_file() or not spec_path.is_file():
+            raise SystemExit("migration snapshot/spec missing")
+        snapshot = strict_read_json(snapshot_path)
+        spec = strict_read_json(spec_path)
+        snapshot_sha = sha256_file(snapshot_path)
+        spec_sha = sha256_file(spec_path)
+        real_path = (Path(args.admission_package).expanduser().resolve()
+                     if args.admission_package is not None else None)
+        real_record = strict_read_json(real_path) if real_path else None
+        real_sha = sha256_file(real_path) if real_path else None
+        gate_path = (Path(args.gate_b).expanduser().resolve()
+                     if args.gate_b is not None else None)
+        gate_sha = sha256_file(gate_path) if gate_path else None
+        out = (args.out or
+               ROOT / "derived/audit/w1_real_training_update_audit/"
+                      "binding_migration_admission")
+        out = _guard(out)
+        package = build_migration_admission(
+            ROOT, snapshot_path=snapshot_path,
+            snapshot_sha256=snapshot_sha, snapshot=snapshot,
+            spec_path=spec_path, spec_sha256=spec_sha, spec=spec,
+            real_admission_path=real_path,
+            real_admission_sha256=real_sha, real_admission=real_record,
+            gate_b_path=gate_path, gate_b_sha256=gate_sha)
+        package_problems = migration_admission_problems(package)
+        if package_problems:
+            package["passed"] = False
+            package["problems"] = list(package["problems"]) + package_problems
+        path, sha = write_migration_admission(out, package)
+        print(f"[update-audit] migration admission={path}")
+        print(f"[update-audit] sha256={sha}")
+        print(f"[update-audit] passed={package['passed']} "
+              f"problems={len(package['problems'])}")
+        for problem in package["problems"][:30]:
+            print(f"[update-audit]   {problem}")
+        return 0 if package["passed"] else 2
+
+    if args.migration_authorization_draft:
+        from ireset.eval.w1_real_training_update_audit import (
+            MIGRATION_SOURCE_RUN,
+            build_migration_authorization_draft,
+            load_binding,
+        )
+        if args.history_snapshot is None or args.binding_spec is None or \
+                args.migration_admission_package is None:
+            raise SystemExit(
+                "--migration-authorization-draft requires --history-snapshot, "
+                "--binding-spec and --migration-admission-package")
+        run_root = Path(args.migration_root or
+                        ROOT / MIGRATION_SOURCE_RUN).expanduser().resolve()
+        binding, problems = load_binding(run_root, require_active=False)
+        if binding is None:
+            raise SystemExit(f"migration binding refused: {problems}")
+        admission_path = Path(
+            args.migration_admission_package).expanduser().resolve()
+        admission_sha = sha256_file(admission_path)
+        real_path = (Path(args.admission_package).expanduser().resolve()
+                     if args.admission_package is not None else None)
+        real_sha = sha256_file(real_path) if real_path else None
+        gate_path = (Path(args.gate_b).expanduser().resolve()
+                     if args.gate_b is not None else None)
+        gate_sha = sha256_file(gate_path) if gate_path else None
+        draft = build_migration_authorization_draft(
+            ROOT, binding=binding,
+            snapshot_path=Path(args.history_snapshot).expanduser().resolve(),
+            spec_path=Path(args.binding_spec).expanduser().resolve(),
+            migration_admission_path=admission_path,
+            migration_admission_sha256=admission_sha,
+            real_admission_path=real_path,
+            real_admission_sha256=real_sha,
+            gate_b_path=gate_path, gate_b_sha256=gate_sha,
+            invocation_id=args.invocation_id, authorized=False)
+        out = (args.out or
+               ROOT / "derived/audit/w1_real_training_update_audit/"
+                      "binding_migration_authorization")
+        out = _guard(out)
+        out.mkdir(parents=True, exist_ok=True)
+        path = out / "authorization_draft.json"
+        if path.exists():
+            raise SystemExit(f"authorization draft already exists: {path}")
+        write_json(path, draft)
+        print(f"[update-audit] authorization draft={path}")
+        print(f"[update-audit] sha256={sha256_file(path)}")
+        print("[update-audit] authorized=false template_only="
+              f"{draft['template_only']}")
+        return 0
+
     if args.real:
         if args.authorization is None:
             raise SystemExit(
@@ -313,6 +463,32 @@ def main() -> int:
         base = (ROOT / HISTORY_ROOT).resolve()
         if out.parent != base:
             raise SystemExit(f"--out must be a direct child of {base}, got {out}")
+        if args.migration:
+            if args.resume or args.stage is not None:
+                raise SystemExit("--migration cannot be combined with --resume")
+            if args.binding_spec is None or args.invocation_id is None:
+                raise SystemExit(
+                    "--migration requires --binding-spec and --invocation-id")
+            acceptance_path = Path(package.get("acceptance_path") or "")
+            if not acceptance_path.is_absolute():
+                acceptance_path = ROOT / acceptance_path
+            provider = RealTrainingProvider(
+                ROOT, MODEL_CONFIG, device="cuda",
+                acceptance_path=(acceptance_path if acceptance_path.is_file()
+                                 else None))
+            provider.acceptance = package.get("acceptance")
+            provider.acceptance_sha = package.get("acceptance_sha256")
+            provider.roster = ((package.get("roster") or {}).get(
+                "parameter_roster"))
+            result = run_binding_migration_audit(
+                out, provider, mode="real", tolerance=contract,
+                authorization_sha=auth_sha, authorization=record,
+                admission_package=package, admission_sha=package_sha,
+                binding_spec_path=args.binding_spec,
+                invocation_id=args.invocation_id,
+                fixed_root=HISTORY_ROOT, project_root=ROOT)
+            _print_result(result)
+            return _EXIT.get(result.get("conclusion", "audit_incomplete"), 3)
         if not args.resume and out.exists() and any(out.iterdir()):
             raise SystemExit(f"real run root is not fresh: {out}")
         runtime = configure_production_runtime()
