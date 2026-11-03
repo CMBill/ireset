@@ -118,6 +118,24 @@ CALIBRATION_VERIFICATION_SCHEMA = (
     "w1_real_training_update_calibration_verification_v1")
 REAL_ADMISSION_SCHEMA = "w1_real_training_update_real_admission_v1"
 
+
+def acceptance_leaf_record(
+        record: Mapping[str, Any] | None) -> Mapping[str, Any]:
+    """Return the ordinary child record of an acceptance v2 wrapper.
+
+    Gate B v2 keeps the frozen v1 record under ``ordinary.record`` so both
+    synthetic chains stay byte-comparable; admission binds the wrapper but
+    reads roster/tolerance/implementation from this leaf.
+    """
+    if not isinstance(record, Mapping):
+        return {}
+    if record.get("schema") == SYNTHETIC_ACCEPTANCE_SCHEMA_V2:
+        ordinary = record.get("ordinary")
+        leaf = ordinary.get("record") if isinstance(ordinary, Mapping) else None
+        return leaf if isinstance(leaf, Mapping) else {}
+    return record
+
+
 N_JOINTS = 29
 N_SITES = len(SITE_NAMES)
 STAGES = ("R0", "P", "I", "F")
@@ -1963,13 +1981,22 @@ def build_real_admission_package(        project_root: Path, *, tolerance_contra
         acceptance_path: Path, acceptance: Mapping[str, Any]) -> dict:
     root = Path(project_root)
     problems: list[str] = []
+    leaf = acceptance_leaf_record(acceptance)
+    leaves = [leaf]
+    if isinstance(acceptance, Mapping) and acceptance.get("schema") == \
+            SYNTHETIC_ACCEPTANCE_SCHEMA_V2:
+        migration = acceptance.get("migration") or {}
+        migration_leaf = migration.get("record") \
+            if isinstance(migration, Mapping) else None
+        if isinstance(migration_leaf, Mapping):
+            leaves.append(migration_leaf)
     provider = RealTrainingProvider(
         root, MODEL_CONFIG, device="cuda", acceptance_path=Path(acceptance_path))
     try:
         provider.acceptance = dict(acceptance)
         provider.acceptance_sha = sha256_file(Path(acceptance_path))
         provider.roster = copy.deepcopy(
-            (acceptance.get("roster") or {}).get("parameter_roster") or {})
+            (leaf.get("roster") or {}).get("parameter_roster") or {})
     except (OSError, ValueError, TypeError):
         problems.append("admission_acceptance_unreadable")
     metadata = provider.metadata()
@@ -1998,17 +2025,19 @@ def build_real_admission_package(        project_root: Path, *, tolerance_contra
     if tolerance_evidence != calibration_verification_record.get(
             "evidence_sha256"):
         problems.append("tolerance_calibration_binding")
-    acceptance_tolerance = acceptance.get("tolerance") or {}
-    if acceptance_tolerance.get("evidence_sha256") != tolerance_evidence:
-        problems.append("acceptance_tolerance_binding")
-    if acceptance_tolerance.get("fp32_contract_sha256") != fp32_sha:
-        problems.append("acceptance_fp32_binding")
+    for child in leaves:
+        acceptance_tolerance = child.get("tolerance") or {}
+        if acceptance_tolerance.get("evidence_sha256") != tolerance_evidence:
+            problems.append("acceptance_tolerance_binding")
+        if acceptance_tolerance.get("fp32_contract_sha256") != fp32_sha:
+            problems.append("acceptance_fp32_binding")
     runtime_identity = runtime_identity_facts()
     problems += [f"runtime_identity:{p}" for p in runtime_identity_problems(
         fp32.get("runtime_identity"), runtime_identity)]
-    problems += [f"acceptance_runtime_identity:{p}"
-                 for p in runtime_identity_problems(
-                     acceptance.get("runtime_identity"), runtime_identity)]
+    for child in leaves:
+        problems += [f"acceptance_runtime_identity:{p}"
+                     for p in runtime_identity_problems(
+                         child.get("runtime_identity"), runtime_identity)]
     problems += [f"calibration_runtime_identity:{p}"
                  for p in runtime_identity_problems(
                      calibration_verification_record.get("runtime_identity"),
@@ -2018,9 +2047,10 @@ def build_real_admission_package(        project_root: Path, *, tolerance_contra
                if not isinstance(sha, str)]
     if missing:
         problems.append(f"implementation_missing:{missing}")
-    acceptance_impl = acceptance.get("implementation") or {}
-    if acceptance_impl.get("files") != impl["files"]:
-        problems.append("acceptance_implementation_drift")
+    for child in leaves:
+        acceptance_impl = child.get("implementation") or {}
+        if acceptance_impl.get("files") != impl["files"]:
+            problems.append("acceptance_implementation_drift")
     runtime = configure_production_runtime()
     problems += [f"runtime_apply:{p}" for p in runtime["problems"]]
     roster = provider.roster or {}

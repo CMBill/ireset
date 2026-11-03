@@ -4157,8 +4157,10 @@ def _worker_main(spec_path: str, out_dir: str) -> int:
 
     def precheck_candidates() -> list[str]:
         found: list[str] = []
-        history = verify_history(root, allow_current=("F", attempt),
-                                 generation=generation, binding=binding)
+        history = verify_history(
+            root, allow_current=("F", attempt),
+            allow_invocation=spec.get("invocation_id"),
+            generation=generation, binding=binding)
         found += [f"f_candidate_history:{p}" for p in history]
         if set(candidate_attempts) != set(STAGE_BUDGETS):
             found.append("f_candidate_keys")
@@ -5169,6 +5171,49 @@ def _snapshot_problems(snapshot: Mapping[str, Any] | None, *,
     if isinstance(payload, Mapping) and snapshot.get("legacy_head_sha256") != \
             legacy_head_sha256(payload):
         problems.append("snapshot_legacy_head_binding")
+    if isinstance(payload, Mapping) and snapshot.get("authorization_sha256") \
+            != payload.get("authorization_sha256"):
+        problems.append("snapshot_authorization_binding")
+    # The frozen file list covers the marker, the authorization-bearing
+    # marker and every old artifact.  The index/ledger are the two files the
+    # migration legitimately appends to; their old rows are checked below by
+    # canonical row hash while every other file must remain byte identical.
+    files = snapshot.get("files")
+    snapshot_root = _reference_path(snapshot.get("run_root"))
+    target_root = Path(run_root).resolve() if run_root is not None else \
+        (snapshot_root.resolve() if snapshot_root is not None else None)
+    if not isinstance(files, Mapping) or not files:
+        problems.append("snapshot_files_missing")
+    else:
+        if "cohort.json" not in files:
+            problems.append("snapshot_marker_file_missing")
+        for recorded in snapshot.get("files_problems") or []:
+            problems.append(f"snapshot_files_recorded:{recorded}")
+        for rel, rec in files.items():
+            path = Path(str(rel))
+            if rel in ("attempts_index.json", "costs.json"):
+                continue
+            if target_root is None:
+                problems.append("snapshot_files_root")
+                break
+            path = target_root / path
+            if not isinstance(rec, Mapping) or not isinstance(
+                    rec.get("sha256"), str):
+                problems.append(f"snapshot_file_entry:{rel}")
+                continue
+            if not path.is_file():
+                problems.append(f"snapshot_file_missing:{rel}")
+                continue
+            try:
+                actual = sha256_file(path)
+                size = int(path.stat().st_size)
+            except OSError:
+                problems.append(f"snapshot_file_unreadable:{rel}")
+                continue
+            if actual != rec.get("sha256"):
+                problems.append(f"snapshot_file_sha:{rel}")
+            if type(rec.get("bytes")) is not int or int(rec["bytes"]) != size:
+                problems.append(f"snapshot_file_bytes:{rel}")
     copies = snapshot.get("source_copies")
     copies = copies if isinstance(copies, Mapping) else {}
 
@@ -5495,6 +5540,63 @@ def load_binding(root: Path, *, generation: str = GENERATION_002,
         activation=activation, activation_sha256=activation_sha), []
 
 
+def load_external_binding_material(
+        snapshot_path: Path, snapshot_sha256: str,
+        spec_path: Path, spec_sha256: str, *,
+        project_root: Path = PROJECT_ROOT,
+        require_current_implementation: bool = False
+        ) -> tuple[BindingContext | None, list[str]]:
+    """Build a read-only context from external snapshot/spec bytes.
+
+    Authorization drafting happens before the original root may contain a
+    binding intent/spec.  This loader therefore verifies the external
+    snapshot and spec directly and never writes to the run root.
+    """
+    snapshot_path = Path(snapshot_path).resolve()
+    spec_path = Path(spec_path).resolve()
+    problems: list[str] = []
+    if not snapshot_path.is_file():
+        return None, ["external_snapshot_missing"]
+    if not spec_path.is_file():
+        return None, ["external_spec_missing"]
+    if sha256_file(snapshot_path) != snapshot_sha256:
+        problems.append("external_snapshot_sha")
+    if sha256_file(spec_path) != spec_sha256:
+        problems.append("external_spec_sha")
+    try:
+        snapshot = strict_read_json(snapshot_path)
+        spec = strict_read_json(spec_path)
+    except (OSError, ValueError, TypeError) as exc:
+        return None, problems + [f"external_material_unreadable:"
+                                 f"{type(exc).__name__}"]
+    if not isinstance(snapshot, Mapping) or not isinstance(spec, Mapping):
+        return None, problems + ["external_material_not_mapping"]
+    reference = spec.get("history_snapshot") or {}
+    ref_path = _reference_path(reference.get("path"))
+    if ref_path is None or ref_path.resolve() != snapshot_path:
+        problems.append("external_spec_snapshot_path")
+    if reference.get("sha256") != snapshot_sha256:
+        problems.append("external_spec_snapshot_sha")
+    run_root = Path(str(snapshot.get("run_root"))).expanduser().resolve()
+    problems += _snapshot_problems(snapshot, run_root=run_root, root=run_root)
+    problems += binding_spec_problems(
+        spec, root=run_root, snapshot=snapshot,
+        require_current_implementation=require_current_implementation,
+        project_root=project_root)
+    payload = snapshot.get("legacy_head_payload")
+    if not isinstance(payload, Mapping):
+        problems.append("external_legacy_head_missing")
+        return None, problems
+    return BindingContext(
+        generation=str(spec.get("generation", GENERATION_002)),
+        spec=dict(spec), spec_sha256=spec_sha256,
+        snapshot=dict(snapshot), snapshot_sha256=snapshot_sha256,
+        snapshot_path=snapshot_path, binding_dir=spec_path.parent,
+        legacy_head=dict(payload),
+        legacy_head_sha256=str(snapshot.get("legacy_head_sha256")),
+        activation=None, activation_sha256=None), problems
+
+
 def _activation_problems(activation: Mapping[str, Any], *, root: Path,
                          spec_sha256: str, snapshot_sha256: str,
                          legacy_head_sha256: str | None,
@@ -5600,6 +5702,93 @@ def activate_binding(root: Path, *, generation: str, commit_path: Path,
 
 def launch_journal_dir(root: Path) -> Path:
     return Path(root) / LAUNCH_JOURNAL_DIR
+
+
+_RETURN_TIMING_TOL = 1e-6
+
+
+def _return_timing_coverage_problems(
+        record: Mapping[str, Any], *,
+        claim: Mapping[str, Any] | None = None) -> list[str]:
+    """Derive return coverage from stage timings and committed costs.
+
+    ``coverage_ok`` in the record is only a caller statement; the public
+    reader recomputes the relation between the outer return time, each
+    stage's inner start/end facts and the commit's billed wall time.
+    """
+    timings = record.get("stage_timings")
+    if not isinstance(timings, Mapping) or set(timings) != set(STAGE_BUDGETS):
+        return ["return_stage_timings"]
+    commits = record.get("commits")
+    if not isinstance(commits, Mapping) or \
+            set(commits) != set(STAGE_BUDGETS):
+        return ["return_commits_scope"]
+    problems: list[str] = []
+    parsed: dict[str, tuple[float, float, float]] = {}
+    for stage in STAGE_BUDGETS:
+        timing = timings.get(stage)
+        ref = commits.get(stage)
+        if not isinstance(timing, Mapping) or not isinstance(ref, Mapping):
+            problems.append(f"return_stage_timing:{stage}")
+            continue
+        t0 = timing.get("t0_perf_counter")
+        end = timing.get("end_perf_counter")
+        if not _nonneg(t0) or not _nonneg(end):
+            problems.append(f"return_stage_timing:{stage}")
+            continue
+        t0 = float(t0)
+        end = float(end)
+        if end + _RETURN_TIMING_TOL < t0:
+            problems.append(f"return_stage_time_reverse:{stage}")
+            continue
+        path = _reference_path(ref.get("path"))
+        if path is None or not path.is_file():
+            problems.append(f"return_stage_commit:{stage}")
+            continue
+        try:
+            if sha256_file(path) != ref.get("sha256"):
+                problems.append(f"return_stage_commit_sha:{stage}")
+                continue
+            commit = strict_read_json(path)
+        except (OSError, ValueError, TypeError):
+            problems.append(f"return_stage_commit:{stage}")
+            continue
+        cost = commit.get("committed_measured_wall_s")
+        commit_t0 = commit.get("stage_t0_perf_counter")
+        if not _nonneg(cost) or not _nonneg(commit_t0):
+            problems.append(f"return_stage_commit_facts:{stage}")
+            continue
+        if abs(float(commit_t0) - t0) > _RETURN_TIMING_TOL:
+            problems.append(f"return_stage_t0:{stage}")
+        parsed[stage] = (t0, end, float(cost))
+    if set(parsed) != set(STAGE_BUDGETS):
+        return problems
+    stages = tuple(STAGE_BUDGETS)
+    for previous, current in zip(stages, stages[1:]):
+        if parsed[current][0] + _RETURN_TIMING_TOL < parsed[previous][1]:
+            problems.append(f"return_stage_overlap:{previous}:{current}")
+    finished = record.get("finished_perf_counter")
+    if not _nonneg(finished):
+        problems.append("return_time:finished_perf_counter")
+    else:
+        finished = float(finished)
+        if parsed["F"][0] + parsed["F"][2] + _RETURN_TIMING_TOL < finished:
+            problems.append("return_coverage:F")
+        last_end = record.get("last_stage_end_perf_counter")
+        if not _nonneg(last_end) or \
+                float(last_end) > finished + _RETURN_TIMING_TOL:
+            problems.append("return_time_order")
+        elif abs(float(last_end) - parsed["F"][1]) > _RETURN_TIMING_TOL:
+            problems.append("return_last_stage_end")
+    for stage in ("R0", "P", "I"):
+        t0, end, cost = parsed[stage]
+        if end - t0 > cost + _RETURN_TIMING_TOL:
+            problems.append(f"return_coverage:{stage}")
+    if claim is not None and _nonneg(claim.get("t0_perf_counter")):
+        if abs(float(claim["t0_perf_counter"]) - parsed["R0"][0]) > \
+                _RETURN_TIMING_TOL:
+            problems.append("return_claim_t0")
+    return problems
 
 
 def _claim_problems(claim: Mapping[str, Any], *, invocation_id: str,
@@ -5717,7 +5906,9 @@ def return_observation_problems(record: Mapping[str, Any] | None, *,
                 problems.append(f"return_{label}_missing:{stage}")
             elif sha256_file(path) != ref.get("sha256"):
                 problems.append(f"return_{label}_sha:{stage}")
-    if record.get("coverage_ok") is not True:
+    coverage_problems = _return_timing_coverage_problems(record, claim=claim)
+    problems += coverage_problems
+    if coverage_problems or record.get("coverage_ok") is not True:
         problems.append("return_coverage")
     if record.get("post_return_work_performed") is not False:
         problems.append("return_post_work")
@@ -5868,10 +6059,12 @@ def scan_launch_journals(fixed_root: Path, *,
                 try:
                     observation = strict_read_json(observation_path)
                 except (OSError, ValueError, TypeError) as exc:
-                    return_problems = [f"return_unreadable:"
-                                       f"{type(exc).__name__}"]
+                    return_problems += [f"return_unreadable:"
+                                        f"{type(exc).__name__}"]
                 else:
-                    return_problems = return_observation_problems(
+                    # Accumulate: a valid observation cannot erase a missing
+                    # or malformed registered/terminal/candidate record.
+                    return_problems += return_observation_problems(
                         observation, invocation_id=directory.name, claim=claim)
                     entry["return_observation"] = observation
             else:
@@ -6662,7 +6855,8 @@ def verify_history(root: Path, *,
                    scan_journal: bool = False) -> list[str]:
     """Full-history gate before any resume/selection decision."""
     problems: list[str] = []
-    if _migration_present(root):
+    migrated = _migration_present(root)
+    if migrated:
         records, loaded, record_problems = _execution_records(
             root, binding=binding, allow_current=allow_current)
         if records is None:
@@ -6671,15 +6865,19 @@ def verify_history(root: Path, *,
         if generation is not None and generation not in (
                 GENERATION_001, GENERATION_002):
             problems.append(f"history_generation:{generation}")
-        if scan_journal:
-            journal = scan_launch_journals(
-                Path(root).parent, allow_invocation=allow_invocation)
-            for problem in journal.get("problems") or []:
-                if str(problem).startswith(
-                        f"launch_journal_missing:{Path(root).name}") or \
-                        f":{Path(root).name}:" in str(problem) or \
-                        str(problem).endswith(f":{Path(root).name}"):
-                    problems.append(f"history_journal:{problem}")
+    # A claim is a liability from the moment it is written, before any
+    # binding/intent exists.  Public history therefore scans the fixed journal
+    # even for a root that has no v2 rows yet; an in-flight execution passes
+    # its own invocation as the sole allowed exception.
+    if scan_journal or migrated or launch_journal_dir(root).is_dir():
+        journal = scan_launch_journals(
+            Path(root).parent, allow_invocation=allow_invocation)
+        for problem in journal.get("problems") or []:
+            if str(problem).startswith(
+                    f"launch_journal_missing:{Path(root).name}") or \
+                    f":{Path(root).name}:" in str(problem) or \
+                    str(problem).endswith(f":{Path(root).name}"):
+                problems.append(f"history_journal:{problem}")
     for stage in STAGE_BUDGETS:
         try:
             index = [r for r in load_index(root) if r.get("stage") == stage]
@@ -7386,6 +7584,16 @@ def _prepare_revision_number(directory: Path) -> int:
     return max(numbers, default=0) + 1
 
 
+_COST_ONLY_ROW_KEYS = ("measured_wall_s", "sampled_wall_s",
+                       "seal_tail_reserve_s")
+
+
+def _frozen_row_view(row: Mapping[str, Any]) -> dict:
+    """Fields that must not change when only the billed cost is re-sealed."""
+    return {key: value for key, value in row.items()
+            if key not in _COST_ONLY_ROW_KEYS}
+
+
 @dataclass
 class PreparedResult:
     row: dict | None
@@ -7443,8 +7651,11 @@ def _verify_prepared_attempt(root: Path, stage: str, attempt: str, *,
             if reservation_data.get("consumed") is None:
                 problems.append("prepared_reservation_unsettled")
     problems += _sealed_evidence_problems(root, stage, row)
-    history = verify_history(root, allow_current=(stage, attempt),
-                             binding=binding, generation=binding.generation)
+    history = verify_history(
+        root, allow_current=(stage, attempt),
+        allow_invocation=(str(execution.get("invocation_id"))
+                          if execution.get("invocation_id") else None),
+        binding=binding, generation=binding.generation)
     problems += history
     consumed = _reservation_consumed(root, stage, attempt)
     if consumed is None:
@@ -7453,8 +7664,13 @@ def _verify_prepared_attempt(root: Path, stage: str, attempt: str, *,
         "stage": stage, "attempt": attempt, "execution_seq": seq,
         "generation": binding.generation,
         "binding_spec_sha256": binding.spec_sha256,
+        "stage_t0_perf_counter": (
+            float(execution["stage_t0_perf_counter"])
+            if execution.get("stage_t0_perf_counter") is not None else None),
         "index_row_sha256": canonical_sha256(row),
         "ledger_row_sha256": canonical_sha256(entry),
+        "index_view_sha256": canonical_sha256(_frozen_row_view(row)),
+        "ledger_view_sha256": canonical_sha256(_frozen_row_view(entry)),
         "reservation_sha256": (sha256_file(reservation)
                                if reservation.is_file() else None),
         "complete": bool(row.get("complete") is True),
@@ -7487,11 +7703,75 @@ def _verify_prepared_attempt(root: Path, stage: str, attempt: str, *,
     return PreparedResult(row, entry, problems, facts)
 
 
+def _refresh_prepared_view(root: Path, stage: str, attempt: str,
+                           prepared: PreparedResult,
+                           execution: Mapping[str, Any]) -> PreparedResult:
+    """Re-check only the frozen small view after the cost re-seal.
+
+    Full artifact hashing belongs to the priced pre-commit verification.  The
+    commit path must not repeat it: it only proves that the rows, state,
+    reservation and binding identity are still the ones that were verified,
+    while allowing the measured cost fields to advance.
+    """
+    problems: list[str] = []
+    try:
+        rows = [r for r in load_index(root)
+                if r.get("stage") == stage and r.get("attempt") == attempt]
+        ledger = [r for r in load_ledger(root)
+                  if r.get("stage") == stage and r.get("attempt") == attempt]
+    except (OSError, ValueError, TypeError):
+        return PreparedResult(None, None,
+                              ["commit_prepared_rows_unreadable"],
+                              dict(prepared.facts))
+    if len(rows) != 1 or len(ledger) != 1:
+        return PreparedResult(None, None, ["commit_prepared_row_missing"],
+                              dict(prepared.facts))
+    row, entry = rows[0], ledger[0]
+    problems += _row_identity_problems(row, kind="index")
+    problems += _row_identity_problems(entry, kind="ledger")
+    problems += _call_balance_problems(row, entry)
+    if canonical_sha256(_frozen_row_view(row)) != prepared.facts.get(
+            "index_view_sha256"):
+        problems.append("commit_prepared_index_view")
+    if canonical_sha256(_frozen_row_view(entry)) != prepared.facts.get(
+            "ledger_view_sha256"):
+        problems.append("commit_prepared_ledger_view")
+    if bool(row.get("complete") is True) != bool(
+            prepared.facts.get("complete")):
+        problems.append("commit_prepared_complete")
+    if row.get("status") != prepared.facts.get("status"):
+        problems.append("commit_prepared_status")
+    for key, want in (("generation", execution.get("generation")),
+                      ("binding_spec_sha256",
+                       execution.get("binding_spec_sha256")),
+                      ("execution_seq", execution.get("execution_seq"))):
+        if want is not None and row.get(key) != want:
+            problems.append(f"commit_prepared_binding:{key}")
+    reservation = stage_dir(root, stage) / attempt / \
+        "call_reservations.json"
+    if not reservation.is_file():
+        problems.append("commit_prepared_reservation_missing")
+        reservation_sha = None
+    else:
+        reservation_sha = sha256_file(reservation)
+        if reservation_sha != prepared.facts.get("reservation_sha256"):
+            problems.append("commit_prepared_reservation")
+    facts = {
+        **prepared.facts,
+        "index_row_sha256": canonical_sha256(row),
+        "ledger_row_sha256": canonical_sha256(entry),
+        "reservation_sha256": reservation_sha,
+        "measured_wall_s": float(row.get("measured_wall_s", 0.0) or 0.0),
+    }
+    return PreparedResult(row, entry, problems, facts)
+
+
 def commit_attempt(root: Path, stage: str, attempt: str, *, t0: float,
                    budget: Mapping[str, Any], binding: BindingContext,
                    execution: Mapping[str, Any] | None = None,
                    cost_floor: float | None = None,
-                   candidate_problems: Sequence[str] = ()) -> CommitResult:
+                   candidate_problems: Sequence[str] = (),
+                   prepared: PreparedResult | None = None) -> CommitResult:
     """Write the single finish/commit pair after internal verification."""
     execution = dict(execution or {})
     seq = execution.get("execution_seq")
@@ -7503,8 +7783,14 @@ def commit_attempt(root: Path, stage: str, attempt: str, *, t0: float,
     if plan is None or plan["stage"] != stage or plan["attempt"] != attempt:
         return CommitResult(False, None, None, None, None,
                             problems + ["commit_plan"])
-    prepared = _verify_prepared_attempt(
-        root, stage, attempt, binding=binding, execution=execution)
+    if prepared is None:
+        prepared = _verify_prepared_attempt(
+            root, stage, attempt,
+            execution={**execution, "stage_t0_perf_counter": t0},
+            binding=binding)
+    else:
+        prepared = _refresh_prepared_view(root, stage, attempt, prepared,
+                                          execution)
     problems += prepared.problems
     row = prepared.row
     entry = prepared.ledger_row
@@ -7539,6 +7825,7 @@ def commit_attempt(root: Path, stage: str, attempt: str, *, t0: float,
         "ledger_row_sha256": canonical_sha256(entry),
         "reservation_sha256": prepared.facts.get("reservation_sha256"),
         "prepared_facts": prepared.facts,
+        "stage_t0_perf_counter": float(t0),
         "committed_measured_wall_s": committed_wall,
         "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
@@ -7568,6 +7855,7 @@ def commit_attempt(root: Path, stage: str, attempt: str, *, t0: float,
         "index_row_sha256": canonical_sha256(row),
         "ledger_row_sha256": canonical_sha256(entry),
         "reservation_sha256": prepared.facts.get("reservation_sha256"),
+        "stage_t0_perf_counter": float(t0),
         "committed_measured_wall_s": committed_wall,
         "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
@@ -7698,6 +7986,20 @@ def write_stage_closed_candidate(
         "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
     write_json_exclusive(directory / "stage_closed_write_after.json", result)
+    # The write-after receipt itself is persistence work.  Sample once more
+    # after its fsync/return so the success path cannot hide its own tail.
+    release = max(0.0, time.perf_counter() - float(t0))
+    if not _nonneg(release) or release >= float(remaining_s) or \
+            release > float(committed_measured_wall_s):
+        problems.append("stage_closed_write_after_proof_gate")
+        append_launch_revoke(
+            root, invocation_id=str(execution.get("invocation_id")),
+            stage=stage, execution_seq=seq, commit_path=commit.commit_path,
+            commit_sha256=str(commit.commit_sha256), candidate_sha256=sha,
+            candidate_path=path, observed_elapsed=release,
+            committed_wall=float(committed_measured_wall_s),
+            remaining_s=float(remaining_s),
+            reason="stage_closed_write_after_proof_gate")
     return path, sha, problems
 
 
@@ -7753,6 +8055,18 @@ def write_launch_stage_closed_candidate(
     write_json_exclusive(
         directory / f"stage_closed_{int(execution_seq):06d}_write_after.json",
         result)
+    release = max(0.0, time.perf_counter() - float(t0))
+    if not _nonneg(release) or release >= float(remaining_s) or \
+            release > float(committed_measured_wall_s):
+        append_launch_revoke(
+            root, invocation_id=invocation_id, stage=stage,
+            execution_seq=int(execution_seq), commit_path=commit.commit_path,
+            commit_sha256=str(commit.commit_sha256), candidate_sha256=sha,
+            candidate_path=path, observed_elapsed=release,
+            committed_wall=float(committed_measured_wall_s),
+            remaining_s=float(remaining_s),
+            reason="launch_stage_closed_write_after_proof_gate")
+        return path, ["launch_stage_closed_write_after_proof_gate"]
     return path, []
 
 
@@ -7802,6 +8116,19 @@ def write_launch_terminal_candidate(
         "passed": True,
         "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     })
+    release = max(0.0, time.perf_counter() - float(t0))
+    if not _nonneg(release) or release >= float(remaining_s) or \
+            release > float(committed_measured_wall_s):
+        append_launch_revoke(
+            root, invocation_id=invocation_id, stage="F",
+            execution_seq=int(commit.commit_path.parent.name),
+            commit_path=commit.commit_path,
+            commit_sha256=str(commit.commit_sha256), candidate_sha256=sha,
+            candidate_path=path, observed_elapsed=release,
+            committed_wall=float(committed_measured_wall_s),
+            remaining_s=float(remaining_s),
+            reason="launch_terminal_write_after_proof_gate")
+        return path, ["launch_terminal_write_after_proof_gate"]
     return path, []
 
 
@@ -7856,6 +8183,19 @@ def write_terminal_candidate(root: Path, *, binding: BindingContext,
         "passed": True,
         "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     })
+    release = max(0.0, time.perf_counter() - float(t0))
+    if not _nonneg(release) or release >= float(remaining_s) or \
+            release > float(committed_measured_wall_s):
+        problems.append("terminal_write_after_proof_gate")
+        append_launch_revoke(
+            root, invocation_id=str(execution.get("invocation_id")),
+            stage=str(execution.get("stage", "F")), execution_seq=seq,
+            commit_path=commit.commit_path,
+            commit_sha256=str(commit.commit_sha256), candidate_sha256=sha,
+            candidate_path=path, observed_elapsed=release,
+            committed_wall=float(committed_measured_wall_s),
+            remaining_s=float(remaining_s),
+            reason="terminal_write_after_proof_gate")
     return path, sha, problems
 
 
@@ -7865,7 +8205,9 @@ def record_return_observation(
         finished_perf_counter: float, last_stage_end_perf_counter: float,
         commits: Mapping[str, Mapping[str, Any]],
         candidate_receipts: Mapping[str, Any],
-        write_after: Mapping[str, bool], coverage_ok: bool,
+        write_after: Mapping[str, bool],
+        coverage_ok: bool | None = None,
+        stage_timings: Mapping[str, Any] | None = None,
         source_kind: str = "outer_wait",
         expected_exit_code: int | None = None,
         conclusion: str | None = None) -> tuple[Path, str, list[str]]:
@@ -7898,10 +8240,9 @@ def record_return_observation(
             and float(finished_perf_counter) + 1e-9 < float(
                 last_stage_end_perf_counter):
         problems.append("return_time_order")
-    if not coverage_ok:
-        problems.append("return_coverage")
     if not write_after or not all(value is True for value in write_after.values()):
         problems.append("return_write_after")
+    timings = stage_timings if isinstance(stage_timings, Mapping) else {}
     record = {
         "schema": RETURN_OBSERVATION_SCHEMA,
         "scope": "post_execution_observation",
@@ -7925,13 +8266,25 @@ def record_return_observation(
                             - float(started_perf_counter)),
         "commits": {k: dict(v) for k, v in commits.items()},
         "candidate_receipts": dict(candidate_receipts),
+        "stage_timings": {
+            str(stage): dict(rec) for stage, rec in timings.items()
+            if isinstance(rec, Mapping)},
         "write_after": {k: bool(v) for k, v in write_after.items()},
-        "coverage_ok": bool(coverage_ok),
+        "coverage_ok": False,
         "expected_exit_code": expected_exit_code,
         "conclusion": conclusion,
         "post_return_work_performed": False,
         "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
+    coverage_problems = _return_timing_coverage_problems(
+        record, claim={**claim, "_sha256": claim_sha})
+    coverage = not coverage_problems
+    if coverage_ok is False:
+        coverage = False
+    record["coverage_ok"] = bool(coverage)
+    problems += coverage_problems
+    if not coverage:
+        problems.append("return_coverage")
     path = directory / "return_observation.json"
     try:
         sha = write_json_exclusive(path, record)
@@ -8335,7 +8688,12 @@ def stage_state(root: Path, stage: str,
         if attempt in all_index_by and migrated:
             return None, [f"selected_attempt_generation:{attempt}"]
         return None, ["selected_attempt_missing"]
+    internal_invocation = (
+        internal_context.get("invocation_id")
+        if isinstance(internal_context, Mapping)
+        and internal_context.get("allow_current") is True else None)
     history = verify_history(root, allow_current=allow_current,
+                             allow_invocation=internal_invocation,
                              binding=binding)
     if history:
         nonterminal = f"history_not_terminal:{stage}"
@@ -11938,7 +12296,8 @@ def _migration_stage_seal(
         return seal, CommitResult(False, None, None, None, None,
                                   list(seal.problems)), None, None, []
     prepared = _verify_prepared_attempt(
-        root, stage, attempt, binding=binding, execution=execution)
+        root, stage, attempt, binding=binding,
+        execution={**execution, "stage_t0_perf_counter": float(t0)})
     problems = list(prepared.problems)
     if complete and problems:
         return seal, CommitResult(False, None, None, None, None,
@@ -11965,7 +12324,7 @@ def _migration_stage_seal(
         root, stage, attempt, t0=t0, budget=budget, binding=binding,
         execution=execution, cost_floor=float(
             seal.row.get("measured_wall_s", 0.0) or 0.0),
-        candidate_problems=[])
+        candidate_problems=[], prepared=prepared)
     problems += commit.problems
     if not commit.committed:
         return seal, commit, None, None, problems
@@ -12107,6 +12466,7 @@ def run_binding_migration_audit(
     candidates: dict[str, Any] = {}
     selected: dict[str, str] = {}
     stage_totals: dict[str, Any] = {}
+    stage_timings: dict[str, dict[str, float]] = {}
     cohort_totals = None
     selected_chain = None
     scope = _stage_scope(provider, provider.roster)
@@ -12268,6 +12628,9 @@ def run_binding_migration_audit(
                             seal.row.get("measured_wall_s", 0.0) or 0.0))
                 if launch_problems:
                     return failed(launch_problems, launch_problems)
+                stage_timings[stage] = {
+                    "t0_perf_counter": float(stage_t0),
+                    "end_perf_counter": float(_now())}
                 registration_sha = r0["registration_sha256"]
                 noise_path = (Path(r0["noise_schedule"])
                               if r0.get("noise_schedule") else None)
@@ -12365,6 +12728,9 @@ def run_binding_migration_audit(
                 if launch_problems:
                     return failed(launch_problems, launch_problems,
                                   list(p.get("failures") or []))
+                stage_timings[stage] = {
+                    "t0_perf_counter": float(stage_t0),
+                    "end_perf_counter": float(_now())}
                 commits[stage] = {"path": path_for_record(commit.commit_path),
                                   "sha256": commit.commit_sha256}
                 candidates[stage] = {"path": path_for_record(closed),
@@ -12445,6 +12811,9 @@ def run_binding_migration_audit(
                 if launch_problems:
                     return failed(launch_problems, launch_problems,
                                   list(i.get("failures") or []))
+                stage_timings[stage] = {
+                    "t0_perf_counter": float(stage_t0),
+                    "end_perf_counter": float(_now())}
                 commits[stage] = {"path": path_for_record(commit.commit_path),
                                   "sha256": commit.commit_sha256}
                 candidates[stage] = {"path": path_for_record(closed),
@@ -12524,9 +12893,29 @@ def run_binding_migration_audit(
             results[stage] = f
             f_dir = stage_dir(run_root, stage) / attempt
             f_report = Path(f["report"]) if f.get("report") else None
+            f_evidence_veto: list[str] = []
+            if f.get("complete_evidence") is not True:
+                f_evidence_veto.append("f_complete_evidence")
+            for problem in f.get("verification_problems") or []:
+                f_evidence_veto.append(f"f_verification:{problem}")
+            if f_evidence_veto:
+                _amend_final_report(f_report, f_evidence_veto)
+                wrow, wprobs, proven = withdraw_attempt_claim(
+                    run_root, stage, attempt, f_report,
+                    _attempt_row(run_root, stage, attempt),
+                    f_evidence_veto, reason="f_evidence_veto",
+                    t0=stage_t0, budget=budget,
+                    call_balance=final_balance)
+                results["F"]["withdrawal"] = {
+                    "problems": wprobs, "proven": bool(proven),
+                    "row": wrow}
+                return failed(f_evidence_veto + wprobs,
+                              f_evidence_veto + wprobs,
+                              list(f.get("failures") or []))
             pre_veto: list[str] = []
             history = verify_history(
-                run_root, allow_current=(stage, attempt), binding=binding)
+                run_root, allow_current=(stage, attempt),
+                allow_invocation=invocation_id, binding=binding)
             pre_veto += history
             deltas = _stage_deltas(run_root, require_commits=False)
             if deltas is None:
@@ -12632,6 +13021,10 @@ def run_binding_migration_audit(
             if terminal_problems:
                 return failed(terminal_problems, terminal_problems,
                               list(f.get("failures") or []))
+            f_end = float(_now())
+            stage_timings[stage] = {
+                "t0_perf_counter": float(stage_t0),
+                "end_perf_counter": f_end}
             return {
                 "mode": mode,
                 "conclusion": ("real_training_update_covered_contract_passed"
@@ -12664,7 +13057,8 @@ def run_binding_migration_audit(
                                 "terminal": f_write_after},
                 "invocation_id": invocation_id,
                 "binding_spec_sha256": binding.spec_sha256,
-                "last_stage_end_perf_counter": _now(),
+                "stage_timings": stage_timings,
+                "last_stage_end_perf_counter": f_end,
             }
         except (TimeoutError, UpdateCallBudgetExceeded, OSError,
                 ValueError, TypeError) as exc:

@@ -252,6 +252,7 @@ def test_public_selection_requires_the_outer_return_observation(migrated):
         last_stage_end_perf_counter=result["last_stage_end_perf_counter"],
         commits=result["commits"], candidate_receipts=result["candidates"],
         write_after=result["write_after"],
+        stage_timings=result["stage_timings"],
         coverage_ok=result["complete_evidence"])
     assert problems == []
     for stage in A.STAGE_BUDGETS:
@@ -346,14 +347,22 @@ def test_terminal_candidate_actual_write_gate_and_revoke(tmp_path,
 def test_return_observation_requires_actual_return_facts(tmp_path):
     commits = {}
     receipts = {}
-    for stage in A.STAGE_BUDGETS:
+    timings = {}
+    for index, stage in enumerate(A.STAGE_BUDGETS):
         commit = tmp_path / f"{stage}_commit.json"
         receipt = tmp_path / f"{stage}_receipt.json"
-        A.write_json(commit, {"stage": stage})
+        t0 = float(index)
+        end = float(index + 1)
+        A.write_json(commit, {
+            "stage": stage,
+            "stage_t0_perf_counter": t0,
+            "committed_measured_wall_s": 2.5,
+        })
         A.write_json(receipt, {"stage": stage})
         commits[stage] = {"path": str(commit), "sha256": A.sha256_file(commit)}
         receipts[stage] = {"path": str(receipt),
                            "sha256": A.sha256_file(receipt)}
+        timings[stage] = {"t0_perf_counter": t0, "end_perf_counter": end}
     base = {
         "schema": A.RETURN_OBSERVATION_SCHEMA,
         "scope": "post_execution_observation",
@@ -368,6 +377,7 @@ def test_return_observation_requires_actual_return_facts(tmp_path):
                         "terminal": True},
         "commits": commits,
         "candidate_receipts": receipts,
+        "stage_timings": timings,
         "coverage_ok": True,
         "post_return_work_performed": False,
     }
@@ -384,6 +394,298 @@ def test_return_observation_requires_actual_return_facts(tmp_path):
     assert "return_coverage" in problems
     assert "return_process_not_returned" in problems
     assert "return_observation_missing" in A.return_observation_problems(None)
+    # A caller-supplied coverage_ok=True cannot hide an outer return that
+    # happened long after the last commit was billed.
+    late = dict(record, finished_perf_counter=1_000_000.0,
+                total_wall_s=1_000_000.0)
+    late_problems = A.return_observation_problems(
+        late, invocation_id="inv", claim=claim)
+    assert "return_coverage:F" in late_problems
+    assert "return_coverage" in late_problems
+
+
+def test_snapshot_consumption_rehashes_frozen_files(tmp_path):
+    root = tmp_path / "cohort"
+    _write_legacy_prefix(root)
+    snapshot_path, _sha, snapshot = A.write_history_snapshot(
+        tmp_path / "migration", root)
+    assert A._snapshot_problems(
+        snapshot, run_root=root, root=root) == []
+    # index/ledger are the only legal append targets.
+    rows = A.load_index(root)
+    ledger = A.load_ledger(root)
+    extra = dict(rows[-1])
+    extra.update(stage="P", attempt="attempt_002", status="incomplete",
+                 complete=False, execution_seq=3)
+    rows.append(extra)
+    ledger.append({**extra, "wall_s": round(
+        float(extra.get("measured_wall_s", 0.0)), 1)})
+    A.save_index(root, rows)
+    A.save_ledger(root, ledger)
+    assert A._snapshot_problems(
+        snapshot, run_root=root, root=root) == []
+    marker = A.read_json(root / "cohort.json")
+    marker["tampered_after_snapshot"] = True
+    A.write_json(root / "cohort.json", marker)
+    problems = A._snapshot_problems(snapshot, run_root=root, root=root)
+    assert "snapshot_file_sha:cohort.json" in problems
+    marker.pop("tampered_after_snapshot")
+    A.write_json(root / "cohort.json", marker)
+    reservation = A.stage_dir(root, "P") / "attempt_001" / \
+        "call_reservations.json"
+    data = A.read_json(reservation)
+    data["consumed"]["native_adamw_steps"] = 99
+    A.write_json(reservation, data)
+    problems = A._snapshot_problems(snapshot, run_root=root, root=root)
+    assert ("snapshot_file_sha:production/attempt_001/"
+            "call_reservations.json") in problems
+
+
+def test_commit_refresh_reuses_the_priced_prepared_view(migrated, monkeypatch):
+    root = migrated["root"]
+    row = next(r for r in A.load_index(root)
+               if r["stage"] == "F" and r["attempt"] == "attempt_001")
+    entry = next(r for r in A.load_ledger(root)
+                 if r["stage"] == "F" and r["attempt"] == "attempt_001")
+    reservation = A.stage_dir(root, "F") / "attempt_001" / \
+        "call_reservations.json"
+    prepared = A.PreparedResult(
+        row, entry, [], {
+            "index_view_sha256": A.canonical_sha256(
+                A._frozen_row_view(row)),
+            "ledger_view_sha256": A.canonical_sha256(
+                A._frozen_row_view(entry)),
+            "complete": row.get("complete") is True,
+            "status": row.get("status"),
+            "reservation_sha256": A.sha256_file(reservation),
+            "generation": row.get("generation"),
+            "binding_spec_sha256": row.get("binding_spec_sha256"),
+            "execution_seq": row.get("execution_seq"),
+        })
+
+    def no_full_verify(*_args, **_kwargs):
+        raise AssertionError("commit must not repeat full prepared hashing")
+
+    monkeypatch.setattr(A, "_verify_prepared_attempt", no_full_verify)
+    refreshed = A._refresh_prepared_view(
+        root, "F", "attempt_001", prepared,
+        {"generation": row.get("generation"),
+         "binding_spec_sha256": row.get("binding_spec_sha256"),
+         "execution_seq": row.get("execution_seq")})
+    assert refreshed.problems == []
+    assert refreshed.facts["index_row_sha256"] == A.canonical_sha256(row)
+
+
+def test_write_after_proof_write_is_itself_release_checked(tmp_path,
+                                                           monkeypatch):
+    from types import SimpleNamespace
+
+    root = tmp_path / "cohort"
+    root.mkdir()
+    commit_path = root / "execution_events/000003/commit.json"
+    commit_path.parent.mkdir(parents=True)
+    A.write_json(commit_path, {"kind": "commit"})
+    commit = A.CommitResult(
+        True, None, None, commit_path, A.sha256_file(commit_path), [], 0.0)
+    clock = SimpleNamespace(now=0.0)
+    original_write = A.write_json_exclusive
+
+    def slow_write(path, data):
+        sha = original_write(path, data)
+        if str(path).endswith("_write_after.json"):
+            clock.now = 100.0
+        return sha
+
+    monkeypatch.setattr(A, "time", SimpleNamespace(
+        perf_counter=lambda: clock.now,
+        strftime=lambda fmt: "2026-11-03T00:00:00+0800",
+        time=lambda: clock.now,
+        time_ns=lambda: int(clock.now * 1e9)))
+    monkeypatch.setattr(A, "write_json_exclusive", slow_write)
+    path, problems = A.write_launch_stage_closed_candidate(
+        root, invocation_id="inv-proof", stage="R0", execution_seq=3,
+        commit=commit, event_candidate=None, event_candidate_sha256=None,
+        t0=0.0, remaining_s=200.0, committed_measured_wall_s=10.0)
+    assert path is not None
+    assert "launch_stage_closed_write_after_proof_gate" in problems
+    revokes = list((root / "launch_journal/inv-proof").glob("revoke_*.json"))
+    assert revokes
+    assert A.strict_read_json(revokes[0])["reason"] == \
+        "launch_stage_closed_write_after_proof_gate"
+    clock.now = 0.0
+    terminal_commit = root / "execution_events/000006/commit.json"
+    terminal_commit.parent.mkdir(parents=True)
+    A.write_json(terminal_commit, {"kind": "commit"})
+    terminal = A.CommitResult(
+        True, None, None, terminal_commit,
+        A.sha256_file(terminal_commit), [], 0.0)
+    _path, problems = A.write_launch_terminal_candidate(
+        root, invocation_id="inv-proof", commit=terminal,
+        event_candidate=None, event_candidate_sha256=None,
+        t0=0.0, remaining_s=200.0, committed_measured_wall_s=10.0)
+    assert "launch_terminal_write_after_proof_gate" in problems
+
+
+def test_f_incomplete_evidence_is_not_committed(tmp_path, monkeypatch):
+    root = tmp_path / "cohort"
+    _write_legacy_prefix(root)
+    fixture_dir = tmp_path / "fixture"
+    provider = A.SyntheticTrainingProvider(
+        TINY_CONFIG, seed=A.FIXTURE_SEED, device="cuda")
+    provider.prepare_fixture(fixture_dir)
+    provider.load_fixture()
+    spec_path, _spec_sha, _snapshot_path, auth, _binding, t0 = \
+        _install_migration(root, provider, tmp_path,
+                           invocation="inv-f-veto")
+    original = A.run_f_stage
+
+    def forced_incomplete(*args, **kwargs):
+        result = original(*args, **kwargs)
+        result["complete_evidence"] = False
+        result.setdefault("verification_problems", []).append(
+            "forced_incomplete")
+        return result
+
+    monkeypatch.setattr(A, "run_f_stage", forced_incomplete)
+    result = A.run_binding_migration_audit(
+        root, provider, mode="synthetic",
+        tolerance=A.build_default_tolerance_contract(),
+        authorization_sha=OLD_MARKER_AUTH, authorization=auth,
+        binding_spec_path=spec_path, invocation_id="inv-f-veto",
+        fixed_root=A.HISTORY_ROOT, r0_started_perf=t0)
+    assert result["conclusion"] == "audit_incomplete"
+    assert result["selected_attempts"] is None
+    row = next(r for r in A.load_index(root)
+               if r["stage"] == "F" and r["attempt"] == "attempt_001")
+    assert row["status"] == "incomplete" and row["complete"] is False
+    assert not A._commit_path(root, 6).exists()
+
+
+def test_scanner_keeps_structural_problems_when_observation_is_valid(tmp_path):
+    root = tmp_path / "cohort"
+    _write_legacy_prefix(root)
+    commits = {}
+    receipts = {}
+    timings = {}
+    for index, stage in enumerate(A.STAGE_BUDGETS):
+        commit = tmp_path / f"scan_{stage}_commit.json"
+        receipt = tmp_path / f"scan_{stage}_receipt.json"
+        t0 = float(index)
+        A.write_json(commit, {
+            "stage": stage, "stage_t0_perf_counter": t0,
+            "committed_measured_wall_s": 2.5})
+        A.write_json(receipt, {"stage": stage})
+        commits[stage] = {"path": str(commit),
+                          "sha256": A.sha256_file(commit)}
+        receipts[stage] = {"path": str(receipt),
+                           "sha256": A.sha256_file(receipt)}
+        timings[stage] = {"t0_perf_counter": t0,
+                          "end_perf_counter": float(index + 1)}
+    A.claim_launch(
+        root, authorization_sha256=OLD_MARKER_AUTH,
+        spec_sha256="b" * 64, legacy_head_sha256="c" * 64,
+        marker_sha256=A.sha256_file(root / "cohort.json"),
+        invocation_id="inv-structure", t0_perf_counter=0.0,
+        target={"stage": "R0", "attempt": "attempt_002",
+                "execution_seq": 3})
+    observation = {
+        "schema": A.RETURN_OBSERVATION_SCHEMA,
+        "scope": "post_execution_observation",
+        "process_returned": True,
+        "invocation_id": "inv-structure",
+        "authorization_sha256": OLD_MARKER_AUTH,
+        "spec_sha256": "b" * 64,
+        "legacy_head_sha256": "c" * 64,
+        "claim_sha256": A.sha256_file(
+            A._launch_invocation_dir(root, "inv-structure") / "claim.json"),
+        "pid": 1, "ppid": 0,
+        "source": {"kind": "outer_wait", "pid": 1, "ppid": 0,
+                   "exit_code": 3, "signal": None},
+        "started_perf_counter": 0.0, "finished_perf_counter": 5.0,
+        "last_stage_end_perf_counter": 4.0, "total_wall_s": 5.0,
+        "commits": commits, "candidate_receipts": receipts,
+        "stage_timings": timings,
+        "write_after": {"R0": True, "P": True, "I": True, "F": True,
+                        "terminal": True},
+        "coverage_ok": True,
+        "expected_exit_code": 3, "conclusion": "audit_incomplete",
+        "post_return_work_performed": False,
+    }
+    A.write_json(
+        A._launch_invocation_dir(root, "inv-structure") /
+        "return_observation.json", observation)
+    journal = A.scan_launch_journals(tmp_path)
+    record = next(r for r in journal["records"]
+                  if r["invocation_id"] == "inv-structure")
+    assert "registered_missing" in record["return_problems"]
+    assert "terminal_candidate_missing" in record["return_problems"]
+    assert journal["known"] is False
+
+
+def test_claim_only_root_is_public_history_debt(tmp_path):
+    root = tmp_path / "cohort"
+    _write_legacy_prefix(root)
+    A.claim_launch(
+        root, authorization_sha256=OLD_MARKER_AUTH,
+        spec_sha256="b" * 64, legacy_head_sha256="c" * 64,
+        marker_sha256=A.sha256_file(root / "cohort.json"),
+        invocation_id="inv-claim-only", t0_perf_counter=A._now(),
+        target={"stage": "R0", "attempt": "attempt_002",
+                "execution_seq": 3})
+    problems = A.verify_history(root)
+    assert any(p.startswith("history_journal:")
+               and "inv-claim-only" in p for p in problems)
+    allowed = A.verify_history(root, allow_invocation="inv-claim-only")
+    assert not any(p.startswith("history_journal:") for p in allowed)
+
+
+def test_acceptance_v2_exposes_the_ordinary_leaf_record():
+    from ireset.eval.w1_real_training_update_provider import (
+        SYNTHETIC_ACCEPTANCE_SCHEMA_V2,
+        acceptance_leaf_record,
+    )
+    leaf = {
+        "schema": A.AUDIT_SCHEMA,
+        "roster": {"parameter_roster": {"n_total": 1}},
+        "tolerance": {"evidence_sha256": "e" * 64},
+        "implementation": {"files": {"x": "y"}},
+    }
+    wrapper = {
+        "schema": SYNTHETIC_ACCEPTANCE_SCHEMA_V2,
+        "ordinary": {"record": leaf},
+        "migration": {"record": {"schema": A.AUDIT_SCHEMA}},
+    }
+    assert acceptance_leaf_record(wrapper) is leaf
+    assert acceptance_leaf_record(leaf) is leaf
+    assert acceptance_leaf_record(None) == {}
+
+
+def test_authorization_draft_reads_external_binding_material(tmp_path):
+    root = tmp_path / "cohort"
+    _write_legacy_prefix(root)
+    snapshot_path, snapshot_sha, snapshot = A.write_history_snapshot(
+        tmp_path / "migration", root)
+    spec = A.build_binding_spec(
+        PROJECT_ROOT, snapshot_path, snapshot_sha, snapshot,
+        invocation_id="inv-external",
+        gate_b={"sha256": "3" * 64}, admission={"sha256": "4" * 64})
+    spec_path = tmp_path / "migration" / "binding_spec.json"
+    A.write_json_exclusive(spec_path, spec)
+    spec_sha = A.sha256_file(spec_path)
+    context, problems = A.load_external_binding_material(
+        snapshot_path, snapshot_sha, spec_path, spec_sha,
+        project_root=PROJECT_ROOT,
+        require_current_implementation=True)
+    assert context is not None and problems == []
+    assert not (root / A.BINDINGS_DIR).exists()
+    marker = A.read_json(root / "cohort.json")
+    marker["tampered_after_snapshot"] = True
+    A.write_json(root / "cohort.json", marker)
+    _context, problems = A.load_external_binding_material(
+        snapshot_path, snapshot_sha, spec_path, spec_sha,
+        project_root=PROJECT_ROOT,
+        require_current_implementation=True)
+    assert "snapshot_file_sha:cohort.json" in problems
 
 
 def test_unsettled_f_reports_null_total_and_known_lower_bound(migrated,

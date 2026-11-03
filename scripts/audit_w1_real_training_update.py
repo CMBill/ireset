@@ -372,20 +372,25 @@ def main() -> int:
 
     if args.migration_authorization_draft:
         from ireset.eval.w1_real_training_update_audit import (
-            MIGRATION_SOURCE_RUN,
             build_migration_authorization_draft,
-            load_binding,
+            load_external_binding_material,
         )
         if args.history_snapshot is None or args.binding_spec is None or \
                 args.migration_admission_package is None:
             raise SystemExit(
                 "--migration-authorization-draft requires --history-snapshot, "
                 "--binding-spec and --migration-admission-package")
-        run_root = Path(args.migration_root or
-                        ROOT / MIGRATION_SOURCE_RUN).expanduser().resolve()
-        binding, problems = load_binding(run_root, require_active=False)
+        snapshot_path = Path(args.history_snapshot).expanduser().resolve()
+        spec_path = Path(args.binding_spec).expanduser().resolve()
+        snapshot_sha = sha256_file(snapshot_path)
+        spec_sha = sha256_file(spec_path)
+        binding, problems = load_external_binding_material(
+            snapshot_path, snapshot_sha, spec_path, spec_sha,
+            project_root=ROOT, require_current_implementation=True)
         if binding is None:
             raise SystemExit(f"migration binding refused: {problems}")
+        if problems:
+            raise SystemExit(f"external binding material refused: {problems}")
         admission_path = Path(
             args.migration_admission_package).expanduser().resolve()
         admission_sha = sha256_file(admission_path)
@@ -397,8 +402,7 @@ def main() -> int:
         gate_sha = sha256_file(gate_path) if gate_path else None
         draft = build_migration_authorization_draft(
             ROOT, binding=binding,
-            snapshot_path=Path(args.history_snapshot).expanduser().resolve(),
-            spec_path=Path(args.binding_spec).expanduser().resolve(),
+            snapshot_path=snapshot_path, spec_path=spec_path,
             migration_admission_path=admission_path,
             migration_admission_sha256=admission_sha,
             real_admission_path=real_path,

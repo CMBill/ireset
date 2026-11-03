@@ -1,6 +1,6 @@
 # W1 训练更新绑定迁移实现与验证记录
 
-日期：2026-11-03。状态：**M0 完成；M1 核心接口完成；M2 部分反例完成；M3–M6 未执行**。本记录只描述本轮实际写入的代码、合成测试和只读迁移材料，不构成真实恢复授权，也不替代 Gate B attempt_013 的既有证据。
+日期：2026-11-03。状态：**M0 完成；M1 核心接口与复审修复完成；M2 迁移合成反例 17 项通过；M3–M6 未执行**。本记录只描述本轮实际写入的代码、合成测试和只读迁移材料，不构成真实恢复授权，也不替代 Gate B attempt_013 的既有证据。
 
 ## 1. 范围与权威边界
 
@@ -104,9 +104,23 @@ commit 已写时不再改写行、finish 或 commit。
 - `build_migration_admission` / `write_migration_admission` / `migration_admission_problems`：只读复核快照、spec、source copies、legacy head、预算/attempt、固定启动日志、实现身份和 Gate B/admission 绑定；
 - CLI 新增 `--migration-snapshot`、`--migration-admission`、`--migration-authorization-draft`；普通 `--resume` 遇到 v2 授权会拒绝，不会自动升级身份。
 
+### 3.5 M1 复审后的修复（6 P1 + 3 P2）
+
+复审在 M1 边界发现并已修复以下问题，均加入迁移合成反例：
+
+1. **快照文件清单消费**：`_snapshot_problems` 现在逐项复核 `snapshot.files` 的 SHA/bytes；仅 `attempts_index.json`、`costs.json` 允许合法追加，其旧行仍按 canonical 行哈希和 reservation 摘要核验。原 marker、旧 NPZ/JSON/reservation 漂移均拒绝。
+2. **提交前只做一次全量准备态核验**：`_migration_stage_seal` 的一次全量核验在成本稳定前完成并计费；`commit_attempt(..., prepared=...)` 只复核冻结的小型 `index_view/ledger_view/status/complete/reservation/identity` 视图，不再重复大工件哈希。成本重封口只允许 `measured_wall_s/sampled_wall_s/seal_tail_reserve_s` 变化。
+3. **写后证明自身计费**：`stage_closed`/`terminal` 及两支 launch 变体在写完 `*_write_after.json` 返回后再次采样；超过已计费上界或阶段预算时追加 `*_write_after_proof_gate` revoke，不再出现“最后一次检查之后又慢写 5 秒仍成功”。
+4. **F 不完整证据硬否决**：迁移 F 封口前检查 `complete_evidence is True` 且 `verification_problems` 为空；否则改写报告、以 `incomplete` 撤回 F，保留已结算调用账并令 `selected_attempts=null`，不写 F commit。
+5. **日志结构错误累积**：`scan_launch_journals` 不再用返回观察覆盖 `registered`/`terminal`/`stage_closed` 的结构错误；有效观察与缺失记录会同时保留在 `return_problems` 和 `known=false` 中。
+6. **返回覆盖由实际时间/成本重算**：返回观察新增 `stage_timings`；公开读取器从各 commit 的 `stage_t0_perf_counter/committed_measured_wall_s` 与 `finished_perf_counter` 重算覆盖，`coverage_ok` 不再是唯一判据。合成把结束时间推到 1,000,000 秒时得到 `return_coverage:F`。
+7. **登记前 claim 进入公共历史**：`verify_history` 在存在固定 `launch_journal` 时即扫描，即使尚无 binding/v2 行；仅当前 `allow_invocation` 获得运行内豁免。只有 claim、缺 registered/terminal/返回观察的根不再返回空 problems。
+8. **真实准入适配 acceptance v2**：新增 `acceptance_leaf_record`，从 `ordinary.record` 读取 roster/tolerance/implementation/runtime，并同时检查 ordinary 与 migration 两个子记录；real admission 不再因 v2 包装得到空 roster 或伪实现漂移。
+9. **授权草案不依赖原根 binding**：新增 `load_external_binding_material`，从外部 snapshot/spec 只读构造上下文；`--migration-authorization-draft` 不再要求原根已发布 intent/spec，授权后再由迁移流程发布原根绑定。
+
 ## 4. M2：本轮已执行的反例
 
-新增 `tests/test_w1_real_training_update_migration.py`，共 **9 passed（27.98s）**：
+新增 `tests/test_w1_real_training_update_migration.py`，共 **17 passed（49.18s）**：
 
 1. 真实原根独立重算的 legacy head 等于 `b499a6ce…`，两条记录为 R0→P，旧累计更新为 2；
 2. 合成迁移根按 seq 3→6 完整执行第二代 R0_002/P_002/I_001/F_001，`complete_evidence=true`，selected chain 更新 16，cohort 更新 18；
@@ -115,12 +129,19 @@ commit 已写时不再改写行、finish 或 commit。
 5. 迁移根未指定代次返回 `generation_ambiguous`；旧 generation_001 行仍存在且只读保留；
 6. 篡改执行序号后不能重推为已知链；
 7. v2 授权拒绝更新额度重置（prior=0、incremental=18、remaining=3240）；
-8. `stage_closed` 和 terminal 候选各有一个受控时钟慢写反例：尾部只预留 1 秒而实际 5 秒时，写后门否决并写入至少 4 秒的未覆盖下界 revoke；另有 return observation 缺来源/覆盖/过程返回事实的拒绝测试。
+8. `stage_closed` 和 terminal 候选各有一个受控时钟慢写反例：尾部只预留 1 秒而实际 5 秒时，写后门否决并写入至少 4 秒的未覆盖下界 revoke；另有 return observation 缺来源/覆盖/过程返回事实的拒绝测试；
+9. 快照消费复验 marker/旧 reservation 摘要，同时允许 index/ledger 合法追加；
+10. commit 复用冻结的小型准备态视图，不再重复全量大工件哈希；
+11. `*_write_after.json` 自身慢写时由最终放行检查否决并 revoke；
+12. F `complete_evidence=false` 或 `verification_problems` 非空时不写 commit，F 行撤回为 incomplete 且 selected 为空；
+13. 有效返回观察不能覆盖缺失 registered/terminal 的结构错误；
+14. 外层结束时间扩到 1,000,000 秒时公开读取器报 `return_coverage:F`；
+15. 只有 claim、尚无 binding 的根被公共历史判为负债，当前 invocation 可有显式运行内豁免；
+16. acceptance v2 的 ordinary leaf 与外部 snapshot/spec 授权草案入口可用，且不要求原根已有 binding。
 
 另运行既有相关回归：
 
-- `tests/test_w1_real_training_update_audit.py` + 新迁移测试：**81 passed（116.10s）**；
-- `tests/test_w1_real_training_update_provider.py`：**45 passed（149.10s）**。
+- `tests/test_w1_real_training_update_audit.py` + `tests/test_w1_real_training_update_provider.py` + 新迁移测试：**134 passed（281.87s）**。
 
 全项目套件未重跑；这些数字不是 380 旧基线的替代。
 
