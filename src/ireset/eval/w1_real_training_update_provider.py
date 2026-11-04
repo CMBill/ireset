@@ -86,10 +86,14 @@ from ireset.eval.w1_real_training_update_audit import (
     environment_facts,
     implementation_identity,
     independent_x_t,
+    migration_synthetic_identity_problems,
     read_json,
+    return_observation_problems,
     row_catalog,
     roster_problems,
     runtime_identity_facts,
+    scan_launch_journals,
+    strict_read_json,
     runtime_identity_problems,
     sha256_file,
     write_json,
@@ -646,7 +650,8 @@ def synthetic_acceptance(
         result: Mapping[str, Any], *, run_root: Path,
         tolerance_contract: Mapping[str, Any],
         calibration_verification_record: Mapping[str, Any] | None,
-        roster: Mapping[str, Any]) -> dict:
+        roster: Mapping[str, Any],
+        publication: Mapping[str, Any] | None = None) -> dict:
     """Persist the Gate B synthetic acceptance consumed by real admission."""
     stages = result.get("stages") or {}
     seals = result.get("seals") or {}
@@ -779,6 +784,7 @@ def synthetic_acceptance(
         },
         "calibration_verification": copy.deepcopy(
             dict(calibration_verification_record or {})),
+        "publication": copy.deepcopy(dict(publication or {})),
         "implementation": implementation_identity(PROJECT_ROOT),
         "environment": environment_facts(),
         "runtime_identity": runtime_identity_facts(),
@@ -912,6 +918,186 @@ def synthetic_acceptance_problems(record: Mapping[str, Any] | None) -> list[str]
 # ---------------------------------------------------------------------------
 
 
+_EXIT_BY_CONCLUSION = {
+    "synthetic_contract_passed": 0,
+    "real_training_update_covered_contract_passed": 0,
+    "real_training_update_mismatch": 2,
+    "audit_incomplete": 3,
+}
+
+
+def _resolve_record_path(value: Any) -> Path | None:
+    if not isinstance(value, str) or not value:
+        return None
+    path = Path(value)
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path.expanduser().resolve()
+
+
+def _receipt_ref_problems(label: str, refs: Any) -> list[str]:
+    problems: list[str] = []
+    if not isinstance(refs, Mapping) or set(refs) != set(STAGES):
+        return [f"publication_{label}_scope"]
+    for stage in STAGES:
+        ref = refs.get(stage)
+        if not isinstance(ref, Mapping):
+            problems.append(f"publication_{label}:{stage}")
+            continue
+        path = _resolve_record_path(ref.get("path"))
+        if path is None or not path.is_file():
+            problems.append(f"publication_{label}_missing:{stage}")
+        elif sha256_file(path) != ref.get("sha256"):
+            problems.append(f"publication_{label}_sha:{stage}")
+    return problems
+
+
+def _ordinary_publication_problems(record: Mapping[str, Any]) -> list[str]:
+    publication = record.get("publication")
+    if not isinstance(publication, Mapping):
+        return ["publication_missing"]
+    problems: list[str] = []
+    if publication.get("kind") != "v1_stage_receipts":
+        problems.append("publication_kind")
+    receipts = publication.get("stage_receipts")
+    if not isinstance(receipts, Mapping) or set(receipts) != set(STAGES):
+        problems.append("publication_receipts_scope")
+    else:
+        stages = record.get("stages") or {}
+        for stage in STAGES:
+            ref = receipts.get(stage)
+            if not isinstance(ref, Mapping):
+                problems.append(f"publication_receipt:{stage}")
+                continue
+            path = _resolve_record_path(ref.get("path"))
+            if path is None or not path.is_file():
+                problems.append(f"publication_receipt_missing:{stage}")
+                continue
+            if sha256_file(path) != ref.get("sha256"):
+                problems.append(f"publication_receipt_sha:{stage}")
+            files = (stages.get(stage) or {}).get("files") or {}
+            entry = files.get(path.name) if isinstance(files, Mapping) else None
+            if not isinstance(entry, Mapping) or \
+                    entry.get("sha256") != ref.get("sha256"):
+                problems.append(f"publication_receipt_manifest:{stage}")
+    outer_ref = publication.get("outer_return")
+    if not isinstance(outer_ref, Mapping):
+        return problems + ["publication_outer_return"]
+    path = _resolve_record_path(outer_ref.get("path"))
+    if path is None or not path.is_file():
+        return problems + ["publication_outer_return_missing"]
+    if sha256_file(path) != outer_ref.get("sha256"):
+        problems.append("publication_outer_return_sha")
+    try:
+        outer = strict_read_json(path)
+    except (OSError, ValueError, TypeError):
+        return problems + ["publication_outer_return_unreadable"]
+    if not isinstance(outer, Mapping):
+        return problems + ["publication_outer_return_object"]
+    if outer.get("schema") != "w1_real_training_update_synthetic_return_v1":
+        problems.append("publication_outer_return_schema")
+    if outer.get("post_return_work_performed") is not False:
+        problems.append("publication_outer_return_work")
+    source = outer.get("source")
+    if not isinstance(source, Mapping) or source.get("kind") not in (
+            "outer_wait", "outer_exec"):
+        problems.append("publication_outer_return_source")
+    else:
+        if type(source.get("pid")) is not int or source["pid"] <= 0:
+            problems.append("publication_outer_return_pid")
+        if type(source.get("ppid")) is not int or source["ppid"] < 0:
+            problems.append("publication_outer_return_ppid")
+        exit_code = source.get("exit_code")
+        expected = _EXIT_BY_CONCLUSION.get(record.get("conclusion"))
+        if type(exit_code) is not int or exit_code != expected:
+            problems.append("publication_outer_return_exit")
+    started = outer.get("started_perf_counter")
+    finished = outer.get("finished_perf_counter")
+    total = outer.get("total_wall_s")
+    if not all(_nonneg(value) for value in (started, finished, total)):
+        problems.append("publication_outer_return_time")
+    elif float(finished) + 1e-9 < float(started) or abs(
+            float(total) - (float(finished) - float(started))) > 1e-9:
+        problems.append("publication_outer_return_time")
+    return problems
+
+
+def _migration_publication_problems(record: Mapping[str, Any]) -> list[str]:
+    publication = record.get("publication")
+    if not isinstance(publication, Mapping):
+        return ["publication_missing"]
+    problems: list[str] = []
+    if publication.get("kind") != "v2_commit_candidates":
+        problems.append("publication_kind")
+    problems += _receipt_ref_problems("commits", publication.get("commits"))
+    problems += _receipt_ref_problems(
+        "candidate_receipts", publication.get("candidate_receipts"))
+    journal = publication.get("launch_journal")
+    if not isinstance(journal, Mapping) or journal.get("known") is not True:
+        problems.append("publication_launch_journal")
+    obs_ref = publication.get("return_observation")
+    if not isinstance(obs_ref, Mapping):
+        return problems + ["publication_return_observation"]
+    path = _resolve_record_path(obs_ref.get("path"))
+    if path is None or not path.is_file():
+        return problems + ["publication_return_observation_missing"]
+    if sha256_file(path) != obs_ref.get("sha256"):
+        problems.append("publication_return_observation_sha")
+    try:
+        observation = strict_read_json(path)
+    except (OSError, ValueError, TypeError):
+        return problems + ["publication_return_observation_unreadable"]
+    if not isinstance(observation, Mapping):
+        return problems + ["publication_return_observation_object"]
+    invocation = observation.get("invocation_id")
+    claim_path = path.parent / "claim.json"
+    claim = None
+    if isinstance(invocation, str) and invocation and claim_path.is_file():
+        try:
+            claim = strict_read_json(claim_path)
+        except (OSError, ValueError, TypeError):
+            claim = None
+        if isinstance(claim, Mapping):
+            claim = {**claim, "_sha256": sha256_file(claim_path)}
+        else:
+            claim = None
+    if claim is None:
+        problems.append("publication_return_claim")
+    else:
+        problems += [f"publication_return:{p}" for p in
+                     return_observation_problems(
+                         observation, invocation_id=invocation, claim=claim)]
+    if observation.get("coverage_ok") is not True:
+        problems.append("publication_return_coverage")
+    source = observation.get("source")
+    expected = _EXIT_BY_CONCLUSION.get(record.get("conclusion"))
+    if not isinstance(source, Mapping) or source.get("kind") not in (
+            "outer_wait", "outer_exec"):
+        problems.append("publication_return_source")
+    elif source.get("exit_code") != expected:
+        problems.append("publication_return_exit")
+    run_root = _resolve_record_path(observation.get("run_root_realpath"))
+    if run_root is not None:
+        scanned = scan_launch_journals(run_root.parent)
+        if scanned.get("known") is not True:
+            problems += [f"publication_journal:{p}" for p in
+                         scanned.get("problems") or []]
+    problems += [f"publication_identity:{p}" for p in
+                 migration_synthetic_identity_problems(
+                     record.get("migration_identity"))]
+    return problems
+
+
+def _acceptance_publication_problems(record: Mapping[str, Any]) -> list[str]:
+    publication = record.get("publication")
+    kind = publication.get("kind") if isinstance(publication, Mapping) else None
+    if kind == "v1_stage_receipts":
+        return _ordinary_publication_problems(record)
+    if kind == "v2_commit_candidates":
+        return _migration_publication_problems(record)
+    return ["publication_kind"]
+
+
 def synthetic_acceptance_v2(
         *, ordinary: Mapping[str, Any], ordinary_path: Path,
         ordinary_sha256: str, migration: Mapping[str, Any],
@@ -939,6 +1125,16 @@ def synthetic_acceptance_v2(
                  synthetic_acceptance_problems(ordinary)]
     problems += [f"migration:{p}" for p in
                  synthetic_acceptance_problems(migration)]
+    problems += [f"ordinary:{p}" for p in
+                 _acceptance_publication_problems(ordinary)]
+    problems += [f"migration:{p}" for p in
+                 _acceptance_publication_problems(migration)]
+    identity = migration.get("migration_identity") or {}
+    for key, value in (("spec_sha256", spec_sha256),
+                       ("snapshot_sha256", snapshot_sha256),
+                       ("legacy_head_sha256", legacy_head_sha256)):
+        if identity.get(key) != value:
+            problems.append(f"migration_identity:{key}")
     for key in ("spec_sha256", "snapshot_sha256", "legacy_head_sha256"):
         value = locals()[key]
         if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}",
@@ -994,8 +1190,14 @@ def synthetic_acceptance_v2_problems(
             problems.append(f"acceptance_v2_{name}_path")
         elif sha256_file(path) != part.get("sha256"):
             problems.append(f"acceptance_v2_{name}_sha")
+        child = part.get("record")
         problems += [f"acceptance_v2_{name}:{p}" for p in
-                     synthetic_acceptance_problems(part.get("record"))]
+                     synthetic_acceptance_problems(child)]
+        if isinstance(child, Mapping):
+            problems += [f"acceptance_v2_{name}:{p}" for p in
+                         _acceptance_publication_problems(child)]
+        else:
+            problems.append(f"acceptance_v2_{name}_record")
     migration = record.get("migration") or {}
     if migration.get("incremental_training_updates") != 16 or \
             migration.get("cohort_training_updates") != 18 or \
@@ -1006,6 +1208,17 @@ def synthetic_acceptance_v2_problems(
         if not isinstance(value, str) or not re.fullmatch(
                 r"[0-9a-f]{64}", value):
             problems.append(f"acceptance_v2_{key}")
+    migration_record = migration.get("record")
+    identity = (migration_record.get("migration_identity")
+                if isinstance(migration_record, Mapping) else None)
+    if not isinstance(identity, Mapping):
+        problems.append("acceptance_v2_migration_identity")
+    else:
+        for key in ("spec_sha256", "snapshot_sha256", "legacy_head_sha256"):
+            if identity.get(key) != migration.get(key):
+                problems.append(f"acceptance_v2_identity:{key}")
+        problems += [f"acceptance_v2_identity:{p}" for p in
+                     migration_synthetic_identity_problems(identity)]
     return problems
 
 

@@ -42,11 +42,13 @@ from ireset.eval.w1_real_training_update_audit import (  # noqa: E402
     authorization_problems,
     build_admission_package,
     build_default_tolerance_contract,
+    build_binding_spec,
     build_migration_admission,
     configure_production_runtime,
     load_authorization,
     load_tolerance_contract,
     run_binding_migration_audit,
+    run_migration_synthetic_gate_b,
     run_registered_audit,
     sha256_file,
     strict_read_json,
@@ -55,10 +57,12 @@ from ireset.eval.w1_real_training_update_audit import (  # noqa: E402
     tolerance_contract_problems,
     write_history_snapshot,
     write_json,
+    write_json_exclusive,
     write_migration_admission,
     write_migration_baseline,
     write_package,
 )
+from ireset.paths import path_for_record  # noqa: E402
 
 _EXIT = {
     "synthetic_contract_passed": 0,
@@ -162,6 +166,14 @@ def main() -> int:
                       help="write the read-only binding migration admission")
     mode.add_argument("--migration-authorization-draft", action="store_true",
                       help="write the non-authorized v2 migration draft")
+    mode.add_argument("--migration-synthetic", action="store_true",
+                      help="run the synthetic second-generation chain and "
+                           "write its migration acceptance")
+    mode.add_argument("--migration-spec", action="store_true",
+                      help="freeze the read-only binding spec outside the root")
+    mode.add_argument("--gate-b-v2", action="store_true",
+                      help="bind the ordinary and migration synthetic "
+                           "acceptances into Gate B v2")
     mode.add_argument("--real", action="store_true",
                       help="registered real audit (authorization + admission)")
     ap.add_argument("--out", type=Path, default=None)
@@ -170,6 +182,8 @@ def main() -> int:
     ap.add_argument("--authorization", type=Path, default=None)
     ap.add_argument("--admission-package", type=Path, default=None)
     ap.add_argument("--synthetic-acceptance", type=Path, default=None)
+    ap.add_argument("--ordinary-acceptance", type=Path, default=None)
+    ap.add_argument("--migration-acceptance", type=Path, default=None)
     ap.add_argument("--calibration-verification", type=Path, default=None)
     ap.add_argument("--migration-root", type=Path, default=None,
                     help="original v1 cohort run root (never written)")
@@ -424,6 +438,151 @@ def main() -> int:
               f"{draft['template_only']}")
         return 0
 
+    if args.migration_synthetic:
+        if args.out is None:
+            raise SystemExit("--migration-synthetic requires --out")
+        if args.tolerance_contract is None:
+            raise SystemExit(
+                "--migration-synthetic requires --tolerance-contract")
+        contract, sha, problems = load_tolerance_contract(
+            args.tolerance_contract, recompute=False)
+        if problems:
+            raise SystemExit(f"tolerance contract refused: {problems}")
+        if not isinstance(sha, str) or \
+                contract.get("mode") != "synthetic_calibrated":
+            raise SystemExit("calibrated tolerance contract required")
+        contract_path = Path(args.tolerance_contract).expanduser().resolve()
+        verification = _load_calibration_verification(
+            _calibration_verification_path(args, contract_path))
+        if verification is None:
+            raise SystemExit(
+                "--migration-synthetic requires calibration_verification.json")
+        device = args.device
+        if device == "auto":
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        out = _guard(args.out)
+        result = run_migration_synthetic_gate_b(
+            out, tolerance=contract,
+            calibration_verification_record=verification, seed=args.seed,
+            device=device)
+        acceptance = result.get("migration_acceptance") or {}
+        print(f"[update-audit] migration synthetic conclusion="
+              f"{result.get('conclusion')}")
+        print(f"[update-audit] selected_attempts={result.get('selected_attempts')}")
+        print(f"[update-audit] cohort_training_updates="
+              f"{result.get('cohort_training_updates')}")
+        print(f"[update-audit] migration acceptance="
+              f"{acceptance.get('path')}")
+        print(f"[update-audit] sha256={acceptance.get('sha256')}")
+        print(f"[update-audit] passed={acceptance.get('passed')} "
+              f"problems={len(acceptance.get('problems') or [])}")
+        for problem in (acceptance.get("problems") or [])[:30]:
+            print(f"[update-audit]   {problem}")
+        return 0 if acceptance.get("passed") else 2
+
+    if args.migration_spec:
+        if args.out is None or args.history_snapshot is None or \
+                args.gate_b is None or args.admission_package is None:
+            raise SystemExit(
+                "--migration-spec requires --out, --history-snapshot, "
+                "--gate-b and --admission-package")
+        snapshot_path = Path(args.history_snapshot).expanduser().resolve()
+        gate_path = Path(args.gate_b).expanduser().resolve()
+        admission_path = Path(args.admission_package).expanduser().resolve()
+        for label, path in (("history snapshot", snapshot_path),
+                            ("Gate B", gate_path),
+                            ("real admission", admission_path)):
+            if not path.is_file():
+                raise SystemExit(f"{label} missing: {path}")
+        snapshot = strict_read_json(snapshot_path)
+        snapshot_sha = sha256_file(snapshot_path)
+        gate_sha = sha256_file(gate_path)
+        admission_sha = sha256_file(admission_path)
+        gate_b = {"path": path_for_record(gate_path), "sha256": gate_sha,
+                  "acceptance_sha256": gate_sha}
+        if args.tolerance_contract is not None:
+            contract, contract_sha, problems = load_tolerance_contract(
+                args.tolerance_contract, recompute=False)
+            if problems:
+                raise SystemExit(f"tolerance contract refused: {problems}")
+            contract_path = Path(
+                args.tolerance_contract).expanduser().resolve()
+            gate_b.update(
+                tolerance_contract_sha256=contract_sha,
+                tolerance_evidence_sha256=contract.get("evidence_sha256"),
+                fp32_contract_sha256=contract.get("fp32_contract_sha256"))
+            verification_path = _calibration_verification_path(
+                args, contract_path)
+            if verification_path is not None and verification_path.is_file():
+                gate_b["calibration_verification_sha256"] = sha256_file(
+                    verification_path)
+        spec = build_binding_spec(
+            ROOT, snapshot_path, snapshot_sha, snapshot,
+            invocation_id=args.invocation_id, gate_b=gate_b,
+            admission={"path": path_for_record(admission_path),
+                       "sha256": admission_sha})
+        out = _guard(args.out)
+        out.mkdir(parents=True, exist_ok=True)
+        path = out / "binding_spec.json"
+        if path.exists():
+            raise SystemExit(f"binding spec already exists: {path}")
+        sha = write_json_exclusive(path, spec)
+        print(f"[update-audit] binding spec={path}")
+        print(f"[update-audit] sha256={sha}")
+        print(f"[update-audit] legacy_head_sha256="
+              f"{spec.get('legacy_head_sha256')}")
+        return 0
+
+    if args.gate_b_v2:
+        if args.out is None or args.ordinary_acceptance is None or \
+                args.migration_acceptance is None:
+            raise SystemExit(
+                "--gate-b-v2 requires --out, --ordinary-acceptance and "
+                "--migration-acceptance")
+        from ireset.eval.w1_real_training_update_provider import (
+            synthetic_acceptance_v2,
+            synthetic_acceptance_v2_problems,
+        )
+        ordinary_path = Path(args.ordinary_acceptance).expanduser().resolve()
+        migration_path = Path(args.migration_acceptance).expanduser().resolve()
+        for label, path in (("ordinary acceptance", ordinary_path),
+                            ("migration acceptance", migration_path)):
+            if not path.is_file():
+                raise SystemExit(f"{label} missing: {path}")
+        ordinary = strict_read_json(ordinary_path)
+        migration = strict_read_json(migration_path)
+        identity = migration.get("migration_identity") or {}
+        for key in ("spec_sha256", "snapshot_sha256", "legacy_head_sha256"):
+            value = identity.get(key)
+            if not isinstance(value, str):
+                raise SystemExit(f"migration identity missing {key}")
+        record = synthetic_acceptance_v2(
+            ordinary=ordinary, ordinary_path=ordinary_path,
+            ordinary_sha256=sha256_file(ordinary_path),
+            migration=migration, migration_path=migration_path,
+            migration_sha256=sha256_file(migration_path),
+            spec_sha256=identity["spec_sha256"],
+            snapshot_sha256=identity["snapshot_sha256"],
+            legacy_head_sha256=identity["legacy_head_sha256"])
+        problems = synthetic_acceptance_v2_problems(record)
+        if problems:
+            record["passed"] = False
+            record["problems"] = list(record.get("problems") or []) + problems
+        out = _guard(args.out)
+        out.mkdir(parents=True, exist_ok=True)
+        path = out / "synthetic_acceptance.json"
+        if path.exists():
+            raise SystemExit(f"Gate B v2 already exists: {path}")
+        sha = write_json_exclusive(path, record)
+        print(f"[update-audit] Gate B v2={path}")
+        print(f"[update-audit] sha256={sha}")
+        print(f"[update-audit] passed={record['passed']} "
+              f"problems={len(record['problems'])}")
+        for problem in record["problems"][:30]:
+            print(f"[update-audit]   {problem}")
+        return 0 if record["passed"] else 2
+
     if args.real:
         if args.authorization is None:
             raise SystemExit(
@@ -544,7 +703,8 @@ def main() -> int:
     verification = _load_calibration_verification(verification_path)
     result = synthetic_self_test(
         out, seed=args.seed, device=device, tolerance=tolerance,
-        calibration_verification_record=verification)
+        calibration_verification_record=verification,
+        outer_started_perf=_ENTRY_STARTED_PERF)
     _print_result(result)
     return _EXIT.get(result.get("conclusion", "audit_incomplete"), 3)
 

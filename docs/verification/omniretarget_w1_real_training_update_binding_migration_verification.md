@@ -1,6 +1,6 @@
 # W1 训练更新绑定迁移实现与验证记录
 
-日期：2026-11-03。状态：**M0 完成；M1 核心接口与复审修复完成；M2 迁移合成反例 17 项通过；M3–M6 未执行**。本记录只描述本轮实际写入的代码、合成测试和只读迁移材料，不构成真实恢复授权，也不替代 Gate B attempt_013 的既有证据。
+日期：2026-11-04。状态：**M0–M5 完成；M3 实现清单已按最终字节冻结，M4 新校准与普通/迁移双合成接受已通过，M5 只读迁移准入与 v2 授权草案已生成；M6 未授权、未执行**。本记录只描述实际写入的代码、合成测试和只读迁移材料，不构成真实恢复授权。当前 Gate B 权威已从 attempt_013 更新为 `calibration/attempt_015` + `synthetic/attempt_015` + `binding_migration_synthetic/attempt_002` + `binding_migration_gate_b/attempt_002` + `admission_real/attempt_015`。
 
 ## 1. 范围与权威边界
 
@@ -165,11 +165,101 @@ commit 已写时不再改写行、finish 或 commit。
 
 全项目套件未重跑；这些数字不是 380 旧基线的替代。
 
-## 5. 仍未完成 / 下一步
+## 5. M3–M5 完成状态
 
-- M3：把本方案、新测试和最终源码纳入完整实现清单，重新冻结 Gate B；
-- M4：重算校准、普通合成接受和迁移合成接受，确认普通链 16 次与迁移链累计 18 次，并逐项解释 P/I/F 数组/rows 与 attempt_013 的差异；
-- M5：用最终字节生成新的 real metadata admission、迁移 snapshot/spec/migration admission 和严格 v2 授权草案；任何未结清 claim/failure/revoke 都必须使准入失败；
-- M6：只能在 M0–M5 完成、复审无阻断并取得绑定最终字节的新明确授权后，执行一次真实 R0_002→P_002→I_001→F_001；不得把本轮实现或旧授权解释为 M6 授权。
+- M3 已完成：`IMPLEMENTATION_FILES` 为 **28 项**（原 26 项 + 本方案 + 迁移测试），`EXECUTION_PLAN` 指向本方案，`PREREG_DRAFT` 保持 v0.9；最终字节回归见 §6.1。
+- M4 已完成：新校准、普通合成链和迁移合成链均通过；Gate B v2 同时绑定两者；P/I/F 数组与 rows 相对 attempt_013 **12/12 逐字节相同**（两条链各自）。
+- M5 已完成：新 real metadata admission、history snapshot、binding spec、migration admission 和 v2 授权草案均生成并通过只读复核；原真实根仍 10 文件 / 466,350,106 bytes，无 launch journal、无新注册/授权/数值更新。
+- M6：未取得绑定最终字节的新明确授权，未执行真实 R0_002→P_002→I_001→F_001；旧一次授权与本轮材料均不得解释为 M6 授权。
+
+### 5.1 被取代的本轮中间尝试
+
+为避免混淆：`calibration/attempt_014`、`synthetic/attempt_014`、`binding_migration_synthetic/attempt_001`、`binding_migration_gate_b/attempt_001`、`admission_real/attempt_014` 是在发现 `--migration-spec` 返回值解包错误之前按当时字节生成的中间尝试，全部保留但**不是最终 Gate B 权威**；最终字节使用 attempt_015/attempt_002 系列。M5 的 `admission_real/attempt_015`、`binding_migration_spec/attempt_002`、`binding_migration_admission/attempt_001`、`binding_migration_authorization/attempt_001` 在文档树定稿前生成，因草案 `implementation_sha256` 含 git 工作区状态，最终重新生成为 attempt_016/attempt_003/attempt_002/attempt_002。旧 attempt_013、attempt_014、attempt_015 与更早历史均未删除、未改写。
 
 `objective_coverage=partial`、`full_objective_contract_passed=null`、`factor_selected=false`、`auto_execute=false`、`final_interaction_method=not_ready`、`production_integration=false` 及旧 U0/UR/原 F/r6/旋转融合结论全部保持。
+
+## 6. M3–M5 最终执行事实（2026-11-04）
+
+### 6.1 M3：实现清单与最终字节回归
+
+- `IMPLEMENTATION_FILES`：原 26 项保留，新增 `docs/plans/omniretarget_w1_real_training_update_binding_migration_plan.md` 与 `tests/test_w1_real_training_update_migration.py`，共 28 项。
+- `EXECUTION_PLAN` 改为本方案；`PREREG_DRAFT` 仍为预注册 v0.9（SHA `e2ba8ef9…`）。
+- 最终字节定向测试：`test_w1_real_training_update_audit.py` + provider + migration **141 passed（359.87s）**。
+- 最终字节 M3 回归集（provider + audit + 六个 v0.12 相关文件）**380 passed（469.08s）**；全项目套件未重跑。
+- 中间尝试（attempt_014/001 系列）测试为 **141 passed（357.48s）**、**380 passed（469.83s）**，保留但不再作为权威。
+
+### 6.2 M4：校准与双合成链
+
+校准 `derived/audit/w1_real_training_update_audit/calibration/attempt_015/`：
+
+| 材料 | SHA-256 |
+| --- | --- |
+| tolerance contract | `634f2d0ff56c6c1c979639d5ec83d4a156c421e6c49909f3c3683e3b474d4cbc` |
+| calibration evidence | `b848cbb4e54553dd19daf69a471076ddfc3bd2c6030c55608413d746d0c096b2` |
+| fp32 contract canonical | `574d9a0a2115e3619aa260f3eef4ef83c8ff85e377e2f23eebc078434a0d441e` |
+| `calibration_verification.json` | `4cef73aa755a0597d907b76bb451d320ec8023f1b3ec993b96181a50d8d7be73`（canonical `ba4044ad…`） |
+| `adamw_fp32_contract.json` | `2c4ddba84d43a2264eca94b603b400af8be764de97352e3cf933e569822c44b2` |
+
+`recompute_problems=0`、`four_x_ok=true`；`tolerances`、`rules`、`tiny_zero_floors` 与 attempt_013 逐项相同，差异仅 `created_wall` 与实现身份相关字段。
+
+普通合成链 `synthetic/attempt_015/`：
+
+| 项目 | 结果 |
+| --- | --- |
+| 结论 | `audit_incomplete` / exit 3；`complete_evidence=true`、`failures=0`、**582 gap**（392 precision + 190 sensitivity + 0 bound） |
+| 选中链 | R0/P/I/F 均 `attempt_001`；selected chain updates 16；training_updates 16 |
+| 阶段文件数 | R0 3 / P 5 / I 5 / F 12 |
+| 成本（秒） | R0 1.181511805 / P 18.241404025 / I 72.379080199 / F 166.204949871 = **258.006945900** |
+| `audit_result.json` | `31dee169eb14bab9c8c201f47e9c0ed6a6f68e24ec17b848c250777a10e67925` |
+| final | `96bc097dce224f84ac7d9ce68bbed43f4a63146bdfbf169631d20cf863487d84` |
+| registration | `60edc8b109b6b00648ac9a0f6b1ebd3da816a64125a73050a0ac92ccbf357403` |
+| acceptance | `9eb4ce4ccf69007f4fc2a470a80ae44ff1f7eed3e0bd063256829eaeafaa9857`（passed/problems 空，`run_sha256=ca2f5bd2…`） |
+| 外层返回 | `synthetic_return.json` `24c814c50c1aee8a1114f07fd76f576eb22893902d2239d12565fdfc189ad4f5` |
+| 工件 | 7,404,802,655 bytes |
+
+迁移合成链 `binding_migration_synthetic/attempt_002/`：
+
+| 项目 | 结果 |
+| --- | --- |
+| 结论 | `audit_incomplete` / exit 3；`complete_evidence=true`、`failures=0`、**582 gap**（与普通链相同分类） |
+| 选中链 | R0/P `attempt_002`、I/F `attempt_001`；selected chain updates 16；cohort updates **18**（旧 2 + 新 16） |
+| 阶段文件数 | R0 4（含合成 noise）/ P 5 / I 5 / F 12 |
+| 新阶段成本（秒） | R0 1.411957657 / P 18.419276195 / I 71.977563807 / F 105.407851266 = **197.216648925**；含旧 67.102733224 的 cohort 累计 264.319382149 |
+| migration acceptance | `65ced169c8abe46637a395ce5988a827934bc316a0f3060a6108cf193acd06da`（passed/problems 空，`run_sha256=ad32fd51…`） |
+| migration result | `ecee70205288fb725610af8b199b69ce28b3c62cafcf01070389824dec2c901f` |
+| synthetic spec / snapshot | `e1ac7d7c…` / `43888f4f…`；synthetic legacy head `97a75062…`（与真实头 `b499a6ce…` 不同，属预期） |
+| return observation | `177fca06441a4f6a0c3c55aa01f06ac451776c04b17ad36f47ed402a1303a62e`；journal `known=true`、0 problems |
+| 工件 | 7,404,765,832 bytes |
+
+Gate B v2 `binding_migration_gate_b/attempt_002/synthetic_acceptance.json` SHA **`e937c27adf1cf6cddba69f123b781ef19290a25e9bb83d4bbcc07414daf38c66`**，`passed=true/problems=[]`。消费端 `synthetic_acceptance_v2_problems` 重算通过，校验两侧 child acceptance、阶段报告/数组摘要、候选收据、commit、外层 return observation（含 claim/覆盖/exit）、launch journal 与独立重算的 legacy head。
+
+P/I/F 对比（`binding_migration_gate_b/attempt_002/gate_b_comparison.json` SHA `0ff9f07d134652e0f2c14ab49cce894078c3bb82dffcd352ba3a0c2f8919eb27`，`passed=true`）：
+
+- 普通 attempt_015 与 attempt_013：**12/12 文件字节完全相同**（8 个 NPZ + 4 份 rows）。
+- 迁移 attempt_002 与 attempt_013：**12/12 文件字节完全相同**（P 位于 `production/attempt_002`）。
+- 两链均为 582 gap、0 failure、`audit_incomplete`；未因迁移放宽任何数值门。
+
+### 6.3 M5：只读迁移准入与 v2 授权草案
+
+M5 材料在**最终文档树**上重新生成；精确文件 SHA 与逐项绑定值统一记录在 `binding_migration_authorization/attempt_002/m5_verification.json`，避免把易受文档树 git 身份影响的摘要写死后再次漂移。下表的路径与结果在生成时核验：
+
+| 材料 | 结果 |
+| --- | --- |
+| real metadata admission `admission_real/attempt_016/attempt_001/admission_package.json` | passed/problems 空，`metadata_only`，`authorized=false/registered=false/run=not_run`；SHA 见复核 JSON |
+| history snapshot `binding_migration/attempt_003/history_snapshot.json` | legacy head `b499a6ce…`；cost 67.10273322396097s；1 个未封口旧文件；SHA 见复核 JSON |
+| protected manifest v2 `binding_migration/attempt_003/protected_manifest.json` | 94 entries；drift 0；SHA 见复核 JSON |
+| binding spec `binding_migration_spec/attempt_003/binding_spec.json` | 绑定 snapshot/Gate B/real admission/28 文件实现/runtime；SHA 见复核 JSON |
+| migration admission `binding_migration_admission/attempt_002/migration_admission.json` | passed/problems 空；SHA 见复核 JSON |
+| v2 授权草案 `binding_migration_authorization/attempt_002/authorization_draft.json` | `authorized=false/template_only=true`，10 项 checklist 均 null，`authorization_problems` 为预期 11 项（`not_authorized` + 10 项 checklist）；SHA 见复核 JSON |
+| M5 独立复核 `binding_migration_authorization/attempt_002/m5_verification.json` | passed/problems 空；`implementation_sha256` 与当前最终文档树逐位一致 |
+
+M5 复核事实：
+
+- 草案绑定 snapshot/spec/migration admission/legacy head/Gate B/real admission/plan/prereg/implementation/runtime，`prior_updates=2`、`incremental_update_limit=16`、`cohort_update_limit_for_this_authorization=18`、`prior_cost_s=67.10273322396097`、`remaining_s=3172.897266776039`、`invocation_id=w1-migration-20261104-001`。
+- 原真实根仍 **10 文件 / 466,350,106 bytes**，文件集合与 snapshot 完全一致；无 `launch_journal`、无新 attempt/registration/authorization；`scan_launch_journals(HISTORY_ROOT)` 为 known、0 records；`verify_history` 无问题。
+- 草案不含未来 R0/commit/return observation 的 SHA；真实 admission / migration admission / snapshot / spec 均为只读，未加载 checkpoint payload、NPZ 数值、模型、MuJoCo 或执行 forward/VJP/optimizer/cohort 注册。
+- 当前实现树为**未提交工作区**（文件字节已绑定）；M6 授权前若提交或改写任何实现/方案文件，必须重新生成 spec/authorization draft 并重新核验，不能沿用当前 `implementation_sha256`。
+
+### 6.4 边界
+
+本轮未读取真实 checkpoint payload、父 NPZ 数值、数据 cache 或真实资产编译；未构造真实模型/优化器；未执行真实 forward/backward/FK/AdamW；未创建真实授权、真实 R0_002/P_002/I_001/F_001 或真实 reservation。M4 的 16 次普通合成更新与 18 次迁移合成累计更新均为合成证据，不增加真实额度。M6 仍需绑定最终字节的新明确授权；旧一次授权、M3–M5 实现或本轮草案均不得解释为 M6 授权。`partial/null/false/not_ready/不接入` 与旧质量结论保持。

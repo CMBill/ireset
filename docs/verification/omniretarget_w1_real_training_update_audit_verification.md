@@ -1,9 +1,9 @@
 # W1 真实网络参数梯度与优化更新链路审计 —— I/C 验证与真实执行记录
 
-日期：2026-11-03。冻结方案：[预注册 v0.9](/home/c112/codes/bill/ireset/docs/plans/omniretarget_w1_real_training_update_audit_prereg_draft.md)、[执行计划 v0.11](/home/c112/codes/bill/ireset/docs/plans/omniretarget_w1_real_training_update_provider_execution_plan.md)及[alpha 修正补充计划 v0.12](/home/c112/codes/bill/ireset/docs/plans/omniretarget_w1_real_training_update_alpha_fix_plan.md)。
-状态：**alpha 有效常数修复完成，Gate B 已重冻结为 attempt_013；v0.13 绑定迁移与有限恢复方案修订2补齐1 P1写后计费问题、尚未实施，修订1的2 P1+2 P2方案修复保留。首次真实结果仍为 R0 完成、P incomplete、I/F 未启动、实际更新 2 次，未真实续跑，新实现未获真实恢复授权。**
+日期：2026-11-04。冻结方案：[预注册 v0.9](/home/c112/codes/bill/ireset/docs/plans/omniretarget_w1_real_training_update_audit_prereg_draft.md)、[执行计划 v0.11](/home/c112/codes/bill/ireset/docs/plans/omniretarget_w1_real_training_update_provider_execution_plan.md)及[alpha 修正补充计划 v0.12](/home/c112/codes/bill/ireset/docs/plans/omniretarget_w1_real_training_update_alpha_fix_plan.md)。
+状态：**绑定迁移 M0–M5 已完成，Gate B 已按最终字节更新为 `calibration/attempt_015` + `synthetic/attempt_015` + `binding_migration_synthetic/attempt_002` + `binding_migration_gate_b/attempt_002` + `admission_real/attempt_015`；M6 未授权、未执行。首次真实结果仍为 R0 完成、P incomplete、I/F 未启动、实际更新 2 次。**
 
-当前 Gate B 权威见 §12 / attempt_013，迁移初稿/修订1历史见 §13/13.1、当前方案修订见 §13.2；真实执行事实见 §11 与[首次执行报告](/home/c112/codes/bill/ireset/docs/verification/omniretarget_w1_real_training_update_audit_report.md)。§1–10.11 保留原 I/C、合成、准入及未授权时点的历史记录；其中“真实未读/未运行”仅适用于各节原记录时点。旧方案与 attempt_012 工件保留原字节。
+当前 Gate B 权威见 §12（历史 attempt_013）与 §13.4（绑定迁移最终字节 attempt_015/attempt_002）；迁移初稿/修订1历史见 §13/13.1、当前方案修订见 §13.2、M0/M1 见 §13.3；真实执行事实见 §11 与[首次执行报告](/home/c112/codes/bill/ireset/docs/verification/omniretarget_w1_real_training_update_audit_report.md)。§1–10.11 保留原 I/C、合成、准入及未授权时点的历史记录；其中“真实未读/未运行”仅适用于各节原记录时点。旧方案与 attempt_012 工件保留原字节。
 
 ## 1. 交付文件
 
@@ -1021,3 +1021,12 @@ v0.13列出原始摘要锚点、单向身份依赖、schema与事件提交、未
 M1 已实现：规范 JSON/重复键拒绝、legacy head 与 source copy 校验、执行序号/前驱头重推、generation 显式选链、准备态内部核验、一次性 finish/commit、提交后禁改写、固定 launch journal 扫描、stage_closed/terminal 写后实际耗时门、外层 return observation、v2 授权/迁移准入/草案 CLI。普通 resume 遇到 v2 授权明确拒绝，不会自动升级旧身份。
 
 本轮新增 9 项迁移合成反例（含 seq/legacy head/缺返回观察/慢写 revoke/授权额度重置）；`test_w1_real_training_update_audit.py`+迁移测试 **81 passed（116.10s）**、provider **45 passed（149.10s）**。全项目套件未重跑。M3 新 Gate B、M4 校准/普通+迁移双合成接受、M5 最终迁移准入与新授权草案、M6 真实 R0_002→P_002→I_001→F_001 仍未执行；本轮不创建真实授权/注册/返回观察，不改变原 2 次更新/67.10273322396097 秒与 3172.897266776039 秒剩余。`objective_coverage=partial`、`full_objective_contract_passed=null`、`factor_selected=false`、`auto_execute=false`、`final_interaction_method=not_ready`、`production_integration=false` 及旧质量结论保持。
+
+### 13.4 绑定迁移 M3–M5 完成与最终字节 Gate B（2026-11-04，未真实续跑）
+
+按[绑定迁移方案 v0.13 修订2](/home/c112/codes/bill/ireset/docs/plans/omniretarget_w1_real_training_update_binding_migration_plan.md)完成 M3–M5，详细事实见[绑定迁移实现验证记录 §6](omniretarget_w1_real_training_update_binding_migration_verification.md)。
+
+- **M3**：`IMPLEMENTATION_FILES` 28 项（原 26 + 本方案 + 迁移测试），`EXECUTION_PLAN` 指向本方案，`PREREG_DRAFT` 保持 v0.9。最终字节定向测试 **141 passed（359.87s）**、M3 回归集 **380 passed（469.08s）**；全项目套件未重跑。
+- **M4**：校准 `calibration/attempt_015` 通过（contract `634f2d0f…`、evidence `b848cbb4…`、fp32 `574d9a0a…`、verification `4cef73aa…`，`recompute_problems=0/four_x_ok=true`，阈值/规则/零底与 attempt_013 逐项相同）。普通合成 `synthetic/attempt_015` 为 `audit_incomplete`/16 updates/**582 gap**，acceptance `9eb4ce4c…` passed。迁移合成 `binding_migration_synthetic/attempt_002` 为旧失败前缀 + 新链 **cohort 18**（selected 16），acceptance `65ced169…` passed。Gate B v2 `binding_migration_gate_b/attempt_002/synthetic_acceptance.json` SHA **`e937c27adf1cf6cddba69f123b781ef19290a25e9bb83d4bbcc07414daf38c66`**，passed/problems 空；消费端重算通过，绑定两侧 child acceptance、候选收据、commit、外层 return observation 与独立重算 legacy head。两条链的 P/I/F **各 12/12 文件与 attempt_013 逐字节相同**（8 NPZ + 4 rows），未放宽数值门。
+- **M5**：在最终文档树上重新生成只读材料——real metadata admission `admission_real/attempt_016/attempt_001/admission_package.json`（passed/metadata_only）、history snapshot `binding_migration/attempt_003/history_snapshot.json`（legacy head `b499a6ce…`、cost 67.10273322396097s、1 个未封口旧文件）、protected manifest v2（94 entries、drift 0）、binding spec `binding_migration_spec/attempt_003/binding_spec.json`、migration admission `binding_migration_admission/attempt_002/migration_admission.json`（passed）、v2 授权草案 `binding_migration_authorization/attempt_002/authorization_draft.json`（`authorized=false/template_only=true`、10 项 checklist 均 null）与独立复核 `m5_verification.json`（passed/problems 空）。精确 SHA 与绑定值见复核 JSON，不再写入文档以免 git 工作区身份再次漂移。原真实根仍 **10 文件 / 466,350,106 bytes**，无 launch journal、无新注册/授权/数值更新；`scan_launch_journals` known/0 records，`verify_history` 无问题。
+- **边界**：未读取真实 checkpoint payload/父 NPZ 数值/资产编译，未构造真实模型/优化器，未执行真实 forward/backward/FK/AdamW，未创建真实授权/cohort/注册或真实 R0_002→P_002→I_001→F_001。旧 attempt_013/012 与首次真实记录保留原字节；`calibration/attempt_014` 等中间尝试保留但被最终字节 attempt_015/attempt_002 取代。M6 仍需绑定最终字节的新明确授权；`partial/null/false/not_ready/不接入` 与旧质量结论保持。
