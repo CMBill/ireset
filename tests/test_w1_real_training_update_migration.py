@@ -237,6 +237,17 @@ def test_sequence_starts_after_the_frozen_prefix_and_matches_plan(migrated):
         assert row["execution_seq"] == seq
         assert row["predecessor_kind"] == (
             "legacy_head" if seq == 3 else "attempt_commit")
+    root = migrated["root"]
+    r0_commit = A.strict_read_json(
+        root / "execution_events/000003/commit.json")
+    activation_path = (root / A.BINDINGS_DIR / A.GENERATION_002 /
+                       "activation.json")
+    activation = A.strict_read_json(activation_path)
+    assert r0_commit["activation"] == {
+        "path": A.path_for_record(activation_path),
+        "sha256": A.sha256_file(activation_path)}
+    assert activation["r0"]["reservation_sha256"] == \
+        r0_commit["reservation_sha256"]
 
 
 def test_public_selection_requires_the_outer_return_observation(migrated):
@@ -800,7 +811,7 @@ def _write_valid_journal(root: Path, invocation: str = "inv-valid") -> Path:
         event_dir = root / "execution_events" / f"{seq:06d}"
         event_dir.mkdir(parents=True, exist_ok=True)
         commit_path = event_dir / "commit.json"
-        A.write_json(commit_path, {
+        commit_payload = {
             "schema": A.EVENT_SCHEMA, "kind": "commit",
             "execution_seq": seq, "stage": stage,
             "attempt": A.MIGRATION_STAGE_PLAN[index]["attempt"],
@@ -808,7 +819,30 @@ def _write_valid_journal(root: Path, invocation: str = "inv-valid") -> Path:
             "binding_spec_sha256": claim["spec_sha256"],
             "invocation_id": invocation,
             "stage_t0_perf_counter": float(index),
-            "committed_measured_wall_s": 2.5})
+            "committed_measured_wall_s": 2.5}
+        if stage == "F":
+            # The terminal proof must bind the commit's frozen cost and the
+            # F stage's registered remaining budget, not its own claims.
+            ledger_row = {
+                "stage": stage,
+                "attempt": A.MIGRATION_STAGE_PLAN[index]["attempt"],
+                "budget": {"remaining_s": 100.0}}
+            finish_path = event_dir / "finish.json"
+            A.write_json(finish_path, {
+                "schema": A.EVENT_SCHEMA, "kind": "finish",
+                "execution_seq": seq, "stage": stage,
+                "attempt": A.MIGRATION_STAGE_PLAN[index]["attempt"],
+                "generation": A.GENERATION_002,
+                "binding_spec_sha256": claim["spec_sha256"],
+                "invocation_id": invocation,
+                "committed_measured_wall_s": 2.5,
+                "ledger_row_snapshot": ledger_row})
+            commit_payload["finish"] = {
+                "path": str(finish_path),
+                "sha256": A.sha256_file(finish_path)}
+            commit_payload["ledger_row_sha256"] = A.canonical_sha256(
+                ledger_row)
+        A.write_json(commit_path, commit_payload)
         commits[stage] = {"path": str(commit_path),
                           "sha256": A.sha256_file(commit_path)}
         receipt_path = directory / f"stage_closed_{seq:06d}.json"
@@ -1032,3 +1066,182 @@ def test_commit_view_allows_cost_reseal_and_checks_wall_projection(
     refreshed = A._refresh_prepared_view(
         root, stage, attempt, prepared, execution)
     assert "commit_prepared_cost_decreased" in refreshed.problems
+
+
+class _MutableClock:
+    def __init__(self, now: float) -> None:
+        self.now = float(now)
+
+    def advance(self, seconds: float) -> None:
+        self.now += float(seconds)
+
+    def perf_counter(self) -> float:
+        return self.now
+
+    def time(self) -> float:
+        return self.now
+
+    def time_ns(self) -> int:
+        return int(self.now * 1e9)
+
+    def strftime(self, fmt: str) -> str:
+        return "2026-11-04T00:00:00+0800"
+
+
+def test_activation_delay_is_charged_to_r0_not_p(tmp_path, monkeypatch,
+                                                migrated):
+    """Binding publication belongs to R0; a slow activation cannot borrow P."""
+    base = tmp_path / "activation_budget"
+    root = base / "cohort"
+    _write_legacy_prefix(root)
+    provider = migrated["provider"]
+    clock = _MutableClock(1_000.0)
+    monkeypatch.setattr(A, "time", clock)
+    spec_path, _spec_sha, _snapshot_path, auth, _binding, t0 = \
+        _install_migration(root, provider, base)
+    real_activate = A.activate_binding
+
+    def delayed_activate(*args, **kwargs):
+        clock.advance(200.0)
+        return real_activate(*args, **kwargs)
+
+    monkeypatch.setattr(A, "activate_binding", delayed_activate)
+    result = A.run_binding_migration_audit(
+        root, provider, mode="synthetic",
+        tolerance=A.build_default_tolerance_contract(),
+        authorization_sha=OLD_MARKER_AUTH, authorization=auth,
+        binding_spec_path=spec_path, invocation_id="inv-migration-001",
+        fixed_root=A.HISTORY_ROOT, r0_started_perf=t0)
+    assert result["complete_evidence"] is False
+    assert result["selected_attempts"] is None
+    assert any("budget_exceeded" in problem
+               for problem in result["problems"]), result["problems"]
+    # P must never start: its own large budget cannot absorb R0 activation.
+    assert not (A.stage_dir(root, "P") / "attempt_002").exists()
+    rows = {(row["stage"], row["attempt"]): row
+            for row in A.load_index(root)}
+    r0 = rows[("R0", "attempt_002")]
+    assert r0["status"] == "incomplete"
+    assert r0["complete"] is False
+    assert float(r0["measured_wall_s"]) > 181.40009476602427
+
+
+def test_terminal_write_after_binds_commit_cost_and_registered_budget(
+        tmp_path):
+    root = tmp_path / "cohort"
+    directory = _write_valid_journal(root)
+    proofs = (directory / "terminal_write_after.json",
+              root / "execution_events/000006/terminal_write_after.json")
+    saved = {path: path.read_bytes() for path in proofs}
+    try:
+        # Consistent self-declared bounds that differ from the F commit cost
+        # and the registered budget must not close the journal.
+        for path in proofs:
+            proof = A.strict_read_json(path)
+            proof["observed_elapsed_s"] = 19.8921
+            proof["committed_measured_wall_s"] = 24.8921
+            A.write_json(path, proof)
+        journal = A.scan_launch_journals(tmp_path)
+        assert journal["known"] is False
+        record = next(record for record in journal["records"]
+                      if record["invocation_id"] == directory.name)
+        assert {"terminal_write_after_committed",
+                "terminal_event_write_after_committed"} <= set(
+                    record["return_problems"])
+
+        for path in proofs:
+            path.write_bytes(saved[path])
+            proof = A.strict_read_json(path)
+            proof["remaining_s"] = 1234.0
+            A.write_json(path, proof)
+        journal = A.scan_launch_journals(tmp_path)
+        assert journal["known"] is False
+        record = next(record for record in journal["records"]
+                      if record["invocation_id"] == directory.name)
+        assert {"terminal_write_after_remaining",
+                "terminal_event_write_after_remaining"} <= set(
+                    record["return_problems"])
+    finally:
+        for path, data in saved.items():
+            path.write_bytes(data)
+    assert A.scan_launch_journals(tmp_path)["known"] is True
+
+
+def test_non_object_terminal_json_is_unknown_not_crash(migrated):
+    root = migrated["root"]
+    invocation = "inv-migration-001"
+    directory = A._launch_invocation_dir(root, invocation)
+    candidate_path = directory / "terminal_candidate.json"
+    launch_proof = directory / "terminal_write_after.json"
+    event_candidate = root / "execution_events/000006/terminal_candidate.json"
+    event_proof = root / "execution_events/000006/terminal_write_after.json"
+    commit_path = root / "execution_events/000006/commit.json"
+    paths = (candidate_path, launch_proof, event_candidate, event_proof,
+             commit_path)
+    saved = {path: path.read_bytes() for path in paths}
+    if not (directory / "return_observation.json").is_file():
+        result = migrated["result"]
+        _path, _sha, problems = A.record_return_observation(
+            root, invocation_id=invocation, pid=os.getpid(),
+            ppid=os.getppid(), exit_code=3, signal=None,
+            started_perf_counter=migrated["t0"],
+            finished_perf_counter=A._now(),
+            last_stage_end_perf_counter=result[
+                "last_stage_end_perf_counter"],
+            commits=result["commits"],
+            candidate_receipts=result["candidates"],
+            write_after=result["write_after"],
+            stage_timings=result["stage_timings"],
+            coverage_ok=result["complete_evidence"])
+        assert problems == []
+    assert A.scan_launch_journals(root.parent)["known"] is True
+
+    def scan_record():
+        journal = A.scan_launch_journals(root.parent)
+        assert journal["known"] is False
+        return next(record for record in journal["records"]
+                    if record["invocation_id"] == invocation)
+
+    try:
+        A.write_json(candidate_path, [])
+        assert "terminal_candidate_not_object" in \
+            scan_record()["return_problems"]
+        problems = A.verify_history(root)
+        assert any("history_journal" in problem for problem in problems)
+        row, problems = A.stage_state(
+            root, "F", generation=A.GENERATION_002)
+        assert row is None and problems
+
+        candidate_path.write_bytes(saved[candidate_path])
+        A.write_json(launch_proof, None)
+        assert "terminal_write_after_not_object" in \
+            scan_record()["return_problems"]
+
+        launch_proof.write_bytes(saved[launch_proof])
+        A.write_json(event_candidate, [])
+        # Rebind the launch-side reference so the event object itself is
+        # parsed; otherwise only the stale digest would be reported.
+        launch = A.strict_read_json(candidate_path)
+        launch["event_candidate"]["sha256"] = A.sha256_file(event_candidate)
+        A.write_json(candidate_path, launch)
+        assert "terminal_event_candidate_not_object" in \
+            scan_record()["return_problems"]
+
+        candidate_path.write_bytes(saved[candidate_path])
+        event_candidate.write_bytes(saved[event_candidate])
+        A.write_json(event_proof, [])
+        assert "terminal_event_write_after_not_object" in \
+            scan_record()["return_problems"]
+
+        event_proof.write_bytes(saved[event_proof])
+        A.write_json(commit_path, [])
+        problems = A.verify_history(root)
+        assert any("commit_not_object" in problem or
+                   "history_journal" in problem for problem in problems)
+        row, problems = A.stage_state(
+            root, "F", generation=A.GENERATION_002)
+        assert row is None and problems
+    finally:
+        for path, data in saved.items():
+            path.write_bytes(data)
+    assert A.scan_launch_journals(root.parent)["known"] is True

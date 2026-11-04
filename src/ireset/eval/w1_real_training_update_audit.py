@@ -5477,6 +5477,8 @@ def load_binding(root: Path, *, generation: str = GENERATION_002,
         spec = strict_read_json(spec_path)
     except (OSError, ValueError, TypeError) as exc:
         return None, [f"binding_unreadable:{type(exc).__name__}"]
+    if not isinstance(intent, Mapping) or not isinstance(spec, Mapping):
+        return None, ["binding_not_object"]
     if intent.get("schema") != BINDING_INTENT_SCHEMA:
         problems.append("binding_intent_schema")
     if intent.get("generation") != generation:
@@ -5526,7 +5528,7 @@ def load_binding(root: Path, *, generation: str = GENERATION_002,
                 activation, root=root, spec_sha256=spec_sha,
                 snapshot_sha256=snapshot_sha,
                 legacy_head_sha256=snapshot_data.get("legacy_head_sha256"),
-                generation=generation)
+                generation=generation, activation_sha256=activation_sha)
     elif require_active:
         problems.append("binding_activation_missing")
     if problems:
@@ -5600,7 +5602,11 @@ def load_external_binding_material(
 def _activation_problems(activation: Mapping[str, Any], *, root: Path,
                          spec_sha256: str, snapshot_sha256: str,
                          legacy_head_sha256: str | None,
-                         generation: str) -> list[str]:
+                         generation: str,
+                         activation_sha256: str | None = None
+                         ) -> list[str]:
+    if not isinstance(activation, Mapping):
+        return ["activation_not_object"]
     problems: list[str] = []
     if activation.get("schema") != BINDING_ACTIVATION_SCHEMA:
         problems.append("activation_schema")
@@ -5618,23 +5624,44 @@ def _activation_problems(activation: Mapping[str, Any], *, root: Path,
             problems.append("activation_run_root")
     except OSError:
         problems.append("activation_run_root")
-    commit = activation.get("commit") or {}
-    if not isinstance(commit, Mapping):
-        problems.append("activation_commit")
-        return problems
-    path = _reference_path(commit.get("path"))
-    if path is None or not path.is_file():
-        problems.append("activation_commit_missing")
-    elif sha256_file(path) != commit.get("sha256"):
-        problems.append("activation_commit_sha")
+    if not isinstance(activation.get("invocation_id"), str) or not \
+            activation.get("invocation_id"):
+        problems.append("activation_invocation")
     r0 = activation.get("r0") or {}
-    for key in ("registration_sha256", "admission_sha256",
-                "noise_schedule_sha256", "reservation_sha256"):
-        if not isinstance(r0.get(key), str) or not re.fullmatch(
-                r"[0-9a-f]{64}", r0[key]):
-            problems.append(f"activation_r0:{key}")
+    if not isinstance(r0, Mapping):
+        problems.append("activation_r0")
+    else:
+        for key in ("registration_sha256", "admission_sha256",
+                    "noise_schedule_sha256", "reservation_sha256"):
+            if not isinstance(r0.get(key), str) or not re.fullmatch(
+                    r"[0-9a-f]{64}", r0[key]):
+                problems.append(f"activation_r0:{key}")
     if activation.get("effective") is not True:
         problems.append("activation_not_effective")
+    # The activation only becomes effective through the R0 commit that binds
+    # it.  A pending activation without that commit must not load as active.
+    commit_path = _commit_path(root, 3)
+    if not commit_path.is_file():
+        problems.append("activation_commit_missing")
+    else:
+        try:
+            commit = strict_read_json(commit_path)
+        except (OSError, ValueError, TypeError):
+            problems.append("activation_commit_unreadable")
+        else:
+            reference = (commit.get("activation")
+                         if isinstance(commit, Mapping) else None)
+            if not isinstance(reference, Mapping):
+                problems.append("activation_commit")
+            else:
+                path = _reference_path(reference.get("path"))
+                want_sha = reference.get("sha256")
+                if path is None or not path.is_file() or \
+                        (activation_sha256 is not None
+                         and want_sha != activation_sha256) or \
+                        (activation_sha256 is None
+                         and sha256_file(path) != want_sha):
+                    problems.append("activation_commit")
     return problems
 
 
@@ -5664,9 +5691,16 @@ def stage_binding(root: Path, *, spec_path: Path, spec_sha256: str,
     return target
 
 
-def activate_binding(root: Path, *, generation: str, commit_path: Path,
-                     commit_sha256: str, r0: Mapping[str, Any],
+def activate_binding(root: Path, *, generation: str,
+                     r0: Mapping[str, Any],
                      invocation_id: str) -> Path:
+    """Publish the pending activation; the R0 commit binds it.
+
+    The activation deliberately does not reference the commit that will bind
+    it (that would be a self-hash cycle).  It is written before the R0 seal so
+    its publication time is billed to the R0 stage, and only becomes
+    effective once the R0 commit references this file.
+    """
     directory = _binding_dir(root, generation)
     intent = strict_read_json(directory / "intent.json")
     spec_path = directory / "binding_spec.json"
@@ -5682,8 +5716,6 @@ def activate_binding(root: Path, *, generation: str, commit_path: Path,
                 "history_snapshot") or {}).get("path"))).get(
                     "legacy_head_sha256")),
         "invocation_id": invocation_id,
-        "commit": {"path": path_for_record(Path(commit_path)),
-                   "sha256": commit_sha256},
         "r0": {k: r0[k] for k in ("registration_sha256",
                                    "admission_sha256",
                                    "noise_schedule_sha256",
@@ -5752,6 +5784,9 @@ def _return_timing_coverage_problems(
             commit = strict_read_json(path)
         except (OSError, ValueError, TypeError):
             problems.append(f"return_stage_commit:{stage}")
+            continue
+        if not isinstance(commit, Mapping):
+            problems.append(f"return_stage_commit_object:{stage}")
             continue
         cost = commit.get("committed_measured_wall_s")
         commit_t0 = commit.get("stage_t0_perf_counter")
@@ -5829,8 +5864,9 @@ def _claim_problems(claim: Mapping[str, Any], *, invocation_id: str,
             problems.append(f"claim_hash:{key}")
     if not _nonneg(claim.get("t0_perf_counter")):
         problems.append("claim_t0")
-    target = claim.get("target") or {}
-    if target.get("stage") != "R0" or \
+    target = claim.get("target")
+    if not isinstance(target, Mapping) or \
+            target.get("stage") != "R0" or \
             target.get("attempt") != "attempt_002" or \
             target.get("execution_seq") != 3:
         problems.append("claim_target")
@@ -5944,14 +5980,25 @@ _TERMINAL_STAGES = tuple(
 
 
 def _terminal_write_after_problems(path: Path, *, expected_sha: Any,
-                                   label: str) -> list[str]:
-    """A terminal candidate is only closed by its own sampled write proof."""
+                                   label: str,
+                                   expected_committed: float | None = None,
+                                   expected_remaining: float | None = None
+                                   ) -> list[str]:
+    """A terminal candidate is only closed by its own sampled write proof.
+
+    ``committed_measured_wall_s`` and ``remaining_s`` are declarations inside
+    the proof.  When the referenced commit and registered budget are
+    available, those authoritative bounds replace the self-declared values
+    and a proof whose fields disagree is rejected.
+    """
     if not path.is_file():
         return [f"{label}_write_after_missing"]
     try:
         proof = strict_read_json(path)
     except (OSError, ValueError, TypeError):
         return [f"{label}_write_after_unreadable"]
+    if not isinstance(proof, Mapping):
+        return [f"{label}_write_after_not_object"]
     problems: list[str] = []
     if proof.get("schema") != EVENT_SCHEMA or \
             proof.get("kind") != "terminal_write_after" or \
@@ -5965,10 +6012,76 @@ def _terminal_write_after_problems(path: Path, *, expected_sha: Any,
     remaining = proof.get("remaining_s")
     if not (_nonneg(observed) and _nonneg(committed) and _nonneg(remaining)):
         problems.append(f"{label}_write_after_facts")
-    elif float(observed) > float(committed) or \
-            float(observed) >= float(remaining):
+        return problems
+    if expected_committed is not None and \
+            float(committed) != float(expected_committed):
+        problems.append(f"{label}_write_after_committed")
+    if expected_remaining is not None and \
+            float(remaining) != float(expected_remaining):
+        problems.append(f"{label}_write_after_remaining")
+    gate_committed = (float(expected_committed)
+                      if expected_committed is not None
+                      else float(committed))
+    gate_remaining = (float(expected_remaining)
+                      if expected_remaining is not None
+                      else float(remaining))
+    if float(observed) > gate_committed or float(observed) >= gate_remaining:
         problems.append(f"{label}_write_after_gate")
     return problems
+
+
+def _terminal_commit_bounds(commit: Mapping[str, Any]) -> tuple[
+        float | None, float | None, list[str]]:
+    """Authoritative F bounds: frozen commit cost and registered budget."""
+    problems: list[str] = []
+    committed = commit.get("committed_measured_wall_s")
+    if not _nonneg(committed):
+        problems.append("terminal_candidate_commit_cost")
+        expected_committed = None
+    else:
+        expected_committed = float(committed)
+    finish_ref = commit.get("finish")
+    if not isinstance(finish_ref, Mapping):
+        return expected_committed, None, problems + [
+            "terminal_candidate_finish"]
+    finish_path = _reference_path(finish_ref.get("path"))
+    if finish_path is None or \
+            _file_sha(finish_path) != finish_ref.get("sha256"):
+        return expected_committed, None, problems + [
+            "terminal_candidate_finish"]
+    try:
+        finish = strict_read_json(finish_path)
+    except (OSError, ValueError, TypeError):
+        return expected_committed, None, problems + [
+            "terminal_candidate_finish_unreadable"]
+    if not isinstance(finish, Mapping):
+        return expected_committed, None, problems + [
+            "terminal_candidate_finish_not_object"]
+    if finish.get("schema") != EVENT_SCHEMA or \
+            finish.get("kind") != "finish" or \
+            finish.get("execution_seq") != _TERMINAL_EXECUTION_SEQ or \
+            finish.get("stage") not in _TERMINAL_STAGES or \
+            finish.get("invocation_id") != commit.get("invocation_id") or \
+            finish.get("binding_spec_sha256") != commit.get(
+                "binding_spec_sha256"):
+        problems.append("terminal_candidate_finish_binding")
+    finish_committed = finish.get("committed_measured_wall_s")
+    if expected_committed is None or not _nonneg(finish_committed) or \
+            float(finish_committed) != expected_committed:
+        problems.append("terminal_candidate_finish_cost")
+    ledger_row = finish.get("ledger_row_snapshot")
+    if not isinstance(ledger_row, Mapping) or \
+            canonical_sha256(ledger_row) != \
+            commit.get("ledger_row_sha256"):
+        problems.append("terminal_candidate_finish_ledger")
+        return expected_committed, None, problems
+    budget = ledger_row.get("budget")
+    remaining = (budget.get("remaining_s")
+                 if isinstance(budget, Mapping) else None)
+    if not _nonneg(remaining):
+        problems.append("terminal_candidate_budget")
+        return expected_committed, None, problems
+    return expected_committed, float(remaining), problems
 
 
 def _terminal_closure_problems(directory: Path, *,
@@ -5979,7 +6092,8 @@ def _terminal_closure_problems(directory: Path, *,
     points at the event-directory terminal candidate; each side writes its own
     sampled ``terminal_write_after`` proof.  Existence alone is not closure:
     the candidates, their commit/event references and both proofs must agree
-    with the claim and with the expected F execution sequence.
+    with the claim, with the expected F execution sequence, with the commit's
+    frozen cost and with the F stage's registered budget.
     """
     candidate_path = directory / "terminal_candidate.json"
     if not candidate_path.is_file():
@@ -5989,6 +6103,8 @@ def _terminal_closure_problems(directory: Path, *,
         candidate_sha = sha256_file(candidate_path)
     except (OSError, ValueError, TypeError):
         return ["terminal_candidate_unreadable"]
+    if not isinstance(candidate, Mapping):
+        return ["terminal_candidate_not_object"]
     problems: list[str] = []
     if candidate.get("schema") != EVENT_SCHEMA or \
             candidate.get("kind") != "terminal_candidate" or \
@@ -5996,6 +6112,8 @@ def _terminal_closure_problems(directory: Path, *,
         problems.append("terminal_candidate_binding")
     if candidate.get("invocation_id") != directory.name:
         problems.append("terminal_candidate_invocation")
+    expected_committed = None
+    expected_remaining = None
     commit_ref = candidate.get("commit")
     commit_path = None
     if not isinstance(commit_ref, Mapping):
@@ -6011,16 +6129,22 @@ def _terminal_closure_problems(directory: Path, *,
             except (OSError, ValueError, TypeError):
                 problems.append("terminal_candidate_commit_unreadable")
             else:
-                if commit.get("schema") != EVENT_SCHEMA or \
-                        commit.get("kind") != "commit" or \
-                        commit.get("execution_seq") != \
-                        _TERMINAL_EXECUTION_SEQ or \
-                        commit.get("stage") not in _TERMINAL_STAGES or \
-                        commit.get("invocation_id") != directory.name:
-                    problems.append("terminal_candidate_commit_binding")
-                if commit.get("binding_spec_sha256") != \
-                        claim.get("spec_sha256"):
-                    problems.append("terminal_candidate_commit_spec")
+                if not isinstance(commit, Mapping):
+                    problems.append("terminal_candidate_commit_not_object")
+                else:
+                    if commit.get("schema") != EVENT_SCHEMA or \
+                            commit.get("kind") != "commit" or \
+                            commit.get("execution_seq") != \
+                            _TERMINAL_EXECUTION_SEQ or \
+                            commit.get("stage") not in _TERMINAL_STAGES or \
+                            commit.get("invocation_id") != directory.name:
+                        problems.append("terminal_candidate_commit_binding")
+                    if commit.get("binding_spec_sha256") != \
+                            claim.get("spec_sha256"):
+                        problems.append("terminal_candidate_commit_spec")
+                    expected_committed, expected_remaining, bounds = \
+                        _terminal_commit_bounds(commit)
+                    problems += bounds
             if commit_path is not None and \
                     commit_path.parent.name != f"{_TERMINAL_EXECUTION_SEQ:06d}":
                 problems.append("terminal_candidate_commit_seq")
@@ -6038,27 +6162,44 @@ def _terminal_closure_problems(directory: Path, *,
             except (OSError, ValueError, TypeError):
                 problems.append("terminal_event_candidate_unreadable")
             else:
-                if event.get("schema") != EVENT_SCHEMA or \
-                        event.get("kind") != "terminal_candidate" or \
-                        event.get("execution_seq") != \
-                        _TERMINAL_EXECUTION_SEQ or \
-                        event.get("invocation_id") != directory.name or \
-                        event.get("binding_spec_sha256") != \
-                        claim.get("spec_sha256"):
-                    problems.append("terminal_event_candidate_binding")
-                if isinstance(commit_ref, Mapping) and (
-                        (event.get("commit") or {}).get("path") !=
-                        commit_ref.get("path") or
-                        (event.get("commit") or {}).get("sha256") !=
-                        commit_ref.get("sha256")):
-                    problems.append("terminal_event_candidate_commit")
-            problems += _terminal_write_after_problems(
-                event_path.parent / "terminal_write_after.json",
-                expected_sha=event_ref.get("sha256"),
-                label="terminal_event")
+                if not isinstance(event, Mapping):
+                    problems.append("terminal_event_candidate_not_object")
+                else:
+                    if event.get("schema") != EVENT_SCHEMA or \
+                            event.get("kind") != "terminal_candidate" or \
+                            event.get("execution_seq") != \
+                            _TERMINAL_EXECUTION_SEQ or \
+                            event.get("invocation_id") != directory.name or \
+                            event.get("binding_spec_sha256") != \
+                            claim.get("spec_sha256"):
+                        problems.append("terminal_event_candidate_binding")
+                    event_commit = event.get("commit")
+                    if not isinstance(event_commit, Mapping):
+                        problems.append("terminal_event_candidate_commit")
+                    elif isinstance(commit_ref, Mapping) and (
+                            event_commit.get("path") !=
+                            commit_ref.get("path") or
+                            event_commit.get("sha256") !=
+                            commit_ref.get("sha256")):
+                        problems.append("terminal_event_candidate_commit")
+                    if expected_committed is not None:
+                        event_committed = event.get(
+                            "committed_measured_wall_s")
+                        if not _nonneg(event_committed) or \
+                                float(event_committed) != expected_committed:
+                            problems.append(
+                                "terminal_event_candidate_committed")
+                problems += _terminal_write_after_problems(
+                    event_path.parent / "terminal_write_after.json",
+                    expected_sha=event_ref.get("sha256"),
+                    label="terminal_event",
+                    expected_committed=expected_committed,
+                    expected_remaining=expected_remaining)
     problems += _terminal_write_after_problems(
         directory / "terminal_write_after.json",
-        expected_sha=candidate_sha, label="terminal")
+        expected_sha=candidate_sha, label="terminal",
+        expected_committed=expected_committed,
+        expected_remaining=expected_remaining)
     return problems
 
 
@@ -6110,6 +6251,10 @@ def scan_launch_journals(fixed_root: Path, *,
                 problems.append(f"launch_claim_unreadable:{sibling.name}:"
                                 f"{directory.name}:{type(exc).__name__}")
                 continue
+            if not isinstance(claim, Mapping):
+                problems.append(f"launch_claim_not_object:{sibling.name}:"
+                                f"{directory.name}")
+                continue
             claim["_sha256"] = sha256_file(claim_path)
             found = _claim_problems(claim, invocation_id=directory.name,
                                     root=sibling)
@@ -6140,7 +6285,9 @@ def scan_launch_journals(fixed_root: Path, *,
                     except (OSError, ValueError, TypeError):
                         return_problems.append("registered_unreadable")
                     else:
-                        if (registered.get("schema") != EVENT_SCHEMA or
+                        if not isinstance(registered, Mapping):
+                            return_problems.append("registered_not_object")
+                        elif (registered.get("schema") != EVENT_SCHEMA or
                                 registered.get("kind") != "registered" or
                                 registered.get("invocation_id") !=
                                 directory.name or
@@ -6148,11 +6295,19 @@ def scan_launch_journals(fixed_root: Path, *,
                                 registered.get("stage") != "R0" or
                                 registered.get("attempt") != "attempt_002"):
                             return_problems.append("registered_binding")
-                        start = registered.get("start") or {}
-                        start_path = _reference_path(start.get("path"))
-                        if start_path is None or not start_path.is_file() or \
-                                sha256_file(start_path) != start.get("sha256"):
-                            return_problems.append("registered_start")
+                        else:
+                            start = registered.get("start")
+                            if not isinstance(start, Mapping):
+                                return_problems.append("registered_start")
+                            else:
+                                start_path = _reference_path(
+                                    start.get("path"))
+                                if start_path is None or \
+                                        not start_path.is_file() or \
+                                        sha256_file(start_path) != \
+                                        start.get("sha256"):
+                                    return_problems.append(
+                                        "registered_start")
                 return_problems += _terminal_closure_problems(
                     directory, claim=claim)
                 for candidate_path in sorted(
@@ -6166,15 +6321,21 @@ def scan_launch_journals(fixed_root: Path, *,
                         return_problems.append(
                             f"stage_closed_unreadable:{candidate_path.name}")
                         continue
+                    if not isinstance(candidate, Mapping):
+                        return_problems.append(
+                            f"stage_closed_not_object:{candidate_path.name}")
+                        continue
                     if candidate.get("schema") != EVENT_SCHEMA or \
                             candidate.get("kind") != "stage_closed_candidate" or \
                             candidate.get("invocation_id") != directory.name or \
                             candidate.get("execution_seq") != seq:
                         return_problems.append(
                             f"stage_closed_binding:{seq}")
-                    commit = candidate.get("commit") or {}
-                    commit_path = _reference_path(commit.get("path"))
-                    if commit_path is None or not commit_path.is_file() or \
+                    commit = candidate.get("commit")
+                    commit_path = (_reference_path(commit.get("path"))
+                                   if isinstance(commit, Mapping) else None)
+                    if not isinstance(commit, Mapping) or \
+                            commit_path is None or not commit_path.is_file() or \
                             sha256_file(commit_path) != commit.get("sha256"):
                         return_problems.append(
                             f"stage_closed_commit:{seq}")
@@ -6190,7 +6351,11 @@ def scan_launch_journals(fixed_root: Path, *,
                             return_problems.append(
                                 f"stage_closed_write_after_unreadable:{seq}")
                         else:
-                            if after.get("passed") is not True or \
+                            if not isinstance(after, Mapping):
+                                return_problems.append(
+                                    f"stage_closed_write_after_not_object:"
+                                    f"{seq}")
+                            elif after.get("passed") is not True or \
                                     after.get("candidate_sha256") != \
                                     sha256_file(candidate_path):
                                 return_problems.append(
@@ -6586,6 +6751,8 @@ def _commit_problems(root: Path, execution_seq: int, *,
     except (OSError, ValueError, TypeError) as exc:
         return None, [f"commit_unreadable:{execution_seq}:"
                       f"{type(exc).__name__}"]
+    if not isinstance(commit, Mapping):
+        return None, [f"commit_not_object:{execution_seq}"]
     problems: list[str] = []
     if commit.get("schema") != EVENT_SCHEMA or \
             commit.get("kind") != "commit":
@@ -6629,6 +6796,46 @@ def _commit_problems(root: Path, execution_seq: int, *,
     if execution_seq == 3:
         if commit.get("predecessor_kind") != "legacy_head":
             problems.append("commit_predecessor_kind:3")
+        activation_ref = commit.get("activation")
+        if not isinstance(activation_ref, Mapping):
+            problems.append("commit_activation:3")
+        else:
+            activation_path = _reference_path(activation_ref.get("path"))
+            if activation_path is None or not activation_path.is_file() or \
+                    sha256_file(activation_path) != activation_ref.get("sha256"):
+                problems.append("commit_activation:3")
+            else:
+                if binding is not None and \
+                        binding.activation_sha256 is not None and \
+                        activation_ref.get("sha256") != \
+                        binding.activation_sha256:
+                    problems.append("commit_activation_sha:3")
+                try:
+                    activation = strict_read_json(activation_path)
+                except (OSError, ValueError, TypeError):
+                    problems.append("commit_activation_unreadable:3")
+                else:
+                    if not isinstance(activation, Mapping):
+                        problems.append("commit_activation_not_object:3")
+                    else:
+                        for key, want in (
+                                ("schema", BINDING_ACTIVATION_SCHEMA),
+                                ("generation", commit.get("generation")),
+                                ("spec_sha256",
+                                 commit.get("binding_spec_sha256")),
+                                ("legacy_head_sha256",
+                                 commit.get("legacy_head_sha256")),
+                                ("invocation_id",
+                                 commit.get("invocation_id")),
+                                ("effective", True)):
+                            if activation.get(key) != want:
+                                problems.append(
+                                    f"commit_activation_binding:{key}")
+                        r0 = activation.get("r0")
+                        if not isinstance(r0, Mapping) or \
+                                r0.get("reservation_sha256") != \
+                                commit.get("reservation_sha256"):
+                            problems.append("commit_activation_r0:3")
     else:
         if commit.get("predecessor_kind") != "attempt_commit":
             problems.append(f"commit_predecessor_kind:{execution_seq}")
@@ -6674,6 +6881,8 @@ def _start_event_problems(root: Path, execution_seq: int,
     except (OSError, ValueError, TypeError) as exc:
         return [f"start_event_unreadable:{execution_seq}:"
                 f"{type(exc).__name__}"]
+    if not isinstance(event, Mapping):
+        return [f"start_event_not_object:{execution_seq}"]
     problems: list[str] = []
     if event.get("schema") != EVENT_SCHEMA or event.get("kind") != "start":
         problems.append(f"start_event_schema:{execution_seq}")
@@ -7941,7 +8150,9 @@ def commit_attempt(root: Path, stage: str, attempt: str, *, t0: float,
                    execution: Mapping[str, Any] | None = None,
                    cost_floor: float | None = None,
                    candidate_problems: Sequence[str] = (),
-                   prepared: PreparedResult | None = None) -> CommitResult:
+                   prepared: PreparedResult | None = None,
+                   activation: tuple[Path, str] | None = None,
+                   ) -> CommitResult:
     """Write the single finish/commit pair after internal verification."""
     execution = dict(execution or {})
     seq = execution.get("execution_seq")
@@ -7953,6 +8164,8 @@ def commit_attempt(root: Path, stage: str, attempt: str, *, t0: float,
     if plan is None or plan["stage"] != stage or plan["attempt"] != attempt:
         return CommitResult(False, None, None, None, None,
                             problems + ["commit_plan"])
+    if plan["stage"] == "R0" and activation is None:
+        problems.append("commit_activation_missing")
     if prepared is None:
         prepared = _verify_prepared_attempt(
             root, stage, attempt,
@@ -7999,6 +8212,10 @@ def commit_attempt(root: Path, stage: str, attempt: str, *, t0: float,
         "committed_measured_wall_s": committed_wall,
         "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
+    if activation is not None:
+        activation_path, activation_sha = activation
+        finish["activation"] = {"path": path_for_record(activation_path),
+                                "sha256": activation_sha}
     try:
         finish_sha = write_json_exclusive(finish_path, finish)
     except (OSError, ValueError, TypeError) as exc:
@@ -8029,6 +8246,10 @@ def commit_attempt(root: Path, stage: str, attempt: str, *, t0: float,
         "committed_measured_wall_s": committed_wall,
         "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
+    if activation is not None:
+        activation_path, activation_sha = activation
+        commit["activation"] = {"path": path_for_record(activation_path),
+                                "sha256": activation_sha}
     try:
         commit_sha = write_json_exclusive(commit_path, commit)
     except (OSError, ValueError, TypeError) as exc:
@@ -8788,7 +9009,9 @@ def _v2_public_row_problems(root: Path, stage: str, attempt: str,
     if not isinstance(candidate, Mapping):
         problems.append("stage_closed_missing")
     elif commit is not None:
-        if (candidate.get("commit") or {}).get("sha256") != \
+        candidate_commit = candidate.get("commit")
+        if not isinstance(candidate_commit, Mapping) or \
+                candidate_commit.get("sha256") != \
                 sha256_file(_commit_path(root, seq)):
             problems.append("stage_closed_commit")
         if candidate.get("stage") != stage or \
@@ -12451,7 +12674,8 @@ def _migration_stage_seal(
         scope: Mapping[str, Any], numeric_passed: bool | None = None,
         final: bool = False, actual_cost: float | None = None,
         extra_row: Mapping[str, Any] | None = None,
-        extra: Mapping[str, Any] | None = None
+        extra: Mapping[str, Any] | None = None,
+        activation: tuple[Path, str] | None = None
         ) -> tuple[SealResult, CommitResult, Path | None, str | None,
                    list[str]]:
     """finish -> internal prepared verification -> stable cost -> commit."""
@@ -12496,6 +12720,9 @@ def _migration_stage_seal(
             verification_wall=0.0)
         problems += list(cost_problems or [])
     if not seal.sealed or seal.row.get("complete") is not True:
+        if not problems:
+            reason = str(seal.row.get("incomplete_reason") or "incomplete")
+            problems = [f"{stage.lower()}_seal:{reason}"]
         return seal, CommitResult(False, None, None, None, None,
                                   problems or list(seal.problems)), None, None, \
             problems
@@ -12503,7 +12730,8 @@ def _migration_stage_seal(
         root, stage, attempt, t0=t0, budget=budget, binding=binding,
         execution=execution, cost_floor=float(
             seal.row.get("measured_wall_s", 0.0) or 0.0),
-        candidate_problems=[], prepared=prepared)
+        candidate_problems=[], prepared=prepared,
+        activation=activation)
     problems += commit.problems
     if not commit.committed:
         return seal, commit, None, None, problems
@@ -12786,18 +13014,43 @@ def run_binding_migration_audit(
                                    _stage_delta(counter, base_counts))
                 results[stage] = r0
                 r0_dir = stage_dir(run_root, stage) / attempt
+                registration_sha = r0["registration_sha256"]
+                noise_path = (Path(r0["noise_schedule"])
+                              if r0.get("noise_schedule") else None)
+                noise_sha = r0.get("noise_schedule_sha256")
+                if mode == "synthetic" and noise_path is None:
+                    # Synthetic migration exercises the same binding identity;
+                    # the real noise file is not part of the analytic fixture.
+                    noise_path = r0_dir / "noise_schedule.npz"
+                    np.savez(noise_path, synthetic_fixture=np.array([1], np.int8))
+                    noise_sha = sha256_file(noise_path)
                 artifacts = [r0_dir / "registration.json",
                              r0_dir / "admission.json",
                              r0_dir / "call_reservations.json"]
                 if mode == "real":
                     artifacts.append(r0_dir / "noise_schedule.npz")
+                reservation_sha = sha256_file(
+                    r0_dir / "call_reservations.json")
+                # Binding publication is R0 work: the activation is written
+                # before the R0 seal so its cost is charged to the R0 budget,
+                # and the commit that follows binds the activation bytes.
+                activation_path = activate_binding(
+                    run_root, generation=binding.generation,
+                    r0={"registration_sha256": registration_sha,
+                        "admission_sha256": sha256_file(
+                            r0_dir / "admission.json"),
+                        "noise_schedule_sha256": noise_sha,
+                        "reservation_sha256": reservation_sha},
+                    invocation_id=invocation_id)
                 seal, commit, closed, closed_sha, problems = \
                     _migration_stage_seal(
                         run_root, stage, attempt, stage_t0, budget, binding,
                         execution, {"complete": bool(r0["passed"])},
                         complete=bool(r0["passed"]),
                         report=Path(r0["admission"]), artifacts=artifacts,
-                        counter=counter, scope=scope)
+                        counter=counter, scope=scope,
+                        activation=(activation_path,
+                                    sha256_file(activation_path)))
                 if problems or not commit.committed:
                     return failed(r0["problems"] + problems,
                                   r0["gaps"] + problems)
@@ -12816,28 +13069,6 @@ def run_binding_migration_audit(
                 stage_timings[stage] = {
                     "t0_perf_counter": float(stage_t0),
                     "end_perf_counter": stage_cursor}
-                registration_sha = r0["registration_sha256"]
-                noise_path = (Path(r0["noise_schedule"])
-                              if r0.get("noise_schedule") else None)
-                noise_sha = r0.get("noise_schedule_sha256")
-                if mode == "synthetic" and noise_path is None:
-                    # Synthetic migration exercises the same binding identity;
-                    # the real noise file is not part of the analytic fixture.
-                    noise_path = r0_dir / "noise_schedule.npz"
-                    np.savez(noise_path, synthetic_fixture=np.array([1], np.int8))
-                    noise_sha = sha256_file(noise_path)
-                reservation_sha = sha256_file(
-                    r0_dir / "call_reservations.json")
-                activate_binding(
-                    run_root, generation=binding.generation,
-                    commit_path=commit.commit_path,
-                    commit_sha256=commit.commit_sha256,
-                    r0={"registration_sha256": registration_sha,
-                        "admission_sha256": sha256_file(
-                            r0_dir / "admission.json"),
-                        "noise_schedule_sha256": noise_sha,
-                        "reservation_sha256": reservation_sha},
-                    invocation_id=invocation_id)
                 commits[stage] = {"path": path_for_record(commit.commit_path),
                                   "sha256": commit.commit_sha256}
                 candidates[stage] = {"path": path_for_record(closed),

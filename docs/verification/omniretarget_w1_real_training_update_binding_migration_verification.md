@@ -121,12 +121,18 @@ commit 已写时不再改写行、finish 或 commit。
 ### 3.6 2026-11-04 复审后的 3 项 P1 修复
 
 1. **成本补记不再被派生字段误拒**：`_frozen_row_view` 排除 `wall_s`（`upsert_cost` 每次重封口同步写入的 `round(measured_wall_s,1)`）；新增 `_billed_cost_problems` 在准备态核验和提交前刷新中要求 ledger 的 `wall_s` 与 `measured_wall_s` 一致（index 通常不携带该字段，若存在则同样核对）；刷新视图还要求成本不得低于准备态（`commit_prepared_cost_decreased`）。隔离迁移根上把成本提高 5 秒后刷新通过；篡改 `wall_s` 或降低成本分别被拒。
-2. **阶段交接纳入计时**：迁移执行器改用单一 `stage_cursor`，下一阶段 `stage_t0` 等于上一阶段记录的 `end_perf_counter`，activation、receipt 与下一阶段预算历史扫描全部落入下游阶段区间并随其成本计费；消费端 `_return_timing_coverage_problems` 新增 `return_stage_gap`（相邻阶段不得留空档，重叠仍拒绝）、`return_total_wall`（`total_wall_s` 必须等于外层返回减起点）和 `return_started`（起点必须等于 claim t0）。
+2. **阶段交接纳入计时**：迁移执行器改用单一 `stage_cursor`，下一阶段 `stage_t0` 等于上一阶段记录的 `end_perf_counter`，receipt 与下一阶段预算历史扫描全部落入下游阶段区间并随其成本计费（binding 发布已改计入 R0，见 §3.7）；消费端 `_return_timing_coverage_problems` 新增 `return_stage_gap`（相邻阶段不得留空档，重叠仍拒绝）、`return_total_wall`（`total_wall_s` 必须等于外层返回减起点）和 `return_started`（起点必须等于 claim t0）。
 3. **terminal 闭包解析而非存在性**：扫描器解析 launch `terminal_candidate.json` 及其 commit/event 引用（commit 必须为 seq 6/F、spec 与 claim 一致），并解析 event 目录 terminal 候选与两份 `terminal_write_after` 证明（launch 与 event 各一份），要求 `passed=true`、`candidate_sha256` 对应、`observed<=committed` 且 `<remaining`。launch 候选改为 `{}`、删除 event 候选或任意/两份写后证明均使 journal unknown，并经公共 `verify_history`/`stage_state` 报出。
+
+### 3.7 2026-11-04 第二轮复审后的 2 项 P1 + 1 项 P2 修复
+
+1. **绑定发布计入 R0 预算**：`activate_binding` 不再引用尚不存在的 commit（避免自摘要环），改为在 R0 封口前发布；`commit_attempt` 在 seq=3 的 finish/commit 中绑定 activation 路径与 SHA，`_commit_problems` 复核该引用、activation 内容与 R0 reservation SHA，`_activation_problems` 要求 activation 只有被 R0 commit 引用后才生效。受控时钟注入 200 秒 activation 延迟（R0 剩余 181.4001 秒、P 预算充足）后，R0 在封口阶段即 `budget_exceeded_after_registration`，P 不创建 attempt，返回 `r0_seal:budget_exceeded_after_registration`，R0 登记成本 201 秒；旧实现会把 activation 记入 P 并完整执行。
+2. **terminal 写后门绑定权威上界**：新增 `_terminal_commit_bounds`，从 F commit 的 `committed_measured_wall_s` 与 `finish.ledger_row_snapshot.budget.remaining_s`（以 commit 的 `ledger_row_sha256` 绑定）取得权威成本与剩余预算；两份 proof 的 `committed_measured_wall_s/remaining_s` 必须与该权威值逐位相等，放行检查改用权威上界。把两份证明同时改为 observed=19.8921、committed=24.8921（自洽但超过 F commit 冻结成本的篡改）后 journal unknown（`terminal[_event]_write_after_committed`），remaining 改为 1234 秒得到 `..._write_after_remaining`。
+3. **非对象 terminal JSON 不再崩溃**：`terminal_candidate`/`terminal_write_after`/commit/event/registered/stage_closed 及其嵌套 `commit`/`start`/`event_candidate` 引用在调用 `.get` 前检查 `Mapping`；数组/null 使 `scan_launch_journals`/`verify_history`/`stage_state` 返回结构错误（`terminal_candidate_not_object`、`terminal_write_after_not_object`、`terminal_event_candidate_not_object`、`commit_not_object` 等）而不是 AttributeError；claim `target`、binding intent/spec 与 activation 同样加固。
 
 ## 4. M2：本轮已执行的反例
 
-新增 `tests/test_w1_real_training_update_migration.py`，共 **21 passed（50.78s）**：
+新增 `tests/test_w1_real_training_update_migration.py`，共 **24 passed（51.90s）**：
 
 1. 真实原根独立重算的 legacy head 等于 `b499a6ce…`，两条记录为 R0→P，旧累计更新为 2；
 2. 合成迁移根按 seq 3→6 完整执行第二代 R0_002/P_002/I_001/F_001，`complete_evidence=true`，selected chain 更新 16，cohort 更新 18；
@@ -147,11 +153,15 @@ commit 已写时不再改写行、finish 或 commit。
 17. 迁移结果中相邻阶段的 `t0` 与上一阶段 `end` 逐位相等（交接无空档）；
 18. 终端闭包：launch 候选改 `{}`、删除 event 候选或两份写后证明的不同组合均使 journal unknown，公共 `verify_history` 报 `history_journal`；
 19. 返回覆盖：20 秒交接空档报 `return_stage_gap:R0:P`，`total_wall_s` 漂移报 `return_total_wall`，起点偏离 claim t0 报 `return_started`；
-20. 成本重封口：提高 5 秒后冻结小视图通过；`wall_s` 不投影或成本下降被拒（旧实现报 `commit_prepared_ledger_view`）。
+20. 成本重封口：提高 5 秒后冻结小视图通过；`wall_s` 不投影或成本下降被拒（旧实现报 `commit_prepared_ledger_view`）；
+21. R0 commit 绑定 activation 路径/SHA，activation 的 R0 reservation SHA 与 commit 一致；
+22. 受控时钟注入 200 秒 activation 延迟（R0 剩余 181.4001 秒、P 预算充足）后 R0 封口即超预算，P 不启动，R0 成本覆盖 activation；
+23. terminal 两份证明同时改为自洽的 observed=19.8921/committed=24.8921 后 journal unknown（绑定 F commit 冻结成本），remaining 改 1234 秒同样被拒；
+24. terminal candidate/proof、event candidate、commit 改为数组或 null 时 `scan_launch_journals`/`verify_history`/`stage_state` 报结构错误而不抛 AttributeError。
 
 另运行既有相关回归：
 
-- `tests/test_w1_real_training_update_audit.py` + `tests/test_w1_real_training_update_provider.py` + 新迁移测试：**138 passed（291.14s，最终字节）**。
+- `tests/test_w1_real_training_update_audit.py` + `tests/test_w1_real_training_update_provider.py` + 新迁移测试：**141 passed（293.20s，最终字节）**。
 
 全项目套件未重跑；这些数字不是 380 旧基线的替代。
 
