@@ -5767,7 +5767,10 @@ def _return_timing_coverage_problems(
     for previous, current in zip(stages, stages[1:]):
         if parsed[current][0] + _RETURN_TIMING_TOL < parsed[previous][1]:
             problems.append(f"return_stage_overlap:{previous}:{current}")
+        elif parsed[current][0] - _RETURN_TIMING_TOL > parsed[previous][1]:
+            problems.append(f"return_stage_gap:{previous}:{current}")
     finished = record.get("finished_perf_counter")
+    started = record.get("started_perf_counter")
     if not _nonneg(finished):
         problems.append("return_time:finished_perf_counter")
     else:
@@ -5780,6 +5783,18 @@ def _return_timing_coverage_problems(
             problems.append("return_time_order")
         elif abs(float(last_end) - parsed["F"][1]) > _RETURN_TIMING_TOL:
             problems.append("return_last_stage_end")
+        total = record.get("total_wall_s")
+        if _nonneg(started) and _nonneg(total):
+            if abs(float(total) - (finished - float(started))) > \
+                    _RETURN_TIMING_TOL:
+                problems.append("return_total_wall")
+        else:
+            problems.append("return_time:total_wall_s")
+    if claim is not None and _nonneg(claim.get("t0_perf_counter")) and \
+            _nonneg(started):
+        if abs(float(started) - float(claim["t0_perf_counter"])) > \
+                _RETURN_TIMING_TOL:
+            problems.append("return_started")
     for stage in ("R0", "P", "I"):
         t0, end, cost = parsed[stage]
         if end - t0 > cost + _RETURN_TIMING_TOL:
@@ -5922,6 +5937,131 @@ def return_observation_problems(record: Mapping[str, Any] | None, *,
     return problems
 
 
+_TERMINAL_EXECUTION_SEQ = int(MIGRATION_STAGE_PLAN[-1]["execution_seq"])
+_TERMINAL_STAGES = tuple(
+    item["stage"] for item in MIGRATION_STAGE_PLAN
+    if int(item["execution_seq"]) == _TERMINAL_EXECUTION_SEQ)
+
+
+def _terminal_write_after_problems(path: Path, *, expected_sha: Any,
+                                   label: str) -> list[str]:
+    """A terminal candidate is only closed by its own sampled write proof."""
+    if not path.is_file():
+        return [f"{label}_write_after_missing"]
+    try:
+        proof = strict_read_json(path)
+    except (OSError, ValueError, TypeError):
+        return [f"{label}_write_after_unreadable"]
+    problems: list[str] = []
+    if proof.get("schema") != EVENT_SCHEMA or \
+            proof.get("kind") != "terminal_write_after" or \
+            proof.get("passed") is not True:
+        problems.append(f"{label}_write_after_binding")
+    if not isinstance(expected_sha, str) or \
+            proof.get("candidate_sha256") != expected_sha:
+        problems.append(f"{label}_write_after_sha")
+    observed = proof.get("observed_elapsed_s")
+    committed = proof.get("committed_measured_wall_s")
+    remaining = proof.get("remaining_s")
+    if not (_nonneg(observed) and _nonneg(committed) and _nonneg(remaining)):
+        problems.append(f"{label}_write_after_facts")
+    elif float(observed) > float(committed) or \
+            float(observed) >= float(remaining):
+        problems.append(f"{label}_write_after_gate")
+    return problems
+
+
+def _terminal_closure_problems(directory: Path, *,
+                               claim: Mapping[str, Any]) -> list[str]:
+    """Parse the launch/event terminal pair and both write-after proofs.
+
+    ``write_launch_terminal_candidate`` writes a launch-journal candidate that
+    points at the event-directory terminal candidate; each side writes its own
+    sampled ``terminal_write_after`` proof.  Existence alone is not closure:
+    the candidates, their commit/event references and both proofs must agree
+    with the claim and with the expected F execution sequence.
+    """
+    candidate_path = directory / "terminal_candidate.json"
+    if not candidate_path.is_file():
+        return ["terminal_candidate_missing"]
+    try:
+        candidate = strict_read_json(candidate_path)
+        candidate_sha = sha256_file(candidate_path)
+    except (OSError, ValueError, TypeError):
+        return ["terminal_candidate_unreadable"]
+    problems: list[str] = []
+    if candidate.get("schema") != EVENT_SCHEMA or \
+            candidate.get("kind") != "terminal_candidate" or \
+            candidate.get("candidate") is not True:
+        problems.append("terminal_candidate_binding")
+    if candidate.get("invocation_id") != directory.name:
+        problems.append("terminal_candidate_invocation")
+    commit_ref = candidate.get("commit")
+    commit_path = None
+    if not isinstance(commit_ref, Mapping):
+        problems.append("terminal_candidate_commit")
+    else:
+        commit_path = _reference_path(commit_ref.get("path"))
+        if commit_path is None or \
+                _file_sha(commit_path) != commit_ref.get("sha256"):
+            problems.append("terminal_candidate_commit")
+        else:
+            try:
+                commit = strict_read_json(commit_path)
+            except (OSError, ValueError, TypeError):
+                problems.append("terminal_candidate_commit_unreadable")
+            else:
+                if commit.get("schema") != EVENT_SCHEMA or \
+                        commit.get("kind") != "commit" or \
+                        commit.get("execution_seq") != \
+                        _TERMINAL_EXECUTION_SEQ or \
+                        commit.get("stage") not in _TERMINAL_STAGES or \
+                        commit.get("invocation_id") != directory.name:
+                    problems.append("terminal_candidate_commit_binding")
+                if commit.get("binding_spec_sha256") != \
+                        claim.get("spec_sha256"):
+                    problems.append("terminal_candidate_commit_spec")
+            if commit_path is not None and \
+                    commit_path.parent.name != f"{_TERMINAL_EXECUTION_SEQ:06d}":
+                problems.append("terminal_candidate_commit_seq")
+    event_ref = candidate.get("event_candidate")
+    if not isinstance(event_ref, Mapping):
+        problems.append("terminal_event_candidate_missing")
+    else:
+        event_path = _reference_path(event_ref.get("path"))
+        if event_path is None or \
+                _file_sha(event_path) != event_ref.get("sha256"):
+            problems.append("terminal_event_candidate")
+        else:
+            try:
+                event = strict_read_json(event_path)
+            except (OSError, ValueError, TypeError):
+                problems.append("terminal_event_candidate_unreadable")
+            else:
+                if event.get("schema") != EVENT_SCHEMA or \
+                        event.get("kind") != "terminal_candidate" or \
+                        event.get("execution_seq") != \
+                        _TERMINAL_EXECUTION_SEQ or \
+                        event.get("invocation_id") != directory.name or \
+                        event.get("binding_spec_sha256") != \
+                        claim.get("spec_sha256"):
+                    problems.append("terminal_event_candidate_binding")
+                if isinstance(commit_ref, Mapping) and (
+                        (event.get("commit") or {}).get("path") !=
+                        commit_ref.get("path") or
+                        (event.get("commit") or {}).get("sha256") !=
+                        commit_ref.get("sha256")):
+                    problems.append("terminal_event_candidate_commit")
+            problems += _terminal_write_after_problems(
+                event_path.parent / "terminal_write_after.json",
+                expected_sha=event_ref.get("sha256"),
+                label="terminal_event")
+    problems += _terminal_write_after_problems(
+        directory / "terminal_write_after.json",
+        expected_sha=candidate_sha, label="terminal")
+    return problems
+
+
 def scan_launch_journals(fixed_root: Path, *,
                          allow_invocation: str | None = None
                          ) -> dict:
@@ -6013,8 +6153,8 @@ def scan_launch_journals(fixed_root: Path, *,
                         if start_path is None or not start_path.is_file() or \
                                 sha256_file(start_path) != start.get("sha256"):
                             return_problems.append("registered_start")
-                if not (directory / "terminal_candidate.json").is_file():
-                    return_problems.append("terminal_candidate_missing")
+                return_problems += _terminal_closure_problems(
+                    directory, claim=claim)
                 for candidate_path in sorted(
                         directory.glob("stage_closed_*.json")):
                     if candidate_path.name.endswith("_write_after.json"):
@@ -7585,13 +7725,32 @@ def _prepare_revision_number(directory: Path) -> int:
 
 
 _COST_ONLY_ROW_KEYS = ("measured_wall_s", "sampled_wall_s",
-                       "seal_tail_reserve_s")
+                       "seal_tail_reserve_s", "wall_s")
 
 
 def _frozen_row_view(row: Mapping[str, Any]) -> dict:
-    """Fields that must not change when only the billed cost is re-sealed."""
+    """Fields that must not change when only the billed cost is re-sealed.
+
+    ``wall_s`` is the ledger's rounded projection of ``measured_wall_s`` and
+    is re-written by every cost re-seal, so it must track the billed cost
+    instead of being frozen with the semantic row.
+    """
     return {key: value for key, value in row.items()
             if key not in _COST_ONLY_ROW_KEYS}
+
+
+def _billed_cost_problems(row: Mapping[str, Any], *, kind: str,
+                          label: str) -> list[str]:
+    """The rounded ledger field must remain a projection of the cost."""
+    measured = row.get("measured_wall_s")
+    if not _nonneg(measured):
+        return [f"{label}_{kind}_measured_cost"]
+    rounded = row.get("wall_s")
+    if rounded is None:
+        return [] if kind == "index" else [f"{label}_{kind}_wall_s_missing"]
+    if not _nonneg(rounded) or float(rounded) != round(float(measured), 1):
+        return [f"{label}_{kind}_wall_s"]
+    return []
 
 
 @dataclass
@@ -7628,6 +7787,8 @@ def _verify_prepared_attempt(root: Path, stage: str, attempt: str, *,
     problems += _row_identity_problems(row, kind="index")
     problems += _row_identity_problems(entry, kind="ledger")
     problems += _call_balance_problems(row, entry)
+    problems += _billed_cost_problems(row, kind="index", label="prepared")
+    problems += _billed_cost_problems(entry, kind="ledger", label="prepared")
     for key, want in (("generation", binding.generation),
                       ("binding_spec_sha256", binding.spec_sha256),
                       ("execution_seq", seq)):
@@ -7671,6 +7832,7 @@ def _verify_prepared_attempt(root: Path, stage: str, attempt: str, *,
         "ledger_row_sha256": canonical_sha256(entry),
         "index_view_sha256": canonical_sha256(_frozen_row_view(row)),
         "ledger_view_sha256": canonical_sha256(_frozen_row_view(entry)),
+        "measured_wall_s": float(row.get("measured_wall_s", 0.0) or 0.0),
         "reservation_sha256": (sha256_file(reservation)
                                if reservation.is_file() else None),
         "complete": bool(row.get("complete") is True),
@@ -7730,6 +7892,14 @@ def _refresh_prepared_view(root: Path, stage: str, attempt: str,
     problems += _row_identity_problems(row, kind="index")
     problems += _row_identity_problems(entry, kind="ledger")
     problems += _call_balance_problems(row, entry)
+    problems += _billed_cost_problems(row, kind="index",
+                                      label="commit_prepared")
+    problems += _billed_cost_problems(entry, kind="ledger",
+                                      label="commit_prepared")
+    prepared_cost = prepared.facts.get("measured_wall_s")
+    if _nonneg(prepared_cost) and _nonneg(row.get("measured_wall_s")) and \
+            float(row["measured_wall_s"]) < float(prepared_cost):
+        problems.append("commit_prepared_cost_decreased")
     if canonical_sha256(_frozen_row_view(row)) != prepared.facts.get(
             "index_view_sha256"):
         problems.append("commit_prepared_index_view")
@@ -8334,6 +8504,15 @@ def _reference_path(value: Any) -> Path | None:
         return None
     path = Path(value)
     return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def _file_sha(path: Path | None) -> str | None:
+    if path is None or not Path(path).is_file():
+        return None
+    try:
+        return sha256_file(Path(path))
+    except OSError:
+        return None
 
 
 def _reference_problems(label: str, path_value: Any,
@@ -12486,6 +12665,11 @@ def run_binding_migration_audit(
     if r0_started_perf is None:
         r0_started_perf = float(claim.get("t0_perf_counter"))
     t_r0 = float(r0_started_perf)
+    # One clock cursor for the whole chain: the next stage starts where the
+    # previous one was closed, so handoff work (activation, receipts, budget
+    # history scan) is billed to the downstream stage instead of falling into
+    # an untimed gap between stage intervals.
+    stage_cursor = t_r0
     claim_record = {"claim_path": claim_path, "claim_sha256": claim_sha}
 
     def failed(problems: Sequence[str], gaps: Sequence[str] = (),
@@ -12560,7 +12744,7 @@ def run_binding_migration_audit(
                 allow_invocation=invocation_id)
         except SystemExit as exc:
             return failed([str(exc)], [str(exc)])
-        stage_t0 = (t_r0 if stage == "R0" else _now())
+        stage_t0 = (t_r0 if stage == "R0" else stage_cursor)
         execution = _migration_execution(
             binding, invocation_id=invocation_id, claim_path=claim_path,
             claim_sha256=claim_sha, stage=stage)
@@ -12628,9 +12812,10 @@ def run_binding_migration_audit(
                             seal.row.get("measured_wall_s", 0.0) or 0.0))
                 if launch_problems:
                     return failed(launch_problems, launch_problems)
+                stage_cursor = float(_now())
                 stage_timings[stage] = {
                     "t0_perf_counter": float(stage_t0),
-                    "end_perf_counter": float(_now())}
+                    "end_perf_counter": stage_cursor}
                 registration_sha = r0["registration_sha256"]
                 noise_path = (Path(r0["noise_schedule"])
                               if r0.get("noise_schedule") else None)
@@ -12728,9 +12913,10 @@ def run_binding_migration_audit(
                 if launch_problems:
                     return failed(launch_problems, launch_problems,
                                   list(p.get("failures") or []))
+                stage_cursor = float(_now())
                 stage_timings[stage] = {
                     "t0_perf_counter": float(stage_t0),
-                    "end_perf_counter": float(_now())}
+                    "end_perf_counter": stage_cursor}
                 commits[stage] = {"path": path_for_record(commit.commit_path),
                                   "sha256": commit.commit_sha256}
                 candidates[stage] = {"path": path_for_record(closed),
@@ -12811,9 +12997,10 @@ def run_binding_migration_audit(
                 if launch_problems:
                     return failed(launch_problems, launch_problems,
                                   list(i.get("failures") or []))
+                stage_cursor = float(_now())
                 stage_timings[stage] = {
                     "t0_perf_counter": float(stage_t0),
-                    "end_perf_counter": float(_now())}
+                    "end_perf_counter": stage_cursor}
                 commits[stage] = {"path": path_for_record(commit.commit_path),
                                   "sha256": commit.commit_sha256}
                 candidates[stage] = {"path": path_for_record(closed),

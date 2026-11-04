@@ -766,3 +766,269 @@ def test_migration_authorization_rejects_budget_and_update_reset():
     problems = A.authorization_problems(auth)
     assert any("update" in p for p in problems)
     assert any("remaining" in p or "prior_cost" in p for p in problems)
+
+
+def test_executor_stage_intervals_are_contiguous(migrated):
+    """The next stage must start at the previous stage's recorded end."""
+    timings = migrated["result"]["stage_timings"]
+    stages = tuple(A.STAGE_BUDGETS)
+    assert set(timings) == set(stages)
+    for previous, current in zip(stages, stages[1:]):
+        assert timings[current]["t0_perf_counter"] == \
+            timings[previous]["end_perf_counter"]
+
+
+def _write_valid_journal(root: Path, invocation: str = "inv-valid") -> Path:
+    """Build a fully closed launch journal (scan-only, no execution rows)."""
+    root.mkdir(parents=True, exist_ok=True)
+    A.write_cohort(root, mode="synthetic")
+    directory = A._launch_invocation_dir(root, invocation)
+    directory.mkdir(parents=True)
+    A.claim_launch(
+        root, authorization_sha256=OLD_MARKER_AUTH, spec_sha256="b" * 64,
+        legacy_head_sha256="c" * 64,
+        marker_sha256=A.sha256_file(root / "cohort.json"),
+        invocation_id=invocation, t0_perf_counter=0.0,
+        target={"stage": "R0", "attempt": "attempt_002",
+                "execution_seq": 3})
+    claim = A.strict_read_json(directory / "claim.json")
+    commits: dict[str, dict] = {}
+    receipts: dict[str, dict] = {}
+    timings: dict[str, dict] = {}
+    for index, stage in enumerate(A.STAGE_BUDGETS):
+        seq = index + 3
+        event_dir = root / "execution_events" / f"{seq:06d}"
+        event_dir.mkdir(parents=True, exist_ok=True)
+        commit_path = event_dir / "commit.json"
+        A.write_json(commit_path, {
+            "schema": A.EVENT_SCHEMA, "kind": "commit",
+            "execution_seq": seq, "stage": stage,
+            "attempt": A.MIGRATION_STAGE_PLAN[index]["attempt"],
+            "generation": A.GENERATION_002,
+            "binding_spec_sha256": claim["spec_sha256"],
+            "invocation_id": invocation,
+            "stage_t0_perf_counter": float(index),
+            "committed_measured_wall_s": 2.5})
+        commits[stage] = {"path": str(commit_path),
+                          "sha256": A.sha256_file(commit_path)}
+        receipt_path = directory / f"stage_closed_{seq:06d}.json"
+        A.write_json(receipt_path, {
+            "schema": A.EVENT_SCHEMA, "kind": "stage_closed_candidate",
+            "candidate": True, "invocation_id": invocation,
+            "stage": stage, "execution_seq": seq,
+            "commit": commits[stage]})
+        A.write_json(directory / f"stage_closed_{seq:06d}_write_after.json", {
+            "schema": A.EVENT_SCHEMA, "kind": "stage_closed_write_after",
+            "candidate_sha256": A.sha256_file(receipt_path),
+            "observed_elapsed_s": 1.0, "committed_measured_wall_s": 2.5,
+            "remaining_s": 100.0, "passed": True})
+        receipts[stage] = {"path": str(receipt_path),
+                           "sha256": A.sha256_file(receipt_path)}
+        timings[stage] = {"t0_perf_counter": float(index),
+                          "end_perf_counter": float(index + 1)}
+    start_path = root / "execution_events" / "000003" / "start.json"
+    A.write_json(start_path, {"schema": A.EVENT_SCHEMA, "kind": "start"})
+    A.write_json(directory / "registered.json", {
+        "schema": A.EVENT_SCHEMA, "kind": "registered",
+        "invocation_id": invocation, "execution_seq": 3,
+        "stage": "R0", "attempt": "attempt_002",
+        "start": {"path": str(start_path),
+                  "sha256": A.sha256_file(start_path)}})
+    final_commit = commits[tuple(A.STAGE_BUDGETS)[-1]]
+    event_terminal_path = root / "execution_events" / "000006" / \
+        "terminal_candidate.json"
+    A.write_json(event_terminal_path, {
+        "schema": A.EVENT_SCHEMA, "kind": "terminal_candidate",
+        "execution_seq": 6, "generation": A.GENERATION_002,
+        "binding_spec_sha256": claim["spec_sha256"],
+        "invocation_id": invocation, "commit": final_commit,
+        "committed_measured_wall_s": 2.5})
+    A.write_json(event_terminal_path.parent / "terminal_write_after.json", {
+        "schema": A.EVENT_SCHEMA, "kind": "terminal_write_after",
+        "candidate_sha256": A.sha256_file(event_terminal_path),
+        "observed_elapsed_s": 1.0, "committed_measured_wall_s": 2.5,
+        "remaining_s": 100.0, "passed": True})
+    launch_terminal_path = directory / "terminal_candidate.json"
+    A.write_json(launch_terminal_path, {
+        "schema": A.EVENT_SCHEMA, "kind": "terminal_candidate",
+        "candidate": True, "invocation_id": invocation,
+        "commit": final_commit,
+        "event_candidate": {"path": str(event_terminal_path),
+                            "sha256": A.sha256_file(event_terminal_path)}})
+    A.write_json(directory / "terminal_write_after.json", {
+        "schema": A.EVENT_SCHEMA, "kind": "terminal_write_after",
+        "candidate_sha256": A.sha256_file(launch_terminal_path),
+        "observed_elapsed_s": 1.0, "committed_measured_wall_s": 2.5,
+        "remaining_s": 100.0, "passed": True})
+    A.write_json(directory / "return_observation.json", {
+        "schema": A.RETURN_OBSERVATION_SCHEMA,
+        "scope": "post_execution_observation",
+        "process_returned": True,
+        "invocation_id": invocation,
+        "authorization_sha256": claim["authorization_sha256"],
+        "spec_sha256": claim["spec_sha256"],
+        "legacy_head_sha256": claim["legacy_head_sha256"],
+        "claim_sha256": A.sha256_file(directory / "claim.json"),
+        "pid": claim["pid"], "ppid": claim["ppid"],
+        "source": {"kind": "outer_wait", "pid": claim["pid"],
+                   "ppid": claim["ppid"], "exit_code": 0, "signal": None},
+        "started_perf_counter": 0.0, "finished_perf_counter": 5.0,
+        "last_stage_end_perf_counter": 4.0, "total_wall_s": 5.0,
+        "commits": commits, "candidate_receipts": receipts,
+        "stage_timings": timings,
+        "write_after": {"R0": True, "P": True, "I": True, "F": True,
+                        "terminal": True},
+        "coverage_ok": True,
+        "expected_exit_code": 0,
+        "conclusion": "real_training_update_covered_contract_passed",
+        "post_return_work_performed": False})
+    return directory
+
+
+def test_terminal_closure_parses_candidate_event_and_proofs(tmp_path):
+    root = tmp_path / "cohort"
+    directory = _write_valid_journal(root)
+    invocation = directory.name
+    journal = A.scan_launch_journals(tmp_path)
+    assert journal["known"] is True, journal["problems"]
+    assert A.verify_history(root) == []
+
+    saved = (directory / "terminal_candidate.json").read_bytes()
+    A.write_json(directory / "terminal_candidate.json", {})
+    journal = A.scan_launch_journals(tmp_path)
+    assert journal["known"] is False
+    record = next(r for r in journal["records"]
+                  if r["invocation_id"] == invocation)
+    assert "terminal_candidate_binding" in record["return_problems"]
+    assert "terminal_event_candidate_missing" in record["return_problems"]
+    assert any(p.startswith("launch_unsettled:")
+               for p in journal["problems"])
+    assert any("history_journal:" in p for p in A.verify_history(root))
+    (directory / "terminal_candidate.json").write_bytes(saved)
+
+    (root / "execution_events/000006/terminal_write_after.json").unlink()
+    journal = A.scan_launch_journals(tmp_path)
+    assert journal["known"] is False
+    record = next(r for r in journal["records"]
+                  if r["invocation_id"] == invocation)
+    assert "terminal_event_write_after_missing" in \
+        record["return_problems"]
+
+    (root / "execution_events/000006/terminal_candidate.json").unlink()
+    (directory / "terminal_write_after.json").unlink()
+    journal = A.scan_launch_journals(tmp_path)
+    assert journal["known"] is False
+    record = next(r for r in journal["records"]
+                  if r["invocation_id"] == invocation)
+    assert "terminal_event_candidate" in record["return_problems"]
+    assert "terminal_write_after_missing" in record["return_problems"]
+
+
+def test_return_coverage_rejects_handoff_gap_and_total_wall_drift(tmp_path):
+    root = tmp_path / "cohort"
+    directory = _write_valid_journal(root)
+    record = A.strict_read_json(directory / "return_observation.json")
+    claim = A.strict_read_json(directory / "claim.json")
+    claim["_sha256"] = A.sha256_file(directory / "claim.json")
+    assert A.return_observation_problems(
+        record, invocation_id=directory.name, claim=claim) == []
+
+    drifted = dict(record, total_wall_s=record["total_wall_s"] + 7.0)
+    problems = A.return_observation_problems(
+        drifted, invocation_id=directory.name, claim=claim)
+    assert "return_total_wall" in problems
+
+    shifted = dict(record, started_perf_counter=2.0)
+    problems = A.return_observation_problems(
+        shifted, invocation_id=directory.name, claim=claim)
+    assert "return_started" in problems
+
+    gapped = json.loads(json.dumps(record))
+    for stage in ("P", "I", "F"):
+        gapped["stage_timings"][stage]["t0_perf_counter"] += 20.0
+        gapped["stage_timings"][stage]["end_perf_counter"] += 20.0
+        # Keep the commit facts consistent so the gap is the only defect.
+        commit_path = Path(gapped["commits"][stage]["path"])
+        commit = A.strict_read_json(commit_path)
+        commit["stage_t0_perf_counter"] += 20.0
+        A.write_json(commit_path, commit)
+        gapped["commits"][stage]["sha256"] = A.sha256_file(commit_path)
+    gapped["last_stage_end_perf_counter"] += 20.0
+    gapped["finished_perf_counter"] += 20.0
+    gapped["total_wall_s"] += 20.0
+    problems = A.return_observation_problems(
+        gapped, invocation_id=directory.name, claim=claim)
+    assert "return_stage_gap:R0:P" in problems
+    assert not any(p.startswith("return_stage_t0") for p in problems)
+
+
+def test_commit_view_allows_cost_reseal_and_checks_wall_projection(
+        migrated, tmp_path):
+    import shutil
+
+    root = tmp_path / "cohort"
+    shutil.copytree(migrated["root"], root)
+    stage, attempt = "F", "attempt_001"
+    row = next(r for r in A.load_index(root)
+               if r["stage"] == stage and r["attempt"] == attempt)
+    entry = next(r for r in A.load_ledger(root)
+                 if r["stage"] == stage and r["attempt"] == attempt)
+    reservation = A.stage_dir(root, stage) / attempt / \
+        "call_reservations.json"
+    measured = float(entry["measured_wall_s"])
+    prepared = A.PreparedResult(
+        row, entry, [], {
+            "index_view_sha256": A.canonical_sha256(
+                A._frozen_row_view(row)),
+            "ledger_view_sha256": A.canonical_sha256(
+                A._frozen_row_view(entry)),
+            "complete": row.get("complete") is True,
+            "status": row.get("status"),
+            "measured_wall_s": measured,
+            "reservation_sha256": A.sha256_file(reservation),
+            "generation": row.get("generation"),
+            "binding_spec_sha256": row.get("binding_spec_sha256"),
+            "execution_seq": row.get("execution_seq"),
+        })
+    execution = {"generation": row.get("generation"),
+                 "binding_spec_sha256": row.get("binding_spec_sha256"),
+                 "execution_seq": row.get("execution_seq")}
+    resealed = measured + 5.0
+    A.upsert_cost(root, stage, attempt, resealed,
+                  {"complete": True, "status": "done",
+                   "accounting_schema": entry.get("accounting_schema")},
+                  "done")
+    index = A.load_index(root)
+    for item in index:
+        if item["stage"] == stage and item["attempt"] == attempt:
+            item["measured_wall_s"] = resealed
+    A.save_index(root, index)
+    refreshed = A._refresh_prepared_view(
+        root, stage, attempt, prepared, execution)
+    assert refreshed.problems == [], refreshed.problems
+    assert refreshed.facts["measured_wall_s"] == resealed
+
+    ledger = A.load_ledger(root)
+    for item in ledger:
+        if item["stage"] == stage and item["attempt"] == attempt:
+            item["wall_s"] = round(resealed, 1) + 10.0
+    A.save_ledger(root, ledger)
+    refreshed = A._refresh_prepared_view(
+        root, stage, attempt, prepared, execution)
+    assert "commit_prepared_ledger_wall_s" in refreshed.problems
+
+    # A reseal may only ever raise the billed cost.
+    index = A.load_index(root)
+    for item in index:
+        if item["stage"] == stage and item["attempt"] == attempt:
+            item["measured_wall_s"] = measured - 1.0
+    A.save_index(root, index)
+    ledger = A.load_ledger(root)
+    for item in ledger:
+        if item["stage"] == stage and item["attempt"] == attempt:
+            item["measured_wall_s"] = measured - 1.0
+            item["wall_s"] = round(measured - 1.0, 1)
+    A.save_ledger(root, ledger)
+    refreshed = A._refresh_prepared_view(
+        root, stage, attempt, prepared, execution)
+    assert "commit_prepared_cost_decreased" in refreshed.problems
