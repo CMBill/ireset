@@ -233,6 +233,10 @@ STAGE_BUDGETS = {
 }
 TOTAL_BUDGET_S = 3240.0
 SEAL_TAIL_RESERVE_S = 1.0
+#: v2 final stages include the worker's real process teardown/return; the
+#: committed floor must reserve that observed fixed cost, not just the file
+#: write tail.  The outer return observation still rejects a larger actual.
+FINAL_PROCESS_RETURN_TAIL_S = 3.0
 SEAL_VERIFY_ROUNDS = 4
 STAGE_DIRS = {"R0": "registration", "P": "production", "I": "independent",
               "F": "finalize"}
@@ -5043,8 +5047,9 @@ def _git_blob_sha256(project_root: Path, rel: str) -> str | None:
 
 
 def build_protected_manifest(project_root: Path, run_root: Path,
-                             *, synthetic_attempt: str = "attempt_015",
-                             admission_attempt: str = "attempt_015"
+                             *, calibration_attempt: str = "attempt_013",
+                             synthetic_attempt: str = "attempt_013",
+                             admission_attempt: str = "attempt_013"
                              ) -> dict:
     root = Path(project_root)
     entries: dict[str, dict] = {}
@@ -5063,8 +5068,9 @@ def build_protected_manifest(project_root: Path, run_root: Path,
         if path.is_file():
             add(path)
     audit = root / "derived/audit/w1_real_training_update_audit"
-    for rel in ("authorization/attempt_012", "calibration/attempt_015",
-                "admission_real/attempt_015"):
+    for rel in ("authorization/attempt_012",
+                f"calibration/{calibration_attempt}",
+                f"admission_real/{admission_attempt}"):
         for path in (audit / rel).rglob("*"):
             if path.is_file():
                 add(path)
@@ -5136,12 +5142,19 @@ def build_protected_manifest(project_root: Path, run_root: Path,
 
 
 def write_migration_baseline(out_dir: Path, project_root: Path,
-                             run_root: Path) -> tuple[Path, str, dict]:
+                             run_root: Path, *,
+                             calibration_attempt: str = "attempt_013",
+                             synthetic_attempt: str = "attempt_013",
+                             admission_attempt: str = "attempt_013"
+                             ) -> tuple[Path, str, dict]:
     out_dir = Path(out_dir)
     path = out_dir / "protected_manifest.json"
     if path.exists():
         raise FileExistsError(f"protected manifest already exists: {path}")
-    record = build_protected_manifest(project_root, run_root)
+    record = build_protected_manifest(
+        project_root, run_root, calibration_attempt=calibration_attempt,
+        synthetic_attempt=synthetic_attempt,
+        admission_attempt=admission_attempt)
     sha = write_json_exclusive(path, record)
     return path, sha, record
 
@@ -7873,7 +7886,8 @@ def _report_hashes(row: dict) -> dict:
 def finish_attempt(root: Path, stage: str, attempt: str, t0: float,
                    budget: dict, row: dict, *, status: str = "done",
                    extra: dict | None = None,
-                   cost_floor: float | None = None) -> SealResult:
+                   cost_floor: float | None = None,
+                   tail_floor: float = 0.0) -> SealResult:
     """running -> publishing -> seal; non-consumable on unproven coverage.
 
     ``cost_floor`` preserves a previously published cost when an attempt is
@@ -7921,7 +7935,8 @@ def finish_attempt(root: Path, stage: str, attempt: str, t0: float,
         writes.append(time.perf_counter() - start)
 
     def reserve() -> float:
-        return max(SEAL_TAIL_RESERVE_S, 2.0 * max(writes, default=0.0))
+        return max(SEAL_TAIL_RESERVE_S, float(tail_floor),
+                   2.0 * max(writes, default=0.0))
 
     def elapsed() -> float:
         return max(floor, time.perf_counter() - t0)
@@ -9684,6 +9699,18 @@ def implementation_identity(project_root: Path) -> dict:
             "files": files, "git": _git_identity(root)}
 
 
+def implementation_files_sha256(identity: Mapping[str, Any]) -> str:
+    """Stable implementation identity: the 28 file bytes, not git state.
+
+    Documentation commits must not invalidate an otherwise byte-identical
+    authorization; the spec still records the full git identity for audit.
+    """
+    return canonical_sha256({
+        "schema": "w1_real_training_update_implementation_files_v1",
+        "files": dict(identity.get("files") or {}),
+    })
+
+
 #: Runtime facts whose drift invalidates the frozen numeric calibration.  The
 #: check is metadata/source-hash only; it never runs a numeric probe.
 RUNTIME_IDENTITY_KEYS = (
@@ -11056,7 +11083,7 @@ def build_migration_authorization_draft(
         },
         "target_generation": binding.generation,
         "plan_sha256": sha256_file(root / MIGRATION_PLAN),
-        "implementation_sha256": canonical_sha256(impl),
+        "implementation_sha256": implementation_files_sha256(impl),
         "runtime_sha256": canonical_sha256(runtime),
         "gate_b_sha256": gate_b_sha256,
         "real_admission_sha256": real_admission_sha256,
@@ -12837,7 +12864,8 @@ def _migration_stage_seal(
                "call_balance": counter.snapshot(),
                **dict(extra or {}),
                **({"numeric_passed": bool(numeric_passed)}
-                  if numeric_passed is not None else {})})
+                  if numeric_passed is not None else {})},
+        tail_floor=(FINAL_PROCESS_RETURN_TAIL_S if final else 0.0))
     if not seal.terminal:
         return seal, CommitResult(False, None, None, None, None,
                                   list(seal.problems)), None, None, []
@@ -12950,8 +12978,8 @@ def run_binding_migration_audit(
             raise SystemExit(f"authorization migration binding: {key}")
     impl_now = implementation_identity(project_root)
     plan_sha = sha256_file(Path(project_root) / MIGRATION_PLAN)
-    if migration_auth.get("implementation_sha256") != canonical_sha256(
-            impl_now):
+    if migration_auth.get("implementation_sha256") != \
+            implementation_files_sha256(impl_now):
         raise SystemExit("authorization implementation identity drifted")
     if migration_auth.get("execution_plan_sha256") != plan_sha or \
             migration_auth.get("plan_sha256") != plan_sha:
@@ -13628,14 +13656,6 @@ def run_binding_migration_audit(
     return failed(["migration_incomplete"])
 
 
-_SYNTHETIC_EXIT_BY_CONCLUSION = {
-    "synthetic_contract_passed": 0,
-    "real_training_update_covered_contract_passed": 0,
-    "real_training_update_mismatch": 2,
-    "audit_incomplete": 3,
-}
-
-
 def synthetic_stage_receipts(result: Mapping[str, Any],
                              run_root: Path) -> dict:
     """Hash the terminal stage reports referenced by a synthetic result."""
@@ -13660,14 +13680,21 @@ def synthetic_stage_receipts(result: Mapping[str, Any],
 
 def synthetic_outer_return_record(
         *, started_perf_counter: float, finished_perf_counter: float,
-        conclusion: str | None, pid: int, ppid: int) -> dict:
-    exit_code = _SYNTHETIC_EXIT_BY_CONCLUSION.get(conclusion, 2)
+        conclusion: str | None, pid: int, ppid: int, exit_code: int,
+        signal: int | None = None) -> dict:
+    """Copy the actual wait/exec facts of the observed process.
+
+    ``exit_code`` is never derived from the conclusion; a mismatch is left
+    visible for the acceptance consumer to reject.
+    """
+    if type(exit_code) is not int:
+        raise ValueError("synthetic return exit_code must be an int")
     return {
         "schema": "w1_real_training_update_synthetic_return_v1",
         "scope": "post_execution_observation",
         "source": {"kind": "outer_wait", "pid": int(pid),
                    "ppid": int(ppid), "exit_code": int(exit_code),
-                   "signal": None},
+                   "signal": signal},
         "pid": int(pid), "ppid": int(ppid),
         "started_perf_counter": float(started_perf_counter),
         "finished_perf_counter": float(finished_perf_counter),
@@ -13683,14 +13710,8 @@ def synthetic_outer_return_record(
 def synthetic_self_test(out_root: Path, *, seed: int = FIXTURE_SEED,
                         device: str = "cuda",
                         tolerance: Mapping[str, Any] | None = None,
-                        config: Mapping[str, Any] | None = None,
-                        calibration_verification_record: Mapping[str, Any]
-                        | None = None,
-                        outer_started_perf: float | None = None
-                        ) -> dict:
-    """Full analytic R0->P->I->F chain; no real asset/dataset/checkpoint."""
-    started = (float(outer_started_perf) if outer_started_perf is not None
-               else float(time.perf_counter()))
+                        config: Mapping[str, Any] | None = None) -> dict:
+    """Run the analytic chain; outer launchers own return/acceptance."""
     run_root = Path(out_root).expanduser().resolve()
     if run_root.exists() and any(run_root.iterdir()):
         n = 1
@@ -13707,73 +13728,55 @@ def synthetic_self_test(out_root: Path, *, seed: int = FIXTURE_SEED,
         fixed_root=HISTORY_ROOT)
     result["run_root"] = path_for_record(run_root)
     result["tolerance_contract"] = contract
-    if calibration_verification_record is not None:
-        from ireset.eval.w1_real_training_update_provider import (
-            synthetic_acceptance,
-        )
-        outer = synthetic_outer_return_record(
-            started_perf_counter=started,
-            finished_perf_counter=float(time.perf_counter()),
-            conclusion=result.get("conclusion"),
-            pid=os.getpid(), ppid=os.getppid())
-        outer_path = run_root / "synthetic_return.json"
-        write_json(outer_path, outer)
-        publication = {
-            "kind": "v1_stage_receipts",
-            "stage_receipts": synthetic_stage_receipts(result, run_root),
-            "outer_return": {"path": path_for_record(outer_path),
-                             "sha256": sha256_file(outer_path)},
-        }
-        acceptance = synthetic_acceptance(
-            result, run_root=run_root, tolerance_contract=contract,
-            calibration_verification_record=calibration_verification_record,
-            roster=provider.roster, publication=publication)
-        acceptance_path = run_root / "synthetic_acceptance.json"
-        write_json(acceptance_path, acceptance)
-        result["synthetic_acceptance"] = {
-            "path": path_for_record(acceptance_path),
-            "sha256": sha256_file(acceptance_path),
-            "passed": acceptance["passed"],
-            "problems": acceptance["problems"],
-        }
+    result["roster"] = provider.roster
     write_json(run_root / "audit_result.json", result)
     return result
 
 
-def run_migration_synthetic_gate_b(
-        out_root: Path, *, tolerance: Mapping[str, Any],
+def build_ordinary_synthetic_acceptance(
+        run_root: Path, result: Mapping[str, Any], *,
+        roster: Mapping[str, Any], tolerance: Mapping[str, Any],
         calibration_verification_record: Mapping[str, Any],
-        seed: int = FIXTURE_SEED, device: str = "cuda",
-        config: Mapping[str, Any] | None = None,
-        invocation_id: str = "inv-gate-b-migration-001") -> dict:
-    """Run the v2 migration protocol on a synthetic failure prefix.
-
-    The whole chain, the external return observation and the migration
-    acceptance are written under ``out_root``; nothing touches the real root.
-    """
+        outer_return_path: Path, outer_return_sha256: str) -> dict:
+    """Bind a worker's chain result to the outer process return facts."""
     from ireset.eval.w1_real_training_update_provider import (
         synthetic_acceptance,
-        synthetic_acceptance_problems,
     )
+    publication = {
+        "kind": "v1_stage_receipts",
+        "stage_receipts": synthetic_stage_receipts(result, run_root),
+        "outer_return": {"path": path_for_record(outer_return_path),
+                         "sha256": outer_return_sha256},
+    }
+    acceptance = synthetic_acceptance(
+        result, run_root=run_root, tolerance_contract=tolerance,
+        calibration_verification_record=calibration_verification_record,
+        roster=roster, publication=publication)
+    acceptance_path = Path(run_root) / "synthetic_acceptance.json"
+    write_json(acceptance_path, acceptance)
+    return {"path": path_for_record(acceptance_path),
+            "sha256": sha256_file(acceptance_path),
+            "passed": acceptance["passed"],
+            "problems": acceptance["problems"]}
+
+
+def prepare_migration_synthetic_launch(
+        out_root: Path, *, tolerance: Mapping[str, Any],
+        calibration_verification_record: Mapping[str, Any],
+        invocation_id: str = "inv-gate-b-migration-001") -> dict:
+    """Freeze prefix/snapshot/spec/binding/claim; the worker runs the chain."""
     out_root = Path(out_root).expanduser().resolve()
     if out_root.exists() and any(out_root.iterdir()):
         raise SystemExit(
             f"migration synthetic root is not fresh: {out_root}")
     out_root.mkdir(parents=True, exist_ok=True)
+    t0 = float(time.perf_counter())
     root = out_root / "cohort"
     write_synthetic_legacy_prefix(root)
     # The frozen prefix snapshot must precede the fixture so the migration
     # protected-file list covers only the v1 rows and reservations.
     snapshot_path, snapshot_sha, snapshot = write_history_snapshot(
         out_root / "migration", root)
-    provider = SyntheticTrainingProvider(
-        dict(MODEL_CONFIG if config is None else config), seed=seed,
-        device=device)
-    provider.prepare_fixture(root / "fixture")
-    provider.load_fixture()
-    if provider.fixture.get("problems"):
-        raise SystemExit(
-            f"synthetic fixture refused: {provider.fixture['problems']}")
     spec = build_binding_spec(
         PROJECT_ROOT, snapshot_path, snapshot_sha, snapshot,
         invocation_id=invocation_id,
@@ -13783,18 +13786,6 @@ def run_migration_synthetic_gate_b(
     spec_sha = sha256_file(spec_path)
     stage_binding(root, spec_path=spec_path, spec_sha256=spec_sha,
                   snapshot_sha256=snapshot_sha, invocation_id=invocation_id)
-    binding, binding_problems = load_binding(root, require_active=False)
-    if binding is None or binding_problems:
-        raise SystemExit(f"synthetic binding refused: {binding_problems}")
-    t0 = float(time.perf_counter())
-    claim_launch(
-        root, authorization_sha256=SYNTHETIC_LEGACY_AUTHORIZATION_SHA256,
-        spec_sha256=spec_sha,
-        legacy_head_sha256=binding.legacy_head_sha256,
-        marker_sha256=snapshot["marker_sha256"], invocation_id=invocation_id,
-        t0_perf_counter=t0,
-        target={"stage": "R0", "attempt": "attempt_002",
-                "execution_seq": 3})
     impl = implementation_identity(PROJECT_ROOT)
     auth = migration_authorization_template()
     auth.update(template_only=False, authorized=True,
@@ -13807,11 +13798,9 @@ def run_migration_synthetic_gate_b(
         calibration_verification_record)
     auth["acceptance_sha256"] = "c" * 64
     auth["tolerance_evidence_sha256"] = (
-        tolerance.get("evidence_sha256")
-        or "0" * 64)
+        tolerance.get("evidence_sha256") or "0" * 64)
     auth["fp32_contract_sha256"] = (
-        tolerance.get("fp32_contract_sha256")
-        or "0" * 64)
+        tolerance.get("fp32_contract_sha256") or "0" * 64)
     auth["admission_package_sha256"] = "4" * 64
     auth["implementation_files"] = impl["files"]
     migration = auth["migration"]
@@ -13821,10 +13810,10 @@ def run_migration_synthetic_gate_b(
         source_authorization_sha256=snapshot["authorization_sha256"],
         snapshot_sha256=snapshot_sha, spec_sha256=spec_sha,
         migration_admission_sha256="2" * 64,
-        legacy_head_sha256=binding.legacy_head_sha256,
+        legacy_head_sha256=snapshot["legacy_head_sha256"],
         target_generation=GENERATION_002,
         plan_sha256=sha256_file(PROJECT_ROOT / MIGRATION_PLAN),
-        implementation_sha256=canonical_sha256(impl),
+        implementation_sha256=implementation_files_sha256(impl),
         runtime_sha256=canonical_sha256(runtime_identity_facts()),
         gate_b_sha256="3" * 64, real_admission_sha256="4" * 64,
         execution_plan_sha256=sha256_file(PROJECT_ROOT / MIGRATION_PLAN),
@@ -13846,41 +13835,74 @@ def run_migration_synthetic_gate_b(
     auth_problems = authorization_problems(auth)
     if auth_problems:
         raise SystemExit(f"synthetic authorization refused: {auth_problems}")
-    result = run_binding_migration_audit(
-        root, provider, mode="synthetic", tolerance=tolerance,
-        authorization_sha=SYNTHETIC_LEGACY_AUTHORIZATION_SHA256,
-        authorization=auth, binding_spec_path=spec_path,
-        invocation_id=invocation_id, fixed_root=root.parent,
-        r0_started_perf=t0)
-    finished = float(time.perf_counter())
-    conclusion = result.get("conclusion")
-    exit_code = _SYNTHETIC_EXIT_BY_CONCLUSION.get(conclusion, 2)
+    auth_path = out_root / "migration" / "authorization.json"
+    write_json_exclusive(auth_path, auth)
+    auth_sha = sha256_file(auth_path)
+    claim_launch(
+        root, authorization_sha256=auth_sha, spec_sha256=spec_sha,
+        legacy_head_sha256=snapshot["legacy_head_sha256"],
+        marker_sha256=snapshot["marker_sha256"], invocation_id=invocation_id,
+        t0_perf_counter=t0,
+        target={"stage": "R0", "attempt": "attempt_002",
+                "execution_seq": 3})
+    return {
+        "root": str(root), "spec_path": str(spec_path),
+        "spec_sha256": spec_sha, "snapshot_path": str(snapshot_path),
+        "snapshot_sha256": snapshot_sha,
+        "legacy_head_sha256": snapshot["legacy_head_sha256"],
+        "invocation_id": invocation_id, "t0_perf_counter": t0,
+        "authorization_path": str(auth_path),
+        "authorization_sha256": auth_sha,
+    }
+
+
+def compact_migration_result(result: Mapping[str, Any]) -> dict:
+    """Keep the facts an outer launcher/acceptance needs, not bulk arrays."""
+    keep = (
+        "conclusion", "complete_evidence", "covered_contract_passed",
+        "problems", "failures", "gaps", "selected_attempts",
+        "selected_chain_counts", "selected_chain_training_updates",
+        "cohort_training_updates", "training_updates",
+        "training_updates_known_lower_bound", "training_updates_scope",
+        "call_accounting_known", "commits", "candidates", "write_after",
+        "stage_timings", "last_stage_end_perf_counter", "invocation_id",
+        "binding_spec_sha256", "terminal_candidate",
+    )
+    compact = {key: result.get(key) for key in keep if key in result}
+    stages = {}
+    for stage, payload in (result.get("stages") or {}).items():
+        if not isinstance(payload, Mapping):
+            continue
+        stages[stage] = {
+            key: payload.get(key) for key in (
+                "complete_evidence", "passed", "report", "admission",
+                "failures", "gaps", "worker_result",
+                "verification_problems", "registration_sha256",
+                "numeric_passed", "paths", "withdrawal")
+            if key in payload}
+    compact["stages"] = stages
+    return compact
+
+
+def build_migration_synthetic_acceptance(
+        out_root: Path, result: Mapping[str, Any], *,
+        roster: Mapping[str, Any], tolerance: Mapping[str, Any],
+        calibration_verification_record: Mapping[str, Any],
+        launch: Mapping[str, Any], return_path: Path | None,
+        return_sha256: str | None, return_problems: Sequence[str],
+        journal: Mapping[str, Any]) -> dict:
+    """Bind the worker result to its actual outer return observation."""
+    from ireset.eval.w1_real_training_update_provider import (
+        synthetic_acceptance,
+        synthetic_acceptance_problems,
+    )
+    out_root = Path(out_root)
     commits = result.get("commits") or {}
     candidates = result.get("candidates") or {}
-    timings = result.get("stage_timings") or {}
-    return_sha = None
-    return_path = None
-    journal: dict = {"known": False, "problems": ["not_run"]}
-    return_problems: list[str] = []
-    if conclusion == "audit_incomplete" and commits and candidates and \
-            set(commits) == set(STAGE_BUDGETS) and \
-            set(candidates) == set(STAGE_BUDGETS):
-        return_path, return_sha, return_problems = record_return_observation(
-            root, invocation_id=invocation_id, pid=os.getpid(),
-            ppid=os.getppid(), exit_code=exit_code, signal=None,
-            started_perf_counter=t0, finished_perf_counter=finished,
-            last_stage_end_perf_counter=float(
-                timings["F"]["end_perf_counter"]),
-            commits=commits, candidate_receipts=candidates,
-            write_after={**{stage: True for stage in STAGE_BUDGETS},
-                         "terminal": bool(
-                             (result.get("write_after") or {}).get(
-                                 "terminal", True))},
-            stage_timings=timings, source_kind="outer_wait",
-            expected_exit_code=exit_code, conclusion=conclusion)
-        journal = scan_launch_journals(root.parent)
-    seals = {stage: {"sealed": True, "terminal": True, "problems": []}
-             for stage in STAGE_BUDGETS}
+    seals = {
+        stage: {"sealed": stage in commits, "terminal": stage in candidates,
+                "problems": []}
+        for stage in STAGE_BUDGETS}
     acceptance_input = dict(result)
     acceptance_input["seals"] = seals
     publication = {
@@ -13888,25 +13910,26 @@ def run_migration_synthetic_gate_b(
         "commits": commits, "candidate_receipts": candidates,
         "return_observation": (
             {"path": path_for_record(return_path),
-             "sha256": return_sha} if return_path else None),
+             "sha256": return_sha256} if return_path else None),
         "launch_journal": {"known": bool(journal.get("known")),
                            "problems": list(journal.get("problems") or [])},
     }
     acceptance = synthetic_acceptance(
-        acceptance_input, run_root=root, tolerance_contract=tolerance,
+        acceptance_input, run_root=Path(launch["root"]),
+        tolerance_contract=tolerance,
         calibration_verification_record=calibration_verification_record,
-        roster=provider.roster, publication=publication)
+        roster=roster, publication=publication)
     acceptance.update(
         generation=GENERATION_002,
         prior_training_updates=MIGRATION_SOURCE_UPDATES,
         cohort_training_updates=int(result.get("cohort_training_updates") or 0),
         migration_identity={
-            "spec_path": path_for_record(spec_path),
-            "spec_sha256": spec_sha,
-            "snapshot_path": path_for_record(snapshot_path),
-            "snapshot_sha256": snapshot_sha,
-            "legacy_head_sha256": binding.legacy_head_sha256,
-            "invocation_id": invocation_id,
+            "spec_path": path_for_record(Path(launch["spec_path"])),
+            "spec_sha256": launch["spec_sha256"],
+            "snapshot_path": path_for_record(Path(launch["snapshot_path"])),
+            "snapshot_sha256": launch["snapshot_sha256"],
+            "legacy_head_sha256": launch["legacy_head_sha256"],
+            "invocation_id": launch["invocation_id"],
         })
     acceptance_problems = synthetic_acceptance_problems(acceptance)
     acceptance["problems"] = list(acceptance.get("problems") or []) + \
@@ -13914,17 +13937,7 @@ def run_migration_synthetic_gate_b(
     acceptance["passed"] = not acceptance["problems"]
     acceptance_path = out_root / "migration_synthetic_acceptance.json"
     write_json(acceptance_path, acceptance)
-    result["migration_acceptance"] = {
-        "path": path_for_record(acceptance_path),
-        "sha256": sha256_file(acceptance_path),
-        "passed": acceptance["passed"],
-        "problems": acceptance["problems"],
-    }
-    result["return_observation"] = (
-        {"path": path_for_record(return_path), "sha256": return_sha,
-         "problems": return_problems} if return_path else None)
-    result["launch_journal"] = {
-        "known": bool(journal.get("known")),
-        "problems": list(journal.get("problems") or [])}
-    write_json(out_root / "migration_synthetic_result.json", result)
-    return result
+    return {"path": path_for_record(acceptance_path),
+            "sha256": sha256_file(acceptance_path),
+            "passed": acceptance["passed"],
+            "problems": acceptance["problems"]}

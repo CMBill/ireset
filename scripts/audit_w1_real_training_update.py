@@ -26,33 +26,53 @@ _ENTRY_STARTED_PERF = time.perf_counter()
 
 import argparse
 import json
+import subprocess
 import sys
 from pathlib import Path
+from typing import Any, Mapping
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from ireset.eval.w1_real_training_update_audit import (  # noqa: E402
+    ACCOUNTING_SCHEMA_V2,
     ADMISSION_SCHEMA,
     AUDIT_SCHEMA,
+    BINDINGS_DIR,
     COHORT_ID,
+    EXECUTION_EVENTS_DIR,
     HISTORY_ROOT,
+    LAUNCH_JOURNAL_DIR,
     MODEL_CONFIG,
+    STAGE_BUDGETS,
     admission_package_problems,
     authorization_problems,
     build_admission_package,
     build_default_tolerance_contract,
     build_binding_spec,
     build_migration_admission,
+    build_migration_synthetic_acceptance,
+    build_ordinary_synthetic_acceptance,
+    claim_launch,
+    compact_migration_result,
     configure_production_runtime,
+    implementation_files_sha256,
+    implementation_identity,
     load_authorization,
+    load_external_binding_material,
+    load_index,
     load_tolerance_contract,
+    prepare_migration_synthetic_launch,
+    record_return_observation,
     run_binding_migration_audit,
-    run_migration_synthetic_gate_b,
     run_registered_audit,
+    scan_launch_journals,
     sha256_file,
+    stage_binding,
     strict_read_json,
+    SyntheticTrainingProvider,
     synthetic_calibration,
+    synthetic_outer_return_record,
     synthetic_self_test,
     tolerance_contract_problems,
     write_history_snapshot,
@@ -147,6 +167,114 @@ def _load_calibration_verification(path: Path | None) -> dict | None:
     return record
 
 
+def _load_synthetic_config(args) -> dict | None:
+    if args.synthetic_config_json is None:
+        return None
+    path = Path(args.synthetic_config_json).expanduser().resolve()
+    try:
+        record = strict_read_json(path)
+    except (OSError, ValueError, TypeError) as exc:
+        raise SystemExit(f"synthetic config unreadable: {type(exc).__name__}")
+    if not isinstance(record, dict):
+        raise SystemExit("synthetic config must be a JSON object")
+    return record
+
+
+def _spawn_worker(command: list[str], log_path: Path) -> dict:
+    log_path = Path(log_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    started = float(time.perf_counter())
+    with open(log_path, "wb") as log:
+        process = subprocess.Popen(
+            command, cwd=str(ROOT), stdout=log, stderr=subprocess.STDOUT,
+            env=dict(os.environ))
+        pid = int(process.pid)
+        exit_code = int(process.wait())
+    finished = float(time.perf_counter())
+    return {"pid": pid, "ppid": os.getpid(), "exit_code": exit_code,
+            "signal": (-exit_code if exit_code < 0 else None),
+            "started_perf_counter": started,
+            "finished_perf_counter": finished,
+            "log_path": path_for_record(log_path)}
+
+
+def _write_launch_failure(directory: Path, facts: Mapping[str, Any],
+                          reason: str) -> Path:
+    path = Path(directory) / "failure.json"
+    record = {
+        "schema": "w1_real_training_update_launch_failure_v1",
+        "kind": "failure",
+        "reason": reason,
+        "observed": dict(facts),
+        "claimed_wall_s": max(0.0, float(
+            facts.get("finished_perf_counter", 0.0))
+            - float(facts.get("started_perf_counter", 0.0))),
+        "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    write_json_exclusive(path, record)
+    return path
+
+
+def _worker_result(path: Path) -> dict | None:
+    if not Path(path).is_file():
+        return None
+    try:
+        record = strict_read_json(path)
+    except (OSError, ValueError, TypeError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def _fresh_migration_root_problems(root: Path) -> list[str]:
+    problems: list[str] = []
+    for name in (BINDINGS_DIR, LAUNCH_JOURNAL_DIR, EXECUTION_EVENTS_DIR):
+        if (Path(root) / name).exists():
+            problems.append(f"migration_root_has_{name}")
+    try:
+        rows = load_index(Path(root))
+    except (OSError, ValueError, TypeError):
+        rows = []
+    if any(row.get("accounting_schema") == ACCOUNTING_SCHEMA_V2
+           for row in rows):
+        problems.append("migration_root_has_v2_rows")
+    return problems
+
+
+def _record_worker_return(root: Path, invocation_id: str, result: dict,
+                          facts: dict) -> tuple[Path | None, str | None,
+                                                list[str]]:
+    commits = result.get("commits") or {}
+    candidates = result.get("candidates") or {}
+    timings = result.get("stage_timings") or {}
+    write_after = result.get("write_after") or {}
+    stages = set(STAGE_BUDGETS)
+    if set(commits) != stages or set(candidates) != stages or \
+            set(timings) != stages:
+        return None, None, ["worker_return_scope"]
+    last_end = result.get("last_stage_end_perf_counter")
+    if last_end is None:
+        last_end = timings["F"].get("end_perf_counter")
+    try:
+        claim = strict_read_json(
+            Path(root) / LAUNCH_JOURNAL_DIR / invocation_id / "claim.json")
+        started = float(claim["t0_perf_counter"])
+        return record_return_observation(
+            root, invocation_id=invocation_id, pid=facts["pid"],
+            ppid=facts["ppid"], exit_code=facts["exit_code"],
+            signal=facts["signal"],
+            started_perf_counter=started,
+            finished_perf_counter=float(facts["finished_perf_counter"]),
+            last_stage_end_perf_counter=float(last_end),
+            commits=commits, candidate_receipts=candidates,
+            write_after={**{stage: True for stage in STAGE_BUDGETS},
+                         "terminal": bool(write_after.get("terminal", True))},
+            stage_timings=timings, source_kind="outer_wait",
+            expected_exit_code=facts["exit_code"],
+            conclusion=result.get("conclusion"))
+    except (OSError, ValueError, TypeError) as exc:
+        return None, None, [f"worker_return:{type(exc).__name__}"]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     mode = ap.add_mutually_exclusive_group()
@@ -174,8 +302,14 @@ def main() -> int:
     mode.add_argument("--gate-b-v2", action="store_true",
                       help="bind the ordinary and migration synthetic "
                            "acceptances into Gate B v2")
+    mode.add_argument("--migration-worker", action="store_true",
+                      help=argparse.SUPPRESS)
+    mode.add_argument("--synthetic-worker", action="store_true",
+                      help=argparse.SUPPRESS)
     mode.add_argument("--real", action="store_true",
                       help="registered real audit (authorization + admission)")
+    ap.add_argument("--job", type=Path, default=None)
+    ap.add_argument("--synthetic-config-json", type=Path, default=None)
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--tolerance-out", type=Path, default=None)
     ap.add_argument("--tolerance-contract", type=Path, default=None)
@@ -191,6 +325,9 @@ def main() -> int:
     ap.add_argument("--binding-spec", type=Path, default=None)
     ap.add_argument("--gate-b", type=Path, default=None)
     ap.add_argument("--migration-admission-package", type=Path, default=None)
+    ap.add_argument("--calibration-attempt", type=str, default=None)
+    ap.add_argument("--synthetic-attempt", type=str, default=None)
+    ap.add_argument("--admission-attempt", type=str, default=None)
     ap.add_argument("--invocation-id", type=str, default=None)
     ap.add_argument("--migration", action="store_true",
                     help="use the dedicated second-generation binding entry")
@@ -201,6 +338,116 @@ def main() -> int:
     ap.add_argument("--device", type=str, default="auto",
                     choices=("auto", "cpu", "cuda"))
     args = ap.parse_args()
+
+    if args.synthetic_worker:
+        if args.out is None or args.tolerance_contract is None:
+            raise SystemExit(
+                "--synthetic-worker requires --out and --tolerance-contract")
+        contract, _sha, problems = load_tolerance_contract(
+            args.tolerance_contract, recompute=False)
+        if problems:
+            raise SystemExit(f"tolerance contract refused: {problems}")
+        device = args.device
+        if device == "auto":
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        result = synthetic_self_test(
+            args.out, seed=args.seed, device=device, tolerance=contract,
+            config=_load_synthetic_config(args))
+        _print_result(result)
+        return _EXIT.get(result.get("conclusion", "audit_incomplete"), 3)
+
+    if args.migration_worker:
+        if args.job is None:
+            raise SystemExit("--migration-worker requires --job")
+        job = strict_read_json(Path(args.job).expanduser().resolve())
+        if not isinstance(job, Mapping):
+            raise SystemExit("migration worker job must be an object")
+        root = Path(str(job.get("root"))).expanduser().resolve()
+        spec_path = Path(str(job.get("spec_path"))).expanduser().resolve()
+        authorization, auth_sha, auth_problems = load_authorization(
+            Path(str(job.get("authorization_path"))).expanduser().resolve())
+        if auth_problems:
+            raise SystemExit(f"worker authorization refused: {auth_problems}")
+        contract, _contract_sha, contract_problems = load_tolerance_contract(
+            Path(str(job.get("tolerance_contract_path"))).expanduser().resolve(),
+            recompute=False)
+        if contract_problems:
+            raise SystemExit(
+                f"worker tolerance contract refused: {contract_problems}")
+        invocation_id = job.get("invocation_id")
+        result_path = Path(str(job.get("result_path"))).expanduser().resolve()
+        mode = job.get("mode")
+        if mode == "real":
+            from ireset.eval.w1_real_training_update_provider import (
+                REAL_ADMISSION_SCHEMA,
+                RealTrainingProvider,
+                real_admission_package_problems,
+            )
+            package_path = Path(
+                str(job.get("admission_package_path"))).expanduser().resolve()
+            package = strict_read_json(package_path)
+            package_sha = sha256_file(package_path)
+            if package.get("schema") == REAL_ADMISSION_SCHEMA:
+                package_problems = real_admission_package_problems(package)
+            else:
+                package_problems = admission_package_problems(package)
+            if package_problems:
+                raise SystemExit(f"worker admission refused: {package_problems}")
+            acceptance_path = Path(package.get("acceptance_path") or "")
+            if not acceptance_path.is_absolute():
+                acceptance_path = ROOT / acceptance_path
+            provider = RealTrainingProvider(
+                ROOT, MODEL_CONFIG, device="cuda",
+                acceptance_path=(acceptance_path if acceptance_path.is_file()
+                                 else None))
+            provider.acceptance = package.get("acceptance")
+            provider.acceptance_sha = package.get("acceptance_sha256")
+            provider.roster = ((package.get("roster") or {}).get(
+                "parameter_roster"))
+            result = run_binding_migration_audit(
+                root, provider, mode="real", tolerance=contract,
+                authorization_sha=auth_sha, authorization=authorization,
+                admission_package=package, admission_sha=package_sha,
+                binding_spec_path=spec_path, invocation_id=invocation_id,
+                fixed_root=HISTORY_ROOT, project_root=ROOT)
+        elif mode == "synthetic":
+            config = job.get("config")
+            if not isinstance(config, Mapping):
+                config = MODEL_CONFIG
+            device = job.get("device") or "cuda"
+            if device == "auto":
+                import torch
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+            provider = SyntheticTrainingProvider(
+                dict(config), seed=int(job.get("seed", 20261029)),
+                device=device)
+            fixture = root / "fixture"
+            if not (fixture / "fixture.json").is_file():
+                provider.prepare_fixture(fixture)
+            provider.load_fixture()
+            if provider.fixture.get("problems"):
+                raise SystemExit(
+                    f"worker fixture refused: {provider.fixture['problems']}")
+            result = run_binding_migration_audit(
+                root, provider, mode="synthetic", tolerance=contract,
+                authorization_sha=auth_sha, authorization=authorization,
+                binding_spec_path=spec_path, invocation_id=invocation_id,
+                fixed_root=root.parent, project_root=ROOT,
+                r0_started_perf=float(
+                    strict_read_json(
+                        root / LAUNCH_JOURNAL_DIR / invocation_id
+                        / "claim.json")["t0_perf_counter"]))
+        else:
+            raise SystemExit("migration worker mode must be real or synthetic")
+        write_json(result_path, {
+            "result": compact_migration_result(result),
+            "roster": provider.roster})
+        _print_result(result)
+        return _EXIT.get(result.get("conclusion", "audit_incomplete"), 3)
+
+    if args.synthetic_config_json is not None and args.real:
+        raise SystemExit("--synthetic-config-json is synthetic-only")
 
     if args.calibrate_synthetic:
         out = (args.tolerance_out or args.out or
@@ -328,8 +575,15 @@ def main() -> int:
               f"{len(snapshot['unsealed_files'])}")
         baseline_path = out / "protected_manifest.json"
         if not baseline_path.exists():
+            selected = {}
+            for key, value in (
+                    ("calibration_attempt", args.calibration_attempt),
+                    ("synthetic_attempt", args.synthetic_attempt),
+                    ("admission_attempt", args.admission_attempt)):
+                if value is not None:
+                    selected[key] = value
             path, baseline_sha, baseline = write_migration_baseline(
-                out, ROOT, run_root)
+                out, ROOT, run_root, **selected)
             print(f"[update-audit] protected manifest={path}")
             print(f"[update-audit] protected_sha256={baseline_sha} "
                   f"entries={baseline['entry_count']}")
@@ -462,16 +716,59 @@ def main() -> int:
             import torch
             device = "cuda" if torch.cuda.is_available() else "cpu"
         out = _guard(args.out)
-        result = run_migration_synthetic_gate_b(
+        invocation_id = args.invocation_id or "inv-gate-b-migration-001"
+        launch = prepare_migration_synthetic_launch(
             out, tolerance=contract,
-            calibration_verification_record=verification, seed=args.seed,
-            device=device)
-        acceptance = result.get("migration_acceptance") or {}
+            calibration_verification_record=verification,
+            invocation_id=invocation_id)
+        job = {
+            "mode": "synthetic", "root": launch["root"],
+            "spec_path": launch["spec_path"],
+            "authorization_path": launch["authorization_path"],
+            "tolerance_contract_path": str(contract_path),
+            "invocation_id": invocation_id,
+            "result_path": str(out / "migration_worker_result.json"),
+            "seed": args.seed, "device": device,
+            "config": _load_synthetic_config(args) or dict(MODEL_CONFIG),
+        }
+        job_path = out / "migration" / "worker_job.json"
+        write_json_exclusive(job_path, job)
+        facts = _spawn_worker(
+            [sys.executable, str(Path(__file__).resolve()),
+             "--migration-worker", "--job", str(job_path)],
+            out / "migration" / "worker.log")
+        document = _worker_result(Path(job["result_path"]))
+        if document is None or not isinstance(document.get("result"), Mapping):
+            _write_launch_failure(
+                Path(launch["root"]) / LAUNCH_JOURNAL_DIR / invocation_id,
+                facts, "worker_result_missing")
+            print("[update-audit] migration worker did not return a result")
+            print(f"[update-audit] worker_exit={facts['exit_code']} "
+                  f"log={facts['log_path']}")
+            return 3
+        result = dict(document["result"])
+        roster = document.get("roster") or {}
+        return_path, return_sha, return_problems = _record_worker_return(
+            Path(launch["root"]), invocation_id, result, facts)
+        journal = scan_launch_journals(Path(launch["root"]).parent)
+        acceptance = build_migration_synthetic_acceptance(
+            out, result, roster=roster, tolerance=contract,
+            calibration_verification_record=verification, launch=launch,
+            return_path=return_path, return_sha256=return_sha,
+            return_problems=return_problems, journal=journal)
+        result["migration_acceptance"] = acceptance
+        result["worker_return"] = facts
+        result["launch_journal"] = {
+            "known": bool(journal.get("known")),
+            "problems": list(journal.get("problems") or [])}
+        write_json(out / "migration_synthetic_result.json", result)
         print(f"[update-audit] migration synthetic conclusion="
               f"{result.get('conclusion')}")
         print(f"[update-audit] selected_attempts={result.get('selected_attempts')}")
         print(f"[update-audit] cohort_training_updates="
               f"{result.get('cohort_training_updates')}")
+        print(f"[update-audit] worker_exit={facts['exit_code']} "
+              f"pid={facts['pid']} ppid={facts['ppid']}")
         print(f"[update-audit] migration acceptance="
               f"{acceptance.get('path')}")
         print(f"[update-audit] sha256={acceptance.get('sha256')}")
@@ -632,24 +929,105 @@ def main() -> int:
             if args.binding_spec is None or args.invocation_id is None:
                 raise SystemExit(
                     "--migration requires --binding-spec and --invocation-id")
-            acceptance_path = Path(package.get("acceptance_path") or "")
-            if not acceptance_path.is_absolute():
-                acceptance_path = ROOT / acceptance_path
-            provider = RealTrainingProvider(
-                ROOT, MODEL_CONFIG, device="cuda",
-                acceptance_path=(acceptance_path if acceptance_path.is_file()
-                                 else None))
-            provider.acceptance = package.get("acceptance")
-            provider.acceptance_sha = package.get("acceptance_sha256")
-            provider.roster = ((package.get("roster") or {}).get(
-                "parameter_roster"))
-            result = run_binding_migration_audit(
-                out, provider, mode="real", tolerance=contract,
-                authorization_sha=auth_sha, authorization=record,
-                admission_package=package, admission_sha=package_sha,
-                binding_spec_path=args.binding_spec,
+            spec_path = Path(args.binding_spec).expanduser().resolve()
+            if not spec_path.is_file():
+                raise SystemExit(f"binding spec missing: {spec_path}")
+            spec = strict_read_json(spec_path)
+            spec_sha = sha256_file(spec_path)
+            reference = spec.get("history_snapshot") or {}
+            snapshot_path = Path(str(reference.get("path") or ""))
+            if not snapshot_path.is_absolute():
+                snapshot_path = ROOT / snapshot_path
+            snapshot_path = snapshot_path.expanduser().resolve()
+            snapshot_sha = reference.get("sha256")
+            if not snapshot_path.is_file():
+                raise SystemExit(f"history snapshot missing: {snapshot_path}")
+            snapshot = strict_read_json(snapshot_path)
+            binding, binding_problems = load_external_binding_material(
+                snapshot_path, snapshot_sha, spec_path, spec_sha,
+                project_root=ROOT, require_current_implementation=True)
+            if binding is None or binding_problems:
+                raise SystemExit(
+                    f"migration binding refused: {binding_problems}")
+            migration = record.get("migration") or {}
+            expected = {
+                "run_root_realpath": str(out),
+                "invocation_id": args.invocation_id,
+                "spec_sha256": spec_sha,
+                "snapshot_sha256": snapshot_sha,
+                "legacy_head_sha256": snapshot.get("legacy_head_sha256"),
+                "gate_b_sha256": ((spec.get("bindings") or {}).get(
+                    "gate_b") or {}).get("sha256"),
+                "real_admission_sha256": package_sha,
+                "implementation_sha256": implementation_files_sha256(
+                    implementation_identity(ROOT)),
+            }
+            binding_problems = [
+                f"authorization_migration:{key}" for key, value in
+                expected.items() if migration.get(key) != value]
+            if ((spec.get("bindings") or {}).get("real_admission") or {}).get(
+                    "sha256") != package_sha:
+                binding_problems.append("spec_real_admission")
+            if _fresh_migration_root_problems(out):
+                binding_problems += _fresh_migration_root_problems(out)
+            if not (out / "cohort.json").is_file():
+                binding_problems.append("migration_root_missing_marker")
+            if binding_problems:
+                raise SystemExit(
+                    f"migration launch refused: {binding_problems}")
+            stage_binding(
+                out, spec_path=spec_path, spec_sha256=spec_sha,
+                snapshot_sha256=snapshot_sha,
+                invocation_id=args.invocation_id)
+            claim_launch(
+                out, authorization_sha256=auth_sha, spec_sha256=spec_sha,
+                legacy_head_sha256=snapshot["legacy_head_sha256"],
+                marker_sha256=snapshot["marker_sha256"],
                 invocation_id=args.invocation_id,
-                fixed_root=HISTORY_ROOT, project_root=ROOT)
+                t0_perf_counter=_ENTRY_STARTED_PERF,
+                target=dict(spec["stage_plan"][0]))
+            directory = out / LAUNCH_JOURNAL_DIR / args.invocation_id
+            job = {
+                "mode": "real", "root": str(out),
+                "spec_path": str(spec_path),
+                "authorization_path": args.authorization.resolve(),
+                "admission_package_path": args.admission_package.resolve(),
+                "tolerance_contract_path": args.tolerance_contract.resolve(),
+                "invocation_id": args.invocation_id,
+                "result_path": str(directory / "worker_result_inner.json"),
+            }
+            job_path = directory / "worker_job.json"
+            write_json_exclusive(job_path, job)
+            facts = _spawn_worker(
+                [sys.executable, str(Path(__file__).resolve()),
+                 "--migration-worker", "--job", str(job_path)],
+                directory / "worker.log")
+            document = _worker_result(Path(job["result_path"]))
+            if document is None or not isinstance(
+                    document.get("result"), Mapping):
+                _write_launch_failure(directory, facts,
+                                      "worker_result_missing")
+                print("[update-audit] migration worker did not return a result")
+                print(f"[update-audit] worker_exit={facts['exit_code']} "
+                      f"log={facts['log_path']}")
+                return 3
+            result = dict(document["result"])
+            return_path, return_sha, return_problems = _record_worker_return(
+                out, args.invocation_id, result, facts)
+            journal = scan_launch_journals(out.parent)
+            result["return_observation"] = (
+                {"path": path_for_record(return_path),
+                 "sha256": return_sha,
+                 "problems": return_problems} if return_path else None)
+            result["worker_return"] = facts
+            result["launch_journal"] = {
+                "known": bool(journal.get("known")),
+                "problems": list(journal.get("problems") or [])}
+            write_json(directory / "worker_result_outer.json", result)
+            if return_problems or not journal.get("known"):
+                print("[update-audit] migration return/journal not closed: "
+                      f"return={return_problems} "
+                      f"journal={journal.get('problems')}")
             _print_result(result)
             return _EXIT.get(result.get("conclusion", "audit_incomplete"), 3)
         if not args.resume and out.exists() and any(out.iterdir()):
@@ -701,10 +1079,54 @@ def main() -> int:
                          else _calibration_verification_path(args,
                                                              contract_path))
     verification = _load_calibration_verification(verification_path)
+    if verification is not None:
+        if tolerance is None or contract_path is None:
+            raise SystemExit(
+                "synthetic acceptance requires --tolerance-contract")
+        if out.exists() and any(out.iterdir()):
+            raise SystemExit(f"synthetic run root is not fresh: {out}")
+        command = [
+            sys.executable, str(Path(__file__).resolve()),
+            "--synthetic-worker", "--out", str(out),
+            "--tolerance-contract", str(contract_path),
+            "--seed", str(args.seed), "--device", device]
+        if args.synthetic_config_json is not None:
+            command += ["--synthetic-config-json",
+                        str(Path(args.synthetic_config_json).expanduser()
+                            .resolve())]
+        facts = _spawn_worker(
+            command, out.parent / f"{out.name}_synthetic_worker.log")
+        result = _worker_result(out / "audit_result.json")
+        if result is None:
+            print("[update-audit] synthetic worker did not return a result")
+            print(f"[update-audit] worker_exit={facts['exit_code']} "
+                  f"log={facts['log_path']}")
+            return 3
+        outer = synthetic_outer_return_record(
+            started_perf_counter=facts["started_perf_counter"],
+            finished_perf_counter=facts["finished_perf_counter"],
+            conclusion=result.get("conclusion"), pid=facts["pid"],
+            ppid=facts["ppid"], exit_code=facts["exit_code"],
+            signal=facts["signal"])
+        outer_path = out / "synthetic_return.json"
+        write_json(outer_path, outer)
+        acceptance = build_ordinary_synthetic_acceptance(
+            out, result, roster=result.get("roster") or {},
+            tolerance=tolerance,
+            calibration_verification_record=verification,
+            outer_return_path=outer_path,
+            outer_return_sha256=sha256_file(outer_path))
+        result["synthetic_acceptance"] = acceptance
+        write_json(out / "audit_result.json", result)
+        print(f"[update-audit] worker_exit={facts['exit_code']} "
+              f"pid={facts['pid']} ppid={facts['ppid']}")
+        print(f"[update-audit] synthetic acceptance={acceptance['path']}")
+        print(f"[update-audit] sha256={acceptance['sha256']} "
+              f"passed={acceptance['passed']}")
+        _print_result(result)
+        return _EXIT.get(result.get("conclusion", "audit_incomplete"), 3)
     result = synthetic_self_test(
-        out, seed=args.seed, device=device, tolerance=tolerance,
-        calibration_verification_record=verification,
-        outer_started_perf=_ENTRY_STARTED_PERF)
+        out, seed=args.seed, device=device, tolerance=tolerance)
     _print_result(result)
     return _EXIT.get(result.get("conclusion", "audit_incomplete"), 3)
 

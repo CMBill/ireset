@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -152,7 +153,7 @@ def _install_migration(root: Path, provider: A.SyntheticTrainingProvider,
         legacy_head_sha256=binding.legacy_head_sha256,
         target_generation=A.GENERATION_002,
         plan_sha256=A.sha256_file(PROJECT_ROOT / A.MIGRATION_PLAN),
-        implementation_sha256=A.canonical_sha256(impl),
+        implementation_sha256=A.implementation_files_sha256(impl),
         runtime_sha256=A.canonical_sha256(A.runtime_identity_facts()),
         gate_b_sha256="3" * 64, real_admission_sha256="4" * 64,
         execution_plan_sha256=A.sha256_file(PROJECT_ROOT / A.MIGRATION_PLAN),
@@ -1245,3 +1246,101 @@ def test_non_object_terminal_json_is_unknown_not_crash(migrated):
         for path, data in saved.items():
             path.write_bytes(data)
     assert A.scan_launch_journals(root.parent)["known"] is True
+
+def test_implementation_identity_binds_files_not_git_state():
+    impl = A.implementation_identity(PROJECT_ROOT)
+    other = {**impl, "git": {"head": "0" * 40, "dirty": False,
+                             "status_sha256": "0" * 64,
+                             "tracked_diff_sha256": "0" * 64}}
+    assert A.implementation_files_sha256(impl) == \
+        A.implementation_files_sha256(other)
+    changed = {**impl, "files": {**impl["files"], "x": "y"}}
+    assert A.implementation_files_sha256(changed) != \
+        A.implementation_files_sha256(impl)
+
+
+def _gate_b_calibration() -> tuple[Path, Path]:
+    base = PROJECT_ROOT / "derived/audit/w1_real_training_update_audit"
+    contract = base / "calibration/attempt_015/tolerance_contract.json"
+    verification = base / "calibration/attempt_015/calibration_verification.json"
+    if not contract.is_file() or not verification.is_file():
+        pytest.skip("final Gate B calibration artifacts are absent")
+    return contract, verification
+
+
+def _tiny_config(path: Path) -> Path:
+    record = dict(TINY_CONFIG)
+    path.write_text(json.dumps(record))
+    return path
+
+
+def test_ordinary_cli_outer_return_is_an_actual_process(tmp_path):
+    contract, verification = _gate_b_calibration()
+    config = _tiny_config(tmp_path / "tiny.json")
+    out = tmp_path / "ordinary"
+    command = [
+        sys.executable,
+        str(PROJECT_ROOT / "scripts/audit_w1_real_training_update.py"),
+        "--synthetic", "--out", str(out),
+        "--tolerance-contract", str(contract),
+        "--calibration-verification", str(verification),
+        "--synthetic-config-json", str(config),
+        "--device", "cuda",
+    ]
+    env = dict(os.environ)
+    env.pop("OMP_NUM_THREADS", None)
+    proc = subprocess.run(command, cwd=PROJECT_ROOT, capture_output=True,
+                          text=True, timeout=900, env=env)
+    assert proc.returncode == 3, proc.stdout + proc.stderr
+    result = json.loads((out / "audit_result.json").read_text())
+    assert result["synthetic_acceptance"]["passed"] is True
+    outer = json.loads((out / "synthetic_return.json").read_text())
+    assert outer["source"]["kind"] == "outer_wait"
+    assert outer["pid"] != os.getpid()
+    assert outer["pid"] != outer["ppid"]
+    assert outer["exit_code"] == 3
+    assert outer["source"]["exit_code"] == 3
+    assert outer["post_return_work_performed"] is False
+    assert outer["finished_perf_counter"] >= outer["started_perf_counter"]
+
+
+def test_migration_cli_outer_return_and_acceptance(tmp_path):
+    contract, verification = _gate_b_calibration()
+    config = _tiny_config(tmp_path / "tiny.json")
+    out = tmp_path / "migration"
+    invocation = "inv-cli-outer"
+    command = [
+        sys.executable,
+        str(PROJECT_ROOT / "scripts/audit_w1_real_training_update.py"),
+        "--migration-synthetic", "--out", str(out),
+        "--tolerance-contract", str(contract),
+        "--calibration-verification", str(verification),
+        "--synthetic-config-json", str(config),
+        "--device", "cuda", "--invocation-id", invocation,
+    ]
+    env = dict(os.environ)
+    env.pop("OMP_NUM_THREADS", None)
+    proc = subprocess.run(command, cwd=PROJECT_ROOT, capture_output=True,
+                          text=True, timeout=900, env=env)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    acceptance = json.loads(
+        (out / "migration_synthetic_acceptance.json").read_text())
+    assert acceptance["passed"] is True
+    observation_path = (out / "cohort" / A.LAUNCH_JOURNAL_DIR / invocation
+                        / "return_observation.json")
+    observation = json.loads(observation_path.read_text())
+    assert observation["source"]["kind"] == "outer_wait"
+    assert observation["pid"] != os.getpid()
+    assert observation["pid"] != observation["ppid"]
+    assert observation["source"]["exit_code"] == 3
+    assert observation["coverage_ok"] is True
+    assert acceptance["publication"]["return_observation"]["sha256"] == \
+        hashlib.sha256(observation_path.read_bytes()).hexdigest()
+    assert (out / "cohort" / A.BINDINGS_DIR / A.GENERATION_002).is_dir()
+    assert (out / "cohort" / A.LAUNCH_JOURNAL_DIR / invocation
+            / "claim.json").is_file()
+    result = json.loads(
+        (out / "migration_synthetic_result.json").read_text())
+    assert result["cohort_training_updates"] == 18
+    assert result["worker_return"]["pid"] == observation["pid"]
+
