@@ -1723,6 +1723,56 @@ def test_reference_context_target_fk_obeys_the_deadline(chain, tmp_path,
     assert counter.counts["independent_output_vjp"] == 0
 
 
+def test_final_verification_reseal_keeps_process_return_tail(tmp_path,
+                                                             monkeypatch):
+    import types
+
+    root = tmp_path / "tail_cost"
+    A.write_cohort(root, mode="synthetic")
+    attempt = "attempt_001"
+    directory = A.stage_dir(root, "F") / attempt
+    directory.mkdir(parents=True)
+    report = directory / "training_update_final.json"
+    A.write_json(report, {"complete_evidence": True})
+    clock = {"now": 103.0}
+    monkeypatch.setattr(A, "time", types.SimpleNamespace(
+        perf_counter=lambda: clock["now"],
+        strftime=lambda fmt: "2026-11-04T00:00:00+0800",
+        time=lambda: clock["now"],
+        time_ns=lambda: int(clock["now"] * 1e9)))
+    budget = {"remaining_s": 200.0, "reserve_s": 0.0, "attempts": 2,
+              "attempts_used": 0}
+    t0 = 0.0
+    first = A.finish_attempt(
+        root, "F", attempt, t0, budget,
+        {"complete": True, "report": A.path_for_record(report),
+         "summary": A.path_for_record(report)},
+        status="done",
+        extra={"call_balance": A.CallCounter(A.CALL_CAPS).snapshot()},
+        tail_floor=A.FINAL_PROCESS_RETURN_TAIL_S)
+    assert first.sealed and first.row["complete"] is True
+    assert first.row["seal_tail_reserve_s"] >= A.FINAL_PROCESS_RETURN_TAIL_S
+    assert first.row["measured_wall_s"] >= (
+        103.0 + A.FINAL_PROCESS_RETURN_TAIL_S)
+
+    # Post-seal consumer verification costs another 7 s.  The re-seal must
+    # keep the declared 3 s process-return reserve instead of falling back to
+    # the generic 1 s seal tail.
+    clock["now"] = 110.0
+    seals = {"row": first.row, "sealed": True, "terminal": True,
+             "problems": []}
+    charged, revoke = A._charge_final_verification(
+        root, "F", attempt, t0, budget, first, seals, scope={},
+        counter=A.CallCounter(A.CALL_CAPS), actual_cost=110.0)
+    assert revoke is None
+    assert charged.sealed and charged.row["complete"] is True
+    assert charged.row["seal_tail_reserve_s"] >= A.FINAL_PROCESS_RETURN_TAIL_S
+    assert charged.row["measured_wall_s"] >= (
+        110.0 + A.FINAL_PROCESS_RETURN_TAIL_S)
+    # A 2 s outer return after the last observed work is inside that reserve.
+    assert charged.row["measured_wall_s"] >= 112.0
+
+
 def test_final_verification_cost_is_charged_and_overrun_revokes(tmp_path):
     root = tmp_path / "verify_cost"
     A.write_cohort(root, mode="synthetic")

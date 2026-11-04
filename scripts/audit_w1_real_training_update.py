@@ -25,6 +25,7 @@ import time
 _ENTRY_STARTED_PERF = time.perf_counter()
 
 import argparse
+import hashlib
 import json
 import subprocess
 import sys
@@ -33,6 +34,184 @@ from typing import Any, Mapping
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+
+# ---------------------------------------------------------------------------
+# Minimal launch bootstrap (stdlib only, before the project/numeric imports)
+# ---------------------------------------------------------------------------
+# The frozen migration plan (§6.1) requires the one-shot claim to be persisted
+# before uv/project imports and before any substantive precheck.  This block
+# deliberately duplicates only the claim writer; the audit module remains the
+# authority for validation and for every later record.
+_LAUNCH_CLAIM_SCHEMA = "w1_real_training_update_launch_claim_v1"
+_LAUNCH_COHORT_ID = "w1_real_training_update_audit_v1"
+_LAUNCH_EXECUTION_ID = "w1_real_training_update_audit_v1"
+_LAUNCH_HISTORY_ROOT = Path("derived/experiments/omniretarget_first")
+_LAUNCH_TARGET = {"stage": "R0", "attempt": "attempt_002",
+                  "execution_seq": 3}
+
+
+def _flag_present(flag: str, argv: list[str]) -> bool:
+    return any(token == flag or token.startswith(flag + "=")
+               for token in argv)
+
+
+def _flag_value(flag: str, argv: list[str]) -> str | None:
+    for index, token in enumerate(argv):
+        if token == flag:
+            return argv[index + 1] if index + 1 < len(argv) else None
+        if token.startswith(flag + "="):
+            return token[len(flag) + 1:]
+    return None
+
+
+def _hash_path(path: Path | None) -> str:
+    if path is None or not Path(path).is_file():
+        return "0" * 64
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _read_optional_json(path: Path | None) -> dict | None:
+    if path is None or not Path(path).is_file():
+        return None
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _write_minimal_launch_claim(
+        *, root: Path, invocation_id: str, authorization_sha256: str,
+        spec_sha256: str, legacy_head_sha256: str, marker_sha256: str,
+        target: Mapping[str, Any], t0_perf_counter: float) -> Path:
+    """Persist ``claim.json`` before any substantive precheck.
+
+    The write is byte-for-byte the same shape as ``claim_launch`` and uses the
+    same temp + link + directory-fsync publication, so a crash leaves no
+    overwrite and an observable ``.tmp`` sibling.
+    """
+    directory = Path(root) / "launch_journal" / invocation_id
+    path = directory / "claim.json"
+    if path.exists():
+        return path
+    payload = {
+        "schema": _LAUNCH_CLAIM_SCHEMA,
+        "invocation_id": invocation_id,
+        "cohort_id": _LAUNCH_COHORT_ID,
+        "execution_id": _LAUNCH_EXECUTION_ID,
+        "run_root_realpath": str(Path(root).resolve()),
+        "authorization_sha256": authorization_sha256,
+        "spec_sha256": spec_sha256,
+        "legacy_head_sha256": legacy_head_sha256,
+        "marker_sha256": marker_sha256,
+        "t0_perf_counter": float(t0_perf_counter),
+        "target": dict(target),
+        "pid": int(os.getpid()),
+        "ppid": int(os.getppid()),
+        "executable": sys.executable,
+        "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    directory.mkdir(parents=True, exist_ok=True)
+    data = (json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False,
+                       allow_nan=False) + "\n").encode("utf-8")
+    tmp = path.with_name(path.name + f".tmp.{os.getpid()}.{time.time_ns()}")
+    fd = os.open(str(tmp), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(tmp, path)
+        except FileExistsError:
+            return path
+        directory_fd = os.open(str(directory), os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+    return path
+
+
+def _bootstrap_real_migration_launch(
+        argv: list[str] | None = None,
+        base: Path | None = None) -> Path | None:
+    """Write the fixed-root claim before importing the project.
+
+    Only a fresh real migration launch is eligible.  Resume, stage replay and
+    worker processes must not consume another one-shot invocation.
+    """
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if any(_flag_present(flag, argv) for flag in (
+            "--migration-worker", "--synthetic-worker", "--resume", "--stage")):
+        return None
+    if not _flag_present("--real", argv) or \
+            not _flag_present("--migration", argv):
+        return None
+    out_value = _flag_value("--out", argv)
+    invocation_id = _flag_value("--invocation-id", argv)
+    authorization_value = _flag_value("--authorization", argv)
+    spec_value = _flag_value("--binding-spec", argv)
+    if not out_value or not invocation_id or not authorization_value or \
+            not spec_value or Path(invocation_id).name != invocation_id or \
+            invocation_id in (".", ".."):
+        return None
+    out = Path(out_value).expanduser().resolve()
+    fixed_base = (Path(base) if base is not None
+                  else ROOT / _LAUNCH_HISTORY_ROOT).resolve()
+    if out.parent != fixed_base:
+        return None
+    spec_path = Path(spec_value).expanduser()
+    spec_path = (spec_path.resolve() if spec_path.is_file() else None)
+    spec = _read_optional_json(spec_path)
+    snapshot_path = None
+    snapshot = None
+    if isinstance(spec, dict):
+        reference = spec.get("history_snapshot")
+        if isinstance(reference, dict):
+            raw = reference.get("path")
+            if isinstance(raw, str) and raw:
+                snapshot_path = Path(raw)
+                if not snapshot_path.is_absolute():
+                    snapshot_path = ROOT / snapshot_path
+                snapshot_path = snapshot_path.expanduser().resolve()
+                snapshot = _read_optional_json(snapshot_path)
+    legacy = (snapshot or {}).get("legacy_head_sha256")
+    marker = (snapshot or {}).get("marker_sha256")
+    target = _LAUNCH_TARGET
+    if isinstance(spec, dict):
+        plan = spec.get("stage_plan")
+        if isinstance(plan, list) and plan and isinstance(plan[0], dict):
+            target = plan[0]
+    authorization_path = Path(authorization_value).expanduser()
+    authorization_path = (authorization_path.resolve()
+                          if authorization_path.is_file() else None)
+    try:
+        return _write_minimal_launch_claim(
+            root=out, invocation_id=invocation_id,
+            authorization_sha256=_hash_path(authorization_path),
+            spec_sha256=_hash_path(spec_path),
+            legacy_head_sha256=(legacy if isinstance(legacy, str)
+                                and len(legacy) == 64 else "0" * 64),
+            marker_sha256=(marker if isinstance(marker, str)
+                           and len(marker) == 64 else "0" * 64),
+            target=target, t0_perf_counter=_ENTRY_STARTED_PERF)
+    except OSError as exc:
+        print(f"[update-audit] launch claim bootstrap failed: "
+              f"{type(exc).__name__}", file=sys.stderr)
+        return None
+
+
+_BOOTSTRAP_CLAIM = _bootstrap_real_migration_launch()
 
 from ireset.eval.w1_real_training_update_audit import (  # noqa: E402
     ACCOUNTING_SCHEMA_V2,
@@ -58,6 +237,7 @@ from ireset.eval.w1_real_training_update_audit import (  # noqa: E402
     configure_production_runtime,
     implementation_files_sha256,
     implementation_identity,
+    launch_claim_record,
     load_authorization,
     load_external_binding_material,
     load_index,
@@ -213,6 +393,44 @@ def _write_launch_failure(directory: Path, facts: Mapping[str, Any],
     }
     write_json_exclusive(path, record)
     return path
+
+
+def _history_root() -> Path:
+    return (ROOT / HISTORY_ROOT).resolve()
+
+
+def _write_precheck_failure(root: Path, invocation_id: str, t0: float,
+                            reason: str) -> Path | None:
+    """Leave a billed liability when a substantive precheck refuses.
+
+    The claim is already persisted by the minimal launcher, so a precheck
+    failure must not disappear as a clean zero-record journal.
+    """
+    directory = Path(root) / LAUNCH_JOURNAL_DIR / invocation_id
+    claim_path = directory / "claim.json"
+    if not claim_path.is_file():
+        return None
+    try:
+        claim = json.loads(claim_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(claim, dict) or claim.get("pid") != os.getpid() or \
+            claim.get("t0_perf_counter") != float(t0):
+        return None
+    finished = float(time.perf_counter())
+    facts = {
+        "pid": os.getpid(), "ppid": os.getppid(), "exit_code": 1,
+        "signal": None, "started_perf_counter": float(t0),
+        "finished_perf_counter": finished, "log_path": None,
+    }
+    try:
+        return _write_launch_failure(directory, facts, reason)
+    except FileExistsError:
+        return directory / "failure.json"
+    except OSError as exc:
+        print(f"[update-audit] precheck failure record could not be written: "
+              f"{type(exc).__name__}", file=sys.stderr)
+        return None
 
 
 def _worker_result(path: Path) -> dict | None:
@@ -894,110 +1112,133 @@ def main() -> int:
             raise SystemExit("--resume requires --stage")
         if args.stage is not None and not args.resume:
             raise SystemExit("--stage is only valid with --resume")
-        record, auth_sha, auth_problems = load_authorization(args.authorization)
-        if auth_problems:
-            raise SystemExit(f"authorization refused: {auth_problems}")
-        contract, contract_sha, contract_problems = load_tolerance_contract(
-            args.tolerance_contract, recompute=False)
-        if contract_problems:
-            raise SystemExit(f"tolerance contract refused: {contract_problems}")
-        try:
-            package = json.loads(Path(args.admission_package).read_text())
-        except (OSError, ValueError):
-            raise SystemExit("admission package unreadable")
-        package_sha = sha256_file(args.admission_package)
-        from ireset.eval.w1_real_training_update_provider import (
-            REAL_ADMISSION_SCHEMA,
-            RealTrainingProvider,
-        )
-        if package.get("schema") == REAL_ADMISSION_SCHEMA:
-            from ireset.eval.w1_real_training_update_provider import (
-                real_admission_package_problems,
-            )
-            pkg_problems = real_admission_package_problems(package)
-        else:
-            pkg_problems = admission_package_problems(package)
-        if pkg_problems:
-            raise SystemExit(f"admission package refused: {pkg_problems}")
         out = Path(args.out).expanduser().resolve()
-        base = (ROOT / HISTORY_ROOT).resolve()
-        if out.parent != base:
-            raise SystemExit(f"--out must be a direct child of {base}, got {out}")
+        base = _history_root()
+        migration_launch = bool(args.migration and not args.resume
+                                and args.stage is None)
+        try:
+            if out.parent != base:
+                raise SystemExit(
+                    f"--out must be a direct child of {base}, got {out}")
+            record, auth_sha, auth_problems = load_authorization(
+                args.authorization)
+            if auth_problems:
+                raise SystemExit(f"authorization refused: {auth_problems}")
+            contract, contract_sha, contract_problems = load_tolerance_contract(
+                args.tolerance_contract, recompute=False)
+            if contract_problems:
+                raise SystemExit(
+                    f"tolerance contract refused: {contract_problems}")
+            try:
+                package = json.loads(Path(args.admission_package).read_text())
+            except (OSError, ValueError):
+                raise SystemExit("admission package unreadable")
+            package_sha = sha256_file(args.admission_package)
+            from ireset.eval.w1_real_training_update_provider import (
+                REAL_ADMISSION_SCHEMA,
+                RealTrainingProvider,
+            )
+            if package.get("schema") == REAL_ADMISSION_SCHEMA:
+                from ireset.eval.w1_real_training_update_provider import (
+                    real_admission_package_problems,
+                )
+                pkg_problems = real_admission_package_problems(package)
+            else:
+                pkg_problems = admission_package_problems(package)
+            if pkg_problems:
+                raise SystemExit(f"admission package refused: {pkg_problems}")
+            if args.migration:
+                if args.resume or args.stage is not None:
+                    raise SystemExit(
+                        "--migration cannot be combined with --resume")
+                if args.binding_spec is None or args.invocation_id is None:
+                    raise SystemExit(
+                        "--migration requires --binding-spec and --invocation-id")
+                spec_path = Path(args.binding_spec).expanduser().resolve()
+                if not spec_path.is_file():
+                    raise SystemExit(f"binding spec missing: {spec_path}")
+                spec = strict_read_json(spec_path)
+                spec_sha = sha256_file(spec_path)
+                reference = spec.get("history_snapshot") or {}
+                snapshot_path = Path(str(reference.get("path") or ""))
+                if not snapshot_path.is_absolute():
+                    snapshot_path = ROOT / snapshot_path
+                snapshot_path = snapshot_path.expanduser().resolve()
+                snapshot_sha = reference.get("sha256")
+                if not snapshot_path.is_file():
+                    raise SystemExit(
+                        f"history snapshot missing: {snapshot_path}")
+                snapshot = strict_read_json(snapshot_path)
+                binding, binding_problems = load_external_binding_material(
+                    snapshot_path, snapshot_sha, spec_path, spec_sha,
+                    project_root=ROOT, require_current_implementation=True)
+                if binding is None or binding_problems:
+                    raise SystemExit(
+                        f"migration binding refused: {binding_problems}")
+                migration = record.get("migration") or {}
+                expected = {
+                    "run_root_realpath": str(out),
+                    "invocation_id": args.invocation_id,
+                    "spec_sha256": spec_sha,
+                    "snapshot_sha256": snapshot_sha,
+                    "legacy_head_sha256": snapshot.get("legacy_head_sha256"),
+                    "gate_b_sha256": ((spec.get("bindings") or {}).get(
+                        "gate_b") or {}).get("sha256"),
+                    "real_admission_sha256": package_sha,
+                    "implementation_sha256": implementation_files_sha256(
+                        implementation_identity(ROOT)),
+                }
+                binding_problems = [
+                    f"authorization_migration:{key}" for key, value in
+                    expected.items() if migration.get(key) != value]
+                if ((spec.get("bindings") or {}).get(
+                        "real_admission") or {}).get("sha256") != package_sha:
+                    binding_problems.append("spec_real_admission")
+                if _fresh_migration_root_problems(out):
+                    binding_problems += _fresh_migration_root_problems(out)
+                if not (out / "cohort.json").is_file():
+                    binding_problems.append("migration_root_missing_marker")
+                if binding_problems:
+                    raise SystemExit(
+                        f"migration launch refused: {binding_problems}")
+                _claim, _claim_sha, claim_problems = launch_claim_record(
+                    out, args.invocation_id,
+                    authorization_sha256=auth_sha, spec_sha256=spec_sha,
+                    legacy_head_sha256=snapshot["legacy_head_sha256"],
+                    marker_sha256=snapshot["marker_sha256"])
+                if _claim is not None and _claim.get("pid") != os.getpid():
+                    claim_problems.append("launch_claim_not_current_process")
+                if claim_problems:
+                    raise SystemExit(
+                        f"launch claim refused: {claim_problems}")
+                stage_binding(
+                    out, spec_path=spec_path, spec_sha256=spec_sha,
+                    snapshot_sha256=snapshot_sha,
+                    invocation_id=args.invocation_id)
+                directory = out / LAUNCH_JOURNAL_DIR / args.invocation_id
+                job = {
+                    "mode": "real", "root": str(out),
+                    "spec_path": str(spec_path),
+                    "authorization_path": args.authorization.resolve(),
+                    "admission_package_path": args.admission_package.resolve(),
+                    "tolerance_contract_path":
+                        args.tolerance_contract.resolve(),
+                    "invocation_id": args.invocation_id,
+                    "result_path": str(directory / "worker_result_inner.json"),
+                }
+                job_path = directory / "worker_job.json"
+                write_json_exclusive(job_path, job)
+            else:
+                if not args.resume and out.exists() and any(out.iterdir()):
+                    raise SystemExit(f"real run root is not fresh: {out}")
+        except BaseException as exc:
+            if migration_launch:
+                reason = str(exc) or type(exc).__name__
+                _write_precheck_failure(
+                    out, args.invocation_id, _ENTRY_STARTED_PERF, reason)
+            raise
+
         if args.migration:
-            if args.resume or args.stage is not None:
-                raise SystemExit("--migration cannot be combined with --resume")
-            if args.binding_spec is None or args.invocation_id is None:
-                raise SystemExit(
-                    "--migration requires --binding-spec and --invocation-id")
-            spec_path = Path(args.binding_spec).expanduser().resolve()
-            if not spec_path.is_file():
-                raise SystemExit(f"binding spec missing: {spec_path}")
-            spec = strict_read_json(spec_path)
-            spec_sha = sha256_file(spec_path)
-            reference = spec.get("history_snapshot") or {}
-            snapshot_path = Path(str(reference.get("path") or ""))
-            if not snapshot_path.is_absolute():
-                snapshot_path = ROOT / snapshot_path
-            snapshot_path = snapshot_path.expanduser().resolve()
-            snapshot_sha = reference.get("sha256")
-            if not snapshot_path.is_file():
-                raise SystemExit(f"history snapshot missing: {snapshot_path}")
-            snapshot = strict_read_json(snapshot_path)
-            binding, binding_problems = load_external_binding_material(
-                snapshot_path, snapshot_sha, spec_path, spec_sha,
-                project_root=ROOT, require_current_implementation=True)
-            if binding is None or binding_problems:
-                raise SystemExit(
-                    f"migration binding refused: {binding_problems}")
-            migration = record.get("migration") or {}
-            expected = {
-                "run_root_realpath": str(out),
-                "invocation_id": args.invocation_id,
-                "spec_sha256": spec_sha,
-                "snapshot_sha256": snapshot_sha,
-                "legacy_head_sha256": snapshot.get("legacy_head_sha256"),
-                "gate_b_sha256": ((spec.get("bindings") or {}).get(
-                    "gate_b") or {}).get("sha256"),
-                "real_admission_sha256": package_sha,
-                "implementation_sha256": implementation_files_sha256(
-                    implementation_identity(ROOT)),
-            }
-            binding_problems = [
-                f"authorization_migration:{key}" for key, value in
-                expected.items() if migration.get(key) != value]
-            if ((spec.get("bindings") or {}).get("real_admission") or {}).get(
-                    "sha256") != package_sha:
-                binding_problems.append("spec_real_admission")
-            if _fresh_migration_root_problems(out):
-                binding_problems += _fresh_migration_root_problems(out)
-            if not (out / "cohort.json").is_file():
-                binding_problems.append("migration_root_missing_marker")
-            if binding_problems:
-                raise SystemExit(
-                    f"migration launch refused: {binding_problems}")
-            stage_binding(
-                out, spec_path=spec_path, spec_sha256=spec_sha,
-                snapshot_sha256=snapshot_sha,
-                invocation_id=args.invocation_id)
-            claim_launch(
-                out, authorization_sha256=auth_sha, spec_sha256=spec_sha,
-                legacy_head_sha256=snapshot["legacy_head_sha256"],
-                marker_sha256=snapshot["marker_sha256"],
-                invocation_id=args.invocation_id,
-                t0_perf_counter=_ENTRY_STARTED_PERF,
-                target=dict(spec["stage_plan"][0]))
-            directory = out / LAUNCH_JOURNAL_DIR / args.invocation_id
-            job = {
-                "mode": "real", "root": str(out),
-                "spec_path": str(spec_path),
-                "authorization_path": args.authorization.resolve(),
-                "admission_package_path": args.admission_package.resolve(),
-                "tolerance_contract_path": args.tolerance_contract.resolve(),
-                "invocation_id": args.invocation_id,
-                "result_path": str(directory / "worker_result_inner.json"),
-            }
-            job_path = directory / "worker_job.json"
-            write_json_exclusive(job_path, job)
             facts = _spawn_worker(
                 [sys.executable, str(Path(__file__).resolve()),
                  "--migration-worker", "--job", str(job_path)],
@@ -1030,8 +1271,6 @@ def main() -> int:
                       f"journal={journal.get('problems')}")
             _print_result(result)
             return _EXIT.get(result.get("conclusion", "audit_incomplete"), 3)
-        if not args.resume and out.exists() and any(out.iterdir()):
-            raise SystemExit(f"real run root is not fresh: {out}")
         runtime = configure_production_runtime()
         if runtime["problems"]:
             raise SystemExit(

@@ -1304,6 +1304,85 @@ def test_ordinary_cli_outer_return_is_an_actual_process(tmp_path):
     assert outer["finished_perf_counter"] >= outer["started_perf_counter"]
 
 
+def test_real_migration_claim_precedes_admission_and_failure_is_debt(
+        tmp_path, monkeypatch):
+    """The minimal launcher claims first; a refused precheck leaves a debt."""
+    import importlib.util
+
+    script_path = PROJECT_ROOT / "scripts/audit_w1_real_training_update.py"
+    spec = importlib.util.spec_from_file_location(
+        "w1_update_launch_cli_test", script_path)
+    assert spec is not None and spec.loader is not None
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+
+    base = tmp_path / "history"
+    base.mkdir()
+    root = base / "cohort"
+    _write_legacy_prefix(root)
+    invocation = "inv-precheck-debt"
+    snapshot_path = tmp_path / "snapshot.json"
+    A.write_json(snapshot_path, {
+        "legacy_head_sha256": "b" * 64,
+        "marker_sha256": A.sha256_file(root / "cohort.json"),
+    })
+    spec_path = tmp_path / "spec.json"
+    A.write_json(spec_path, {
+        "history_snapshot": {"path": str(snapshot_path),
+                             "sha256": A.sha256_file(snapshot_path)},
+        "stage_plan": [{"stage": "R0", "attempt": "attempt_002",
+                        "execution_seq": 3}],
+    })
+    auth_path = tmp_path / "authorization.json"
+    A.write_json(auth_path, {})
+    contract_path = tmp_path / "tolerance_contract.json"
+    A.write_json(contract_path, {})
+    admission_path = tmp_path / "admission_package.json"
+    A.write_json(admission_path, {})
+    argv = [
+        "--real", "--migration", "--out", str(root),
+        "--authorization", str(auth_path),
+        "--tolerance-contract", str(contract_path),
+        "--admission-package", str(admission_path),
+        "--binding-spec", str(spec_path),
+        "--invocation-id", invocation,
+    ]
+    claim_path = script._bootstrap_real_migration_launch(
+        argv=argv, base=base)
+    assert claim_path is not None and claim_path.is_file()
+
+    seen = {}
+
+    def admission_probe(package):
+        seen["claim_at_admission"] = claim_path.is_file()
+        return ["admission_schema"]
+
+    monkeypatch.setattr(script, "admission_package_problems", admission_probe)
+    monkeypatch.setattr(script, "_history_root", lambda: base)
+    monkeypatch.setattr(
+        script, "load_authorization",
+        lambda path: ({}, A.sha256_file(auth_path), []))
+    monkeypatch.setattr(
+        script, "load_tolerance_contract",
+        lambda path, recompute=False: ({}, "b" * 64, []))
+    monkeypatch.setattr(sys, "argv", ["audit_w1_real_training_update.py",
+                                      *argv])
+    with pytest.raises(SystemExit):
+        script.main()
+
+    assert seen["claim_at_admission"] is True
+    directory = root / "launch_journal" / invocation
+    assert (directory / "claim.json").is_file()
+    failure = A.strict_read_json(directory / "failure.json")
+    assert "admission package refused" in failure["reason"]
+    journal = A.scan_launch_journals(base)
+    assert journal["known"] is False
+    assert any(p.startswith("launch_debt:")
+               for p in journal["problems"])
+    allowed = A.scan_launch_journals(base, allow_invocation=invocation)
+    assert allowed["known"] is True
+
+
 def test_migration_cli_outer_return_and_acceptance(tmp_path):
     contract, verification = _gate_b_calibration()
     config = _tiny_config(tmp_path / "tiny.json")

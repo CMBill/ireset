@@ -8080,6 +8080,39 @@ def claim_launch(root: Path, *, authorization_sha256: str,
     return path, sha
 
 
+def launch_claim_record(
+        root: Path, invocation_id: str, *,
+        authorization_sha256: str, spec_sha256: str,
+        legacy_head_sha256: str, marker_sha256: str
+        ) -> tuple[dict | None, str | None, list[str]]:
+    """Read and bind the pre-import launch claim written by the launcher.
+
+    The claim is persisted by the minimal launcher before any substantive
+    precheck.  The full entry must not rewrite it; it only verifies that the
+    loaded authorization/spec/snapshot facts match the claimed bytes.
+    """
+    path = _launch_invocation_dir(Path(root), invocation_id) / "claim.json"
+    if not path.is_file():
+        return None, None, ["launch_claim_missing"]
+    try:
+        claim = strict_read_json(path)
+    except (OSError, ValueError, TypeError) as exc:
+        return None, None, [f"launch_claim_unreadable:{type(exc).__name__}"]
+    if not isinstance(claim, Mapping):
+        return None, None, ["launch_claim_not_object"]
+    problems = _claim_problems(claim, invocation_id=invocation_id, root=root)
+    expected = {
+        "authorization_sha256": authorization_sha256,
+        "spec_sha256": spec_sha256,
+        "legacy_head_sha256": legacy_head_sha256,
+        "marker_sha256": marker_sha256,
+    }
+    for key, want in expected.items():
+        if claim.get(key) != want:
+            problems.append(f"launch_claim_binding:{key}")
+    return dict(claim), sha256_file(path), problems
+
+
 def _prepare_revision_number(directory: Path) -> int:
     numbers = []
     for path in directory.glob("prepare_revision_*.json"):
@@ -9029,7 +9062,8 @@ def _charge_final_verification(
         extra["selection"] = row["selection"]
     sealed = finish_attempt(root, stage, attempt, t0, budget, dict(row),
                             status=status, extra=extra,
-                            cost_floor=actual_cost)
+                            cost_floor=actual_cost,
+                            tail_floor=FINAL_PROCESS_RETURN_TAIL_S)
     seals["verification_reseal"] = {
         "sealed": sealed.sealed, "terminal": sealed.terminal,
         "problems": sealed.problems, "row": sealed.row,
