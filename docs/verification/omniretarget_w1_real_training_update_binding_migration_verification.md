@@ -1,6 +1,6 @@
 # W1 训练更新绑定迁移实现与验证记录
 
-日期：2026-11-04。状态：**M0–M5 完成；复核 2 P1+1 P2 已修复，最终字节 Gate B 为 `calibration/attempt_017` + `synthetic/attempt_017` + `binding_migration_synthetic/attempt_004` + `binding_migration_gate_b/attempt_004` + `admission_real/attempt_018`；M5 为 snapshot 005/spec 005/migration admission 003/授权草案 004；M6 未授权、未执行**。本记录只描述实际写入的代码、合成测试和只读迁移材料，不构成真实恢复授权。§6 的 015/002 系列为复核前中间权威，已被 §7 最终系列取代。
+日期：2026-11-04。状态：**M0–M5 完成；第三轮复审 2 P1 已修复，最终字节 Gate B 为 `calibration/attempt_018` + `synthetic/attempt_018` + `binding_migration_synthetic/attempt_005` + `binding_migration_gate_b/attempt_005` + `admission_real/attempt_019`；M5 为 snapshot 006/spec 006/migration admission 004/授权草案 005；M6 未授权、未执行**。本记录只描述实际写入的代码、合成测试和只读迁移材料，不构成真实恢复授权。§6 的 015/002 系列与 §7 的 017/004 系列均为历史权威，已被 §8 最终系列取代。
 
 ## 1. 范围与权威边界
 
@@ -332,3 +332,46 @@ M5 复核事实：
 ### 7.6 边界
 
 未读取真实 checkpoint payload/父 NPZ 数值/资产编译，未构造真实模型/优化器，未执行真实 forward/backward/FK/AdamW，未创建真实授权/cohort/注册或真实 R0_002→P_002→I_001→F_001。M6 仍需绑定最终字节的新明确授权；旧一次授权、M3–M5 实现或本轮草案均不得解释为 M6 授权。`partial/null/false/not_ready/不接入` 与旧质量结论保持。
+
+## 8. 第三轮复审 2 P1 修复与最终字节重冻结（2026-11-04）
+
+### 8.1 修复
+
+1. **P1 条件导入导致真实入口 `UnboundLocalError`**：`main()` 的 `--migration-authorization-draft` 分支曾在函数内重复导入 `load_external_binding_material`，使该名字在整个函数内成为局部变量；真实迁移分支未执行该导入时直接未绑定。已删除重复条件导入，统一使用模块级导入。
+2. **P1 新鲜根检查拒绝本次 claim**：bootstrap 先写入 `launch_journal/<invocation_id>/claim.json`，原 `_fresh_migration_root_problems` 却无条件拒绝 `launch_journal` 存在。现先以 `launch_claim_record` 核验当前 claim（授权/spec/legacy/marker/目标/当前进程），再以 `allow_invocation` 仅豁免“该 invocation 目录且只含 `claim.json`”的当前记录；其他 invocation、`failure/revoke`、`.tmp` 或额外文件仍拒绝。
+
+### 8.2 回归
+
+| 项目 | 结果 |
+| --- | --- |
+| 迁移测试 | **30 passed（114.70s）**，新增当前 claim 豁免反例与“全部预检通过后到达 worker 分派”的隔离测试 |
+| 迁移 + audit + provider | **148 passed（346.39s）** |
+| 尾部预留 | `_charge_final_verification` 重封口保留 `FINAL_PROCESS_RETURN_TAIL_S=3.0`；受控时钟反例通过 |
+
+### 8.3 最终 Gate B（重冻结）
+
+| 材料 | SHA-256 / 结果 |
+| --- | --- |
+| calibration `attempt_018` contract | `7f8bd191d9254cd6a5c491ffb6af71e3c4a1cd951813dff82da9ba41843b6f32` |
+| calibration verification | `31992515b44fab40fb52f11ef12dbe51f555fdc757c5df4809eb41e2e1e9dfc1`（canonical `4622f9bd…`；`recompute_problems=0/four_x_ok=true`） |
+| calibration evidence / fp32 | `b848cbb4…` / `574d9a0a…`（与 attempt_017 相同） |
+| ordinary `synthetic/attempt_018` acceptance | `142123d2a1a2543f4bca7f851c7d4019faa697371ed4e785567e6beb84344bfc`（passed；exit 3） |
+| ordinary return / audit_result / final / registration | `f8a856af…` / `a86800b5…` / `2a2d3a83…` / `23a51525…` |
+| migration `binding_migration_synthetic/attempt_005` acceptance | `9b3e54e1a507d463fce660f848be6f674a6e2049a828e5e832926c0fd12f65e7`（passed；cohort=18，selected=16） |
+| migration result / spec / snapshot | `3421ea5d…` / `6a8ce5fc…` / `6dc14fd3…` |
+| Gate B v2 `binding_migration_gate_b/attempt_005` | `c59e719ab53853d770e688f1dcd07109602dcd476c6e74417dbb437acfc5ef3c`（passed/problems 空） |
+| 对比 | `266fc016…`；普通/迁移各 **12/12 文件与 attempt_013 逐字节相同** |
+
+### 8.4 最终 M5（重冻结）
+
+| 材料 | 结果 |
+| --- | --- |
+| real metadata admission `admission_real/attempt_019/attempt_001/admission_package.json` | `62d1965f48b7b90645dad24f089e58eaec0aad1fa0b1285380a6445f9f4eead1`，passed/metadata_only |
+| history snapshot `binding_migration/attempt_006/history_snapshot.json` | `42ffd63f1dca3b695f6ffed523e22fc70186138c4b177f37c5645993f36a08b6`；legacy head `b499a6ce…`；cost 67.10273322396097s |
+| protected manifest `binding_migration/attempt_006/protected_manifest.json` | `7c5c87e321dc30fcea7ce5e75a2607f28cc5eec6e19dfda993dcb1add953cdae`；94 entries；drift 0；覆盖 calibration 018 / synthetic 018 / admission 019 |
+| binding spec `binding_migration_spec/attempt_006/binding_spec.json` | `5b0feaa5f3151a5560f42179d219315017ea6d86cfb58c594b76f7e5b5528d78` |
+| migration admission `binding_migration_admission/attempt_004/attempt_001/migration_admission.json` | `b900f8d21d20ee1cfd3941e1b2cea597d3dae932445de579627bee0cac213d18`，passed/problems 空 |
+| v2 授权草案 `binding_migration_authorization/attempt_005/authorization_draft.json` | `d83d4064aead0fe97107e72b14ede49de04a060ba7077b44d81b31941125a4a4`；`authorized=false/template_only=true`；10 项 checklist null；files-only `implementation_sha256=0cc0622c…` |
+| 独立复核 `binding_migration_authorization/attempt_005/m5_verification.json` | `60f1a7a07f334675179a72d58245fd87f6f87e9949cffaa20b044be445b6cf68`；passed/problems 空；draft/spec files 与当前 28 文件一致、manifest drift 0 |
+
+实现身份为 **`0cc0622c86829b3e4bcbdefc1a3c1edb552ec02b31294dfd98bb70fd563205d8`（28 文件）**。原真实根仍 **10 文件 / 466,350,106 bytes**，无 launch journal、bindings、新注册/授权/数值更新；`scan_launch_journals` known/0 records；`verify_history` 无问题。M6 未执行；旧 §7 的 017/004 系列保留为历史，不能作为本轮最终字节的授权依据。

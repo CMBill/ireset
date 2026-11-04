@@ -443,11 +443,32 @@ def _worker_result(path: Path) -> dict | None:
     return record if isinstance(record, dict) else None
 
 
-def _fresh_migration_root_problems(root: Path) -> list[str]:
+def _fresh_migration_root_problems(
+        root: Path, *, allow_invocation: str | None = None) -> list[str]:
     problems: list[str] = []
-    for name in (BINDINGS_DIR, LAUNCH_JOURNAL_DIR, EXECUTION_EVENTS_DIR):
+    for name in (BINDINGS_DIR, EXECUTION_EVENTS_DIR):
         if (Path(root) / name).exists():
             problems.append(f"migration_root_has_{name}")
+    journal = Path(root) / LAUNCH_JOURNAL_DIR
+    if journal.exists():
+        allowed = False
+        if journal.is_dir() and allow_invocation:
+            try:
+                entries = sorted(journal.iterdir())
+            except OSError:
+                entries = []
+            if len(entries) == 1 and entries[0].name == allow_invocation \
+                    and entries[0].is_dir():
+                try:
+                    children = sorted(entries[0].iterdir())
+                except OSError:
+                    children = []
+                allowed = (
+                    len(children) == 1
+                    and children[0].name == "claim.json"
+                    and children[0].is_file())
+        if not allowed:
+            problems.append("migration_root_has_launch_journal")
     try:
         rows = load_index(Path(root))
     except (OSError, ValueError, TypeError):
@@ -859,7 +880,6 @@ def main() -> int:
     if args.migration_authorization_draft:
         from ireset.eval.w1_real_training_update_audit import (
             build_migration_authorization_draft,
-            load_external_binding_material,
         )
         if args.history_snapshot is None or args.binding_spec is None or \
                 args.migration_admission_package is None:
@@ -1194,13 +1214,6 @@ def main() -> int:
                 if ((spec.get("bindings") or {}).get(
                         "real_admission") or {}).get("sha256") != package_sha:
                     binding_problems.append("spec_real_admission")
-                if _fresh_migration_root_problems(out):
-                    binding_problems += _fresh_migration_root_problems(out)
-                if not (out / "cohort.json").is_file():
-                    binding_problems.append("migration_root_missing_marker")
-                if binding_problems:
-                    raise SystemExit(
-                        f"migration launch refused: {binding_problems}")
                 _claim, _claim_sha, claim_problems = launch_claim_record(
                     out, args.invocation_id,
                     authorization_sha256=auth_sha, spec_sha256=spec_sha,
@@ -1211,6 +1224,15 @@ def main() -> int:
                 if claim_problems:
                     raise SystemExit(
                         f"launch claim refused: {claim_problems}")
+                fresh_problems = _fresh_migration_root_problems(
+                    out, allow_invocation=args.invocation_id)
+                if fresh_problems:
+                    binding_problems += fresh_problems
+                if not (out / "cohort.json").is_file():
+                    binding_problems.append("migration_root_missing_marker")
+                if binding_problems:
+                    raise SystemExit(
+                        f"migration launch refused: {binding_problems}")
                 stage_binding(
                     out, spec_path=spec_path, spec_sha256=spec_sha,
                     snapshot_sha256=snapshot_sha,

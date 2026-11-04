@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -29,6 +30,17 @@ TINY_CONFIG.update(d_model=8, n_layers=1, n_heads=2, ffn_mult=2,
 OLD_R0_COST = 58.59990523397573
 OLD_P_COST = 8.502827989985235
 OLD_MARKER_AUTH = "a" * 64
+
+
+def _load_launch_script(name: str):
+    import importlib.util
+
+    script_path = PROJECT_ROOT / "scripts/audit_w1_real_training_update.py"
+    spec = importlib.util.spec_from_file_location(name, script_path)
+    assert spec is not None and spec.loader is not None
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+    return script
 
 
 def _balance(counts: dict[str, int]) -> dict:
@@ -1307,14 +1319,7 @@ def test_ordinary_cli_outer_return_is_an_actual_process(tmp_path):
 def test_real_migration_claim_precedes_admission_and_failure_is_debt(
         tmp_path, monkeypatch):
     """The minimal launcher claims first; a refused precheck leaves a debt."""
-    import importlib.util
-
-    script_path = PROJECT_ROOT / "scripts/audit_w1_real_training_update.py"
-    spec = importlib.util.spec_from_file_location(
-        "w1_update_launch_cli_test", script_path)
-    assert spec is not None and spec.loader is not None
-    script = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(script)
+    script = _load_launch_script("w1_update_launch_cli_debt_test")
 
     base = tmp_path / "history"
     base.mkdir()
@@ -1381,6 +1386,138 @@ def test_real_migration_claim_precedes_admission_and_failure_is_debt(
                for p in journal["problems"])
     allowed = A.scan_launch_journals(base, allow_invocation=invocation)
     assert allowed["known"] is True
+
+
+def test_fresh_migration_root_exempts_only_the_current_claim(tmp_path):
+    script = _load_launch_script("w1_update_launch_cli_fresh_test")
+    base = tmp_path / "history"
+    base.mkdir()
+    root = base / "cohort"
+    _write_legacy_prefix(root)
+    invocation = "inv-current"
+    A.claim_launch(
+        root, authorization_sha256="a" * 64, spec_sha256="b" * 64,
+        legacy_head_sha256="c" * 64,
+        marker_sha256=A.sha256_file(root / "cohort.json"),
+        invocation_id=invocation, t0_perf_counter=A._now(),
+        target={"stage": "R0", "attempt": "attempt_002",
+                "execution_seq": 3})
+    assert script._fresh_migration_root_problems(root) == [
+        "migration_root_has_launch_journal"]
+    assert script._fresh_migration_root_problems(
+        root, allow_invocation=invocation) == []
+
+    other = root / "launch_journal" / "other-invocation"
+    other.mkdir()
+    assert script._fresh_migration_root_problems(
+        root, allow_invocation=invocation) == [
+            "migration_root_has_launch_journal"]
+    other.rmdir()
+
+    failure = root / "launch_journal" / invocation / "failure.json"
+    failure.write_text("{}")
+    assert script._fresh_migration_root_problems(
+        root, allow_invocation=invocation) == [
+            "migration_root_has_launch_journal"]
+
+
+def test_real_migration_full_precheck_reaches_worker_dispatch(
+        tmp_path, monkeypatch):
+    script = _load_launch_script("w1_update_launch_cli_dispatch_test")
+    base = tmp_path / "history"
+    base.mkdir()
+    root = base / "cohort"
+    _write_legacy_prefix(root)
+    invocation = "inv-dispatch"
+    auth_path = tmp_path / "authorization.json"
+    A.write_json(auth_path, {})
+    contract_path = tmp_path / "tolerance_contract.json"
+    A.write_json(contract_path, {})
+    admission_path = tmp_path / "admission_package.json"
+    A.write_json(admission_path, {"schema": "isolated-test-package"})
+    package_sha = A.sha256_file(admission_path)
+    gate_sha = "3" * 64
+    snapshot_path = tmp_path / "snapshot.json"
+    A.write_json(snapshot_path, {
+        "legacy_head_sha256": "b" * 64,
+        "marker_sha256": A.sha256_file(root / "cohort.json"),
+    })
+    spec_path = tmp_path / "spec.json"
+    A.write_json(spec_path, {
+        "history_snapshot": {"path": str(snapshot_path),
+                             "sha256": A.sha256_file(snapshot_path)},
+        "stage_plan": [{"stage": "R0", "attempt": "attempt_002",
+                        "execution_seq": 3}],
+        "bindings": {
+            "gate_b": {"sha256": gate_sha},
+            "real_admission": {"sha256": package_sha},
+        },
+    })
+    argv = [
+        "--real", "--migration", "--out", str(root),
+        "--authorization", str(auth_path),
+        "--tolerance-contract", str(contract_path),
+        "--admission-package", str(admission_path),
+        "--binding-spec", str(spec_path),
+        "--invocation-id", invocation,
+    ]
+    claim_path = script._bootstrap_real_migration_launch(
+        argv=argv, base=base)
+    assert claim_path is not None and claim_path.is_file()
+    assert script._fresh_migration_root_problems(
+        root, allow_invocation=invocation) == []
+
+    auth_sha = A.sha256_file(auth_path)
+    expected = {
+        "run_root_realpath": str(root),
+        "invocation_id": invocation,
+        "spec_sha256": A.sha256_file(spec_path),
+        "snapshot_sha256": A.sha256_file(snapshot_path),
+        "legacy_head_sha256": "b" * 64,
+        "gate_b_sha256": gate_sha,
+        "real_admission_sha256": package_sha,
+        "implementation_sha256": script.implementation_files_sha256(
+            script.implementation_identity(script.ROOT)),
+    }
+    record = {"migration": expected}
+    seen = {}
+    monkeypatch.setattr(script, "_history_root", lambda: base)
+    monkeypatch.setattr(
+        script, "load_authorization",
+        lambda path: (record, auth_sha, []))
+    monkeypatch.setattr(
+        script, "load_tolerance_contract",
+        lambda path, recompute=False: ({}, "b" * 64, []))
+    monkeypatch.setattr(
+        script, "admission_package_problems", lambda package: [])
+    monkeypatch.setattr(
+        script, "load_external_binding_material",
+        lambda *args, **kwargs: (object(), []))
+
+    def stage_binding(*args, **kwargs):
+        seen["stage_binding"] = True
+
+    def spawn(command, log_path):
+        seen["spawn"] = list(command)
+        now = time.perf_counter()
+        return {
+            "pid": os.getpid() + 1, "ppid": os.getpid(), "exit_code": 0,
+            "signal": None, "started_perf_counter": now,
+            "finished_perf_counter": now + 0.1, "log_path": str(log_path),
+        }
+
+    monkeypatch.setattr(script, "stage_binding", stage_binding)
+    monkeypatch.setattr(script, "_spawn_worker", spawn)
+    monkeypatch.setattr(sys, "argv", ["audit_w1_real_training_update.py",
+                                      *argv])
+    assert script.main() == 3
+    assert seen.get("stage_binding") is True
+    assert "--migration-worker" in seen["spawn"]
+    directory = root / "launch_journal" / invocation
+    job = A.strict_read_json(directory / "worker_job.json")
+    assert job["invocation_id"] == invocation
+    failure = A.strict_read_json(directory / "failure.json")
+    assert failure["reason"] == "worker_result_missing"
 
 
 def test_migration_cli_outer_return_and_acceptance(tmp_path):
