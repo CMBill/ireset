@@ -217,7 +217,31 @@ def test_legacy_head_matches_the_frozen_real_prefix():
     root = PROJECT_ROOT / A.MIGRATION_SOURCE_RUN
     if not root.is_dir():
         pytest.skip("original real cohort is not present")
-    payload = A.build_legacy_head_payload(root)
+    # Once the migration has run, the live index/ledger are append-only and
+    # include generation-2 rows.  The frozen v1 prefix must be rebuilt from
+    # the snapshot's byte-for-byte source copies, exactly as the migration
+    # baseline builder does.  Before any snapshot exists, the live files are
+    # still the original prefix and the direct call is valid.
+    snapshots = sorted(
+        (PROJECT_ROOT / "derived/audit/w1_real_training_update_audit"
+         / "binding_migration").glob("attempt_*/history_snapshot.json"))
+    if snapshots:
+        snapshot_path = snapshots[-1]
+        snapshot = A.strict_read_json(snapshot_path)
+        source = snapshot_path.parent / "source"
+        assert snapshot["legacy_head_sha256"] == \
+            A.MIGRATION_LEGACY_HEAD_SHA256
+        payload = A.build_legacy_head_payload(
+            root,
+            index_rows=A.strict_read_json(source / "index.json")["attempts"],
+            ledger_rows=A.strict_read_json(
+                source / "ledger.json")["invocations"],
+            marker=A.strict_read_json(source / "cohort.json"),
+            marker_sha256=A.sha256_file(source / "cohort.json"),
+            source_index_sha256=A.sha256_file(source / "index.json"),
+            source_ledger_sha256=A.sha256_file(source / "ledger.json"))
+    else:
+        payload = A.build_legacy_head_payload(root)
     assert A.legacy_head_sha256(payload) == \
         A.MIGRATION_LEGACY_HEAD_SHA256
     assert payload["last_execution_seq"] == 2

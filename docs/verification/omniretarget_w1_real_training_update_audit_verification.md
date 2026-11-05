@@ -1,9 +1,9 @@
 # W1 真实网络参数梯度与优化更新链路审计 —— I/C 验证与真实执行记录
 
 日期：2026-11-04。冻结方案：[预注册 v0.9](/home/c112/codes/bill/ireset/docs/plans/omniretarget_w1_real_training_update_audit_prereg_draft.md)、[执行计划 v0.11](/home/c112/codes/bill/ireset/docs/plans/omniretarget_w1_real_training_update_provider_execution_plan.md)及[alpha 修正补充计划 v0.12](/home/c112/codes/bill/ireset/docs/plans/omniretarget_w1_real_training_update_alpha_fix_plan.md)。
-状态：**绑定迁移 M0–M5 已完成；复核 2 P1+1 P2 已修复，最终字节 Gate B 更新为 `calibration/attempt_017` + `synthetic/attempt_017` + `binding_migration_synthetic/attempt_004` + `binding_migration_gate_b/attempt_004` + `admission_real/attempt_018`，M5 为 snapshot 005/spec 005/admission 003/draft 004；M6 未授权、未执行**。首次真实结果仍为 R0 完成、P incomplete、I/F 未启动、实际更新 2 次。
+状态：**绑定迁移 M0–M5 完成；用户新明确授权后 M6 已执行一次，R0_002/P_002/I_001/F_001 均 done/complete，提交与外层返回证明闭合；新增16次/cohort18次更新，登记累计567.845409012秒。真实数值结果为329项 failure、629项 gap，结论 audit_incomplete、covered_contract_passed=false；未自动重试。** 首次 R0_001 done/P_001 incomplete、2次更新仍保留为历史。
 
-当前 Gate B 权威见 §12（历史 attempt_013）与 §13.4（绑定迁移最终字节 attempt_015/attempt_002）；迁移初稿/修订1历史见 §13/13.1、当前方案修订见 §13.2、M0/M1 见 §13.3；真实执行事实见 §11 与[首次执行报告](/home/c112/codes/bill/ireset/docs/verification/omniretarget_w1_real_training_update_audit_report.md)。§1–10.11 保留原 I/C、合成、准入及未授权时点的历史记录；其中“真实未读/未运行”仅适用于各节原记录时点。旧方案与 attempt_012 工件保留原字节。
+当前 Gate B/M5 权威见[绑定迁移验证记录 §8](/home/c112/codes/bill/ireset/docs/verification/omniretarget_w1_real_training_update_binding_migration_verification.md)（calibration/synthetic attempt_018、migration/Gate B v2 attempt_005、real admission019、snapshot/spec006、migration admission004、draft005）；M6执行事实见 §14 与[一次真实恢复报告](/home/c112/codes/bill/ireset/docs/verification/omniretarget_w1_real_training_update_binding_migration_report.md)。§1–13保留各时点的历史记录，其中“真实未读/未运行”仅适用于原记录时点；首次执行事实见 §11 与[首次执行报告](/home/c112/codes/bill/ireset/docs/verification/omniretarget_w1_real_training_update_audit_report.md)。冻结方案与旧工件保持原字节。
 
 ## 1. 交付文件
 
@@ -1042,3 +1042,26 @@ M1 已实现：规范 JSON/重复键拒绝、legacy head 与 source copy 校验�
 - **最终 Gate B**：calibration `1192da63…`（verification `2a1e7d1b…`、canonical `66d47470…`、evidence `b848cbb4…`、fp32 `574d9a0a…`）；普通 acceptance `ade5e22c…`；迁移 acceptance `92f3203a…`（cohort=18/selected=16）；Gate B v2 `046f30a1…` passed；对比 `24602e0f…`，两条链各 12/12 文件与 attempt_013 逐字节相同。
 - **最终 M5**：real admission `23903340…`；snapshot `4ab581a2…`；manifest `2c37d681…`（94 entries、drift 0、覆盖 017/018）；spec `b2cbfae4…`；migration admission `ba12a74c…` passed；草案 `7a027deb…`（authorized=false/template_only=true、files-only `implementation_sha256=22c53707…`）；独立复核 passed/problems 空。原真实根仍 10 文件 / 466,350,106 bytes，无 launch journal/新注册/新授权/数值更新。
 - **边界**：未读取真实 checkpoint payload/父 NPZ 数值/资产编译，未构造真实模型/优化器，未执行真实 forward/backward/FK/AdamW，未创建真实授权/cohort/注册。M6 仍需新明确授权；partial/null/false/not_ready/不接入与旧质量结论保持。
+
+
+## 14. M6 一次真实绑定迁移恢复（2026-11-04）
+
+用户同意最终 attempt_005 授权草案十项后，以正式 v2 授权 `673d750f…`、28文件身份 `0cc0622c…`、spec `5b0feaa5…` 和 Gate B v2 `c59e719a…` 执行一次原根恢复；未修改实现或冻结材料，未自动重试。R0_002→P_002→I_001→F_001 均done/complete，选中链16次、cohort累计18次诊断更新，调用核算已知，四个commit及实际外层return observation闭合。
+
+本轮成本500.742675788秒，含原成本累计567.845409012/3240秒，外层实际wait为496.950582235秒。F独立worker PID/PPID `876939/870249`、exit0，迁移worker实际exit3；return coverage通过，journal known，verification problems为空。
+
+数值结果为 **329项failure + 629项gap**，`complete_evidence=true`、`covered_contract_passed=false`、原始结论 `audit_incomplete`。failure分组为202 micro_param、101 accumulated、25 clipped、1 output_cotangent；gap为381 parameter_delta_precision、223 cross_path_sensitivity、25 cross_path_bound_unverifiable。证据可重放不构成数值契约通过，原因尚未归因。
+
+详见[一次真实恢复报告](/home/c112/codes/bill/ireset/docs/verification/omniretarget_w1_real_training_update_binding_migration_report.md)及[绑定迁移验证记录 §9](/home/c112/codes/bill/ireset/docs/verification/omniretarget_w1_real_training_update_binding_migration_verification.md)。旧两条执行记录及质量结论保留，七项零声明全0，partial/null/false/not_ready/不接入保持。本次一次使用权和新增16次更新额度已用完；未自动修正阈值、扩额、继续训练或接入生产，全项目套件未重跑。
+
+## 15. M6 失败只读归因（2026-11-04）
+
+按用户后续指令完成既有工件分析，详见[归因报告](/home/c112/codes/bill/ireset/docs/verification/omniretarget_w1_real_training_update_failure_attribution.md)和[绑定迁移验证记录 §10](/home/c112/codes/bill/ireset/docs/verification/omniretarget_w1_real_training_update_binding_migration_verification.md)。329项分为156项attention key bias结构零梯度路径与173项diffusion u2局部偏差；输出超差定位W0第0/6帧5个rot6d坐标，最大门比22.9763，绝对近π的trace-only quaternion链为首要待验证原因。分项VJP和I微批梯度原数组未保存，未宣称完成函数级独占因果证明。
+
+25项bound gap与25项clipped失败逐项对应；381项precision均有非零不可辨识坐标，176个AdamW行原始跨路径门已全过。分析34项核对通过、墙钟12.6469s，无新模型/forward/VJP/FK/更新；原工件和28文件身份未变。本轮不修订原`audit_incomplete`、329/629、partial/not_ready/不接入及一次授权耗尽；最小后续修复建议已写入报告，尚未实施，全项目测试未重跑。
+
+## 16. 保存输入局部分项验证与最小修复方向（2026-11-04）
+
+后续局部验证已完成，见[局部分项记录](/home/c112/codes/bill/ireset/docs/verification/omniretarget_w1_real_training_update_local_gradient_verification.md)：原生产cotangent逐位复现，5个输出超差主要由trace-only quaternion FK导致，归一化库候选两帧最大门比0.00140329；42旋转输入×两精度、普通反向及直接R有限差分、4个attention反例和32保存状态算术投影支持[N1–N3最小修复方案](/home/c112/codes/bill/ireset/docs/plans/omniretarget_w1_gradient_numerics_repair_plan.md)。原参数失败传播与其余gap未重新验证，不能改判全链通过。
+
+独立诊断三次启动合计10.3349s、57 autograd/1444运动学状态；001启动失败、002保留20/23及三个未满足假设、003适配验证6/6，原记录未改写。真实训练模型/checkpoint/训练网络重放/优化器step/更新/MuJoCo编译0，生产实现及28文件身份、旧真实根83文件、329/629与audit_incomplete不变。本轮仅新增局部诊断与方案/记录，尚未实施生产修复或更新Gate B/M5，未重跑全项目套件。

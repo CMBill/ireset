@@ -3598,11 +3598,17 @@ def run_i_stage(root: Path, stage: str, attempt: str, t0: float,
                             failures.append(
                                 f"i_micro_presence:{model_type}:u{u}:m{m}:{name}")
                         else:
-                            status = "synthetic_verified"
                             cmp_rec = compare_gradient(
                                 p_val, i_val, tol["parameter_gradient"],
                                 name=f"micro_param:{name}")
                             cmp_ok = cmp_rec["ok"]
+                            # The row status must describe this comparison.
+                            # A failed micro row previously kept the generic
+                            # "synthetic_verified" label even though the
+                            # aggregate already rejected it, which made the
+                            # row evidence lie about its own outcome.
+                            status = ("synthetic_verified" if cmp_ok
+                                      else "mismatch")
                             if not cmp_ok:
                                 failures.append(
                                     f"i_micro_param:{model_type}:u{u}:m{m}:{name}")
@@ -9697,6 +9703,8 @@ IMPLEMENTATION_FILES = (
     "docs/plans/omniretarget_w1_real_training_update_audit_prereg_draft.md",
     "docs/plans/omniretarget_w1_real_training_update_binding_migration_plan.md",
     "tests/test_w1_real_training_update_migration.py",
+    "tests/test_w1_gradient_numerics.py",
+    "docs/plans/omniretarget_w1_gradient_numerics_repair_plan.md",
 )
 PREREG_DRAFT = (
     "docs/plans/omniretarget_w1_real_training_update_audit_prereg_draft.md")
@@ -9734,7 +9742,7 @@ def implementation_identity(project_root: Path) -> dict:
 
 
 def implementation_files_sha256(identity: Mapping[str, Any]) -> str:
-    """Stable implementation identity: the 28 file bytes, not git state.
+    """Stable implementation identity: the 30 file bytes, not git state.
 
     Documentation commits must not invalidate an otherwise byte-identical
     authorization; the spec still records the full git identity for audit.

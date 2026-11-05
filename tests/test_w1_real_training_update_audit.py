@@ -1014,6 +1014,19 @@ def test_complete_numeric_mismatch_reaches_f(chain, tmp_path):
     assert i["failures"]
     assert i["complete_evidence"] is True
     assert i["evidence_failures"] == []
+    micro_rows = [row for row in i["rows"]
+                  if str(row["key"]).startswith("micro_param:")]
+    failed_rows = [row for row in micro_rows if not row["comparison"]["ok"]]
+    assert failed_rows
+    for row in failed_rows:
+        assert row["status"] == "mismatch"
+        assert row["failure"] == "micro_parameter"
+    for row in micro_rows:
+        if row["comparison"]["ok"]:
+            assert row["status"] == "synthetic_verified"
+            assert row["failure"] is None
+    assert any(str(f).startswith("i_micro_param:") for f in i["failures"])
+    assert i["numeric_passed"] is False
     _register_f_parent(tmp_path / "run")
     f = A.run_f_stage(
         tmp_path / "run", "F", "attempt_001", A._now(),
@@ -1361,6 +1374,23 @@ def test_cotangent_group_gate_rejects_a_zeroed_joint_group(chain):
     assert any(p.startswith("row_drift:cotangent") for p in drift)
 
 
+def test_i_micro_parameter_row_status_tracks_the_comparison(chain):
+    """Every micro parameter row must describe its own comparison result."""
+    rows = [row for row in chain["i"]["rows"]
+            if str(row["key"]).startswith("micro_param:")]
+    assert rows
+    assert any(row["comparison"]["ok"] for row in rows)
+    for row in rows:
+        assert row["status"] == ("synthetic_verified"
+                                 if row["comparison"]["ok"] else "mismatch")
+        assert row["failure"] == (None if row["comparison"]["ok"]
+                                  else "micro_parameter")
+    assert chain["i"]["numeric_passed"] is True
+    assert chain["i"]["complete_evidence"] is True
+    assert not any(str(f).startswith("i_micro_param:")
+                   for f in chain["i"]["failures"])
+
+
 def test_f_stage_deducts_the_reserve_once(tmp_path, monkeypatch, chain):
     _register_f_parent(tmp_path)
     counts = {kind: 0 for kind in A.CALL_KINDS}
@@ -1459,10 +1489,19 @@ def test_calibration_chain_applies_the_4x_rule_to_every_gate(chain):
                  "delta_cross_path", "delta_same_input"):
         assert math.isfinite(maxima[name])
         assert 4.0 * maxima[name] <= 1.0, (name, maxima[name])
-    # The precision-gap rows must be inside the statistic: filtering by the
-    # whole-row classification leaves both maxima below 0.1.
-    assert maxima["state_cross_path"] > 0.1
-    assert maxima["delta_cross_path"] > 0.1
+    # The precision-gap rows must be inside the statistic.  Filtering by the
+    # whole-row classification drops the rows whose AdamW gates passed but
+    # whose delta is below the float32 write resolution.  Compare against
+    # that naive view instead of a fixed number tied to one numeric snapshot.
+    passed_only: dict[str, float] = {}
+    for row in rows:
+        if row.get("classification") != "passed":
+            continue
+        for name, value in A._row_ratio_observations(row).items():
+            passed_only[name] = max(passed_only.get(name, 0.0), value)
+    for name in ("state_cross_path", "delta_cross_path"):
+        assert maxima[name] > passed_only.get(name, 0.0), (
+            name, maxima[name], passed_only.get(name))
     precision = [r for r in rows
                  if r.get("classification") == "audit_incomplete"
                  and r.get("gaps") == ["parameter_delta_precision_gap"]

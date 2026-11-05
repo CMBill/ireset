@@ -1,8 +1,12 @@
 # W1 训练更新绑定迁移实现与验证记录
 
-日期：2026-11-04。状态：**M0–M5 完成；第三轮复审 2 P1 已修复，最终字节 Gate B 为 `calibration/attempt_018` + `synthetic/attempt_018` + `binding_migration_synthetic/attempt_005` + `binding_migration_gate_b/attempt_005` + `admission_real/attempt_019`；M5 为 snapshot 006/spec 006/migration admission 004/授权草案 005；M6 未授权、未执行**。本记录只描述实际写入的代码、合成测试和只读迁移材料，不构成真实恢复授权。§6 的 015/002 系列与 §7 的 017/004 系列均为历史权威，已被 §8 最终系列取代。
+日期：2026-11-04。状态：**M0–M5 完成，用户新明确授权后 M6 已执行一次 R0_002→P_002→I_001→F_001；四阶段 done/complete、提交与返回证明闭合；新增16次/cohort18次更新；真实结果为329项 failure、629项 gap，结论 audit_incomplete，数值契约未通过**。最终 Gate B 仍为 calibration/synthetic attempt_018 + migration/Gate B v2 attempt_005，M5 为 snapshot/spec 006、migration admission 004、授权草案005；正式授权 `673d750f…`。执行事实见 §9 与[真实恢复报告](/home/c112/codes/bill/ireset/docs/verification/omniretarget_w1_real_training_update_binding_migration_report.md)；§1–8 的未授权/未执行声明均为各节原记录时点的历史快照。
+
+> 后续状态（2026-11-04）：N1–N3 梯度数值修复已实施，实现闭包由 28 文件 `0cc0622c…` 变为 30 文件 `57bbcae0…`。§8 的 Gate B/M5 与 §9 的 M6 授权均绑定旧 28 文件字节，只能作为历史证据，不能用于新身份的真实执行；新真实执行前必须重新生成校准、普通/迁移合成接受、只读 admission/snapshot/spec/授权草案并取得绑定新字节的新明确授权。当前没有新的真实 R0/P/I/F。修复实现与验证见[梯度数值稳定性修复验证记录](/home/c112/codes/bill/ireset/docs/verification/omniretarget_w1_gradient_numerics_repair_verification.md)。
 
 ## 1. 范围与权威边界
+
+本节保留 M0/M1 开始实施时的历史范围；当前状态以 §9 为准。原记录如下。
 
 本轮按[绑定迁移与有限恢复方案 v0.13 修订2](/home/c112/codes/bill/ireset/docs/plans/omniretarget_w1_real_training_update_binding_migration_plan.md)开始实现。方案文件 SHA-256 仍为 `1b27a41462c4d40fb3e0f54b240c3ac6669e4871062191d470dc734721142b17`。
 
@@ -375,3 +379,43 @@ M5 复核事实：
 | 独立复核 `binding_migration_authorization/attempt_005/m5_verification.json` | `60f1a7a07f334675179a72d58245fd87f6f87e9949cffaa20b044be445b6cf68`；passed/problems 空；draft/spec files 与当前 28 文件一致、manifest drift 0 |
 
 实现身份为 **`0cc0622c86829b3e4bcbdefc1a3c1edb552ec02b31294dfd98bb70fd563205d8`（28 文件）**。原真实根仍 **10 文件 / 466,350,106 bytes**，无 launch journal、bindings、新注册/授权/数值更新；`scan_launch_journals` known/0 records；`verify_history` 无问题。M6 未执行；旧 §7 的 017/004 系列保留为历史，不能作为本轮最终字节的授权依据。
+
+
+## 9. M6：新明确授权后的一次真实恢复（2026-11-04）
+
+用户明确同意本轮 attempt_005 草案十项 checklist，绑定实现身份 `0cc0622c…`，授权一次真实 R0_002→P_002→I_001→F_001，新增最多16次、cohort最多18次诊断更新，不自动重试。正式 v2 授权 SHA `673d750f84029d9fe5c0df80a4269bf7abd03f736c45ca2fb739038126ecd76b`，原草案 `d83d4064…` 及全部 Gate B/M5 字节保留。
+
+执行器已返回：四阶段 done/complete，seq 3/4/5/6 均完成一次 commit、stage_closed 及写后时间门；外层 return observation `32599cf7…` 的 `coverage_ok=true`，`launch_journal.known=true/problems=[]`，`verification_problems=[]`。F worker PID/PPID `876939/870249`、exit0；迁移 worker PID/PPID `870249/868975`、实际 exit3，与原始 `audit_incomplete` 结论一致。
+
+| 阶段 | 本轮登记成本（秒） | 本轮新增诊断更新 |
+| --- | ---: | ---: |
+| R0_002 | 124.442447620 | 0 |
+| P_002 | 28.024673619 | 4 |
+| I_001 | 102.326411103 | 4 |
+| F_001 | 245.949143446 | 8 |
+| 本轮 | 500.742675788 | 16 |
+| 含旧前缀累计 | 567.845409012 / 3240 | 18 |
+
+外层实际 wait 墙钟为496.950582235秒，登记成本含保守 seal-tail，F保留3秒退出预留。旧2次更新及67.10273322396097秒未重置；旧P_001仍为incomplete，旧部分NPZ不纳入新选中链。当前 `selected_attempts=R0_002/P_002/I_001/F_001`、`selected_chain_training_updates=16`，`training_updates_scope=cohort`、实际总数及已知下界均18，`call_accounting_known=true`。
+
+**数值契约未通过。** `complete_evidence=true` 与 F 重放一致不等于数值通过：failure 共329项（micro_param 202、accumulated 101、clipped 25、output_cotangent 1）；gap 共629项（parameter_delta_precision 381、cross_path_sensitivity 223、cross_path_bound_unverifiable 25）。程序原始结论保留 `audit_incomplete`，`covered_contract_passed=false`；失败原因尚未归因，未改阈值或补跑。
+
+终检报告已封口 SHA `ede2254f9212a34a50f1478e85bc98dc199db56dd719efff208d2886ad0d9799`；新R0 registration `38824f20…`；本轮结果摘录 SHA `97b5a94b397f2b212d41099745d2330f195bf851af41ae1ffd53956344514aee`。摘录仅复制已产生的 JSON/台账/实际返回事实，不构成额外成功凭据，未事后重算数值链或重哈希大型工件。
+
+完整授权、commit、调用矩阵和 failure/gap 分类见[一次真实恢复报告](/home/c112/codes/bill/ireset/docs/verification/omniretarget_w1_real_training_update_binding_migration_report.md)与[执行结果摘录](/home/c112/codes/bill/ireset/derived/audit/w1_real_training_update_audit/binding_migration_authorization/attempt_005/execution_observation.json)。运行根83文件/7,835,408,541 bytes（约7.2973GiB，含旧历史），七项零声明全0；partial/null/false/not_ready/不接入及旧质量结论保持。本次授权的一次执行与新增16次更新额度已用完，不自动重试；全项目测试未重跑，28个冻结实现文件未改写。
+
+## 10. M6 既有证据失败只读归因（2026-11-04）
+
+按用户“进行下一步失败归因”读取既有工件，新增独立[归因报告](/home/c112/codes/bill/ireset/docs/verification/omniretarget_w1_real_training_update_failure_attribution.md)与 `derived/audit/w1_real_training_update_audit/failure_attribution/attempt_001/`。分析JSON SHA `652d0025…`，34项交叉核对全过，329/629逐项重建与I/F/外层结果一致，保存F rows与原rows相等；18个读取来源有15份匹配已有摘要，具体边界见报告。原根83文件的路径/大小/mtime及非NPZ摘要前后相同，读取的原P/I四份与合成P两份NPZ全量SHA匹配既有记录，28文件实现身份保持`0cc0622c…`。
+
+156项失败属于attention key bias路径（105 micro/29 accumulated/22 clipped）：理论softmax行平移不变令其精确梯度为零，但真实float32残差超过合成1e-10深噪声标定，冻结group/tiny门拒绝；已保存P/I key bias参数差最高3.37698e-6，不能按“小梯度”直接忽略或统一放宽阈值。其余173项均在diffusion u2：输出cotangent失败定位micro0、slot1/W0第0/6帧5个rot6d坐标，最大门比22.9763。绝对根旋转接近π而相对目标角正常，trace-only quaternion FK解码是强候选；缺分项cotangent与I微批梯度原数组，尚未完成独占因果证明，micro2的root_out.weight失败另行保留。
+
+25个bound-unverifiable与25个clipped失败参数步集合一致；381个precision行都存在非零不可辨识坐标，176个AdamW行原始跨路径门全过但仍记precision gap；629个gap条目有412个未检测到同参数步梯度failure，不能承诺修复梯度后全部消失。202个失败micro行仍带synthetic_verified展示标签，正式failure/ok门已正确拒绝；后续修复展示，不改原工件。
+
+分析只用标准库/NumPy对保存数组作差、掩码和旋转代数，墙钟12.6469s。新checkpoint/模型/forward/VJP/FK/优化器/更新全0，未执行新真实阶段或修改冻结实现。原`audit_incomplete`、329 failure/629 gap、cohort18次/567.845409012秒及授权耗尽保持。下一步局部分项验证与最小修复范围见归因报告§6，本轮未实施；全项目测试未重跑。
+
+## 11. 保存输入的局部分项梯度验证（2026-11-04）
+
+用户后续“继续”指令下完成独立局部验证，见[验证记录](/home/c112/codes/bill/ireset/docs/verification/omniretarget_w1_real_training_update_local_gradient_verification.md)。原diffusion u2/m0 cotangent逐位复现；5处输出超差主要来自trace-only quaternion FK，成熟库归一化候选两帧原5坐标最大门比22.9763→0.00140329。42旋转输入×两精度、普通backward/float64有限差分及4个attention反例通过；32保存状态算术投影说明结构零梯度仍须消费已有动量，不能改为None或清空AdamW状态。
+
+scope/脚本/失败与结果在独立failure_attribution_local目录：001为计算前导入路径失败，002保留20/23及三个未满足的诊断假设，003归一化适配6/6。合计10.3349s、57 autograd调用、1444运动学状态；不记入原真实阶段台账。训练模型/checkpoint/参数重放/优化器step/训练更新/MuJoCo编译为0，原根83文件和28文件身份0cc0622c…未变。新增[最小修复方案](/home/c112/codes/bill/ireset/docs/plans/omniretarget_w1_gradient_numerics_repair_plan.md)，生产实现/Gate B/M5尚未修改；原329/629、audit_incomplete、cohort18次/567.845409012s及旧授权耗尽保持。

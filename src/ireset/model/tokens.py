@@ -27,6 +27,10 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from pytorch_kinematics.transforms import (
+    matrix_to_quaternion,
+    standardize_quaternion,
+)
 
 from ireset.kinematics.rotation_adapter import (
     mat_to_quat_wxyz,
@@ -172,20 +176,25 @@ def quat_to_mat_torch(q: torch.Tensor) -> torch.Tensor:
 
 
 def _mat_to_quat_torch(R: torch.Tensor) -> torch.Tensor:
-    """[.., 3, 3] -> wxyz [.., 4], differentiable (branch on trace is fine).
+    """[.., 3, 3] -> wxyz [.., 4], differentiable.
 
-    Uses the trace-based branch only; near the pi rotation the normalization
-    keeps values finite and the rotation is still recovered up to sign
-    (the 6D decode already orthogonalized R, so the input is SO(3)).
+    Uses the best-conditioned branch from the installed
+    ``pytorch_kinematics.transforms.matrix_to_quaternion``.  The earlier
+    trace-only branch divided three components by ``4 w``; close to a pi
+    rotation ``w`` vanishes and float32 cancellation in the trace made both
+    the recovered rotation and its gradient unusable (the value stayed finite,
+    which hid the defect).  The library branch picks the largest quaternion
+    component before dividing, so the denominator stays well conditioned at
+    exact and near pi.
+
+    The input is already an SO(3) matrix from the 6D Gram-Schmidt decode.  We
+    keep the historical public ``qw >= 0`` sign convention so downstream
+    consumers see the same representative; ``q`` and ``-q`` are the same
+    rotation, and the standardisation is piecewise constant.
     """
-    tr = R[..., 0, 0] + R[..., 1, 1] + R[..., 2, 2]
-    w = torch.sqrt((1.0 + tr).clamp_min(1e-12)) / 2.0
-    denom = (4.0 * w).clamp_min(1e-12)
-    x = (R[..., 2, 1] - R[..., 1, 2]) / denom
-    y = (R[..., 0, 2] - R[..., 2, 0]) / denom
-    z = (R[..., 1, 0] - R[..., 0, 1]) / denom
-    q = torch.stack([w, x, y, z], dim=-1)
-    return q / q.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    q = matrix_to_quaternion(R)
+    q = q / q.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    return standardize_quaternion(q)
 
 
 mat_to_quat_torch = _mat_to_quat_torch

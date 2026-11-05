@@ -55,7 +55,16 @@ class Attn(nn.Module):
         B, L, d = x.shape
         S = kv.shape[1]
         q = self.q(x).view(B, L, self.h, self.dk).transpose(1, 2)      # [B,h,L,dk]
-        k = self.k(kv).view(B, S, self.h, self.dk).transpose(1, 2)
+        # A linear key bias adds the same vector q.b to every logit of a
+        # query, so softmax is invariant to it.  Passing ``bias * 0`` keeps
+        # the parameter in the graph with an exactly zero gradient instead of
+        # dropping it (an omitted bias would produce grad None and alter the
+        # optimizer/step semantics).  This is only valid for this shared
+        # linear key projection -- never apply it to Q/V biases or nonlinear
+        # key paths.
+        key_bias = (None if self.k.bias is None else self.k.bias * 0.0)
+        k = F.linear(kv, self.k.weight, key_bias).view(
+            B, S, self.h, self.dk).transpose(1, 2)
         v = self.v(kv).view(B, S, self.h, self.dk).transpose(1, 2)
         logits = q @ k.transpose(-2, -1) / (self.dk ** 0.5)            # [B,h,L,S]
         if mask is not None:
