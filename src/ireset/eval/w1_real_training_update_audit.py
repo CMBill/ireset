@@ -9762,28 +9762,31 @@ RUNTIME_IDENTITY_KEYS = (
 ADAM_SOURCE_MODULES = ("torch.optim.adam", "torch.optim.adamw")
 SCHEDULER_SOURCE_MODULES = ("diffusers.schedulers.scheduling_ddpm",
                           "diffusers.schedulers.scheduling_ddim")
+#: N1's matrix -> quaternion path imports this module at call time; a version
+#: bump or a source swap changes the branch selection and normalization that
+#: the gradient audit calibrated against.
+PYTORCH_KINEMATICS_SOURCE_MODULES = (
+    "pytorch_kinematics.transforms.rotation_conversions",
+)
+
+
+def _module_source_sha256(modules: tuple[str, ...]) -> dict:
+    source = {}
+    for name in modules:
+        try:
+            mod = __import__(name, fromlist=["x"])
+            source[name] = sha256_file(Path(mod.__file__))
+        except (ImportError, OSError, TypeError):
+            source[name] = None
+    return source
 
 
 def _adamw_source_sha256() -> dict:
-    source = {}
-    for name in ADAM_SOURCE_MODULES:
-        try:
-            mod = __import__(name, fromlist=["x"])
-            source[name] = sha256_file(Path(mod.__file__))
-        except (ImportError, OSError, TypeError):
-            source[name] = None
-    return source
+    return _module_source_sha256(ADAM_SOURCE_MODULES)
 
 
 def _scheduler_source_sha256() -> dict:
-    source = {}
-    for name in SCHEDULER_SOURCE_MODULES:
-        try:
-            mod = __import__(name, fromlist=["x"])
-            source[name] = sha256_file(Path(mod.__file__))
-        except (ImportError, OSError, TypeError):
-            source[name] = None
-    return source
+    return _module_source_sha256(SCHEDULER_SOURCE_MODULES)
 
 
 def runtime_identity_facts() -> dict:
@@ -9801,6 +9804,13 @@ def runtime_identity_facts() -> dict:
     except importlib.metadata.PackageNotFoundError:
         facts["diffusers"] = None
     facts["scheduler_source_sha256"] = _scheduler_source_sha256()
+    try:
+        facts["pytorch_kinematics"] = importlib.metadata.version(
+            "pytorch-kinematics")
+    except importlib.metadata.PackageNotFoundError:
+        facts["pytorch_kinematics"] = None
+    facts["pytorch_kinematics_source_sha256"] = _module_source_sha256(
+        PYTORCH_KINEMATICS_SOURCE_MODULES)
     return facts
 
 
@@ -9811,7 +9821,8 @@ def runtime_identity_problems(reference: Mapping[str, Any] | None,
         return ["runtime_identity_missing"]
     current = runtime_identity_facts() if current is None else current
     problems = [f"runtime_identity:{key}"
-                for key in (*RUNTIME_IDENTITY_KEYS, "device_name", "mujoco")
+                for key in (*RUNTIME_IDENTITY_KEYS, "device_name", "mujoco",
+                            "pytorch_kinematics")
                 if reference.get(key) != current.get(key)]
     reference_sources = reference.get("adamw_source_sha256")
     current_sources = current.get("adamw_source_sha256") or {}
@@ -9830,6 +9841,15 @@ def runtime_identity_problems(reference: Mapping[str, Any] | None,
         if not isinstance(expected, str) or not re.fullmatch(
                 r"[0-9a-f]{64}", expected) \
                 or expected != current_schedulers.get(name):
+            problems.append(f"runtime_identity:source:{name}")
+    reference_kinematics = reference.get("pytorch_kinematics_source_sha256")
+    current_kinematics = current.get("pytorch_kinematics_source_sha256") or {}
+    for name in PYTORCH_KINEMATICS_SOURCE_MODULES:
+        expected = ((reference_kinematics or {}).get(name)
+                    if isinstance(reference_kinematics, Mapping) else None)
+        if not isinstance(expected, str) or not re.fullmatch(
+                r"[0-9a-f]{64}", expected) \
+                or expected != current_kinematics.get(name):
             problems.append(f"runtime_identity:source:{name}")
     return problems
 

@@ -1297,8 +1297,8 @@ def test_implementation_identity_binds_files_not_git_state():
 
 def _gate_b_calibration() -> tuple[Path, Path]:
     base = PROJECT_ROOT / "derived/audit/w1_real_training_update_audit"
-    contract = base / "calibration/attempt_015/tolerance_contract.json"
-    verification = base / "calibration/attempt_015/calibration_verification.json"
+    contract = base / "calibration/attempt_019/tolerance_contract.json"
+    verification = base / "calibration/attempt_019/calibration_verification.json"
     if not contract.is_file() or not verification.is_file():
         pytest.skip("final Gate B calibration artifacts are absent")
     return contract, verification

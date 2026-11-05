@@ -147,6 +147,52 @@ def test_quaternion_dependency_version_and_source_are_pinned():
     assert mat_to_quat_torch is _mat_to_quat_torch
 
 
+def test_runtime_identity_covers_the_quaternion_dependency():
+    """A material that omits the N1 dependency must be refused, not skipped."""
+    from copy import deepcopy
+
+    from ireset.eval.w1_real_training_update_audit import (
+        PYTORCH_KINEMATICS_SOURCE_MODULES,
+        runtime_identity_facts,
+        runtime_identity_problems,
+    )
+
+    assert PYTORCH_KINEMATICS_SOURCE_MODULES == (
+        "pytorch_kinematics.transforms.rotation_conversions",)
+    facts = runtime_identity_facts()
+    assert facts["pytorch_kinematics"] == PK_VERSION
+    assert facts["pytorch_kinematics_source_sha256"] == {
+        PYTORCH_KINEMATICS_SOURCE_MODULES[0]:
+            PK_ROTATION_CONVERSIONS_SHA256}
+    assert runtime_identity_problems(facts, facts) == []
+
+    legacy = deepcopy(facts)
+    legacy.pop("pytorch_kinematics")
+    legacy.pop("pytorch_kinematics_source_sha256")
+    problems = runtime_identity_problems(legacy, facts)
+    assert "runtime_identity:pytorch_kinematics" in problems
+    assert ("runtime_identity:source:pytorch_kinematics.transforms."
+            "rotation_conversions") in problems
+
+    tampered = deepcopy(facts)
+    tampered["pytorch_kinematics"] = "0.0.0"
+    assert "runtime_identity:pytorch_kinematics" in \
+        runtime_identity_problems(tampered, facts)
+
+    tampered = deepcopy(facts)
+    tampered["pytorch_kinematics_source_sha256"][
+        PYTORCH_KINEMATICS_SOURCE_MODULES[0]] = "0" * 64
+    assert ("runtime_identity:source:pytorch_kinematics.transforms."
+            "rotation_conversions") in runtime_identity_problems(
+                tampered, facts)
+
+    tampered = deepcopy(facts)
+    tampered["pytorch_kinematics_source_sha256"] = {}
+    assert ("runtime_identity:source:pytorch_kinematics.transforms."
+            "rotation_conversions") in runtime_identity_problems(
+                tampered, facts)
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_adapter_recovers_rotation_at_pi_branches_and_seams(dtype):
     names, matrices = _edge_matrices()
