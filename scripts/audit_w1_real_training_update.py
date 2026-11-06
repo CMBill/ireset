@@ -87,7 +87,8 @@ def _read_optional_json(path: Path | None) -> dict | None:
 def _write_minimal_launch_claim(
         *, root: Path, invocation_id: str, authorization_sha256: str,
         spec_sha256: str, legacy_head_sha256: str, marker_sha256: str,
-        target: Mapping[str, Any], t0_perf_counter: float) -> Path:
+        target: Mapping[str, Any], t0_perf_counter: float,
+        closed_history_head_sha256: str | None = None) -> Path:
     """Persist ``claim.json`` before any substantive precheck.
 
     The write is byte-for-byte the same shape as ``claim_launch`` and uses the
@@ -108,6 +109,8 @@ def _write_minimal_launch_claim(
         "spec_sha256": spec_sha256,
         "legacy_head_sha256": legacy_head_sha256,
         "marker_sha256": marker_sha256,
+        **({"closed_history_head_sha256": closed_history_head_sha256}
+           if closed_history_head_sha256 is not None else {}),
         "t0_perf_counter": float(t0_perf_counter),
         "target": dict(target),
         "pid": int(os.getpid()),
@@ -152,10 +155,12 @@ def _bootstrap_real_migration_launch(
     """
     argv = list(sys.argv[1:] if argv is None else argv)
     if any(_flag_present(flag, argv) for flag in (
-            "--migration-worker", "--synthetic-worker", "--resume", "--stage")):
+            "--migration-worker", "--retest-worker", "--synthetic-worker",
+            "--resume", "--stage")):
         return None
-    if not _flag_present("--real", argv) or \
-            not _flag_present("--migration", argv):
+    if not _flag_present("--real", argv) or not (
+            _flag_present("--migration", argv)
+            or _flag_present("--retest", argv)):
         return None
     out_value = _flag_value("--out", argv)
     invocation_id = _flag_value("--invocation-id", argv)
@@ -204,7 +209,10 @@ def _bootstrap_real_migration_launch(
                                 and len(legacy) == 64 else "0" * 64),
             marker_sha256=(marker if isinstance(marker, str)
                            and len(marker) == 64 else "0" * 64),
-            target=target, t0_perf_counter=_ENTRY_STARTED_PERF)
+            target=target, t0_perf_counter=_ENTRY_STARTED_PERF,
+            closed_history_head_sha256=(
+                (snapshot or {}).get("closed_history_head_sha256")
+                if isinstance(snapshot, dict) else None))
     except OSError as exc:
         print(f"[update-audit] launch claim bootstrap failed: "
               f"{type(exc).__name__}", file=sys.stderr)
@@ -217,6 +225,7 @@ from ireset.eval.w1_real_training_update_audit import (  # noqa: E402
     ACCOUNTING_SCHEMA_V2,
     ADMISSION_SCHEMA,
     AUDIT_SCHEMA,
+    AUTHORIZATION_REQUIRED,
     BINDINGS_DIR,
     COHORT_ID,
     EXECUTION_EVENTS_DIR,
@@ -232,6 +241,14 @@ from ireset.eval.w1_real_training_update_audit import (  # noqa: E402
     build_migration_admission,
     build_migration_synthetic_acceptance,
     build_ordinary_synthetic_acceptance,
+    build_retest_synthetic_acceptance,
+    build_retest_binding_spec,
+    build_retest_authorization_draft,
+    build_retest_history_snapshot,
+    build_retest_admission,
+    build_budget_revision,
+    build_closed_history_head,
+    budget_revision_problems,
     claim_launch,
     compact_migration_result,
     configure_production_runtime,
@@ -536,12 +553,22 @@ def main() -> int:
     mode.add_argument("--migration-synthetic", action="store_true",
                       help="run the synthetic second-generation chain and "
                            "write its migration acceptance")
+    mode.add_argument("--retest-synthetic", action="store_true",
+                      help="run the synthetic third-generation retest chain "
+                           "and write its acceptance")
+    mode.add_argument("--retest-chain-worker", action="store_true",
+                      help=argparse.SUPPRESS)
     mode.add_argument("--migration-spec", action="store_true",
                       help="freeze the read-only binding spec outside the root")
+    mode.add_argument("--retest-materials", action="store_true",
+                      help="build the read-only generation_003 retest "
+                           "snapshot/spec/admission/authorization draft")
     mode.add_argument("--gate-b-v2", action="store_true",
                       help="bind the ordinary and migration synthetic "
                            "acceptances into Gate B v2")
     mode.add_argument("--migration-worker", action="store_true",
+                      help=argparse.SUPPRESS)
+    mode.add_argument("--retest-worker", action="store_true",
                       help=argparse.SUPPRESS)
     mode.add_argument("--synthetic-worker", action="store_true",
                       help=argparse.SUPPRESS)
@@ -557,6 +584,8 @@ def main() -> int:
     ap.add_argument("--synthetic-acceptance", type=Path, default=None)
     ap.add_argument("--ordinary-acceptance", type=Path, default=None)
     ap.add_argument("--migration-acceptance", type=Path, default=None)
+    ap.add_argument("--retest-acceptance", type=Path, default=None)
+    ap.add_argument("--retest-admission", type=Path, default=None)
     ap.add_argument("--calibration-verification", type=Path, default=None)
     ap.add_argument("--migration-root", type=Path, default=None,
                     help="original v1 cohort run root (never written)")
@@ -570,6 +599,9 @@ def main() -> int:
     ap.add_argument("--invocation-id", type=str, default=None)
     ap.add_argument("--migration", action="store_true",
                     help="use the dedicated second-generation binding entry")
+    ap.add_argument("--retest", action="store_true",
+                    help="use the third-generation gradient-numerics retest "
+                         "entry")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--stage", type=str, default=None,
                     choices=("R0", "P", "I", "F"))
@@ -596,12 +628,51 @@ def main() -> int:
         _print_result(result)
         return _EXIT.get(result.get("conclusion", "audit_incomplete"), 3)
 
-    if args.migration_worker:
+    if args.retest_chain_worker:
         if args.job is None:
-            raise SystemExit("--migration-worker requires --job")
+            raise SystemExit("--retest-chain-worker requires --job")
+        from ireset.eval.w1_real_training_update_audit import (
+            run_retest_chain,
+        )
+        job = strict_read_json(Path(args.job).expanduser().resolve())
+        contract, _sha, problems = load_tolerance_contract(
+            Path(str(job["tolerance_contract_path"])).expanduser().resolve(),
+            recompute=False)
+        if problems:
+            raise SystemExit(f"worker tolerance contract refused: {problems}")
+        device = job.get("device") or "cuda"
+        if device == "auto":
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        provider = SyntheticTrainingProvider(
+            dict(job.get("config") or MODEL_CONFIG),
+            seed=int(job.get("seed", 20261029)), device=device)
+        root = Path(str(job["launch"]["root"])).expanduser().resolve()
+        fixture = root / "fixture"
+        if not (fixture / "fixture.json").is_file():
+            provider.prepare_fixture(fixture)
+        provider.load_fixture()
+        if provider.fixture.get("problems"):
+            raise SystemExit(f"worker fixture refused: "
+                             f"{provider.fixture['problems']}")
+        result = run_retest_chain(
+            base=Path(str(job["base"])), provider=provider,
+            tolerance=contract, v2_launch=job["launch"],
+            v3_invocation=str(job.get("v3_invocation") or "inv-retest-001"))
+        write_json(Path(str(job["result_path"])), {
+            "result": result, "roster": provider.roster})
+        conclusion = (result.get("v3") or {}).get(
+            "conclusion", "audit_incomplete")
+        print(f"[update-audit] retest chain v3 conclusion={conclusion}")
+        return _EXIT.get(conclusion, 3)
+
+    if args.migration_worker or args.retest_worker:
+        retest_worker = bool(args.retest_worker)
+        if args.job is None:
+            raise SystemExit("worker requires --job")
         job = strict_read_json(Path(args.job).expanduser().resolve())
         if not isinstance(job, Mapping):
-            raise SystemExit("migration worker job must be an object")
+            raise SystemExit("worker job must be an object")
         root = Path(str(job.get("root"))).expanduser().resolve()
         spec_path = Path(str(job.get("spec_path"))).expanduser().resolve()
         authorization, auth_sha, auth_problems = load_authorization(
@@ -644,12 +715,32 @@ def main() -> int:
             provider.acceptance_sha = package.get("acceptance_sha256")
             provider.roster = ((package.get("roster") or {}).get(
                 "parameter_roster"))
+            retest_package = None
+            retest_sha = None
+            if retest_worker:
+                from ireset.eval.w1_real_training_update_audit import (
+                    retest_admission_problems,
+                )
+                retest_path = Path(str(
+                    job.get("retest_admission_path"))).expanduser().resolve()
+                if not retest_path.is_file():
+                    raise SystemExit("worker retest admission missing")
+                retest_sha = sha256_file(retest_path)
+                retest_package = strict_read_json(retest_path)
+                admission_errors = retest_admission_problems(
+                    retest_package, project_root=ROOT, strict=True)
+                if admission_errors:
+                    raise SystemExit(
+                        f"worker retest admission refused: {admission_errors}")
             result = run_binding_migration_audit(
                 root, provider, mode="real", tolerance=contract,
                 authorization_sha=auth_sha, authorization=authorization,
                 admission_package=package, admission_sha=package_sha,
                 binding_spec_path=spec_path, invocation_id=invocation_id,
-                fixed_root=HISTORY_ROOT, project_root=ROOT)
+                fixed_root=HISTORY_ROOT, project_root=ROOT,
+                retest=retest_worker,
+                retest_admission_package=retest_package,
+                retest_admission_sha256=retest_sha)
         elif mode == "synthetic":
             config = job.get("config")
             if not isinstance(config, Mapping):
@@ -673,6 +764,7 @@ def main() -> int:
                 authorization_sha=auth_sha, authorization=authorization,
                 binding_spec_path=spec_path, invocation_id=invocation_id,
                 fixed_root=root.parent, project_root=ROOT,
+                retest=retest_worker,
                 r0_started_perf=float(
                     strict_read_json(
                         root / LAUNCH_JOURNAL_DIR / invocation_id
@@ -1016,6 +1108,113 @@ def main() -> int:
             print(f"[update-audit]   {problem}")
         return 0 if acceptance.get("passed") else 2
 
+    if args.retest_synthetic:
+        if args.out is None:
+            raise SystemExit("--retest-synthetic requires --out")
+        if args.tolerance_contract is None:
+            raise SystemExit(
+                "--retest-synthetic requires --tolerance-contract")
+        contract, _sha, problems = load_tolerance_contract(
+            args.tolerance_contract, recompute=False)
+        if problems:
+            raise SystemExit(f"tolerance contract refused: {problems}")
+        contract_path = Path(args.tolerance_contract).expanduser().resolve()
+        verification = _load_calibration_verification(
+            _calibration_verification_path(args, contract_path))
+        if verification is None:
+            raise SystemExit(
+                "--retest-synthetic requires calibration_verification.json")
+        device = args.device
+        if device == "auto":
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        out = _guard(args.out)
+        if out.exists() and any(out.iterdir()):
+            raise SystemExit(f"retest synthetic root is not fresh: {out}")
+        out.mkdir(parents=True, exist_ok=True)
+        v2_invocation = "inv-gate-b-migration-001"
+        launch = prepare_migration_synthetic_launch(
+            out / "prefix", tolerance=contract,
+            calibration_verification_record=verification,
+            invocation_id=v2_invocation)
+        job = {
+            "base": str(out),
+            "launch": launch,
+            "v3_invocation": "inv-retest-001",
+            "tolerance_contract_path": str(contract_path),
+            "result_path": str(out / "retest_chain_result.json"),
+            "seed": args.seed, "device": device,
+            "config": _load_synthetic_config(args) or dict(MODEL_CONFIG),
+        }
+        job_path = out / "retest_chain_job.json"
+        write_json_exclusive(job_path, job)
+        facts = _spawn_worker(
+            [sys.executable, str(Path(__file__).resolve()),
+             "--retest-chain-worker", "--job", str(job_path)],
+            out / "retest_chain_worker.log")
+        document = _worker_result(Path(job["result_path"]))
+        if document is None or not isinstance(document.get("result"), Mapping):
+            print("[update-audit] retest chain worker returned no result")
+            return 3
+        result = dict(document["result"])
+        v3 = result.get("v3_full") or {}
+        v3_launch = result.get("v3_launch") or {}
+        if not v3 or not v3_launch:
+            print("[update-audit] retest chain v3 result missing")
+            return 3
+        stage_timings = v3.get("stage_timings") or {}
+        last_end = v3.get("last_stage_end_perf_counter")
+        return_path = None
+        return_sha = None
+        return_problems: list[str] = []
+        if stage_timings and last_end is not None:
+            return_path, return_sha, return_problems = \
+                record_return_observation(
+                    Path(str(v3_launch["root"])),
+                    invocation_id=str(v3_launch["invocation_id"]),
+                    pid=facts["pid"], ppid=facts["ppid"],
+                    exit_code=facts["exit_code"], signal=facts["signal"],
+                    started_perf_counter=float(
+                        v3_launch["t0_perf_counter"]),
+                    finished_perf_counter=float(
+                        facts["finished_perf_counter"]),
+                    last_stage_end_perf_counter=float(last_end),
+                    commits=v3.get("commits") or {},
+                    candidate_receipts=v3.get("candidates") or {},
+                    write_after={"R0": True, "P": True, "I": True,
+                                 "F": True, "terminal": True},
+                    stage_timings=stage_timings, source_kind="outer_wait",
+                    expected_exit_code=facts["exit_code"],
+                    conclusion=v3.get("conclusion"))
+        else:
+            return_problems = ["v3_timing_missing"]
+        journal = scan_launch_journals(
+            Path(str(v3_launch["root"])).parent)
+        acceptance = build_retest_synthetic_acceptance(
+            out, result, roster=document.get("roster") or {},
+            tolerance=contract,
+            calibration_verification_record=verification,
+            launch=v3_launch, return_path=return_path,
+            return_sha256=return_sha, return_problems=return_problems,
+            journal=journal)
+        result["retest_acceptance"] = acceptance
+        result["worker_return"] = facts
+        write_json(out / "retest_synthetic_result.json", result)
+        print(f"[update-audit] retest synthetic v3 conclusion="
+              f"{v3.get('conclusion')}")
+        print(f"[update-audit] selected_attempts="
+              f"{v3.get('selected_attempts')}")
+        print(f"[update-audit] cohort_training_updates="
+              f"{v3.get('cohort_training_updates')}")
+        print(f"[update-audit] worker_exit={facts['exit_code']} "
+              f"pid={facts['pid']} ppid={facts['ppid']}")
+        print(f"[update-audit] retest acceptance={acceptance.get('path')}")
+        print(f"[update-audit] sha256={acceptance.get('sha256')} "
+              f"passed={acceptance.get('passed')}")
+        for problem in (acceptance.get("problems") or [])[:30]:
+            print(f"[update-audit]   {problem}")
+        return 0 if acceptance.get("passed") else 2
+
     if args.migration_spec:
         if args.out is None or args.history_snapshot is None or \
                 args.gate_b is None or args.admission_package is None:
@@ -1068,6 +1267,225 @@ def main() -> int:
         print(f"[update-audit] legacy_head_sha256="
               f"{spec.get('legacy_head_sha256')}")
         return 0
+
+    if args.retest_materials:
+        from ireset.eval.w1_real_training_update_audit import (
+            MIGRATION_SOURCE_RUN,
+            RETEST_PLAN,
+            build_retest_admission,
+            build_retest_authorization_draft,
+            build_retest_protected_manifest,
+            fresh_retest_root_problems,
+            retest_admission_problems,
+            write_retest_admission,
+        )
+        if args.out is None or args.admission_package is None or \
+                args.gate_b is None or args.retest_acceptance is None:
+            raise SystemExit(
+                "--retest-materials requires --out, --admission-package, "
+                "--gate-b and --retest-acceptance")
+        run_root = Path(args.migration_root or
+                        ROOT / MIGRATION_SOURCE_RUN).expanduser().resolve()
+        if not (run_root / "cohort.json").is_file():
+            raise SystemExit(f"retest run root missing: {run_root}")
+        out = _guard(args.out)
+        if out.exists() and any(out.iterdir()):
+            raise SystemExit(f"retest materials root is not fresh: {out}")
+        out.mkdir(parents=True, exist_ok=True)
+        fresh = fresh_retest_root_problems(run_root)
+        if fresh:
+            raise SystemExit(f"retest target paths already exist: {fresh}")
+        snapshot = build_retest_history_snapshot(run_root)
+        snapshot_file = out / "history_snapshot.json"
+        write_json_exclusive(snapshot_file, snapshot)
+        snapshot_sha = sha256_file(snapshot_file)
+        source = out / "source"
+        source.mkdir(parents=True, exist_ok=True)
+        for name in ("index.json", "ledger.json", "cohort.json"):
+            path = run_root / ("attempts_index.json" if name == "index.json"
+                               else "costs.json" if name == "ledger.json"
+                               else "cohort.json")
+            (source / name).write_bytes(path.read_bytes())
+        revision = build_budget_revision(
+            snapshot, mode=str(snapshot.get("mode") or "real"))
+        revision_file = out / "budget_revision.json"
+        write_json_exclusive(revision_file, revision)
+        protected = build_retest_protected_manifest(
+            ROOT, run_root,
+            repair_evidence=[
+                ROOT / "derived/audit/w1_real_training_update_audit/"
+                       "gradient_numerics_retest/"],
+        )
+        protected_file = out / "protected_manifest.json"
+        write_json_exclusive(protected_file, protected)
+        gate_b_path = Path(args.gate_b).expanduser().resolve()
+        retest_path = Path(args.retest_acceptance).expanduser().resolve()
+        real_path = Path(args.admission_package).expanduser().resolve()
+        gate_b = strict_read_json(gate_b_path)
+        retest_acceptance = strict_read_json(retest_path)
+        real_admission = strict_read_json(real_path)
+        gate_b_sha = sha256_file(gate_b_path)
+        retest_sha = sha256_file(retest_path)
+        real_sha = sha256_file(real_path)
+        spec = build_retest_binding_spec(
+            ROOT, snapshot_file, snapshot_sha, snapshot,
+            invocation_id=args.invocation_id or "inv-retest-real-001",
+            gate_b_v2={"path": path_for_record(gate_b_path),
+                       "sha256": gate_b_sha,
+                       "tolerance_evidence_sha256": (
+                           (real_admission.get("tolerance") or {}).get(
+                               "evidence_sha256")),
+                       "fp32_contract_sha256": real_admission.get(
+                           "fp32_contract_sha256"),
+                       "calibration_verification_sha256": real_admission.get(
+                           "calibration_verification_sha256"),
+                       "acceptance_sha256": gate_b.get("sha256")},
+            retest_acceptance={"path": path_for_record(retest_path),
+                               "sha256": retest_sha},
+            admission={"path": path_for_record(real_path),
+                       "sha256": real_sha},
+            protected_manifest={
+                "path": path_for_record(protected_file),
+                "sha256": sha256_file(protected_file)})
+        spec_file = out / "binding_spec.json"
+        write_json_exclusive(spec_file, spec)
+        spec_sha = sha256_file(spec_file)
+        admission = build_retest_admission(
+            ROOT, snapshot_path=snapshot_file,
+            snapshot_sha256=snapshot_sha, snapshot=snapshot,
+            spec_path=spec_file, spec_sha256=spec_sha, spec=spec,
+            budget_revision_path=revision_file,
+            budget_revision_sha256=revision["sha256"],
+            budget_revision=revision,
+            protected_manifest_path=protected_file,
+            protected_manifest_sha256=sha256_file(protected_file),
+            protected_manifest=protected,
+            real_admission_path=real_path,
+            real_admission_sha256=real_sha,
+            real_admission=real_admission,
+            gate_b_v2_path=gate_b_path,
+            gate_b_v2_sha256=gate_b_sha, gate_b_v2=gate_b,
+            retest_acceptance_path=retest_path,
+            retest_acceptance_sha256=retest_sha,
+            retest_acceptance=retest_acceptance)
+        admission_problems = retest_admission_problems(
+            admission, project_root=ROOT, strict=True)
+        if admission_problems:
+            admission["passed"] = False
+            admission["problems"] = list(admission.get("problems") or []) + \
+                admission_problems
+        admission_path, admission_sha = write_retest_admission(
+            out, admission)
+        draft = build_retest_authorization_draft(
+            ROOT, binding=load_external_binding_material(
+                snapshot_file, snapshot_sha, spec_file, spec_sha,
+                project_root=ROOT,
+                require_current_implementation=True)[0],
+            snapshot_path=snapshot_file, spec_path=spec_file,
+            retest_admission_path=admission_path,
+            retest_admission_sha256=admission_sha,
+            protected_manifest_sha256=sha256_file(protected_file),
+            gate_b_v2_path=gate_b_path, gate_b_v2_sha256=gate_b_sha,
+            retest_acceptance_path=retest_path,
+            retest_acceptance_sha256=retest_sha,
+            real_admission_path=real_path,
+            real_admission_sha256=real_sha,
+            invocation_id=args.invocation_id or "inv-retest-real-001",
+            authorized=False)
+        real_tolerance = real_admission.get("tolerance") or {}
+        draft.update(
+            calibration_verification_sha256=real_admission.get(
+                "calibration_verification_sha256"),
+            tolerance_evidence_sha256=real_tolerance.get("evidence_sha256"),
+            fp32_contract_sha256=real_admission.get(
+                "fp32_contract_sha256"),
+            acceptance_sha256=retest_sha,
+            admission_package_sha256=real_sha)
+        draft_file = out / "authorization_draft.json"
+        write_json_exclusive(draft_file, draft)
+        draft_problems: list[str] = []
+        checklist = draft.get("checklist") or {}
+        if set(checklist) != set(AUTHORIZATION_REQUIRED):
+            draft_problems.append("authorization_checklist_keys")
+        if any(value is not None for value in checklist.values()):
+            draft_problems.append("authorization_checklist_not_null")
+        if draft.get("authorized") is not False or \
+                draft.get("template_only") is not True:
+            draft_problems.append("authorization_must_be_template_only")
+        real_tolerance = real_admission.get("tolerance") or {}
+        expected_top = {
+            "calibration_verification_sha256": real_admission.get(
+                "calibration_verification_sha256"),
+            "tolerance_evidence_sha256": real_tolerance.get(
+                "evidence_sha256"),
+            "fp32_contract_sha256": real_admission.get(
+                "fp32_contract_sha256"),
+            "acceptance_sha256": retest_sha,
+            "admission_package_sha256": real_sha,
+            "draft_sha256": sha256_file(ROOT / "docs/plans/"
+                                        "omniretarget_w1_real_training_"
+                                        "update_audit_prereg_draft.md"),
+            "execution_plan_sha256": sha256_file(
+                ROOT / "docs/plans/"
+                       "omniretarget_w1_gradient_numerics_retest_plan.md"),
+        }
+        for key, want in expected_top.items():
+            value = draft.get(key)
+            if not isinstance(want, str) or not isinstance(value, str) or \
+                    value != want or len(value) != 64:
+                draft_problems.append(f"authorization_binding:{key}")
+        if draft.get("implementation_files") != \
+                implementation_identity(ROOT).get("files"):
+            draft_problems.append("authorization_implementation")
+        expected_retest = {
+            "snapshot_sha256": snapshot_sha,
+            "spec_sha256": spec_sha,
+            "budget_revision_sha256": revision["sha256"],
+            "protected_manifest_sha256": sha256_file(protected_file),
+            "retest_admission_sha256": admission_sha,
+            "gate_b_v2_sha256": gate_b_sha,
+            "retest_acceptance_sha256": retest_sha,
+            "real_admission_sha256": real_sha,
+            "closed_history_head_sha256": snapshot[
+                "closed_history_head_sha256"],
+            "invocation_id": args.invocation_id or "inv-retest-real-001",
+        }
+        retest_draft = draft.get("retest") or {}
+        for key, want in expected_retest.items():
+            if retest_draft.get(key) != want:
+                draft_problems.append(f"authorization_retest:{key}")
+        preflight = {
+            "schema": "w1_real_training_update_retest_preflight_v1",
+            "passed": bool(admission.get("passed")) and not draft_problems,
+            "problems": list(admission.get("problems") or []) + draft_problems,
+            "files": {
+                path_for_record(path): {
+                    "sha256": sha256_file(path),
+                    "bytes": int(path.stat().st_size)}
+                for path in (snapshot_file, revision_file, protected_file,
+                             spec_file, admission_path, draft_file)},
+            "authorization_template_only": draft.get("template_only"),
+            "authorization_authorized": draft.get("authorized"),
+            "next_action": ("user must review and provide the ten explicit "
+                            "section 9 checklist authorizations"),
+            "created_wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        }
+        preflight_file = out / "preflight_verification.json"
+        write_json_exclusive(preflight_file, preflight)
+        print(f"[update-audit] retest snapshot={snapshot_file}")
+        print(f"[update-audit] budget revision={revision_file}")
+        print(f"[update-audit] protected manifest={protected_file} "
+              f"entries={protected['entry_count']}")
+        print(f"[update-audit] binding spec={spec_file}")
+        print(f"[update-audit] retest admission={admission_path} "
+              f"passed={admission.get('passed')}")
+        print(f"[update-audit] authorization draft={draft_file} "
+              f"authorized={draft.get('authorized')}")
+        print(f"[update-audit] preflight={preflight_file} "
+              f"passed={preflight['passed']}")
+        for problem in preflight["problems"][:30]:
+            print(f"[update-audit]   {problem}")
+        return 0 if preflight["passed"] else 2
 
     if args.gate_b_v2:
         if args.out is None or args.ordinary_acceptance is None or \
@@ -1134,8 +1552,8 @@ def main() -> int:
             raise SystemExit("--stage is only valid with --resume")
         out = Path(args.out).expanduser().resolve()
         base = _history_root()
-        migration_launch = bool(args.migration and not args.resume
-                                and args.stage is None)
+        migration_launch = bool((args.migration or args.retest)
+                                and not args.resume and args.stage is None)
         try:
             if out.parent != base:
                 raise SystemExit(
@@ -1167,13 +1585,14 @@ def main() -> int:
                 pkg_problems = admission_package_problems(package)
             if pkg_problems:
                 raise SystemExit(f"admission package refused: {pkg_problems}")
-            if args.migration:
+            if args.migration or args.retest:
                 if args.resume or args.stage is not None:
                     raise SystemExit(
-                        "--migration cannot be combined with --resume")
+                        "binding generation entries cannot use --resume")
                 if args.binding_spec is None or args.invocation_id is None:
                     raise SystemExit(
-                        "--migration requires --binding-spec and --invocation-id")
+                        "generation entry requires --binding-spec and "
+                        "--invocation-id")
                 spec_path = Path(args.binding_spec).expanduser().resolve()
                 if not spec_path.is_file():
                     raise SystemExit(f"binding spec missing: {spec_path}")
@@ -1195,19 +1614,84 @@ def main() -> int:
                 if binding is None or binding_problems:
                     raise SystemExit(
                         f"migration binding refused: {binding_problems}")
-                migration = record.get("migration") or {}
-                expected = {
-                    "run_root_realpath": str(out),
-                    "invocation_id": args.invocation_id,
-                    "spec_sha256": spec_sha,
-                    "snapshot_sha256": snapshot_sha,
-                    "legacy_head_sha256": snapshot.get("legacy_head_sha256"),
-                    "gate_b_sha256": ((spec.get("bindings") or {}).get(
-                        "gate_b") or {}).get("sha256"),
-                    "real_admission_sha256": package_sha,
-                    "implementation_sha256": implementation_files_sha256(
-                        implementation_identity(ROOT)),
-                }
+                retest = bool(args.retest)
+                retest_admission = None
+                retest_admission_sha = None
+                if retest:
+                    from ireset.eval.w1_real_training_update_audit import (
+                        retest_admission_problems,
+                    )
+                    if args.retest_admission is None:
+                        raise SystemExit(
+                            "--real --retest requires --retest-admission")
+                    retest_admission_path = Path(
+                        args.retest_admission).expanduser().resolve()
+                    if not retest_admission_path.is_file():
+                        raise SystemExit(
+                            f"retest admission missing: "
+                            f"{retest_admission_path}")
+                    retest_admission_sha = sha256_file(retest_admission_path)
+                    retest_admission = strict_read_json(
+                        retest_admission_path)
+                    admission_problems = retest_admission_problems(
+                        retest_admission, project_root=ROOT, strict=True)
+                    if admission_problems:
+                        raise SystemExit(
+                            f"retest admission refused: {admission_problems}")
+                    if (retest_admission.get("spec") or {}).get(
+                            "sha256") != spec_sha or \
+                            (retest_admission.get("snapshot") or {}).get(
+                                "sha256") != snapshot_sha:
+                        raise SystemExit(
+                            "retest admission spec/snapshot binding")
+                    if (retest_admission.get("budget_revision") or {}).get(
+                            "sha256") != spec.get(
+                                "budget_revision_sha256"):
+                        raise SystemExit(
+                            "retest admission budget binding")
+                    if (retest_admission.get("protected_manifest") or {}).get(
+                            "sha256") != ((spec.get("bindings") or {}).get(
+                                "protected_manifest") or {}).get("sha256"):
+                        raise SystemExit(
+                            "retest admission protected-manifest binding")
+                migration = (record.get("retest") if retest
+                             else record.get("migration")) or {}
+                if retest:
+                    expected = {
+                        "run_root_realpath": str(out),
+                        "invocation_id": args.invocation_id,
+                        "spec_sha256": spec_sha,
+                        "snapshot_sha256": snapshot_sha,
+                        "closed_history_head_sha256": snapshot.get(
+                            "closed_history_head_sha256"),
+                        "budget_revision_sha256": spec.get(
+                            "budget_revision_sha256"),
+                        "protected_manifest_sha256": (
+                            (spec.get("bindings") or {}).get(
+                                "protected_manifest") or {}).get("sha256"),
+                        "retest_admission_sha256": retest_admission_sha,
+                        "gate_b_v2_sha256": ((spec.get("bindings") or {}).get(
+                            "gate_b_v2") or {}).get("sha256"),
+                        "retest_acceptance_sha256": (
+                            (spec.get("bindings") or {}).get(
+                                "retest_acceptance") or {}).get("sha256"),
+                        "real_admission_sha256": package_sha,
+                        "implementation_sha256": implementation_files_sha256(
+                            implementation_identity(ROOT)),
+                    }
+                else:
+                    expected = {
+                        "run_root_realpath": str(out),
+                        "invocation_id": args.invocation_id,
+                        "spec_sha256": spec_sha,
+                        "snapshot_sha256": snapshot_sha,
+                        "legacy_head_sha256": snapshot.get("legacy_head_sha256"),
+                        "gate_b_sha256": ((spec.get("bindings") or {}).get(
+                            "gate_b") or {}).get("sha256"),
+                        "real_admission_sha256": package_sha,
+                        "implementation_sha256": implementation_files_sha256(
+                            implementation_identity(ROOT)),
+                    }
                 binding_problems = [
                     f"authorization_migration:{key}" for key, value in
                     expected.items() if migration.get(key) != value]
@@ -1218,14 +1702,24 @@ def main() -> int:
                     out, args.invocation_id,
                     authorization_sha256=auth_sha, spec_sha256=spec_sha,
                     legacy_head_sha256=snapshot["legacy_head_sha256"],
-                    marker_sha256=snapshot["marker_sha256"])
+                    marker_sha256=snapshot["marker_sha256"],
+                    closed_history_head_sha256=(
+                        snapshot.get("closed_history_head_sha256")
+                        if retest else None))
                 if _claim is not None and _claim.get("pid") != os.getpid():
                     claim_problems.append("launch_claim_not_current_process")
                 if claim_problems:
                     raise SystemExit(
                         f"launch claim refused: {claim_problems}")
-                fresh_problems = _fresh_migration_root_problems(
-                    out, allow_invocation=args.invocation_id)
+                from ireset.eval.w1_real_training_update_audit import (
+                    fresh_retest_root_problems,
+                )
+                fresh_problems = (
+                    fresh_retest_root_problems(
+                        out, allow_invocation=args.invocation_id)
+                    if retest else
+                    _fresh_migration_root_problems(
+                        out, allow_invocation=args.invocation_id))
                 if fresh_problems:
                     binding_problems += fresh_problems
                 if not (out / "cohort.json").is_file():
@@ -1236,7 +1730,9 @@ def main() -> int:
                 stage_binding(
                     out, spec_path=spec_path, spec_sha256=spec_sha,
                     snapshot_sha256=snapshot_sha,
-                    invocation_id=args.invocation_id)
+                    invocation_id=args.invocation_id,
+                    generation=("generation_003" if retest
+                                else "generation_002"))
                 directory = out / LAUNCH_JOURNAL_DIR / args.invocation_id
                 job = {
                     "mode": "real", "root": str(out),
@@ -1246,6 +1742,10 @@ def main() -> int:
                     "tolerance_contract_path":
                         args.tolerance_contract.resolve(),
                     "invocation_id": args.invocation_id,
+                    "retest": retest,
+                    "retest_admission_path": (
+                        str(retest_admission_path) if retest else None),
+                    "retest_admission_sha256": retest_admission_sha,
                     "result_path": str(directory / "worker_result_inner.json"),
                 }
                 job_path = directory / "worker_job.json"
@@ -1260,10 +1760,12 @@ def main() -> int:
                     out, args.invocation_id, _ENTRY_STARTED_PERF, reason)
             raise
 
-        if args.migration:
+        if args.migration or args.retest:
+            worker_flag = ("--retest-worker" if args.retest
+                           else "--migration-worker")
             facts = _spawn_worker(
                 [sys.executable, str(Path(__file__).resolve()),
-                 "--migration-worker", "--job", str(job_path)],
+                 worker_flag, "--job", str(job_path)],
                 directory / "worker.log")
             document = _worker_result(Path(job["result_path"]))
             if document is None or not isinstance(

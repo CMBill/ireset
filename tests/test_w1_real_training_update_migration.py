@@ -1408,8 +1408,10 @@ def test_real_migration_claim_precedes_admission_and_failure_is_debt(
     assert journal["known"] is False
     assert any(p.startswith("launch_debt:")
                for p in journal["problems"])
-    allowed = A.scan_launch_journals(base, allow_invocation=invocation)
-    assert allowed["known"] is True
+    allowed = A.scan_launch_journals(
+        base, allow_invocation=invocation, allow_root=root)
+    assert allowed["known"] is False
+    assert any(p.startswith("launch_debt:") for p in allowed["problems"])
 
 
 def test_fresh_migration_root_exempts_only_the_current_claim(tmp_path):
