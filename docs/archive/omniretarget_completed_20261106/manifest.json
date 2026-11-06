@@ -1,0 +1,287 @@
+{
+  "date": "2026-11-06",
+  "document_count": 39,
+  "documents": [
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 31533,
+      "path": "docs/plans/omniretarget_a2_closure_plan.md",
+      "sha256": "28fd40e43af0f524e5c2c23dc776a5a9b1b00bd872d75ee90442b5f41a8b81b3",
+      "title": "OmniRetarget A2 收口与有限恢复实现方案"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 64338,
+      "path": "docs/plans/omniretarget_first_training_plan.md",
+      "sha256": "ca7cd4d8db553cac0057d1392c3238f0ca0fbfcbe4748f4c5946a3e650da2e84",
+      "title": "OmniRetarget 优先教师与初步训练执行方案"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 27861,
+      "path": "docs/plans/omniretarget_w1_a3bc_plan.md",
+      "sha256": "e7247e4b76d7cdfec04e288883dbdaccd868c7908108a8f2f5171839c766fc2f",
+      "title": "OmniRetarget W1 弱动作监督 A3/B/C 实现方案"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 8457,
+      "path": "docs/plans/omniretarget_w1_attribution_plan.md",
+      "sha256": "4bf026c71311f6d169bcc9d8cb2c9383c601d2f0a93d22febf60a74482542be4",
+      "title": "W1 失败归因与生成链定位执行方案"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 38408,
+      "path": "docs/plans/omniretarget_w1_de_plan.md",
+      "sha256": "bed1e62d5c85579e96b94695cbbbb067cb79a820f18b9b692d21bda9c1ec1525",
+      "title": "OmniRetarget W1 正式训练与裸输出评估执行方案"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 6434,
+      "path": "docs/plans/omniretarget_w1_gradient_numerics_repair_plan.md",
+      "sha256": "c29a059b568da8f25beb9c7cc5adcfd815ddb2088224fef95d197cb08061bdba",
+      "title": "W1 梯度数值稳定性最小修复方案"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 27641,
+      "path": "docs/plans/omniretarget_w1_gradient_numerics_retest_plan.md",
+      "sha256": "8bb4a79364183231c55dc31c6582ab2622656e9696c0c0724c3e62ce77ebd3e9",
+      "title": "W1 数值修复后真实复验与证据重冻结方案"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 34988,
+      "path": "docs/plans/omniretarget_w1_prediction_consistency_plan.md",
+      "sha256": "b82401f8fb4ea35cc5ac986236fefa59693671042809484627e3b17cce5bfa41",
+      "title": "W1预测误差与窗口一致性诊断执行方案"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 47573,
+      "path": "docs/plans/omniretarget_w1_real_fk_geometry_derivative_audit_prereg_draft.md",
+      "sha256": "e27f882a49896209f0e447c56c24e4433db915435d2713fa2bfd62fccd64cc7a",
+      "title": "W1 真实训练解码、FK 几何与输出空间导数审计预注册草案"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 22956,
+      "path": "docs/plans/omniretarget_w1_real_objective_audit_admission_package.md",
+      "sha256": "5cb0d4493700a0b2b6788cc57ebe940e645321f62cf5e604954ca4a7db67459d",
+      "title": "W1 真实训练目标审计准入包与冻结校准契约"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 30346,
+      "path": "docs/plans/omniretarget_w1_real_objective_audit_prereg_draft.md",
+      "sha256": "42b894810855069887e815675447d081249a859b60170fc4af80ca8df114f15e",
+      "title": "W1 真实训练目标审计预注册草案（未注册、不可执行）"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 5876,
+      "path": "docs/plans/omniretarget_w1_real_training_update_alpha_fix_plan.md",
+      "sha256": "9b49e673d975fdd1fd61ea80e7926618d328750af6054b312827ca97fac646a0",
+      "title": "W1 真实训练更新审计——alpha 有效常数修正补充计划"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 83696,
+      "path": "docs/plans/omniretarget_w1_real_training_update_audit_prereg_draft.md",
+      "sha256": "e2ba8ef9edb7381dbe410f7e0e290a6fbd702323a4416eeacfee4d2d14796242",
+      "title": "W1 真实网络参数梯度与优化更新链路审计预注册方案"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 53647,
+      "path": "docs/plans/omniretarget_w1_real_training_update_binding_migration_plan.md",
+      "sha256": "1b27a41462c4d40fb3e0f54b240c3ac6669e4871062191d470dc734721142b17",
+      "title": "W1 真实训练更新审计——既有 cohort 绑定迁移与有限恢复方案"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 67732,
+      "path": "docs/plans/omniretarget_w1_real_training_update_provider_execution_plan.md",
+      "sha256": "e66cd8a9ac1d94abe8ea3f08aeadd45bec8e5d29f0f2baccfec948a4eca7cb4d",
+      "title": "W1 真实网络参数梯度与优化更新链路——真实 provider 接入与执行计划"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 27701,
+      "path": "docs/plans/omniretarget_w1_rotation_fusion_plan.md",
+      "sha256": "c6aad7cc6f71ee0c7de70f331626e22647bd872c2f0200f4415cda7f0931a822",
+      "title": "W1 旋转融合修复与固定 checkpoint 验证执行方案"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 30100,
+      "path": "docs/plans/omniretarget_w1_training_fit_objective_audit_plan.md",
+      "sha256": "578ad122621bb2b5a71b75801d3b49868066075187f0d8a0f5066cb38628a2b9",
+      "title": "W1训练拟合与目标一致性单因素诊断执行方案"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 14810,
+      "path": "docs/plans/omniretarget_w1_training_objective_audit_refresh_plan.md",
+      "sha256": "cb60d525f0dd6d1cfb1be502380326b16dcdc510a21daa590a11a6bbbb4d768c",
+      "title": "W1 训练目标合成审计证据更新计划"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 47484,
+      "path": "docs/verification/omniretarget_a2_closure_verification.md",
+      "sha256": "2b3d62f92cc1f3730ed20d63d16ff096eeba40217a16a9fe9810fc6a22f843aa",
+      "title": "A2 收口与有限恢复验证记录（C0/C1/D0/G0/UR/C2）"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 56526,
+      "path": "docs/verification/omniretarget_w1_a3bc_verification.md",
+      "sha256": "19e5f50b6d2a0c1f5ea86a9d7ac30c092a7f63d3dc4d55b37a64fc1e835fb34a",
+      "title": "W1 A3/B/C 实施与运行验证记录"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 14854,
+      "path": "docs/verification/omniretarget_w1_attribution_verification.md",
+      "sha256": "107c4e2b9342c551600bd103938cc37ff808fc3245a33737410f9b46bc7c0760",
+      "title": "W1 失败归因诊断验证记录"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 52591,
+      "path": "docs/verification/omniretarget_w1_de_verification.md",
+      "sha256": "17c6b5db2d68c06ce349a763fbbf74cfde1f1787913f5f2212d063903adb3714",
+      "title": "OmniRetarget W1 D/E 实施与正式验证记录"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 16777,
+      "path": "docs/verification/omniretarget_w1_gradient_numerics_repair_verification.md",
+      "sha256": "7d9e4ed7a135129d30badd15d719f2a410ed48894975980c726863c61e673d3c",
+      "title": "W1 梯度数值稳定性修复实现与验证记录"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 5179,
+      "path": "docs/verification/omniretarget_w1_gradient_numerics_retest_authorization_request.md",
+      "sha256": "9d0d2efbfce0681c6e291c03dcfa0e19ff2d69ba98b75f0d5c9ba08a9591b5c9",
+      "title": "W1 数值复验 T6 十项明确授权请求"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 7083,
+      "path": "docs/verification/omniretarget_w1_gradient_numerics_retest_report.md",
+      "sha256": "b2c2e7387d02d65e2a6c4d5188dc56599d90f86d4f0fa0e04e8b53eb13753559",
+      "title": "W1 数值修复后真实复验执行报告（T6）"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 12664,
+      "path": "docs/verification/omniretarget_w1_gradient_numerics_retest_verification.md",
+      "sha256": "210602e0d59fb06e1b6e62f3beb66c5321b81f7ac289d5f8d5a4a543f40ac64d",
+      "title": "W1 数值修复后真实复验与证据重冻结验证记录"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 28097,
+      "path": "docs/verification/omniretarget_w1_prediction_consistency_verification.md",
+      "sha256": "815dc84d3f778f1b19d297e97a85d80d0a4acf00adfad227f9b2fc9e801f8e56",
+      "title": "W1 预测误差与窗口一致性诊断验证记录"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 12237,
+      "path": "docs/verification/omniretarget_w1_real_fk_audit_report.md",
+      "sha256": "6aa62de82890db801df4f3de8a3e15f025f9ace536940317d494ead1ae6b0616",
+      "title": "W1 真实训练解码、FK 几何与输出空间导数审计报告"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 28316,
+      "path": "docs/verification/omniretarget_w1_real_fk_audit_verification.md",
+      "sha256": "5331b75acd6e86e362d44fb6ac6ebe75d7d73d7aa48a86b881779b3408b0057d",
+      "title": "W1 真实训练解码、FK 几何与输出空间导数审计 —— 工程验证与真实执行索引"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 22802,
+      "path": "docs/verification/omniretarget_w1_real_objective_audit_report.md",
+      "sha256": "cf38a29bb6c477e57666ea9f4cabf7e5a261076b78cabd80311b0a254d0148ef",
+      "title": "W1 真实批次目标与输出空间梯度审计报告"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 43579,
+      "path": "docs/verification/omniretarget_w1_real_objective_audit_verification.md",
+      "sha256": "b3b823271aa0ce2f7ab1e73558e8e9f719a727ef2a0aedd9cfb4d0d3bd58acc6",
+      "title": "W1 真实训练目标审计实现与合成自测验证记录"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 7328,
+      "path": "docs/verification/omniretarget_w1_real_training_update_audit_report.md",
+      "sha256": "a881ce3f210d19532a7701e43a244e6b4ba904026ca1907752cb846339e36fed",
+      "title": "W1 真实参数梯度与更新链路首次执行报告"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 104397,
+      "path": "docs/verification/omniretarget_w1_real_training_update_audit_verification.md",
+      "sha256": "6fb476d715bd6823c82216273e2b9e5755922780f88cc4280007604cc16a68a9",
+      "title": "W1 真实网络参数梯度与优化更新链路审计 —— I/C 验证与真实执行记录"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 10372,
+      "path": "docs/verification/omniretarget_w1_real_training_update_binding_migration_report.md",
+      "sha256": "f689c9f9118171fc42fc4612532ae037070fe9ac357b9d278ccbbb219e063688",
+      "title": "W1 绑定迁移一次真实恢复执行报告"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 45444,
+      "path": "docs/verification/omniretarget_w1_real_training_update_binding_migration_verification.md",
+      "sha256": "41641effdf2add4d1bc1bb36083747a23a30c83937ff28a0dbdd3c38f2a03eaa",
+      "title": "W1 训练更新绑定迁移实现与验证记录"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 18624,
+      "path": "docs/verification/omniretarget_w1_real_training_update_failure_attribution.md",
+      "sha256": "c4bc4e8a036de35619df0296b2d2c9828f8fcafb493de5274fbab833c0687b31",
+      "title": "W1 真实参数梯度与更新链路失败只读归因"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 12303,
+      "path": "docs/verification/omniretarget_w1_real_training_update_local_gradient_verification.md",
+      "sha256": "b12591f2b1199abe2844544dd36134692868aaa99d2b17b48e0c42cfc95651c2",
+      "title": "W1 保存输入的局部分项梯度验证"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 32705,
+      "path": "docs/verification/omniretarget_w1_rotation_fusion_verification.md",
+      "sha256": "3948dccf2c9a26a082608339ba7ff6d43bf542defb19023e8adc3cba37ba03fb",
+      "title": "W1 旋转融合修复与固定 checkpoint 验证记录"
+    },
+    {
+      "archive_mode": "in_place_frozen_reference",
+      "bytes": 35204,
+      "path": "docs/verification/omniretarget_w1_training_objective_audit_verification.md",
+      "sha256": "1c4631baad40e2e75a1ff4760d9f1ff4a8d57eee7cbf2d19fd693d38d9aa10ac",
+      "title": "W1 训练拟合与目标一致性合成审计验证记录"
+    }
+  ],
+  "meaning": "Navigation archival only; retain original document paths and bytes. Completion does not imply numerical or quality acceptance.",
+  "mode": "in_place_frozen_reference",
+  "schema": "ireset_completed_document_archive_v1",
+  "source_index": {
+    "bytes": 33073,
+    "path": "docs/README.md",
+    "sha256": "c72f2f5960727dbad7eacba7bef7523dc877104d2b08e765e7293d29b24603ce"
+  }
+}

@@ -1,0 +1,109 @@
+# 已完成阶段历史索引（2026-11-06归档）
+
+本页保存归档前的文档导航与进度说明。下文的“当前入口”“下一候选”和未运行描述均属于各记录时点，不构成新授权或当前执行指令。当前工作入口见[文档索引](../../README.md)，完成阶段分组与状态见[归档说明](README.md)。冻结正文仍位于原路径，未移动或改写。
+
+---
+
+# 文档索引
+
+整理日期：2026-10-11（最后更新 2026-11-05）。训练目标合成审计当前权威为 `derived/audit/w1_training_objective_audit/attempt_004/`（2026-10-27 当前源码重新验收，89 行/0失败/0缺口、5 项限制不变；`attempt_003` 为历史版本证据）。**2026-10-27 用户授权后真实训练目标审计已完成 R0→P→F 一次：四窗、两固定 step-4000 checkpoint、98 目标行/14 梯度行全部 `within_tolerance`，F 两模型逐位重放通过，结论 `real_batch_covered_contract_passed`（`problems=[]`、`gaps=[]`），成本 7.5015s/900s，更新/FD/DDIM/checkpoint 写入 0；覆盖仍 `partial`、最终交互 `not_ready`。** 当前 **W1-D/E/F、失败归因、旋转融合 v2 与 W1 预测/窗口一致性诊断的已运行结论保持：Teacher raw 2/31、模型各 0/31，最终交互方法 `not_ready`**。旋转融合实验权威仍为 r10：GS 失败、GQ 3/26 配对通过/94 项退化/0 缺口，V 按条件未执行，候选不接入；第三轮审计后的只读复验含冻结重放65/65、Teacher标签13/13、V2重推39/39、重测116/116，度量和失败集合不变。S 累计1,513.866/1,800s、扣预留后可用226.134s低于r10实测252.156s，仍未生成r11。**W1 预测/窗口一致性诊断已完成 I→R→W→P→F（r6），但 2026-10-22 两轮独立审计确认同 cohort 尝试数 R 6/W 5/P 3 超过每阶段最多两次、且有一次未计费真实数据预检，r6 的 `implementation_contract_passed`/`diagnosis_complete` 不可验收；第二轮另修复 3 项残留核验缺口（撤回失败终态成本、布尔比较绕过、去噪矩阵分组宏），保守 `not_ready` 结论保留。** 统计已订正：跨窗超描述线按 demo×模型×帧为 **2,892/260**（合并模型 1,471/130），P 主统计改为 demo 等权宏平均（DDIM normalized **0.225310** vs t=999 **0.212026**）；总成本 1,801.345/7,200s 是下界。本 cohort 不再有合法正式复验，须另立新预注册方案。**2026-10-28 用户按 §9.2 明确授权后，真实 FK 几何/输出空间导数审计已完成 R0→G→D→F 各一次：122 主表行（含 20 梯度行）、32 状态/4672 FD 行全部通过，F 独立子进程重放通过，结论 `real_saved_fk_covered_contract_passed`，失败/缺口 0/0，四阶段可消费。** 执行前以 `2083249` 补齐启动/import 计费，模块 77 passed；冻结校准 `e70fa5b5…`、新准入包 attempt_014 `f113887b…`、明确授权 `846b1642…`。登记成本 24.248145s/1800s（含启动与 seal-tail；外层 20.9881s），调用矩阵与预注册精确相等，三处预留全部结算。checkpoint/网络/参数 backward/参数 FD/优化器/训练更新/DDIM/contact 十项计数全为 0；覆盖 partial、full contract=null、归因 insufficient、not_ready 与生产不接入保持。388 个旧证据和 28 个真实工件保护复验未变；执行后仅核对 JSON/哈希与更新文档。原 SOURCE、ATTR、FUSION 与旧方案/产物保持只读。
+
+## 当前入口
+
+| 文档 | 用途与状态 |
+| --- | --- |
+| [W1 数值修复后真实复验与证据重冻结方案](../../plans/omniretarget_w1_gradient_numerics_retest_plan.md) | **2026-11-06 T0–T6 完成**：十项授权后执行一次 R0_003→P_003→I_002→F_002；实现身份 `c4d4a889…`、授权 `09ee83de…`、invocation `w1-retest-20261106-003`。**结论 `audit_incomplete`：failures 329→0，gaps 629→539（350 precision/189 sensitivity/0 bound），covered_contract_passed=false**；complete_evidence=true、F 独立重放/实际返回闭合。成本 779.350098s，累计1347.195507/3240s；cohort 34次更新。一次性授权已消费，不自动重试、不接入生产。详见[执行报告](../../verification/omniretarget_w1_gradient_numerics_retest_report.md) |
+| [W1 数值修复后复验验证记录](../../verification/omniretarget_w1_gradient_numerics_retest_verification.md) | **2026-11-06 T0–T6 完成**：修复授权草案 calibration/evidence/fp32 绑定为空 P1（从 real admission 取值，preflight 检查全部顶层/retest 绑定）；跨根 invocation 豁免、failure/revoke/tmp/非 claim-only、目标 attempt 目录边界保持。32文件 `c4d4a889…`，181项聚焦回归；校准 attempt_025、普通/迁移/复验与 Gate B v2 接受均 passed；M5 attempt_009 preflight passed。T6 一次执行：**329 failures 全部 resolved、539 gaps 保留、audit_incomplete**；key bias/完整输出 cotangent/micro2 梯度通过，AdamW 更新仍有 sensitivity/precision gaps。旧六行不变，原根 158文件/15,204,894,348 bytes；授权已消费，partial/null/not_ready/不接入保持 |
+| [W1 数值修复后复验执行报告](../../verification/omniretarget_w1_gradient_numerics_retest_report.md) | **2026-11-06 T6 已执行一次**：0 failures、539 gaps（350 precision + 189 sensitivity，0 bound），complete_evidence=true、covered_contract_passed=false、audit_incomplete/exit3。旧329（156 key bias + 173 diffusion u2）全部 resolved；旧629 gaps 95 resolved/534 persisted/5 new。完整输出 cotangent max ratio 0.01714、key bias 128数组全零、micro2 root_out 梯度0.30787但 AdamW 仍有 gap。成本779.350098s/累计1347.195507s、cohort34次；F独立重放与返回证明闭合。一次性授权已消费，不自动重试、不接入生产 |
+| [W1 保存输入的局部分项梯度验证](../../verification/omniretarget_w1_real_training_update_local_gradient_verification.md) | **2026-11-04 已完成**：原cotangent逐位复现，5个输出超差主要来自trace-only quaternion FK；归一化库候选使原5坐标最大门比22.9763→0.00140329。42旋转输入×两精度、普通反向/有限差分、4 attention反例和32保存状态算术投影已完成；57 autograd/1444运动学状态、10.3349s单列。训练模型/checkpoint/更新0，生产代码与原329/629结论未改；参数级传播仍待验证 |
+| [W1 梯度数值稳定性修复实现与验证记录](../../verification/omniretarget_w1_gradient_numerics_repair_verification.md) | **2026-11-05 复审3项P2已修复**：四元数依赖纳入运行时身份，局部验收覆盖完整输出并绑定30文件/运行时/资产；聚焦20 passed、provider+audit 119 passed、migration 30 passed。attempt_006 为18/18检查通过、0超差/max ratio 0.01547，原329/629及参数级限制保持；当前身份 `00581d19…`、校准019 verification `fc4e2f34…`。Gate B/M5 未重冻结，后续复验方案见上行 |
+| [W1 梯度数值稳定性最小修复方案](../../plans/omniretarget_w1_gradient_numerics_repair_plan.md) | **v0.1，已实施（2026-11-04）**：N1 成熟库稳定 quaternion 适配、N2 结构零 key bias、N3 失败行展示；修复后复审当前30文件身份为 `00581d19…`，原 `57bbcae0…` 保留为历史。验证结果见上行；未启动新的真实网络重放或 R0/P/I/F，旧 M6 授权仍耗尽 |
+| [W1 真实更新链失败只读归因](../../verification/omniretarget_w1_real_training_update_failure_attribution.md) | **2026-11-04 既有工件分析完成**：329 failure 分为156项attention key bias路径、173项diffusion u2；25个bound gap与25个clipped失败逐项对应，176个AdamW行原始跨路径门全过但仍有precision gap。该轮34项核对通过、0新梯度/FK/更新；后续局部分项验证见上行，原audit_incomplete与329/629不变 |
+| [W1 绑定迁移一次真实恢复执行报告](../../verification/omniretarget_w1_real_training_update_binding_migration_report.md) | **已执行（2026-11-04）**：授权 `673d750f…`、终检 `ede2254f…`、返回证明 `32599cf7…`；四阶段done/complete、F独立重放和提交闭合，新增16/cohort18次更新。**数值未通过：329 failure + 629 gap，audit_incomplete**；本次授权已用完，无自动重试，生产不接入 |
+| [W1 既有 cohort 绑定迁移与有限恢复方案](../../plans/omniretarget_w1_real_training_update_binding_migration_plan.md) | **2026-11-04 M0–M5完成，M6获新明确授权后已执行一次**：28文件身份 `0cc0622c…`，最终Gate B为calibration/synthetic018 + migration/Gate B v2 005；原根R0_002/P_002/I_001/F_001均done/complete，commit/实际返回证明闭合，新增16/cohort18次更新。**329项failure、629项gap，数值契约未通过，原始结论audit_incomplete**；累计成本567.845409012/3240秒，不自动重试。见[真实恢复报告](../../verification/omniretarget_w1_real_training_update_binding_migration_report.md)与[验证记录 §9](../../verification/omniretarget_w1_real_training_update_binding_migration_verification.md) |
+| [W1 alpha 有效常数修正补充计划](../../plans/omniretarget_w1_real_training_update_alpha_fix_plan.md) | 冻结v0.12/attempt_013历史字节保持；原生float32有效常数与Diffusers身份协议沿用。后续最终Gate B与一次真实恢复已由绑定迁移方案承接，见上行及[恢复报告](../../verification/omniretarget_w1_real_training_update_binding_migration_report.md) |
+| [W1 真实参数梯度与更新链路首次执行报告](../../verification/omniretarget_w1_real_training_update_audit_report.md) | **2026-11-02 首次真实执行已停止：audit_incomplete / exit3**。R0完成、P alpha schedule门拒绝，实际2次更新；I/F未启动，无自动重试。正式授权、逐阶段成本/调用、10原始文件及只读观察均有记录；未把部分NPZ当作通过证据 |
+| [W1 真实网络参数梯度与优化更新链路审计预注册方案](../../plans/omniretarget_w1_real_training_update_audit_prereg_draft.md) | 冻结v0.9原字节；首次执行2次更新、P incomplete保留为历史。2026-11-04新授权下完成一次绑定迁移真实链，累计18次更新，329项failure/629项gap、audit_incomplete；partial/not_ready/不接入保持 |
+| [W1 真实 provider 接入与执行计划](../../plans/omniretarget_w1_real_training_update_provider_execution_plan.md) | 冻结v0.11/Gate B attempt_012历史字节保持；当前最终实现与授权按绑定迁移方案执行。M6已真实执行一次，证据闭合但数值契约未通过，不自动续跑 |
+| [W1 真实参数梯度与更新链路 I/C 验证记录](../../verification/omniretarget_w1_real_training_update_audit_verification.md) | §1–13为历史，§14记录M6一次真实恢复：R0_002/P_002/I_001/F_001完整封口，新增16/cohort18次，累计567.845409012秒；真实329项failure/629项gap、audit_incomplete。最终Gate B/M5见绑定迁移验证记录§8，执行与边界见§9 |
+| [W1 真实 FK 几何与输出空间导数审计报告](../../verification/omniretarget_w1_real_fk_audit_report.md) | **已执行（2026-10-28）**：运行根 `20261028_2083249_w1_real_fk_audit`，授权 `846b1642…`，终局 `c1b8e0e…`。122/122 主表（含 20 梯度行）、32 状态/4672 FD 行通过；F 独立进程完整重放，失败/缺口 0/0。保存输入覆盖内未观察到偏离；登记成本 24.248145s/1800s、各阶段 1/2 次，实际调用矩阵与方案一致；网络/checkpoint/参数反向/训练/DDIM 均 0。网络参数及更新链路、选模、DDIM 与端到端质量仍未审计，full contract=null、not_ready、不接入生产 |
+| [W1 真实训练解码、FK 几何与输出空间导数审计预注册草案](../../plans/omniretarget_w1_real_fk_geometry_derivative_audit_prereg_draft.md) | **§9.2 已授权并执行（2026-10-28）**：v0.2 为执行前冻结快照（SHA `e27f882a…`），九项明确授权记录 `846b1642…`、准入包 attempt_014 `f113887b…`；真实 R0→G→D→F 各一次通过，122 主表/4672 FD 行完整，四阶段可消费，登记成本 24.248145s/1800s、调用矩阵精确相等。通过仍 partial/not_ready，不接入生产；方案字节保留，执行事实见[报告](../../verification/omniretarget_w1_real_fk_audit_report.md) |
+| [W1 真实 FK 几何/导数审计工程验证与执行索引](../../verification/omniretarget_w1_real_fk_audit_verification.md) | **真实执行已完成，§10 登记（2026-10-28）**：§1–9 为历史 I/C 快照与三轮修复；启动计时补齐后 77 passed，新纯合成运行通过、准入包 attempt_014；用户授权后真实 R0/G/D/F 各一次，122/4672 行通过、F 独立子进程重放，失败/缺口 0/0、成本 24.248145s、三处调用预留已结算。388 个旧证据、11 绑定文件与七份父锚未变；旧 107 项相关回归仅作历史，本轮未重跑全量。partial/not_ready 保持 |
+| [W1 真实批次目标与输出空间梯度审计报告](../../verification/omniretarget_w1_real_objective_audit_report.md) | **已执行（2026-10-27）**：用户授权记录 SHA `1071810f…`，准入包 `attempt_005` SHA `1aadb296…`，运行根 `20261027_b45cd7c_w1_real_objective_audit`。R0 身份/资产/四窗/checkpoint strict load 全过；P 两模型各一次真实前向+production/independent batched VJP，98/98 objective、14/14 gradient 全部 within_tolerance；F fresh load+RNG 恢复，两模型 prediction/x_t/FK/分项/production 梯度逐位重放；成本 7.5015s/900s，调用各 4/4，contact/更新/FD/DDIM/checkpoint 写入 0。覆盖范围内通过、未观察到目标偏离，不触发单因素诊断；真实 FK 几何/导数已由 2026-10-28 后续审计补齐；参数梯度、累积/裁剪/AdamW/更新、选模、DDIM 与端到端质量未审计，`full_objective_contract_passed=null`/最终交互 `not_ready` |
+| [W1 训练目标合成审计证据更新计划](../../plans/omniretarget_w1_training_objective_audit_refresh_plan.md) | **已执行（2026-10-27）**：`losses.py` observer 改动后按身份与保护清单→两模块合成测试（33/58 passed）→新 A0–A5 attempt→只读复核与新旧对比→文档指针更新完成当前版本验收。新权威 `derived/audit/w1_training_objective_audit/attempt_004/`：生产侧/独立复核/只读 A5 均 `synthetic_contract_passed`，89 行、0失败/0缺口、5 项限制不变；全部 JSON 数值与三个 NPZ 和 `attempt_003` 逐位相同（仅身份字段与 `losses.py` SHA-256 不同）；356 个旧证据文件未变（父方案仅追加 §8）。沿用原数值契约，不授权真实审计，不创建真实cohort/预算，不训练或接入生产 |
+| [W1 真实训练目标审计准入包与冻结校准契约](../../plans/omniretarget_w1_real_objective_audit_admission_package.md) | **准入材料 + 真实执行（2026-10-27）**：契约 SHA `2904fbc4…`/证据 `49371d30…`；当前包 `attempt_005` SHA `1aadb296…`（索引 `bdedc33c…`），由执行前 `b45cd7c` 修复后重生成；`attempt_004` SHA `1cedbb15…` 保留为历史。用户授权记录 `1071810f…` 通过严格 schema/预算/次数/计数门；R0→P→F 全封口，结论 `real_batch_covered_contract_passed`，98/14 行、`problems=[]`、`gaps=[]`、成本 7.5015s/900s；更新/FD/DDIM/checkpoint 写入 0。覆盖仍 partial，最终交互 not_ready |
+| [W1 真实训练目标审计预注册草案](../../plans/omniretarget_w1_real_objective_audit_prereg_draft.md) | **已授权并执行（2026-10-27）；§8 八项已由授权记录与真实产物勾选**：固定四窗/两 checkpoint/`t=[0,250,500,999]`/noise `20261008`、98/14 必测行、180/360/360s、每阶段 2 次、调用各 4。R0→P→F 一次通过：`problems=[]`、`gaps=[]`、`complete_evidence=true`，F 两模型逐位重放，成本 7.5015s/900s；覆盖范围内未观察到目标偏离，不触发单因素诊断。真实 FK 几何/导数已由 2026-10-28 后续审计补齐；参数梯度、累积/裁剪/AdamW/更新、选模、DDIM 与端到端质量仍未审计；`full_objective_contract_passed=null`、`factor_selected=false`、`auto_execute=false`、最终交互 `not_ready`。详见[真实审计报告](../../verification/omniretarget_w1_real_objective_audit_report.md) |
+| [W1训练拟合与目标一致性单因素诊断执行方案](../../plans/omniretarget_w1_training_fit_objective_audit_plan.md) | **合成审计已实现并运行（2026-10-22；2026-10-27 当前源码重新验收，权威改为 `attempt_004/`，§8）**：A0–A5 审计模块、CLI、33项测试与权威合成运行完成；A1–A4 67行+A0 22=89行、0失败/0缺口、5项已登记限制，生产侧与独立复核均 `synthetic_contract_passed`；A4 新增 `(demo,start,t)` 注册多重集与 12 类键级变体（删窗/重窗/换demo/缺t/重t/missing metric/bool与数值/NaN/Inf/缺字段/bool状态/额外t），A5 用独立实现从 raw 键级行重算多重集、宏微、逐键 `per_demo`/`per_window` 明细及关系，并以冻结定义和 raw 行独立分类反例语义；A5 另独立重放4组固定run更新与2组选模，绑定裁剪参数/形状与小量梯度容差、核验AdamW状态非负/二阶尺度/步数、重算FD与batch排列/重复关系、A2明细严格bool/数值类型、对账全部14条A2明细与完整配置，并拦截空梯度证据/清零梯度状/NaN/×2梯度/root平移/权重篡改/x_t错接/DDIM时间表或末步替换/坏结构。未加载真实 dataset/cache/checkpoint，未对 W1 训练 checkpoint/生产模型做前向、真实数据训练更新0（A3 仅随机初始化微型合成模块）；真实数据审计与单因素实验仍未注册，未分配新cohort/预算；`factor_selected=false`、`auto_execute=false`、最终交互`not_ready`。详见[合成审计验证记录](../../verification/omniretarget_w1_training_objective_audit_verification.md) |
+| [W1 预测/窗口一致性验证记录](../../verification/omniretarget_w1_prediction_consistency_verification.md) | **最新已运行交付（审计后不可验收）**：r6 完成 I→R→W→P→F；130 模型窗/65 Teacher/3,512 跨窗对/520 探针；91 高层调用、403 网络前向；Det/DDIM 65/65 逐位重放；Teacher oracle 59/65（6 例旋转精度负门 max 0.02426°）。**2026-10-22 两轮审计：首轮 14 项 + 第二轮 3 项残留核验缺口已修复；同 cohort 尝试数 R 6/W 5/P 3 超限、一次未计费真实数据预检，r6 的 `diagnosis_complete=true` 不可验收；保留 `not_ready`。** 统计订正：跨窗超描述线 2,892/260（合并模型 1,471/130），P 宏平均 DDIM 0.225310 vs t=999 0.212026；完整去噪矩阵分组 FK 宏 train6/val6/known 0.061434/0.100596/0.172076（r6 原始 summary 只存 n 与窗口微平均、无宏字段；宏为第二轮修复后的只读再聚合）；总成本 1,801.345/7,200s（下界，含 r1–r5 失败尝试）。本 cohort 无合法正式复验 |
+| [W1预测误差与窗口一致性诊断执行方案](../../plans/omniretarget_w1_prediction_consistency_plan.md) | 已执行并冻结的契约（v0.1，2026-10-21）：I→R→W→P→F；13段/26份保存窗，52常规+13尾窗，130窗误差/跨窗对账，520单元探针，F固定三段独立重放；训练0步、7,200s预算、不启动新融合/训练或生产接入。实际结果见验证记录，方案字节不改 |
+| [W1 旋转融合验证记录](../../verification/omniretarget_w1_rotation_fusion_verification.md) | 上一轮已运行交付：`w1_rotation_path_nlerp_v2` 的完整 I/R/S/V/F，实验权威运行 r10（第一轮审计修复 11 项缺口后重跑）。S 117/117（116 measured + 1 拒收），V0/V1 各26/26逐位重放，V2位置/关节25/25逐位；GS 因 Det frame120 blend_norm=0.462 拒收与 Diffusion frame108 7.5926 rad/s 失败，V 条件未执行；GQ 修正为3/26通过、94项退化、0缺口；F 重推39/39、重测116/116、54项合成测试通过；候选 `integration_eligible=false`，最终交互 `not_ready`。第二轮审计修复 7 项（4 P1+3 P2）并以只读沙箱复验 r10：冻结重放65/65、重推39/39、重测116/116、GQ 3/26/94 与 GS 失败集合不变。第三轮审计再修复 1 P1+1 P2：S/F 要求 Teacher 行 measured、F 将 Teacher root/joints 与冻结 clip 逐位绑定（沙箱13/13），算法拒收豁免只限独立重推的 V2；路径数组形状/数值类型/有限性/四元数范数先校验，零范数异常登记为失败而不中断 F。r10 真实数据攻击（Teacher 替换/伪装拒收/零范数 path）均被拦截；因 S 阶段累计预算不足仍未生成 r11。rotation 测试68 passed、相关回归243 passed；全量891 passed+1 skipped |
+| [W1 旋转融合与固定 checkpoint 验证方案](../../plans/omniretarget_w1_rotation_fusion_plan.md) | 已执行并冻结的契约（v0.1，2026-10-15）：唯一固定路径NLERP候选、117/155固定键集、7200s预算、训练0步与接入门；实际结果见验证记录，方案字节不改 |
+| [W1 失败归因验证记录](../../verification/omniretarget_w1_attribution_verification.md) | 13段/78轨迹，523只读锚不变，26组保存窗对照重建、14条原产物逐位重放；确认两类局部旋转融合机制，预测侧残差仍在，标签主要瓶颈不获支持；相关159项测试通过 |
+| [W1 失败归因执行方案](../../plans/omniretarget_w1_attribution_plan.md) | 已登记并执行的诊断契约；固定train6/val6/已知案例、两份best、seed7/DDIM25及3600s预算。全贡献SLERP仅作诊断，不自动采用或启动训练 |
+| [W1 D/E 验证记录](../../verification/omniretarget_w1_de_verification.md) | I0–I4及七轮收口修复，全量801 passed+1 skipped；R0/R1事实复验；两模型各4k及完整val31选模；155条raw、18条val6及F独立重测/重放。动作基线证据complete，模型raw均0/31，最终交互not_ready |
+| [W1 正式训练与裸输出评估方案](../../plans/omniretarget_w1_de_plan.md) | 已执行并冻结的契约（v0.1，2026-10-13）；绑定reviewfix8，固定I0–I4、R0/R1、每模型4k/累计12h、val31主/附表和val6/F。首页not_run是起草时快照，实际结果见验证记录 |
+| [W1 弱动作监督 A3/B/C 方案](../../plans/omniretarget_w1_a3bc_plan.md) | 已执行的前置契约（v0.1）；A3/B/C与2026-10-12七轮审阅（30项缺口+1项文档订正全修）继续有效，reviewfix8作为D/E的只读SOURCE |
+| [W1 A3/B/C 验证记录](../../verification/omniretarget_w1_a3bc_verification.md) | 接口实现、74 项相关测试与正式运行的实际证据；§5R7 为第七轮审阅修复权威链（运行根 `20261012_21e5784_w1_a3bc_reviewfix8/w1_reviewfix8`，就绪报告 `decisions/attempt_001`），§5R6/§5R5/§5R4/§5R3/§5R2/§5R 链与旧链保留为被取代证据 |
+| [OmniRetarget 优先教师与初步训练总方案](../../plans/omniretarget_first_training_plan.md) | 父方案，约束来源裁决、W1 用途、训练和裸输出评估；原文字节是 A2 快照证据的一部分 |
+| [A2 收口与有限恢复方案](../../plans/omniretarget_a2_closure_plan.md) | 已执行阶段的实验契约，W1 入口依据；原文字节保留供 A2 证据复核 |
+| [A2 最新验证记录](../../verification/omniretarget_a2_closure_verification.md) | C0/C1/D0/G0/UR/C2 及六轮修复的实际证据；当前权威 C2 为 attempt_010 |
+| [项目整体实现方案](../../plans/interaction_retarget_impl_plan.md) | 项目目标、资产/坐标约定、模型与最终验收设计；当前实施顺序由 OmniRetarget 总方案和 W1 方案具体化 |
+
+当前事实：A1冻结与配对完成；原U0保持 `incomplete` 并停线，独立UR为完整 `no_quality_gain`。W1按published original/`weak_motion_only`完成A3/B/C及七轮修复，reviewfix8的55段准入、尺度正确的源箱条件、键控日程、train统计和两模型S0继续有效；D/E的R0又从当前文件重算四项前置事实并通过，未重写SOURCE。
+
+W1-D/E正式链为 `derived/experiments/omniretarget_first/20261013_be00c50_w1_de/`。两模型各4,000真实更新、16次loss验证及4次完整val31生成，best均step4000；教师拟合宏为0.12204454/0.11134759m。E的155键、val6的18主产物和F独立核验完整，原始数值均有效；质量主比较Teacher2/31、模型各0/31，持续双手交互未证实。D累计8657.971s≤12h、E524.652s≤2h、detail+F570.840s≤1h。原F记录的归因不足保留为当时结论；新诊断详见下一段。UR标签未混入来源。原运行使用内容哈希固定的未提交实现，快照可还原，运行HEAD本身不等于实现提交。
+
+2026-10-15归因诊断完整结束，成本416.249s≤3600s、训练步数0。已知案例frame108的旋转跳变在全贡献对照中由29.715°/99.652°降为1.471°/1.682°；但两窗相对π分支切换仍造成158.324°跳变，且26条模型轨迹的解码窗已存在穿透。train6教师拟合仍约5.8–5.9cm，模型对照仍train6/val6各0/6，部分穿透反而恶化。三个Teacher往返未过注册旋转精度门，负结果原样保留；其最坏手部FK误差约0.124mm。当时提出的下一候选是单独规定/验证旋转融合与拒收契约，该实验现已完成并得到下述负结果；剩余预测/条件/覆盖问题由新诊断方案承接。没有自动续训、扩数据、处理教师或替换融合器。
+
+旋转融合 v2 已按[执行方案](../../plans/omniretarget_w1_rotation_fusion_plan.md)完成 I/R/S/V/F。2026-10-19 第一轮独立审计在 r7 上发现 8 P1+3 P2 缺口，修复后以 r10 重跑权威链（`20261019_worktree_w1_rotation_fusion_r10`）：116 条 measured product、全部 path 与 metrics 与 r7 逐位相同，唯一差异是 seam 元数据由每秒角度改为每帧角度；固定窗矩阵 117 行完整，V0/V1 各26/26逐位重放、V2位置/关节25/25逐位、Teacher往返3个既有负门保留且无新增；known case 中 Deterministic V2 在 frame120 因 blend_norm=0.462 被拒收、Diffusion V2 在 107→108 为 7.5926 rad/s（>7），GS 失败，V 按注册条件未执行；S 的 GQ 修正为 **3/26 配对通过、94项退化、0证据缺口**（89→93、90→93 与 `sub10_063/diffusion` 右脚漂移均登记，111→110 不再误报）。F 重推39/39、重测116/116、54项合成测试通过，`experiment_complete=true`、`integration_eligible=false`、最终交互 `not_ready`；r10 成本413.582s，同 cohort 累计1,963.290s≤7,200s。第二轮审计（4 P1+3 P2）修复 GS 速度重算、V0/V1 冻结产品、decoded 窗口来源、固定 cohort 根、成本数值对账、V 跳过条件与坏工件出口；新增 8 项反例，rotation 测试 62 passed。只读沙箱对 r10 复验：117 行、冻结重放65/65、重推39/39、重测116/116、GQ 3/26/94 与 GS 失败集合完全一致。由于 S 阶段累计 1,513.866/1,800s、扣除 60s 收口后可用 226.134s 小于 r10 实测 252.156s，且计划禁止阶段互借与顺序子进程改并行，本轮**未生成 r11**；没有换父目录/run 名/参数/新 cohort 重置预算。没有切换默认生产入口、没有训练或改教师。完整证据与成本见[验证记录](../../verification/omniretarget_w1_rotation_fusion_verification.md)。
+
+W1 预测/窗口一致性诊断（r6）已按方案完成 130 个保存模型窗、65 Teacher 参考、3,512 个同帧正贡献跨窗对、520 个探针；Det/DDIM 65/65 逐位重放，Teacher oracle 59/65（6 例已知旋转精度负门，max 0.02426°）。**2026-10-22 独立审计发现并修复 6 项 P1+8 项 P2 核验/统计缺口，同时确认同 cohort 尝试数 R 6/W 5/P 3 超过每阶段两次、及一次未计费真实数据预检，故 r6 的 `implementation_contract_passed=true`、`complete_evidence=true`、`diagnosis_complete=true` 不可验收；保守 `not_ready` 结论保留。** 订正后的统计为：跨窗超描述线按 demo×模型×帧 **2,892** 帧/三窗 **260** 帧（合并模型 1,471/130）；P 主统计为 demo 等权宏平均，DDIM normalized **0.225310** vs t=999 **0.212026**（+0.013284），微平均 0.218241/0.206212 仅附表；F 三段重放实际 **17 高层调用/89 网络前向**（方案文本 21/93 为估计，实际未超上限）。修复后的入口按 cohort 拒绝新的 R/W/P 尝试（每阶段上限 2）；方案固定 cohort 身份，不能以 run 名/父目录/方案哈希/实现 SHA 重置，因此本 cohort 无合法正式复验，若需可验收诊断须另立正式修订的新预注册方案并取得授权。总成本 1,801.345/7,200s 是下界（含 r1–r5 的 1,083.650s 失败尝试）；S 旧预算未挪用、未生成 r11。下一候选为另立的训练拟合/目标或实现单因素诊断；不自动续训、换教师、扩数据或接入融合。
+
+[权威 C2](../../../derived/experiments/omniretarget_first/20261010_a39d763_a2_closure/decisions/attempt_010/a2_closure.json) 的 SHA-256 为 `34a392f92a9cda5b8317a08d5b5b486f750c5fc83933174d36d361cb7b1d0fa2`。实际证据位于 ignored 的 derived/，迁移仓库时需按资源和验证记录恢复，不能把文档链接存在视作实验产物已携带。
+
+## 冻结方案与进度说明
+
+父方案、A2收口方案、W1 A3/B/C方案和W1 D/E方案首页保留编写时快照；“尚未实施”及 `not_run` 不代表当前进度。当前结果由本页、最新验证记录和权威产物共同说明：A2已收口，A3/B/C七轮修复完成，D/E正式链、F及随后归因诊断完整结束，最终交互方法未就绪。
+
+A2的 `baseline/snapshots/attempt_006/evidence_files.json` 按路径冻结两份父方案；reviewfix8的 `freeze/preregistration.json` 冻结A3/B/C方案；D/E的 `freeze/execution_registration.json` 冻结D/E方案；失败归因的 `freeze/registration.json` 冻结归因方案和诊断入口。下列字节及直接引用路径保留：
+
+| 冻结文档 | SHA-256 |
+| --- | --- |
+| `plans/omniretarget_first_training_plan.md` | `ca7cd4d8db553cac0057d1392c3238f0ca0fbfcbe4748f4c5946a3e650da2e84` |
+| `plans/omniretarget_a2_closure_plan.md` | `28fd40e43af0f524e5c2c23dc776a5a9b1b00bd872d75ee90442b5f41a8b81b3` |
+| `plans/omniretarget_w1_a3bc_plan.md` | `e7247e4b76d7cdfec04e288883dbdaccd868c7908108a8f2f5171839c766fc2f` |
+| `plans/omniretarget_w1_de_plan.md` | `bed1e62d5c85579e96b94695cbbbb067cb79a820f18b9b692d21bda9c1ec1525` |
+| `plans/omniretarget_w1_attribution_plan.md` | `4bf026c71311f6d169bcc9d8cb2c9383c601d2f0a93d22febf60a74482542be4` |
+| `plans/omniretarget_w1_rotation_fusion_plan.md` | `c6aad7cc6f71ee0c7de70f331626e22647bd872c2f0200f4415cda7f0931a822` |
+| `plans/omniretarget_w1_prediction_consistency_plan.md` | `b82401f8fb4ea35cc5ac986236fefa59693671042809484627e3b17cce5bfa41` |
+
+后续需要修改其协议时，应明确新版本、旧版本保存位置和证据引用关系，避免把历史核验锚点当作普通进度备注覆盖。
+
+## 原路径保留的参考资料
+
+以下材料保留，是因为冻结父方案或现行代码/配置仍直接引用其路径。它们提供带版本范围的参考，**不是当前执行计划**；旧实验数字不自动成为 W1 的新基线或准入门。
+
+| 参考 | 保留作用 |
+| --- | --- |
+| [M0 验证](../../verification/m0_verification.md) | 资产、布局、分组和源/目标配对基础；父方案及资源/任务配置仍引用 |
+| [M1 验证](../../verification/m1_verification.md) | 运动学、独立验收和已知发布教师缺陷；父方案仍引用 |
+| [M2 验证](../../verification/m2_verification.md) | 现行修复配置的测量依据与历史局限 |
+| [M3 验证](../../verification/m3_verification.md) | 模型与历史训练参考；旧口径不与 W1 直接作配对比较 |
+| [P0-fix 验证](../../verification/p0fix_verification.md) | 语义修复及发布数据悬浮证据；父方案仍引用 |
+| [分级标签/train24 方案](../../plans/m2_m3_label_quality_train24_plan.md) | 现行 graded_labels_v1 配置的来源；其[实施记录](../verification/m2_m3_label_quality_train24_verification.md)已归档 |
+| [CPU 并行方案](../../plans/cpu_parallel_optimization_plan.md)与[验证](../../verification/cpu_parallel_optimization_verification.md) | 线程/进程约定及现有测试的依据 |
+| [M1 修复方案](../../plans/m1_fix_plan.md) | 现有接触标定工具的文档依据 |
+| [P0 分层验证方案](../../plans/p0_relaxed_validation_plan.md) | 现有诊断工具的文档依据；不授权重开旧阈值或教师路线 |
+| [train24fix3 方案](../../plans/train24fix3_convergence_recovery_plan.md)与[验证](../../verification/train24fix3_convergence_recovery_verification.md) | 父方案冻结引用的旧 D+ 终局与自研路线边界；停线结论保留 |
+
+## 历史归档
+
+[archive 索引与路径迁移表](../README.md)收纳22份已结束执行、被替代或随旧路线停线的文档，按 `plans/`、`verification/`、`review/` 保留分类和原文件名。方案—审阅—验证的相对链接已随位置更新。
+
+历史实验产物及其哈希不改写。旧产物或消息中出现的文档原路径，通过 archive 的迁移表查找。归档不表示旧阶段目标达成，不删除失败证据，也不恢复已停止的训练或教师生产。
+
+## 文档维护
+
+新增执行方案写入 plans/，明确日期、范围、真实前置证据、预期集合、预算、停止条件和当前状态。实施后在 verification/ 写实际结果，关联方案和产物；方案存在不等于实施完成。
+
+归档前检查冻结哈希及当前引用，更新文档相对链接和项目导航，并核对本地文件链接与标题锚点。涉及已有证据锚点的文件先保留历史字节和引用关系，再建立新版本。当前结果登记在正式链结束后编辑文档；源资源、父方案、SOURCE与既有实验产物保持原字节。
