@@ -314,3 +314,20 @@ v0.1只创建方案并整理文档导航；v0.2修订预算/拟合/容量边界�
 | P2：原始x0与保存物理量关联不明、中间FK覆盖过述 | §7.5固定raw x0→规范CPU metric_decode的重算/逐位关联，三个根/关节指标只消费重解码；中间FK仅保存点度量自洽且显式not_evaluated | 四项公式/目标不放宽；不新增模型或FK批次，不宣称完整中间物理链验证 |
 
 本次仅修订本方案和当前索引，未实施或运行任何阶段。预算/内部预留、2000更新/8000 micro/28000训练窗消费、8206次/路径forward、F最多4次fresh预测及原工件上限均不增加；新增CPU度量解码/核验在原D/F工作时间窗内计费。方案仍待复阅，精确调用矩阵/冻结材料和新明确授权仍是后续真实执行的必要前提，不恢复旧cohort或授权。
+
+## 14. v0.5 独立审阅修订对照（N0/N1 工具修正与重跑）
+
+2026-11-07 独立审阅未通过 N0/N1 首轮"已完整收口"验收（3 P1+5 P2），全部修复并以修正协议重跑：`n0/attempt_001` 与 `n1/attempt_001` 保留为被取代证据，权威为 `attempt_002`（`n0_coordinate_flags_v2` 格式）。本轮只改 N0/N1 工具、测试与人读记录；旧 T6 材料、契约与授权不改写。
+
+| 审阅问题 | 修复 | 不变边界 |
+| --- | --- | --- |
+| P1：N0 漏跨路径分支（单侧可辨识/存在性不一致） | 格式升为 `n0_coordinate_flags_v2`（uint32）：新增 b16 `DELTA_PRESENCE_MISMATCH`、b17 `DELTA_ONE_SIDED_OBSERVABLE`；重跑标出审阅核实的 4 行单侧可辨识坐标 | uint16 v1 的 attempt_001 保留；容量上界按 4 bytes/坐标 重算（64MB+1024），总保守上界 525,374,464 bytes 仍 <1GiB |
+| P1：同输入公式逐位证据不足 | 消费保存的 `same_input_p/i` 标量公式门（False 即 SOURCE_ANOMALY）；新增 `delta_measured == theta_after − theta_before`（float64 精确）一致性核对 | obs/ok 相对门仍重放，但不冒称公式逐位门 |
+| P1：预算未覆盖启动与最终写盘 | 两 CLI 的 t0 采样前移至重模块导入之前；summary 写盘后采样最终墙钟，越硬截止即重写为 `budget_exceeded_after_seal`/不可消费完成声明（成本只升不降）；目录 fsync | 预算数值 900/60/840 不变 |
+| P2：旧 629 项逐键对照未完成 | 解析 `i_adamw_gap:{model}:u{u}:{param}:{kind}` 键并填充 `old_state_*` 列，读取 `new_only_items`（424 行获得附注） | 只读附注，不改写旧分类 |
+| P2：N1 判据不足 | C1 改为 audited 公式 vs 独立手写 float32 节点图逐位对照（中点 fallback 节点显式排除并登记）；C6 偏差输出全部喂给 N0 检测器（`compute_row_flags`）断言 implementation_issue_candidate 语义；C5 要求 ≥2 例跨路径门失败且全部区间内 | 检测能力主张限定于"显著偏差可检出"，不外推 |
+| P2：键集只核计数 | `_canonical_rows` 按 `registration.roster.models[*].parameters` 精确集合核验（参数名×updates{1,2}，同数量替换被拒） | 行序仍为规范字典序（index 记录） |
+| P2：P 侧写界错用 I 侧 theta | `bound_i == half_ulp32(theta_i)`；`bound_p` 经保存 `delta_ref_p` 反解 ratio（精确 f32）重构 P 侧公式参考 theta 并以 delta_ref 精确复核后逐位核对 | 反解不一致 fail-closed 为 SOURCE_ANOMALY |
+| P2：attempt 覆盖风险 | 两 CLI 改为独占创建（mkdir exist_ok=False 递增），已有 001/003 时新写 004 | 旧 attempt 永不覆盖 |
+
+N0 attempt_002（v2）结果：coverage_complete=true、0 异常、54.25s（预算 900s/工作截止 840s 内）；位分布新增 ONE_SIDED=4（恰为审阅核实的 4 行）、PRESENCE=0，其余位与 v1 一致；350/189/147/392 事件重放不变。N1 attempt_002：六类 47 用例全过（C1 独立对照 8/8、零 fallback 豁免；C5 三例门失败全区间内；C6 八偏差全经 N0 检测器检出），go=no_go 维持 `go_for_conditional_fit_diagnostics_review`。I/R/D1/D6/F 仍未实施；真实拟合仍须 §8.3 新冻结材料与新明确授权。

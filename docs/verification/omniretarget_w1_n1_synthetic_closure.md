@@ -37,3 +37,15 @@
 - T6 保持：`audit_incomplete`、`covered_contract_passed=false`、0 failures/539 gaps、cohort 34 次更新/1347.195507s、一次性授权已消费。
 - 全局状态保持：`objective_coverage=partial`、`full_objective_contract_passed=null`、`factor_selected=false`、`auto_execute=false`、`final_interaction_method=not_ready`、`production_integration=false`。
 - N0/N1 均为保存证据/合成算术层面的收口分析；旧报告、旧契约、旧工件未改写。
+
+## 6. 修订记录（2026-11-07 独立审阅后）
+
+独立审阅指出 N1 首轮判据不足以支持检测能力主张（P2-5）且预算封口缺失（P1-3）。全部修复后按修正协议重跑，权威改为 `attempt_002`（attempt_001 保留为被取代证据）。
+
+- **C1**：由"同函数同输入双调用"改为 **audited 公式 vs 独立手写 float32 节点图**（`_independent_fp32_adamw`，按方案节点表独立实现）逐位对照；审计侧记录的中点 fallback 节点显式排除并逐用例登记（本用例集 8 profile × 2 步全部 0 豁免，即全部节点均参与逐位对照且一致）。
+- **C5**：通过判据收紧——三个零分歧构造用例（m_none 零出现分歧、v 侧零分歧、次正规边界）**必须**复现跨路径门失败，且全部落在保存式区间传播内；实测 3/3 门失败、7/7 区间内。
+- **C6**：8 类显著公式偏差全部改为喂给 **N0 坐标检测器 `compute_row_flags`**（与真实证据同一检测器）：断言 SOURCE_ANOMALY 置位、（区间越界或存在性分歧或非有限）触发、且行分类落入失败/gap 语义——8/8 检出，其中 7 例为分类级 gap、1 例（denom_without_eps 产生 ±inf）为非有限来源异常。
+- **预算**：t0 前移至重模块导入前（attempt_002 实测含导入 3.95s）；summary 写盘后最终墙钟封口，越硬截止重写为 `budget_exceeded_after_seal`。
+- **attempt 独占创建**；测试 8 项反例全过（新增 C5 门失败下界与 C1 独立对照断言）。
+
+**go/no-go 维持 `go_for_conditional_fit_diagnostics_review`**，其余结论与 §3–§5 边界不变；计数不变（47 用例、fp32 求值 80、float64 参考 16、区间传播 16、状态推进 9，全部非零登记）。

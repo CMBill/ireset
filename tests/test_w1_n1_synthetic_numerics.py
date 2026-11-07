@@ -57,8 +57,12 @@ def test_c5_zero_disagreement_demonstrated(summary_and_cases):
     _summary, cases = summary_and_cases
     c5 = [c for c in cases if c["class"] == "cancellation_within_intervals"]
     failed = [c for c in c5 if c["observed"]["cross_path_gate_failed"]]
-    assert failed, "at least one case must reproduce a cross-path gate failure"
+    assert len(failed) >= 2, "review requires >=2 gate-failure demonstrations"
     assert all(c["observed"]["inside_intervals"] for c in c5)
+    # the audited-vs-independent C1 contrast must have no fallback exclusions
+    # hiding node mismatches in this case set
+    c1 = [c for c in cases if c["class"] == "same_input_formula_bitwise"]
+    assert all(c["observed"]["bitwise_audited_vs_independent"] for c in c1)
 
 
 def test_c6_all_deviations_caught(summary_and_cases):

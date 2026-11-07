@@ -1,11 +1,15 @@
-"""Synthetic counterexamples for the N0 coordinate-flag analyzer.
+"""Synthetic counterexamples for the N0 coordinate-flag analyzer (format v2).
 
 Pure synthetic: no real dataset, cache, checkpoint, G1 asset or MuJoCo model
 is opened.  The fixture builds a miniature evidence root in the same layout
-the T6 audit produced and checks the frozen ``n0_coordinate_flags_v1``
-semantics: bit definitions, observability/ok byte replay, half-ULP binding,
-cross-NPZ binding, classification replay, labels, extrema ordering, capacity
-prevalidation, multiset validation and budget-stop accounting.
+the T6 audit produced and checks the frozen ``n0_coordinate_flags_v2``
+semantics: bit definitions (including the review-added DELTA_PRESENCE_MISMATCH
+and DELTA_ONE_SIDED_OBSERVABLE), observability/ok byte replay, per-side
+half-ULP write-bound reconstruction, saved same_input formula-gate consumption,
+delta_measured/theta consistency, cross-NPZ binding, classification replay,
+old-chain key mapping, sealed SHA anchors, roster set equality, labels,
+extrema ordering, capacity prevalidation, budget-stop accounting and
+exclusive attempt allocation.
 """
 
 from __future__ import annotations
@@ -20,6 +24,12 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from ireset.eval import w1_n0_coordinate_flags as n0  # noqa: E402
+from ireset.eval.w1_real_training_update_audit import (  # noqa: E402
+    _f32_array,
+    _fma32_array,
+    _half_ulp32,
+    host_constants,
+)
 
 TOLS = {
     "delta_same_input": {"atol": 0.0, "rtol": 5e-4},
@@ -36,6 +46,22 @@ def _half_ulp32(x):
     return np.maximum(xf - down, up - xf) / 2.0
 
 
+def _side_ref_bound_pe(theta_pre: np.ndarray, ratio32: np.ndarray, step: int):
+    """Exact audit-formula construction: decay=R32(pre*d32) (=pre here),
+    ref64 = (decay-pre) + h64*ratio64, pe_theta = fma32(h32, ratio, decay),
+    bound = half-ULP(pe_theta).  ratio32 must be exactly representable in
+    float32 so the detector's division-based reconstruction round-trips."""
+    host = host_constants(step)
+    h32 = np.float32(host["h_32"])
+    h64 = float(host["h_32"])
+    d32 = np.float32(host["d_32"])
+    decay = (theta_pre * d32).astype(np.float32)
+    base = decay.astype(np.float64) - theta_pre.astype(np.float64)
+    ref = base + h64 * ratio32.astype(np.float64)
+    pe_theta = _fma32_array(h32, ratio32, decay)[0]
+    return ref, _half_ulp32(pe_theta), pe_theta
+
+
 class ParamWorld:
     """Builds consistent saved bytes for one (model, update, parameter) row."""
 
@@ -43,10 +69,7 @@ class ParamWorld:
         self.shape = tuple(shape)
         self.n = int(np.prod(shape))
 
-    def build(self, coord_list):
-        """coord_list: list of per-coordinate dicts with keys ref_p, ref_i,
-        theta_pre, theta_p, theta_i, m_p, m_i, v_p, v_i and interval tuples
-        K_m/K_v/K_theta/K_delta.  Measured deltas are derived from thetas."""
+    def build(self, coord_list, step: int):
         def col(name, dtype=None):
             vals = [c[name] for c in coord_list]
             arr = np.asarray(vals, dtype=dtype)
@@ -58,18 +81,20 @@ class ParamWorld:
             return lo, hi
 
         theta_pre = col("theta_pre", np.float32)
-        theta_p = col("theta_p", np.float32)
-        theta_i = col("theta_i", np.float32)
+        # Recorded thetas equal the formula-reference new thetas (the audit's
+        # same-input formula gate requires this bitwise); "erased" coordinates
+        # arise naturally when |h*ratio| < half-ULP so R32 rounds back to pre.
+        ref_p, bound_p, pe_p = _side_ref_bound_pe(theta_pre, col("ratio_p", np.float32), step)
+        ref_i, bound_i, pe_i = _side_ref_bound_pe(theta_pre, col("ratio_i", np.float32), step)
+        theta_p = pe_p
+        theta_i = pe_i
         meas_p = theta_p.astype(np.float64) - theta_pre.astype(np.float64)
         meas_i = theta_i.astype(np.float64) - theta_pre.astype(np.float64)
-        ref_p = col("ref_p", np.float64)
-        ref_i = col("ref_i", np.float64)
         rtol_same = TOLS["delta_same_input"]["rtol"]
         changed_p = theta_p.view(np.uint32) != theta_pre.view(np.uint32)
         changed_i = theta_i.view(np.uint32) != theta_pre.view(np.uint32)
-        bound = _half_ulp32(theta_i)
-        obs_p = ((ref_p != 0) & (bound <= 0.25 * rtol_same * np.abs(ref_p)) & changed_p).astype(np.uint8)
-        obs_i = ((ref_i != 0) & (bound <= 0.25 * rtol_same * np.abs(ref_i)) & changed_i).astype(np.uint8)
+        obs_p = ((ref_p != 0) & (bound_p <= 0.25 * rtol_same * np.abs(ref_p)) & changed_p).astype(np.uint8)
+        obs_i = ((ref_i != 0) & (bound_i <= 0.25 * rtol_same * np.abs(ref_i)) & changed_i).astype(np.uint8)
         ok_p = np.where(ref_p == 0, meas_p == 0,
                         np.where(obs_p.astype(bool),
                                  np.abs(meas_p - ref_p) <= rtol_same * np.abs(ref_p),
@@ -90,7 +115,7 @@ class ParamWorld:
             "m_p": m_p, "v_p": v_p, "m_i": m_i, "v_i": v_i,
             "delta_ref_p": ref_p, "delta_ref_i": ref_i,
             "delta_measured_p": meas_p, "delta_measured_i": meas_i,
-            "bound_delta_p": bound, "bound_delta_i": bound,
+            "bound_delta_p": bound_p, "bound_delta_i": bound_i,
             "K_m_lo": K_m_lo, "K_m_hi": K_m_hi,
             "K_v_lo": K_v_lo, "K_v_hi": K_v_hi,
             "K_theta_lo": K_theta_lo, "K_theta_hi": K_theta_hi,
@@ -104,7 +129,7 @@ WIDE = (-1e6, 1e6)
 
 
 def default_coords(**over):
-    base = dict(ref_p=0.0, ref_i=0.0, theta_pre=1.0, theta_p=1.0, theta_i=1.0,
+    base = dict(ratio_p=0.0, ratio_i=0.0, theta_pre=1.0,
                 m_p=1e-3, m_i=1e-3, v_p=1e-6, v_i=1e-6,
                 K_m=WIDE, K_v=WIDE, K_theta=WIDE, K_delta=WIDE)
     base.update(over)
@@ -113,20 +138,26 @@ def default_coords(**over):
 
 def write_world(root: Path, params: dict, row_meta: dict, analysis_items=None,
                 extra_rows=None):
-    """params: {model: {param: {update: ParamWorld.build() output}}}.
-    row_meta: {(model, param, update): {"classification": str, "gaps": [...]}}.
-    """
     (root / "registration/attempt_003").mkdir(parents=True)
     (root / "production/attempt_003").mkdir(parents=True)
     (root / "independent/attempt_002").mkdir(parents=True)
     n_det = len(params["deterministic"])
     n_diff = len(params["diffusion"])
-    reg = {"roster": {"n_det": n_det, "n_diff": n_diff}, "tolerances": TOLS}
+    roster_models = {}
+    for model, params_by_name in params.items():
+        roster_models[model] = {
+            "n_parameters": len(params_by_name),
+            "parameters": [{"name": name} for name in sorted(params_by_name)],
+        }
+    reg = {"roster": {"n_det": n_det, "n_diff": n_diff, "models": roster_models},
+           "tolerances": TOLS,
+           "config": {"lr": 1e-4, "weight_decay": 1e-5}}
     (root / "registration/attempt_003/registration.json").write_text(json.dumps(reg))
     (root / "independent/attempt_002/i_report.json").write_text(json.dumps({"schema": "x"}))
     rows = []
     if extra_rows:
         rows.extend(extra_rows)
+    import hashlib
     for model in ("deterministic", "diffusion"):
         i_members, p_members = {}, {}
         for param, updates in params[model].items():
@@ -134,6 +165,8 @@ def write_world(root: Path, params: dict, row_meta: dict, analysis_items=None,
                 prefix = f"adamw_{model}_u{update}_{param}"
                 for suf, arr in arrays.items():
                     i_members[f"{prefix}/{suf}"] = arr
+                i_members[f"{prefix}/same_input_p"] = np.array(1, np.uint8)
+                i_members[f"{prefix}/same_input_i"] = np.array(1, np.uint8)
                 i_members[f"i_theta/u{update}/{param}"] = arrays["theta_i"]
                 i_members[f"i_m/u{update}/{param}"] = arrays["m_i"]
                 i_members[f"i_v/u{update}/{param}"] = arrays["v_i"]
@@ -143,14 +176,37 @@ def write_world(root: Path, params: dict, row_meta: dict, analysis_items=None,
                 rows.append({"key": f"adamw:{model}:u{update}:{param}",
                              "classification": meta["classification"],
                              "gaps": list(meta["gaps"])})
-        np.savez(root / f"independent/attempt_002/i_{model}.npz", **i_members)
-        np.savez(root / f"production/attempt_003/p_{model}.npz", **p_members)
+        i_path = root / f"independent/attempt_002/i_{model}.npz"
+        p_path = root / f"production/attempt_003/p_{model}.npz"
+        np.savez(i_path, **i_members)
+        np.savez(p_path, **p_members)
+        # sealed anchors: the P/I reports bind the NPZ file hashes
+        for report_path, npz_path, mkey in (
+                (root / "independent/attempt_002/i_report.json", i_path, f"i_sha_{model}"),
+                (root / "production/attempt_003/p_report.json", p_path, f"p_sha_{model}")):
+            data = json.loads(report_path.read_text()) if report_path.exists() else {}
+            data.setdefault("models", {})[model] = {
+                "arrays_sha256": hashlib.sha256(npz_path.read_bytes()).hexdigest()}
+            report_path.write_text(json.dumps(data))
     (root / "independent/attempt_002/i_rows.json").write_text(json.dumps(rows))
-    analysis = {"gaps": {"items": analysis_items or []}}
+    analysis = {"gaps": {"items": analysis_items or [], "new_only_items": []}}
     apath = root / "analysis.json"
     apath.write_text(json.dumps(analysis))
     return apath
 
+
+
+def _reseal(root: Path, model: str, npz_path: Path):
+    """Re-seal the P/I report anchor after a fixture tamper (the tamper tests
+    exercise downstream detection, not the anchor gate, which has its own
+    dedicated test)."""
+    import hashlib
+    report = root / ("independent/attempt_002/i_report.json"
+                     if npz_path.name.startswith("i_") else
+                     "production/attempt_003/p_report.json")
+    data = json.loads(report.read_text())
+    data["models"][model]["arrays_sha256"] = hashlib.sha256(npz_path.read_bytes()).hexdigest()
+    report.write_text(json.dumps(data))
 
 def make_analyzer(root: Path, out: Path, budget=None, analysis_path=None):
     budget = budget or n0.N0Budget(wall_cap_s=900.0, reserve_s=60.0)
@@ -158,41 +214,57 @@ def make_analyzer(root: Path, out: Path, budget=None, analysis_path=None):
 
 
 def standard_world(root: Path):
-    """4 params x 2 updates covering every flag bit family."""
-    alpha_c1_ref = float(np.float32(1.02)) - 1.0
-    alpha = ParamWorld((3,)).build([
-        # c0: precision, write erased on both sides
-        default_coords(ref_p=1e-5, ref_i=1e-5, theta_p=1.0, theta_i=1.0),
-        # c1: observable, same-input pass (ref equals the measured increment)
-        default_coords(theta_p=1.02, theta_i=1.02,
-                       ref_p=alpha_c1_ref, ref_i=alpha_c1_ref),
-        # c2: observable, same-input gate fail on both sides + delta XP fail
-        default_coords(theta_p=1.1, theta_i=1.1, ref_p=0.101, ref_i=0.101),
-    ])
-    beta = ParamWorld((4,)).build([
+    """4 params x 2 updates covering every flag bit family (per-update bytes).
+
+    Reference deltas are constructed exactly as the audit formula does:
+    ref = (decay-pre) + h64 * f32(ratio); ratios are exact f32 values so the
+    detector's reconstruction round-trips bit-for-bit.
+    """
+    alpha_coords = [
+        # c0: precision, write erased on both sides (|h*ratio| < half-ULP so
+        # R32 rounds the reference theta back to pre)
+        default_coords(ratio_p=-2e-5, ratio_i=-2e-5),
+        # c1: observable, same-input pass
+        default_coords(ratio_p=-20.0, ratio_i=-20.0),
+        # c2: cross-path sensitivity — asymmetric P/I ratios give theta XP +
+        # delta XP failures, both sides observable, all inside intervals
+        default_coords(ratio_p=-20.0, ratio_i=-40.0),
+    ]
+    beta_coords = [
         default_coords(),                                            # c0 clean
         default_coords(m_p=1e-3, m_i=2e-3),                          # c1 M XP inside
         default_coords(m_p=1.0, m_i=1e-3, K_m=(0.0, 2e-3)),          # c2 M XP + outside
-        default_coords(theta_p=1.001, theta_i=1.001),                # c3 zero invented (P)
-    ])
-    gamma = ParamWorld((3,)).build([
-        # c0 theta XP inside; ref_i observable so no zero-invention
-        default_coords(theta_p=1.0, theta_i=1.001, ref_i=1e-3, K_theta=(0.9, 1.1)),
+    ]
+    gamma_coords = [
+        # c0 theta XP inside; one-sided: ref_i observable, ref_p zero
+        default_coords(theta_p=1.0, theta_i=1.001, ratio_i=-1.0, K_theta=(0.9, 1.1)),
         default_coords(m_p=1e-3, m_i=-1e-3, K_m=(-1e-2, 1e-2)),      # c1 m sign + XP
         default_coords(v_p=0.0, v_i=1e-6, K_v=(0.0, 1e-3)),          # c2 v zero + XP
-    ])
-    delta_p = ParamWorld((2,)).build([default_coords(), default_coords()])
-    params = {
-        "deterministic": {"alpha": {1: alpha, 2: alpha}, "beta": {1: beta, 2: beta}},
-        "diffusion": {"gamma": {1: gamma, 2: gamma}, "delta_p": {1: delta_p, 2: delta_p}},
-    }
+    ]
+    delta_coords = [default_coords(), default_coords()]
+
+    params = {"deterministic": {}, "diffusion": {}}
+    for update in (1, 2):
+        params["deterministic"]["alpha"] = params["deterministic"].get("alpha", {})
+        params["deterministic"]["alpha"][update] = ParamWorld((3,)).build(alpha_coords, update)
+        params["deterministic"]["beta"] = params["deterministic"].get("beta", {})
+        params["deterministic"]["beta"][update] = ParamWorld((3,)).build(beta_coords, update)
+        params["diffusion"]["gamma"] = params["diffusion"].get("gamma", {})
+        params["diffusion"]["gamma"][update] = ParamWorld((3,)).build(gamma_coords, update)
+        params["diffusion"]["delta_p"] = params["diffusion"].get("delta_p", {})
+        params["diffusion"]["delta_p"][update] = ParamWorld((2,)).build(delta_coords, update)
+
     row_meta = {
-        ("deterministic", "alpha", 1): {"classification": "direct_failure",
-                                        "gaps": ["parameter_delta_precision_gap"]},
-        ("deterministic", "alpha", 2): {"classification": "direct_failure",
-                                        "gaps": ["parameter_delta_precision_gap"]},
-        ("deterministic", "beta", 1): {"classification": "direct_failure", "gaps": []},
-        ("deterministic", "beta", 2): {"classification": "direct_failure", "gaps": []},
+        ("deterministic", "alpha", 1): {"classification": "cross_path_sensitivity_gap",
+                                        "gaps": ["cross_path_sensitivity_gap",
+                                                 "parameter_delta_precision_gap"]},
+        ("deterministic", "alpha", 2): {"classification": "cross_path_sensitivity_gap",
+                                        "gaps": ["cross_path_sensitivity_gap",
+                                                 "parameter_delta_precision_gap"]},
+        ("deterministic", "beta", 1): {"classification": "cross_path_bound_unverifiable",
+                                       "gaps": ["cross_path_bound_unverifiable"]},
+        ("deterministic", "beta", 2): {"classification": "cross_path_bound_unverifiable",
+                                       "gaps": ["cross_path_bound_unverifiable"]},
         ("diffusion", "gamma", 1): {"classification": "cross_path_sensitivity_gap",
                                     "gaps": ["cross_path_sensitivity_gap"]},
         ("diffusion", "gamma", 2): {"classification": "cross_path_sensitivity_gap",
@@ -200,11 +272,23 @@ def standard_world(root: Path):
         ("diffusion", "delta_p", 1): {"classification": "passed", "gaps": []},
         ("diffusion", "delta_p", 2): {"classification": "passed", "gaps": []},
     }
-    analysis_items = [{"key": "adamw:deterministic:u1:alpha",
-                       "kind": "parameter_delta_precision_gap", "state": "resolved"}]
+    analysis_items = [
+        {"key": "i_adamw_gap:deterministic:u1:alpha:parameter_delta_precision_gap",
+         "kind": "parameter_delta_precision_gap", "state": "resolved"},
+        {"key": "i_adamw_gap:diffusion:u2:gamma:cross_path_sensitivity_gap",
+         "kind": "cross_path_sensitivity_gap", "state": "new"},
+    ]
+    new_only_items = [
+        {"key": "i_adamw_gap:deterministic:u2:beta:parameter_delta_precision_gap",
+         "kind": "parameter_delta_precision_gap"},
+    ]
     apath = write_world(root, params, row_meta, analysis_items,
                         extra_rows=[{"key": "cotangent:deterministic:u1:m0",
                                      "classification": "synthetic_verified"}])
+    # attach new_only_items to the analysis file
+    analysis = json.loads(apath.read_text())
+    analysis["gaps"]["new_only_items"] = new_only_items
+    apath.write_text(json.dumps(analysis))
     return params, row_meta, apath
 
 
@@ -220,10 +304,12 @@ def test_flags_bits_and_labels(world):
     root, out, apath = world
     summary = make_analyzer(root, out, analysis_path=apath).run()
     assert summary["coverage_complete"] is True
+    assert summary["n_rows_with_anomalies"] == 0
     flags = np.load(out / "coordinate_flags.npy")
+    assert flags.dtype == np.uint32
     index = json.loads((out / "coordinate_index.json").read_text())
+    assert index["schema"] == "n0_coordinate_flags_v2"
     offsets = {r["key"]: (r["offset"], r["shape"]) for r in index["rows"]}
-    # canonical row order: deterministic before diffusion, u1 before u2
     keys = [r["key"] for r in index["rows"]]
     assert keys == sorted(keys, key=lambda k: (k.split(":")[1], int(k.split(":")[2][1:]), k.split(":")[3]))
 
@@ -236,44 +322,46 @@ def test_flags_bits_and_labels(world):
         B.DELTA_UNOBSERVABLE_P | B.DELTA_UNOBSERVABLE_I | B.DELTA_WRITE_ERASED_P | B.DELTA_WRITE_ERASED_I)
     assert bits("adamw:deterministic:u1:alpha", 1) == 0
     assert bits("adamw:deterministic:u1:alpha", 2) == (
-        B.DELTA_SAME_INPUT_GATE_FAIL_P | B.DELTA_SAME_INPUT_GATE_FAIL_I | B.DELTA_CROSS_PATH_GATE_FAIL)
+        B.THETA_CROSS_PATH_GATE_FAIL | B.DELTA_CROSS_PATH_GATE_FAIL)
     assert bits("adamw:deterministic:u1:beta", 0) == 0
     assert bits("adamw:deterministic:u1:beta", 1) == B.M_CROSS_PATH_GATE_FAIL
     assert bits("adamw:deterministic:u1:beta", 2) == (B.M_CROSS_PATH_GATE_FAIL | B.INTERVAL_OUTSIDE)
-    assert bits("adamw:deterministic:u1:beta", 3) == B.DELTA_ZERO_INVENTED
-    assert bits("adamw:diffusion:u1:gamma", 0) == B.THETA_CROSS_PATH_GATE_FAIL
+    assert bits("adamw:diffusion:u1:gamma", 0) == (
+        B.THETA_CROSS_PATH_GATE_FAIL | B.DELTA_PRESENCE_MISMATCH | B.DELTA_ONE_SIDED_OBSERVABLE)
     assert bits("adamw:diffusion:u1:gamma", 1) == (B.M_CROSS_PATH_GATE_FAIL | B.M_ZERO_OR_SIGN_DISAGREE)
     assert bits("adamw:diffusion:u1:gamma", 2) == (B.V_CROSS_PATH_GATE_FAIL | B.V_ZERO_OR_SIGN_DISAGREE)
     assert bits("adamw:diffusion:u1:delta_p", 0) == 0
 
-    rows = {r["key"]: r for r in index["rows"]}
-    # gap_rows.csv labels
     import csv as _csv
     with open(out / "gap_rows.csv") as f:
         recs = {r["key"]: r for r in _csv.DictReader(f)}
-    assert "implementation_issue_candidate" in recs["adamw:deterministic:u1:alpha"]["labels"]
+    assert recs["adamw:deterministic:u1:alpha"]["labels"] == "cross_path_sensitive|precision_limited"
     assert "implementation_issue_candidate" in recs["adamw:deterministic:u1:beta"]["labels"]
     assert recs["adamw:diffusion:u1:gamma"]["labels"] == "cross_path_sensitive"
+    assert recs["adamw:diffusion:u1:gamma"]["n_one_sided_observable"] == "1"
+    assert recs["adamw:diffusion:u1:gamma"]["n_presence_mismatch"] == "1"
     assert recs["adamw:diffusion:u1:delta_p"]["labels"] == "no_gap"
+    # old-chain mapping (i_adamw_gap keys) and new_only annotation
     assert recs["adamw:deterministic:u1:alpha"]["old_state_precision"] == "resolved"
-    # event replay from flags
+    assert recs["adamw:diffusion:u2:gamma"]["old_state_sensitivity"] == "new"
+    assert recs["adamw:deterministic:u2:beta"]["old_new_only"] == "new_only"
     er = summary["event_replay"]
-    assert er["precision_rows"] == 2 and er["sensitivity_rows"] == 2
-    assert er["both_rows"] == 0 and er["gap_rows"] == 4
+    assert er["precision_rows"] == 2 and er["sensitivity_rows"] == 6
+    assert er["both_rows"] == 2 and er["gap_rows"] == 6
+    assert "seal" in summary and "measured_wall_s_final" in summary["seal"]
 
 
-def test_source_anomaly_on_tampered_ok(world, tmp_path):
+def test_source_anomaly_on_tampered_ok(world):
     root, out, apath = world
-    # tamper one saved ok byte in the i NPZ for alpha u1
     npz_path = root / "independent/attempt_002/i_deterministic.npz"
     members = dict(np.load(npz_path))
     members["adamw_deterministic_u1_alpha/ok_p"] = members["adamw_deterministic_u1_alpha/ok_p"].copy()
     members["adamw_deterministic_u1_alpha/ok_p"][1] = 0
     np.savez(npz_path, **members)
+    _reseal(root, "deterministic", npz_path)
     summary = make_analyzer(root, out, analysis_path=apath).run()
     flags = np.load(out / "coordinate_flags.npy")
-    off = 0  # alpha u1 is the first row
-    assert all(f & n0.SOURCE_ANOMALY for f in flags[off:off + 3])
+    assert all(f & n0.SOURCE_ANOMALY for f in flags[0:3])
     assert summary["coverage_complete"] is False
 
 
@@ -283,6 +371,7 @@ def test_source_anomaly_on_p_binding_mismatch(world):
     members = dict(np.load(npz_path))
     members["theta_before/u1/alpha"] = members["theta_before/u1/alpha"] + np.float32(1e-3)
     np.savez(npz_path, **members)
+    _reseal(root, "deterministic", npz_path)
     summary = make_analyzer(root, out, analysis_path=apath).run()
     flags = np.load(out / "coordinate_flags.npy")
     assert all(f & n0.SOURCE_ANOMALY for f in flags[0:3])
@@ -295,27 +384,97 @@ def test_source_anomaly_on_bad_half_ulp(world):
     members["adamw_deterministic_u1_alpha/bound_delta_p"] = (
         members["adamw_deterministic_u1_alpha/bound_delta_p"] * 2.0)
     np.savez(npz_path, **members)
+    _reseal(root, "deterministic", npz_path)
     summary = make_analyzer(root, out, analysis_path=apath).run()
     flags = np.load(out / "coordinate_flags.npy")
     assert all(f & n0.SOURCE_ANOMALY for f in flags[0:3])
 
 
-def test_prevalidation_cap(world, tmp_path, monkeypatch):
+def test_source_anomaly_on_same_input_flag_false(world):
+    root, out, apath = world
+    npz_path = root / "independent/attempt_002/i_deterministic.npz"
+    members = dict(np.load(npz_path))
+    members["adamw_deterministic_u1_alpha/same_input_p"] = np.array(0, np.uint8)
+    np.savez(npz_path, **members)
+    _reseal(root, "deterministic", npz_path)
+    summary = make_analyzer(root, out, analysis_path=apath).run()
+    flags = np.load(out / "coordinate_flags.npy")
+    assert all(f & n0.SOURCE_ANOMALY for f in flags[0:3])
+    import csv as _csv
+    with open(out / "gap_rows.csv") as f:
+        recs = {r["key"]: r for r in _csv.DictReader(f)}
+    assert "implementation_issue_candidate" in recs["adamw:deterministic:u1:alpha"]["labels"]
+
+
+def test_source_anomaly_on_delta_measured_inconsistent(world):
+    root, out, apath = world
+    npz_path = root / "independent/attempt_002/i_deterministic.npz"
+    members = dict(np.load(npz_path))
+    arr = members["adamw_deterministic_u1_alpha/delta_measured_p"].copy()
+    arr[1] = arr[1] + 1.0
+    members["adamw_deterministic_u1_alpha/delta_measured_p"] = arr
+    np.savez(npz_path, **members)
+    _reseal(root, "deterministic", npz_path)
+    summary = make_analyzer(root, out, analysis_path=apath).run()
+    flags = np.load(out / "coordinate_flags.npy")
+    assert all(f & n0.SOURCE_ANOMALY for f in flags[0:3])
+
+
+def test_zero_invented_tamper_detected(world):
+    """A recorded theta that moved with a zero reference delta is the
+    zero-invention direct-failure semantics (unreachable in self-consistent
+    evidence, so exercised by tampering)."""
+    root, out, apath = world
+    npz_path = root / "independent/attempt_002/i_diffusion.npz"
+    members = dict(np.load(npz_path))
+    key = "adamw_diffusion_u1_delta_p/theta_p"
+    members[key] = members[key] + np.float32(1e-3)
+    # keep the saved measured delta consistent with the tampered theta so the
+    # ZERO_INVENTED bit (not the measured-delta consistency check) fires
+    members["adamw_diffusion_u1_delta_p/delta_measured_p"] = (
+        members[key].astype(np.float64)
+        - members["adamw_diffusion_u1_delta_p/theta_pre"].astype(np.float64))
+    np.savez(npz_path, **members)
+    _reseal(root, "diffusion", npz_path)
+    summary = make_analyzer(root, out, analysis_path=apath).run()
+    flags = np.load(out / "coordinate_flags.npy")
+    index = json.loads((out / "coordinate_index.json").read_text())
+    off = {r["key"]: r["offset"] for r in index["rows"]}["adamw:diffusion:u1:delta_p"]
+    assert all(f & n0.DELTA_ZERO_INVENTED for f in flags[off:off + 2])
+    assert all(f & n0.SOURCE_ANOMALY for f in flags[off:off + 2])
+    assert summary["coverage_complete"] is False
+
+
+def test_sealed_sha_anchor_mismatch_rejected(world):
+    root, out, apath = world
+    report_path = root / "independent/attempt_002/i_report.json"
+    report = json.loads(report_path.read_text())
+    report["models"]["deterministic"]["arrays_sha256"] = "0" * 64
+    report_path.write_text(json.dumps(report))
+    with pytest.raises(n0.N0Error, match="sealed anchor mismatch"):
+        make_analyzer(root, out, analysis_path=apath).run()
+
+
+def test_roster_substitution_rejected(world):
+    root, out, apath = world
+    # same row count, one parameter name swapped -> exact-set gate must fire
+    rows_path = root / "independent/attempt_002/i_rows.json"
+    rows = json.loads(rows_path.read_text())
+    for r in rows:
+        if r["key"] == "adamw:deterministic:u1:alpha":
+            r["key"] = "adamw:deterministic:u1:alpha_swapped"
+            break
+    rows_path.write_text(json.dumps(rows))
+    with pytest.raises(n0.N0Error, match="row key set != roster"):
+        make_analyzer(root, out, analysis_path=apath).run()
+
+
+def test_prevalidation_cap(world, monkeypatch):
     root, out, apath = world
     monkeypatch.setattr(n0, "MAX_TOTAL_COORDS", 5)
     with pytest.raises(n0.N0Error, match="exceeds frozen cap"):
         make_analyzer(root, out, analysis_path=apath).run()
     assert not (out / "coordinate_flags.npy").exists()
-
-
-def test_row_multiset_mismatch(world, tmp_path):
-    root, out, apath = world
-    reg_path = root / "registration/attempt_003/registration.json"
-    reg = json.loads(reg_path.read_text())
-    reg["roster"]["n_det"] = 3
-    reg_path.write_text(json.dumps(reg))
-    with pytest.raises(n0.N0Error, match="row multiset mismatch"):
-        make_analyzer(root, out, analysis_path=apath).run()
 
 
 def test_budget_stop_partial_coverage(world):
@@ -340,7 +499,6 @@ def test_budget_stop_partial_coverage(world):
     assert summary["coverage_complete"] is False
     assert summary["label_verdict"] == "evidence_incomplete/resource_limit"
     assert summary["budget"]["budget_exceeded"] is True
-    # completed rows are retained in flags
     flags = np.load(out / "coordinate_flags.npy")
     assert flags.size > 0
 
@@ -351,12 +509,14 @@ def test_extrema_top16_deterministic(tmp_path):
     n = 20
     coords = []
     for i in range(n):
-        # descending scores 20-i via m gate ratio; all inside intervals
         coords.append(default_coords(m_p=1e-3 * (n - i), m_i=1e-6, K_m=(0.0, 1.0)))
-    world_arrays = ParamWorld((n,)).build(coords)
-    params = {"deterministic": {"big": {1: world_arrays, 2: world_arrays}},
-              "diffusion": {"z": {1: ParamWorld((1,)).build([default_coords()]),
-                                  2: ParamWorld((1,)).build([default_coords()])}}}
+    params = {"deterministic": {}, "diffusion": {}}
+    for update in (1, 2):
+        params["deterministic"]["big"] = params["deterministic"].get("big", {})
+        params["deterministic"]["big"][update] = ParamWorld((n,)).build(coords, update)
+        params["diffusion"]["z"] = params["diffusion"].get("z", {})
+        params["diffusion"]["z"][update] = ParamWorld((1,)).build(
+            [default_coords()], update)
     row_meta = {
         ("deterministic", "big", 1): {"classification": "cross_path_sensitivity_gap",
                                       "gaps": ["cross_path_sensitivity_gap"]},
@@ -375,30 +535,26 @@ def test_extrema_top16_deterministic(tmp_path):
     flat = [int(r["flat_index"]) for r in recs]
     scores = [float(r["score"]) for r in recs]
     assert scores == sorted(scores, reverse=True)
-    # top-16 by score desc, coordinate order tiebreak
-    assert flat == [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    assert flat == list(range(16))
     with open(out / "gap_rows.csv") as f:
         rec = [r for r in _csv.DictReader(f) if r["key"] == "adamw:deterministic:u1:big"][0]
     assert rec["n_extrema_sensitivity"] == "20"
     assert int(rec["n_sensitivity"]) == 20
 
 
-def test_cli_exit_codes(world, tmp_path):
+def test_cli_exclusive_attempts(world, tmp_path):
     import subprocess
     root, out, apath = world
     script = Path(__file__).resolve().parents[1] / "scripts/analyze_w1_n0_coordinate_flags.py"
+    out_root = tmp_path / "cli_out"
+    (out_root / "attempt_001").mkdir(parents=True)
+    (out_root / "attempt_003").mkdir(parents=True)
     r = subprocess.run([sys.executable, str(script), "--run-root", str(root),
-                        "--output-root", str(tmp_path / "cli_out"),
-                        "--analysis-path", str(apath),
-                        "--wall-cap-s", "900"],
+                        "--output-root", str(out_root),
+                        "--analysis-path", str(apath), "--wall-cap-s", "900"],
                        capture_output=True, text=True, cwd=str(tmp_path))
     assert r.returncode == 0, r.stdout + r.stderr
     payload = json.loads(r.stdout)
+    # existing 001/003 must never be overwritten: next exclusive attempt is 004
+    assert payload["output_dir"].endswith("attempt_004")
     assert payload["coverage_complete"] is True
-    # attempt directories are never overwritten on a second run
-    r2 = subprocess.run([sys.executable, str(script), "--run-root", str(root),
-                         "--output-root", str(tmp_path / "cli_out"),
-                         "--analysis-path", str(apath), "--wall-cap-s", "900"],
-                        capture_output=True, text=True, cwd=str(tmp_path))
-    assert r2.returncode == 0, r2.stdout + r2.stderr
-    assert payload["output_dir"] != json.loads(r2.stdout)["output_dir"]

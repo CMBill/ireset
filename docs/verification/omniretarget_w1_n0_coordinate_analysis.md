@@ -90,3 +90,16 @@
 | [gap_rows.csv](../..//derived/audit/w1_numerics_n0_n1/n0/attempt_001/gap_rows.csv) | 全部 528 行逐行：gap 类别、坐标计数、标签、分类重放、比例极值、旧链附注 |
 | [gap_coordinates_extrema.csv](../..//derived/audit/w1_numerics_n0_n1/n0/attempt_001/gap_coordinates_extrema.csv) | 6,210 条极值（每行每类≤16，按门比/绝对误差预定排序+坐标序决胜） |
 | [summary.json](../..//derived/audit/w1_numerics_n0_n1/n0/attempt_001/summary.json) | 事件重放、标签计数、预算事实、产物 SHA、coverage_complete=true |
+
+## 7. 修订记录（2026-11-07 独立审阅后）
+
+独立审阅未通过 attempt_001 的"已完整收口"验收（3 P1+5 P2）。全部修复后按修正协议重跑，权威改为 `attempt_002`（[attempt_001](../..//derived/audit/w1_numerics_n0_n1/n0/attempt_001/summary.json) 保留为被取代的 v1 证据，不再消费）。修订对照见方案 §14。
+
+**v2 关键变化与 attempt_002 结果：**
+
+- 格式 `n0_coordinate_flags_v2`（uint32）：新增 b16 `DELTA_PRESENCE_MISMATCH`、b17 `DELTA_ONE_SIDED_OBSERVABLE`。**attempt_002 标出 ONE_SIDED=4 个坐标**，恰为审阅核实的 4 行单侧可辨识（`deterministic u1 blocks.1.ffn.0.weight`、`deterministic u2 blocks.0.ffn.2.weight`、`diffusion u1 blocks.2.cross_attn.out.weight`、`diffusion u2 blocks.1.ffn.2.weight` 各 1 坐标）；PRESENCE=0。
+- 消费保存的 `same_input_p/i` 公式门标量并新增 `delta_measured == theta_after − theta_before`（float64 精确）核对；**分侧重构写界**：`bound_i == half_ulp32(theta_i)`，`bound_p` 经 `delta_ref_p` 反解 ratio（精确复核 delta_ref）重构 P 侧公式参考 theta 后逐位核对——528 行全部通过。
+- 键集按 `registration.roster.models[*].parameters` 精确集合核验；来源 SHA 自动对照 `i_report/p_report.models.*.arrays_sha256` 封口锚（实测一致）；旧 629 项按 `i_adamw_gap:*:*:*:kind` 键逐键对照，**424 行获得 old_state/new_only 附注**（attempt_001 因键格式不匹配全空）。
+- t0 前移至模块导入前；summary 写盘后最终墙钟封口（`measured_wall_s_final=54.251s`，硬截止 900s 内）。
+- 位分布（v2 重放，与 v1 一致部分不变）：UNOBSERVABLE P/I 1,214,768/1,214,770、V/M/DELTA/THETA 跨路径门失败 1499/1346/844/82、写擦除 203/201、m 零/符号 2、ONE_SIDED 4、同输入门失败/zero-invented/区间外/来源异常全部 0；分类重放 528/528、0 行 SOURCE_ANOMALY；`coverage_complete=true`。
+- 标签分布：203 `precision_limited` + 42 `cross_path_sensitive` + 147 `cross_path_sensitive|precision_limited` + 136 `no_gap`。**结论不变：全部 392 行 gap 均为 precision_limited 或 cross_path_sensitive，无实现问题候选**；测试 13 项反例全过（含 roster 替换、封口锚漂移、写界篡改、same_input 篡改、zero-invention 篡改、attempt 独占等新反例）。

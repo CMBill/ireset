@@ -17,17 +17,25 @@ evaluation and state-advance counts are registered as nonzero JSON integers.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
 from ireset.eval.w1_n0_coordinate_flags import (BudgetExceeded,  # noqa: F401
+                                                DELTA_PRESENCE_MISMATCH,
+                                                DELTA_ONE_SIDED_OBSERVABLE,
+                                                INTERVAL_OUTSIDE,
                                                 MAX_REPORT_BYTES,
-                                                N0Budget)
+                                                N0Budget,
+                                                SOURCE_ANOMALY,
+                                                compute_row_flags,
+                                                recompute_classification)
 from ireset.eval.w1_real_training_update_audit import (
     _cross_path_flags,
     _delta_observability,
+    _f32_array,
     _half_ulp32,
     _inside,
     _zero_state_problems,
@@ -85,6 +93,50 @@ def _f32(x):
     return np.asarray(x, dtype=np.float32)
 
 
+def _independent_fp32_adamw(theta, m, v, g, step, host):
+    """Independent hand-written effective-float32 node graph (N1 C1 contrast).
+
+    Written from the plan's node list, not copied from the audited function:
+    z=R32(g-m), m=R32(a*z+m), v=R32(c*g^2+b2*v), s=sqrtf(v),
+    b=R32(s/bc2), den=R32(b+eps), ratio=R32(m/den),
+    theta=R32(h*ratio+theta_decay), theta_decay=R32(theta*d).
+    FMA nodes are emulated as exact-product-plus-sum rounded once in float64
+    (this is the naive emulation; the audited function adds exact-rational
+    mid-point fallbacks, so nodes with recorded fallbacks are excluded from
+    the bitwise comparison by the caller).
+    """
+    theta32 = _f32(theta)
+    g32 = _f32(g)
+    m_old = _f32(m)
+    v_old = _f32(v)
+    a32 = np.float32(host["a_32"])
+    b2 = np.float32(host["b2_32"])
+    c32 = np.float32(host["one_minus_b2_32"])
+    h32 = np.float32(host["h_32"])
+    d32 = np.float32(host["d_32"])
+    eps32 = np.float32(host["eps_32"])
+    bc2 = np.float32(host["bc2_sqrt_32"])
+
+    theta_decay = (theta32 * d32).astype(np.float32)
+    z = (g32 - m_old).astype(np.float32)
+    m_new = (a32.astype(np.float64) * z.astype(np.float64)
+             + m_old.astype(np.float64)).astype(np.float32)
+    v_scaled = (b2 * v_old).astype(np.float32)
+    g2 = (g32 * g32).astype(np.float32)
+    v_new = (c32.astype(np.float64) * g2.astype(np.float64)
+             + v_scaled.astype(np.float64)).astype(np.float32)
+    s = np.sqrt(v_new.astype(np.float64)).astype(np.float32)
+    b = (s.astype(np.float64) / bc2.astype(np.float64)).astype(np.float32)
+    denom = (b + eps32).astype(np.float32)
+    ratio = (m_new.astype(np.float64) / denom.astype(np.float64)).astype(np.float32)
+    theta_new = (h32.astype(np.float64) * ratio.astype(np.float64)
+                 + theta_decay.astype(np.float64)).astype(np.float32)
+    delta_ref64 = ((theta_decay.astype(np.float64) - theta32.astype(np.float64))
+                   + float(h32) * ratio.astype(np.float64))
+    return {"theta": theta_new, "m": m_new, "v": v_new, "s": s, "b": b,
+            "denom": denom, "ratio": ratio, "delta_ref64": delta_ref64}
+
+
 def _f16vec(specs) -> np.ndarray:
     v = _f32(specs)
     if v.size > MAX_COORDS_PER_CASE:
@@ -114,6 +166,15 @@ class CaseRunner:
 
     # ------------------------------------------------------------ class C1
     def c1_same_input_formula(self) -> None:
+        """Audited formula vs an independent hand-written node graph.
+
+        A same-function double call has no discriminating power; here the
+        second path is an independent implementation written from the plan's
+        node list, so a misunderstood node order/dtype would diverge bitwise.
+        Nodes where the audited path recorded exact-rational mid-point
+        fallbacks are excluded (the naive FMA emulation legitimately differs
+        there) and the exclusion is recorded per case.
+        """
         cls = "same_input_formula_bitwise"
         g_profiles = [
             np.zeros(16, np.float32),
@@ -137,29 +198,40 @@ class CaseRunner:
             v_old = _f32(np.full(16, 1e-8) * (pi + 1))
             bitwise_ok = True
             max_math_rel = 0.0
+            excluded_nodes: list[str] = []
             for step in (1, 2):
-                p = adamw_effective_fp32(theta, m_old, v_old, g1, step)
-                i = adamw_effective_fp32(theta, m_old, v_old, g1, step)
+                aud = adamw_effective_fp32(theta, m_old, v_old, g1, step)
+                ind = _independent_fp32_adamw(theta, m_old, v_old, g1, step,
+                                              host_constants(step))
                 self.counters.fp32_formula_evals += 2
                 ref = adamw_math_reference(theta, m_old, v_old, g1, step)
                 self.counters.float64_reference_evals += 1
                 if step == 2:
                     self.counters.state_advances += 1
-                for node in ("theta", "m", "v", "s", "b", "denom", "ratio"):
-                    if not _bitwise_eq(np.asarray(p[node], np.float32),
-                                       np.asarray(i[node], np.float32)):
+                fb = aud["rounding_fallbacks"]
+                fb_nodes = {k for k, cnt in fb.items() if cnt}
+                node_map = {"m": "m", "v": "v", "b": "b", "ratio": "ratio",
+                            "theta": "theta", "sqrt": "s", "denom": "denom"}
+                for node, key in node_map.items():
+                    if node in fb_nodes:
+                        excluded_nodes.append(f"step{step}:{node}")
+                        continue
+                    if not _bitwise_eq(np.asarray(aud[key], np.float32),
+                                       np.asarray(ind[key], np.float32)):
                         bitwise_ok = False
-                if not np.array_equal(p["delta_ref64"], i["delta_ref64"]):
+                if "ratio" not in fb_nodes and not np.array_equal(
+                        aud["delta_ref64"], ind["delta_ref64"]):
                     bitwise_ok = False
                 denom64 = np.abs(ref["theta"])
                 max_math_rel = max(max_math_rel, float(
-                    np.max(np.abs(p["theta"].astype(np.float64) - ref["theta"])
+                    np.max(np.abs(aud["theta"].astype(np.float64) - ref["theta"])
                            / np.where(denom64 > 0, denom64, 1.0))))
-                theta, m_old, v_old = p["theta"], p["m"], p["v"]
+                theta, m_old, v_old = aud["theta"], aud["m"], aud["v"]
             self.record(cls, f"profile_{pi}",
-                        expected={"bitwise_same_input": True},
-                        observed={"bitwise_same_input": bitwise_ok,
-                                  "max_rel_vs_float64_reference": max_math_rel},
+                        expected={"bitwise_audited_vs_independent": True},
+                        observed={"bitwise_audited_vs_independent": bitwise_ok,
+                                  "max_rel_vs_float64_reference": max_math_rel,
+                                  "fallback_excluded_nodes": excluded_nodes},
                         passed=bitwise_ok)
 
     # ------------------------------------------------------------ class C2
@@ -369,14 +441,18 @@ class CaseRunner:
                     if not _inside(iv["K_delta"], val):
                         inside_all = False
                 theta, m, v = p["theta"], p["m"], p["v"]
+            must_fail_gate = c["tag"] in ("m_none_zero_disagreement",
+                                          "v_zero_disagreement", "subnormal_boundary")
             semantics = ("cross_path_sensitivity_gap_inside_intervals" if gate_failed
                          else "gates_hold")
+            passed = inside_all and (gate_failed or not must_fail_gate)
             self.record(cls, f"case_{ci}_{c['tag']}",
-                        expected={"inside_intervals": True},
+                        expected={"inside_intervals": True,
+                                  "cross_path_gate_failed": must_fail_gate},
                         observed={"inside_intervals": inside_all,
                                   "cross_path_gate_failed": gate_failed,
                                   "semantics": semantics},
-                        passed=inside_all)
+                        passed=passed)
 
     # ------------------------------------------------------------ class C6
     def c6_interval_violation(self) -> None:
@@ -448,14 +524,64 @@ class CaseRunner:
             delta_outside = not _inside(
                 iv["K_delta"], theta_dev.astype(np.float64) - th.astype(np.float64))
             bitwise_diff = not _bitwise_eq(theta_dev, frozen["theta"])
-            caught = bitwise_diff and (theta_outside or delta_outside)
+
+            # Feed the deviation through the N0 coordinate detector: the saved
+            # same_input flag would be false (formula mismatch) and the theta
+            # write must land outside the N0 interval check or break delta
+            # existence — i.e. the exact detector used for the real evidence
+            # must flag this row as an implementation issue, not stay silent.
+            obs = 1 if float(np.asarray(frozen["delta_ref64"]).reshape(-1)[0]) != 0.0 else 0
+            detector_input = {
+                "theta_pre": th, "theta_p": theta_dev, "theta_i": frozen["theta"],
+                "m_p": m_d, "v_p": v_d, "m_i": frozen["m"], "v_i": frozen["v"],
+                "delta_ref_p": theta_dev.astype(np.float64) - th.astype(np.float64),
+                "delta_ref_i": frozen["delta_ref64"],
+                "delta_measured_p": theta_dev.astype(np.float64) - th.astype(np.float64),
+                "delta_measured_i": frozen["theta"].astype(np.float64) - th.astype(np.float64),
+                "bound_delta_p": _half_ulp32(theta_dev),
+                "bound_delta_i": _half_ulp32(frozen["theta"]),
+                "K_m_lo": np.zeros(1), "K_m_hi": np.full(1, 1e30),
+                "K_v_lo": np.zeros(1), "K_v_hi": np.full(1, 1e30),
+                "K_theta_lo": np.asarray(iv["K_theta"][0]).reshape(-1),
+                "K_theta_hi": np.asarray(iv["K_theta"][1]).reshape(-1),
+                "K_delta_lo": np.asarray(iv["K_delta"][0]).reshape(-1),
+                "K_delta_hi": np.asarray(iv["K_delta"][1]).reshape(-1),
+                "obs_p": np.array([obs], np.uint8), "obs_i": np.array([obs], np.uint8),
+                "ok_p": np.array([1], np.uint8), "ok_i": np.array([1], np.uint8),
+                "i_theta_bind": frozen["theta"], "i_m_bind": frozen["m"],
+                "i_v_bind": frozen["v"],
+                "p_theta_before": th, "p_theta_after": theta_dev,
+                "step": step, "lr": 1e-4, "weight_decay": 1e-5,
+            }
+            d_flags, d_anomalies = compute_row_flags(
+                detector_input,
+                {"delta_same_input": DELTA_SAME_INPUT_RTOL,
+                 "delta_cross_path": DELTA_SAME_INPUT_RTOL,
+                 "theta_atol": THETA_SPEC["atol"], "theta_rtol": THETA_SPEC["rtol"],
+                 "state_atol": STATE_SPEC["atol"], "state_rtol": STATE_SPEC["rtol"]},
+                native_shape=(int(np.asarray(frozen["theta"]).size),),
+                same_input_p=0, same_input_i=1)
+            cls_out, _gaps = recompute_classification(d_flags)
+            nonfinite = any(x.startswith("nonfinite") for x in d_anomalies)
+            detected = (bool((d_flags & SOURCE_ANOMALY).any())
+                        and (bool((d_flags & INTERVAL_OUTSIDE).any())
+                             or bool((d_flags & (DELTA_PRESENCE_MISMATCH
+                                                 | DELTA_ONE_SIDED_OBSERVABLE)).any())
+                             or nonfinite)
+                        and (cls_out in ("direct_failure", "cross_path_bound_unverifiable",
+                                         "cross_path_sensitivity_gap") or nonfinite))
+            caught = bitwise_diff and (theta_outside or delta_outside) and detected
             self.record(cls, f"case_{ci}_{name}",
                         expected={"caught_as_implementation_issue": True},
                         observed={"bitwise_differs_from_frozen": bitwise_diff,
                                   "theta_outside_interval": theta_outside,
-                                  "delta_outside_interval": delta_outside},
+                                  "delta_outside_interval": delta_outside,
+                                  "n0_detector_source_anomaly": bool((d_flags & SOURCE_ANOMALY).any()),
+                                  "n0_detector_interval_outside": bool((d_flags & INTERVAL_OUTSIDE).any()),
+                                  "n0_detector_classification": cls_out,
+                                  "n0_detector_anomalies": d_anomalies[:3]},
                         passed=caught,
-                        note="N0-style detection: same-input formula mismatch + interval violation")
+                        note="deviation fed through the N0 coordinate detector")
 
 
 def run_synthetic_verification(budget: N0Budget) -> tuple:
@@ -531,7 +657,10 @@ def run_synthetic_verification(budget: N0Budget) -> tuple:
     return summary, runner.cases
 
 
-def write_outputs(output_dir: Path, summary: dict, cases: list) -> dict:
+def write_outputs(output_dir: Path, summary: dict, cases: list,
+                  budget: N0Budget | None = None) -> dict:
+    import os
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     cases_path = output_dir / "n1_cases.json"
@@ -540,7 +669,31 @@ def write_outputs(output_dir: Path, summary: dict, cases: list) -> dict:
         raise N1Error("n1_cases.json exceeds frozen report bound")
     summary["outputs"] = {"n1_cases.json": cases_path.name}
     summary_path = output_dir / "n1_summary.json"
+    if budget is not None:
+        summary["seal"] = {
+            "hard_deadline_s": budget.hard_deadline,
+            "measured_wall_s_before_summary_write": time.perf_counter() - budget.t0,
+        }
     summary_path.write_text(json.dumps(summary, indent=1))
+    fd = os.open(output_dir, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    if budget is not None:
+        final = time.perf_counter() - budget.t0
+        summary["seal"]["measured_wall_s_final"] = final
+        if final > budget.hard_deadline:
+            summary["budget_exceeded_after_seal"] = True
+            summary["all_cases_passed"] = False
+            summary["label_verdict"] = "budget_exceeded_after_seal"
+        summary["budget"]["measured_wall_s_at_summary"] = final
+        summary_path.write_text(json.dumps(summary, indent=1))
+        fd = os.open(output_dir, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
     if summary_path.stat().st_size > MAX_REPORT_BYTES:
         raise N1Error("n1_summary.json exceeds frozen report bound")
     return {"cases": str(cases_path), "summary": str(summary_path)}

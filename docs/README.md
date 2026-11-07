@@ -14,8 +14,8 @@
 
 | 文档 | 用途与状态 |
 | --- | --- |
-| [N1 最小合成验证与有限数值收口说明](verification/omniretarget_w1_n1_synthetic_closure.md) | **N1已完整收口（2026-11-07）**：六类47用例全过（fp32公式逐位确定、擦除=precision、单侧可辨识=sensitivity、零/符号=direct failure、相消在区间内、8类显著偏差全可检出）；go=no_go→go_for_conditional_fit_diagnostics_review；0.026s/预算900s。I/R/D/F仍未授权 |
-| [N0 坐标级数值缺口分析记录](verification/omniretarget_w1_n0_coordinate_analysis.md) | **N0已完整收口（2026-11-07）**：`n0_coordinate_flags_v1`冻结格式；528行/15,134,440坐标全覆盖，350/189/147/392事件重放与T6逐项一致，分类重放528/528、0异常；结论=350 precision_limited+189 cross_path_sensitive+0 implementation_issue_candidate。T6 audit_incomplete与旧gap不改写 |
+| [N1 最小合成验证与有限数值收口说明](verification/omniretarget_w1_n1_synthetic_closure.md) | **N1已收口（2026-11-07，审阅修订后 attempt_002）**：C1 audited vs 独立节点图逐位对照、C5 三例门失败全区间内、C6 八偏差全经N0检测器检出；六类47用例全过，go=no_go→go_for_conditional_fit_diagnostics_review。I/R/D/F仍未授权 |
+| [N0 坐标级数值缺口分析记录](verification/omniretarget_w1_n0_coordinate_analysis.md) | **N0已收口（2026-11-07，v2格式 attempt_002）**：uint32新增存在性/单侧可辨识位（标出审阅核实的4行）；same_input公式门与delta_measured一致性消费；分侧写界重构；roster精确集合+封口SHA锚核验；旧629逐键对照424行附注。结论=350 precision_limited+189 cross_path_sensitive+0 implementation_issue_candidate |
 | [数值缺口有限收口与受控拟合诊断方案](plans/omniretarget_w1_numerics_closure_fit_diagnostic_plan.md) | **v0.4，N0/N1已完成（2026-11-07）、I待审阅后实施**：N0保存证据坐标级分析✓→N1最小合成验证/有限收口✓→I共享Trainer诊断实现→R新冻结/授权→D1单窗/D6六窗确定性拟合→F收口。平均门、预算和8206次/路径forward上限不放宽；真实拟合须新明确授权 |
 | [最新T6执行报告](verification/omniretarget_w1_gradient_numerics_retest_report.md) | **已执行的基线，不是待执行任务**：329 failures清零，539 gaps保留；一次性授权已消费，完整目标与交互质量不通过 |
 | [项目整体实现方案](plans/interaction_retarget_impl_plan.md) | 总体目标、坐标/资产约定和最终质量/端到端加速标准；其历史完成快照不能覆盖最新裁决 |
