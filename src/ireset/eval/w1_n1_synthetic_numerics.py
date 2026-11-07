@@ -31,7 +31,9 @@ from ireset.eval.w1_n0_coordinate_flags import (BudgetExceeded,  # noqa: F401
                                                 N0Budget,
                                                 SOURCE_ANOMALY,
                                                 compute_row_flags,
-                                                recompute_classification)
+                                                recompute_classification,
+                                                _write_json_fsync,
+                                                _write_summary_sealed)
 from ireset.eval.w1_real_training_update_audit import (
     _cross_path_flags,
     _delta_observability,
@@ -657,8 +659,18 @@ def run_synthetic_verification(budget: N0Budget) -> tuple:
     return summary, runner.cases
 
 
+# On a seal withdrawal (slow write crossing the wall cap) the go/no-go
+# recommendation is revoked together with the completion claims: a budget-
+# exceeded run must not publish a go suggestion.
+N1_WITHDRAW_ON_EXCEED = {
+    "all_cases_passed": False,
+    "label_verdict": "budget_exceeded_after_seal",
+    "go_no_go": "no_go_budget_seal_exceeded",
+}
+
+
 def write_outputs(output_dir: Path, summary: dict, cases: list,
-                  budget: N0Budget | None = None) -> dict:
+                  budget: N0Budget | None = None, clock=None) -> dict:
     import os
 
     output_dir = Path(output_dir)
@@ -670,30 +682,22 @@ def write_outputs(output_dir: Path, summary: dict, cases: list,
     summary["outputs"] = {"n1_cases.json": cases_path.name}
     summary_path = output_dir / "n1_summary.json"
     if budget is not None:
-        summary["seal"] = {
-            "hard_deadline_s": budget.hard_deadline,
-            "measured_wall_s_before_summary_write": time.perf_counter() - budget.t0,
-        }
-    summary_path.write_text(json.dumps(summary, indent=1))
-    fd = os.open(output_dir, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    if budget is not None:
-        final = time.perf_counter() - budget.t0
-        summary["seal"]["measured_wall_s_final"] = final
-        if final > budget.hard_deadline:
-            summary["budget_exceeded_after_seal"] = True
-            summary["all_cases_passed"] = False
-            summary["label_verdict"] = "budget_exceeded_after_seal"
-        summary["budget"]["measured_wall_s_at_summary"] = final
+        seal_facts = _write_summary_sealed(summary_path, summary, budget,
+                                           withdraw=dict(N1_WITHDRAW_ON_EXCEED),
+                                           clock=clock)
+    else:
         summary_path.write_text(json.dumps(summary, indent=1))
         fd = os.open(output_dir, os.O_RDONLY)
         try:
             os.fsync(fd)
         finally:
             os.close(fd)
+        seal_facts = {"status": "unsealed_no_budget", "measured_wall_s": None,
+                      "rounds": 0, "samples": []}
     if summary_path.stat().st_size > MAX_REPORT_BYTES:
         raise N1Error("n1_summary.json exceeds frozen report bound")
-    return {"cases": str(cases_path), "summary": str(summary_path)}
+    # The on-disk document (post-seal) is returned so the CLI decides from
+    # disk state, never from pre-write memory.
+    return {"cases": str(cases_path), "summary": str(summary_path),
+            "summary_doc": json.loads(summary_path.read_text()),
+            "seal_facts": seal_facts}

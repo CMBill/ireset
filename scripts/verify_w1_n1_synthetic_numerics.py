@@ -68,22 +68,31 @@ def main() -> int:
                                     else "synthetic_failure")
     paths = n1.write_outputs(out_dir, summary, cases, budget=budget)
 
+    # Fail-closed: the on-disk sealed summary is the authority for the exit
+    # decision.  The seal may have withdrawn the completion claims (and the
+    # go/no-go recommendation) after the in-memory values above were
+    # computed; those stale values are never used to decide the exit code.
+    disk = paths["summary_doc"]
     print(json.dumps({
         "output_dir": str(out_dir),
-        "all_cases_passed": summary["all_cases_passed"],
-        "label_verdict": summary["label_verdict"],
-        "go_no_go": summary["go_no_go"] if not incomplete else None,
-        "per_class": summary["per_class"],
-        "counters": summary["counters"],
-        "seal": summary.get("seal"),
-        "budget": {k: summary["budget"][k] for k in
+        "all_cases_passed": disk.get("all_cases_passed"),
+        "label_verdict": disk.get("label_verdict"),
+        "go_no_go": disk.get("go_no_go"),
+        "per_class": disk.get("per_class"),
+        "counters": disk.get("counters"),
+        "seal": disk.get("seal"),
+        "seal_facts": paths["seal_facts"],
+        "budget": {k: disk.get("budget", {}).get(k) for k in
                    ("measured_wall_s_at_summary", "work_deadline_s",
                     "hard_deadline_s", "budget_exceeded", "stopped_at")},
-        "outputs": paths,
+        "outputs": {"cases": paths["cases"], "summary": paths["summary"]},
     }, indent=1))
-    if incomplete:
+    sealed = (disk.get("seal") or {}).get("status") == "sealed_within_budget"
+    if not sealed or disk.get("budget", {}).get("budget_exceeded"):
         return 3
-    return 0 if summary["all_cases_passed"] else 1
+    if disk.get("all_cases_passed") and str(disk.get("go_no_go") or "").startswith("go_"):
+        return 0
+    return 1
 
 
 if __name__ == "__main__":

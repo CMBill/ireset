@@ -77,6 +77,8 @@ def main() -> int:
         "total_coords": summary["total_coords"],
         "n_rows": summary["n_rows"],
         "event_replay": summary["event_replay"],
+        "old_chain_comparison": summary["old_chain_comparison"],
+        "source_closure": summary["source_closure"],
         "label_counts": summary["label_counts"],
         "n_rows_with_anomalies": summary["n_rows_with_anomalies"],
         "seal": summary.get("seal"),
@@ -84,7 +86,10 @@ def main() -> int:
                    ("measured_wall_s_at_summary", "work_deadline_s", "hard_deadline_s",
                     "budget_exceeded", "stopped_at")},
     }, indent=1))
-    return 0 if summary["coverage_complete"] else 3
+    # Fail-closed: run() re-reads the sealed summary from disk, so this
+    # decision uses the on-disk terminal state, never pre-write memory.
+    sealed = (summary.get("seal") or {}).get("status") == "sealed_within_budget"
+    return 0 if sealed and summary.get("coverage_complete") is True else 3
 
 
 if __name__ == "__main__":

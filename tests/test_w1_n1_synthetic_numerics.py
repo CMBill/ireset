@@ -123,3 +123,36 @@ def test_cli(tmp_path):
     assert payload["all_cases_passed"] is True
     summary = json.loads(Path(payload["outputs"]["summary"]).read_text())
     assert summary["label_verdict"] == "complete"
+
+
+def test_seal_withdraws_go_no_go(tmp_path):
+    """P2-3: a seal withdrawal must revoke the go/no-go recommendation
+    together with the completion claims (correct elapsed-vs-cap semantics:
+    t0 is large, elapsed 901s exceeds the 900s cap)."""
+    summary, cases = n1.run_synthetic_verification(
+        N0Budget(wall_cap_s=900.0, reserve_s=60.0))
+    budget = N0Budget(wall_cap_s=900.0, reserve_s=60.0, t0=5000.0)
+    ticks = iter([5000.0 + t for t in (10.0, 901.0, 902.0, 905.0, 910.0)])
+    paths = n1.write_outputs(tmp_path, summary, cases, budget=budget,
+                             clock=lambda: next(ticks))
+    disk = paths["summary_doc"]
+    assert paths["seal_facts"]["status"] == "budget_exceeded_after_seal"
+    assert disk["seal"]["status"] == "budget_exceeded_after_seal"
+    assert disk["go_no_go"] == "no_go_budget_seal_exceeded"
+    assert disk["all_cases_passed"] is False
+    assert disk["label_verdict"] == "budget_exceeded_after_seal"
+
+
+def test_seal_two_phase_normal(tmp_path):
+    """Happy path: publish (sealing) -> verify -> seal; go/no-go preserved."""
+    summary, cases = n1.run_synthetic_verification(
+        N0Budget(wall_cap_s=900.0, reserve_s=60.0))
+    budget = N0Budget(wall_cap_s=900.0, reserve_s=60.0, t0=0.0)
+    ticks = iter([10.0, 20.0, 21.0, 30.0])
+    paths = n1.write_outputs(tmp_path, summary, cases, budget=budget,
+                             clock=lambda: next(ticks))
+    disk = paths["summary_doc"]
+    assert disk["seal"]["status"] == "sealed_within_budget"
+    assert disk["seal"]["terminal"] is True
+    assert disk["go_no_go"] == "go_for_conditional_fit_diagnostics_review"
+    assert disk["all_cases_passed"] is True

@@ -331,3 +331,17 @@ v0.1只创建方案并整理文档导航；v0.2修订预算/拟合/容量边界�
 | P2：attempt 覆盖风险 | 两 CLI 改为独占创建（mkdir exist_ok=False 递增），已有 001/003 时新写 004 | 旧 attempt 永不覆盖 |
 
 N0 attempt_002（v2）结果：coverage_complete=true、0 异常、54.25s（预算 900s/工作截止 840s 内）；位分布新增 ONE_SIDED=4（恰为审阅核实的 4 行）、PRESENCE=0，其余位与 v1 一致；350/189/147/392 事件重放不变。N1 attempt_002：六类 47 用例全过（C1 独立对照 8/8、零 fallback 豁免；C5 三例门失败全区间内；C6 八偏差全经 N0 检测器检出），go=no_go 维持 `go_for_conditional_fit_diagnostics_review`。I/R/D1/D6/F 仍未实施；真实拟合仍须 §8.3 新冻结材料与新明确授权。
+
+## 15. v0.5 第二轮复阅修订对照（封口口径、来源闭链与 bound 事件交付）
+
+2026-11-07 第二轮独立复阅确认主要数值修复成立，但驳回"全部问题已闭合"（2 P1+3 P2），全部修复并以修正协议重跑：`n0/attempt_002` 与 `n1/attempt_002` 保留为被取代证据，权威为 **attempt_003**。本轮只改 N0/N1 工具、测试与人读记录；旧 T6 材料、契约与授权不改写；不进入 I 实施等待复阅。
+
+| 复阅问题 | 修复 | 不变边界 |
+| --- | --- | --- |
+| P1：封口比较了不同时间口径（已用秒数 vs 绝对 `hard_deadline=t0+cap`，t0≈14467 时 901 秒不触发 900 秒超限） | `_write_summary_sealed` 重写为发布-核验循环：每次比较用**已用秒数**（`clock()-t0`）对 `wall_cap_s`；先写 `sealing`（非权威），写盘后采样，cap 内再写 `sealed_within_budget` 并再次采样核验 | 预算数值 900/60/840 不变；受控时钟反例钉死大 t0 下 901s 必须触发 |
+| P1：最终写盘在最后采样之后（第二次写 summary 不再核验，慢写盘越界仍保留完成声明） | 每次写盘后都有采样；完成声明只能在"通过采样之后无任何写盘"时存续；采样越界即撤回为 `budget_exceeded_after_seal`（保守方向，撤回写盘自身无需再核验） | 新增反例：慢 sealed 写盘被撤回；通过采样后写次数断言为 2 |
+| P2：N1 预算撤销未同步撤销 go 建议；CLI 用写盘前缓存决定退出码 | `N1_WITHDRAW_ON_EXCEED` 把 `go_no_go` 一并撤为 `no_go_budget_seal_exceeded`；两个 CLI 一律以**盘上最终 summary**（run/write 返回的落盘文档 + `seal.status`）决定打印与退出码，fail-closed | 非撤回路径 go/no_go 值不变 |
+| P2：封口 SHA 锚未闭到旧封口链（协调修改 NPZ+报告可绕过） | 新增 `_verify_source_closure`：以 `launch_journal/w1-retest-20261106-003/return_observation.json` 为锚根（其 SHA 入册）→ `commits{P,I,F}` 逐级核验 commit.json/finish.json 文件 SHA → `index_row_snapshot.artifacts` 对每个消费输入（p_report/p_rows 级 NPZ×4/i_report/i_rows/NPZ×2）逐文件 SHA 对照；registration 对照三个 stage 快照一致的 `execution_registration_sha256`；P NPZ 另对照 F 终局报告 `worker_result.p_replay.arrays_sha256` 双锚；不匹配即硬失败。post-chain 的 analysis.json 非封口件，SHA 显式记录并标注 `analysis_journal_bound=false` | 闭链根为旧 journal 工件本身（只读消费）；不改写旧链 |
+| P2：旧 629 对照遗漏 25 项 bound 事件 | `gap_rows.csv` 新增 `old_state_bound` 列；summary 新增 `old_chain_comparison`（items_total/items_by_kind/new_only_by_kind/rows_annotated），三类事件全部交付 | 只读附注，不改写旧分类 |
+
+N0 attempt_003 结果：coverage_complete=true、0 异常、55.47s（seal=sealed_within_budget，round 1）；闭链全过——P/I/F commit SHA 与 journal 记录一致（`773cb48c…`/`459ef764…`/`7ee1965b…`）、registration SHA `87961838…`、F 重放锚 `44bb2b19…`/`8d02383d…`；事件重放 350/189/147/392 与标签 350/189/136 不变；旧对照 items_total=629（381 precision+223 sensitivity+25 bound）、new_only 5（1+4）、rows_annotated=424，`old_state_bound` 恰好 25 行 resolved。N1 attempt_003：六类 47 用例全过（计数 80/16/16/9），go=no_go 维持 `go_for_conditional_fit_diagnostics_review`，seal 3.95s（round 1）。测试 **29 passed**（N0 18+N1 11，新增 6 项：协调篡改/registration 篡改/封口时间口径/通过后零写盘/慢 sealed 写盘撤回/bound 列交付 + N1 go 撤回与两阶段正例）。I/R/D1/D6/F 仍未实施；真实拟合仍须 §8.3 新冻结材料与新明确授权。

@@ -192,14 +192,76 @@ def write_world(root: Path, params: dict, row_meta: dict, analysis_items=None,
     analysis = {"gaps": {"items": analysis_items or [], "new_only_items": []}}
     apath = root / "analysis.json"
     apath.write_text(json.dumps(analysis))
+    _build_journal(root)
     return apath
 
 
+RETEST_INV = "w1-retest-20261106-003"
 
-def _reseal(root: Path, model: str, npz_path: Path):
+
+def _sha(p: Path) -> str:
+    import hashlib
+    return hashlib.sha256(p.read_bytes()).hexdigest()
+
+
+def _build_journal(root: Path):
+    """Seal a minimal T6-retest journal chain around the CURRENT fixture
+    bytes: return_observation -> commits{P,I,F} -> commit.json ->
+    finish.json -> index_row_snapshot.artifacts (run-root-relative paths)
+    plus execution_registration_sha256, and the F final report's replay
+    array anchor for the P NPZs.  Idempotent: rebuilding after a tamper
+    re-seals the chain to the new bytes (used by the tamper tests that
+    exercise downstream detection); a tamper WITHOUT rebuilding is the
+    coordinated-modification attack tested separately."""
+    journal = root / "launch_journal" / RETEST_INV
+    events = root / "execution_events"
+    reg_sha = _sha(root / "registration/attempt_003/registration.json")
+    fin_dir = root / "finalize/attempt_002"
+    fin_dir.mkdir(parents=True, exist_ok=True)
+    (fin_dir / "training_update_final.json").write_text(json.dumps({
+        "worker_result": {"p_replay": {"arrays_sha256": {
+            "deterministic": _sha(root / "production/attempt_003/p_deterministic.npz"),
+            "diffusion": _sha(root / "production/attempt_003/p_diffusion.npz"),
+        }}}},
+    ))
+    stage_files = {
+        "P": ["production/attempt_003/p_deterministic.npz",
+              "production/attempt_003/p_diffusion.npz",
+              "production/attempt_003/p_report.json"],
+        "I": ["independent/attempt_002/i_deterministic.npz",
+              "independent/attempt_002/i_diffusion.npz",
+              "independent/attempt_002/i_report.json",
+              "independent/attempt_002/i_rows.json"],
+    }
+    commits = {}
+    for stage, seq in (("P", 8), ("I", 9), ("F", 10)):
+        ev = events / f"{seq:06d}"
+        ev.mkdir(parents=True, exist_ok=True)
+        if stage == "F":
+            artifacts = {"finalize/attempt_002/training_update_final.json":
+                         _sha(fin_dir / "training_update_final.json")}
+        else:
+            artifacts = {rel: _sha(root / rel) for rel in stage_files[stage]}
+        (ev / "finish.json").write_text(json.dumps(
+            {"index_row_snapshot": {"artifacts": artifacts,
+                                    "execution_registration_sha256": reg_sha}}))
+        (ev / "commit.json").write_text(json.dumps(
+            {"finish": {"path": f"execution_events/{seq:06d}/finish.json",
+                        "sha256": _sha(ev / "finish.json")}}))
+        commits[stage] = {"path": f"execution_events/{seq:06d}/commit.json",
+                          "sha256": _sha(ev / "commit.json")}
+    journal.mkdir(parents=True, exist_ok=True)
+    (journal / "return_observation.json").write_text(json.dumps({"commits": commits}))
+
+
+
+def _reseal(root: Path, model: str, npz_path: Path, rebuild_chain: bool = True):
     """Re-seal the P/I report anchor after a fixture tamper (the tamper tests
     exercise downstream detection, not the anchor gate, which has its own
-    dedicated test)."""
+    dedicated test).  With rebuild_chain=True the journal chain is rebuilt to
+    the new bytes so the source-closure gate stays consistent; the
+    coordinated-tamper test passes rebuild_chain=False to leave the chain
+    sealed to the pre-tamper bytes."""
     import hashlib
     report = root / ("independent/attempt_002/i_report.json"
                      if npz_path.name.startswith("i_") else
@@ -207,6 +269,8 @@ def _reseal(root: Path, model: str, npz_path: Path):
     data = json.loads(report.read_text())
     data["models"][model]["arrays_sha256"] = hashlib.sha256(npz_path.read_bytes()).hexdigest()
     report.write_text(json.dumps(data))
+    if rebuild_chain:
+        _build_journal(root)
 
 def make_analyzer(root: Path, out: Path, budget=None, analysis_path=None):
     budget = budget or n0.N0Budget(wall_cap_s=900.0, reserve_s=60.0)
@@ -277,6 +341,8 @@ def standard_world(root: Path):
          "kind": "parameter_delta_precision_gap", "state": "resolved"},
         {"key": "i_adamw_gap:diffusion:u2:gamma:cross_path_sensitivity_gap",
          "kind": "cross_path_sensitivity_gap", "state": "new"},
+        {"key": "i_adamw_gap:deterministic:u2:alpha:cross_path_bound_unverifiable",
+         "kind": "cross_path_bound_unverifiable", "state": "resolved"},
     ]
     new_only_items = [
         {"key": "i_adamw_gap:deterministic:u2:beta:parameter_delta_precision_gap",
@@ -348,7 +414,22 @@ def test_flags_bits_and_labels(world):
     er = summary["event_replay"]
     assert er["precision_rows"] == 2 and er["sensitivity_rows"] == 6
     assert er["both_rows"] == 2 and er["gap_rows"] == 6
-    assert "seal" in summary and "measured_wall_s_final" in summary["seal"]
+    assert summary["seal"]["status"] == "sealed_within_budget"
+    assert summary["seal"]["terminal"] is True
+    # source closure: every consumed input journal-bound, analysis recorded
+    sc = summary["source_closure"]
+    assert sc["all_consumed_inputs_journal_bound"] is True
+    assert sc["analysis_journal_bound"] is False
+    assert {"p_report", "p_npz", "p_npz_diffusion", "i_report", "i_rows",
+            "i_npz", "i_npz_diffusion", "registration",
+            "p_npz_f_replay_anchor"} <= set(sc["bindings"])
+    assert set(sc["stages"]) == {"P", "I", "F"}
+    # old-chain comparison delivers all three gap kinds
+    oc = summary["old_chain_comparison"]
+    assert oc["items_total"] == 3
+    assert oc["items_by_kind"]["cross_path_bound_unverifiable"] == 1
+    assert oc["items_by_kind"]["parameter_delta_precision_gap"] == 1
+    assert oc["items_by_kind"]["cross_path_sensitivity_gap"] == 1
 
 
 def test_source_anomaly_on_tampered_ok(world):
@@ -558,3 +639,119 @@ def test_cli_exclusive_attempts(world, tmp_path):
     # existing 001/003 must never be overwritten: next exclusive attempt is 004
     assert payload["output_dir"].endswith("attempt_004")
     assert payload["coverage_complete"] is True
+
+
+def test_coordinated_report_npz_tamper_rejected(world):
+    """P2-4 attack: tamper an NPZ AND its report's self-reported anchor so the
+    intra-report check passes; the journal-sealed chain must still reject."""
+    root, out, apath = world
+    npz_path = root / "independent/attempt_002/i_diffusion.npz"
+    members = dict(np.load(npz_path))
+    members["adamw_diffusion_u2_gamma/theta_i"] = (
+        members["adamw_diffusion_u2_gamma/theta_i"] + np.float32(1e-3))
+    np.savez(npz_path, **members)
+    _reseal(root, "diffusion", npz_path, rebuild_chain=False)
+    with pytest.raises(n0.N0Error, match="source closure mismatch"):
+        make_analyzer(root, out, analysis_path=apath).run()
+
+
+def test_registration_tamper_rejected(world):
+    root, out, apath = world
+    reg_path = root / "registration/attempt_003/registration.json"
+    reg = json.loads(reg_path.read_text())
+    reg["config"]["lr"] = 2e-4
+    reg_path.write_text(json.dumps(reg))
+    with pytest.raises(n0.N0Error, match="registration file SHA"):
+        make_analyzer(root, out, analysis_path=apath).run()
+
+
+def test_summary_seal_elapsed_vs_cap_withdrawal(tmp_path):
+    """P1-1: elapsed seconds must be compared against the wall cap, never
+    against the absolute hard_deadline perf-counter value (t0 is large)."""
+    budget = n0.N0Budget(wall_cap_s=900.0, reserve_s=60.0, t0=14467.0)
+    # the fake clock returns perf-counter-style ABSOLUTE values; elapsed is
+    # value - t0, so 901s elapsed must exceed the 900s cap despite the large t0
+    ticks = iter([14467.0 + t for t in (10.0, 901.0, 902.0, 905.0, 910.0)])
+    summary = {"coverage_complete": True, "label_verdict": "complete", "budget": {}}
+    facts = n0._write_summary_sealed(
+        tmp_path / "s.json", summary, budget,
+        withdraw={"coverage_complete": False,
+                  "label_verdict": "budget_exceeded_after_seal"},
+        clock=lambda: next(ticks))
+    assert facts["status"] == "budget_exceeded_after_seal"
+    assert facts["measured_wall_s"] == 905.0
+    disk = json.loads((tmp_path / "s.json").read_text())
+    assert disk["seal"]["status"] == "budget_exceeded_after_seal"
+    assert disk["seal"]["terminal"] is True
+    assert disk["coverage_complete"] is False
+    assert disk["label_verdict"] == "budget_exceeded_after_seal"
+
+
+def test_summary_seal_no_write_after_passing_sample(tmp_path, monkeypatch):
+    """P1-2: once a post-write sample is inside the cap with a sealed claim,
+    no further write may happen (a slow second write can no longer publish a
+    completion claim past the budget)."""
+    calls = {"n": 0}
+    real = n0._write_json_fsync
+
+    def counting(path, doc):
+        calls["n"] += 1
+        real(path, doc)
+
+    monkeypatch.setattr(n0, "_write_json_fsync", counting)
+    budget = n0.N0Budget(wall_cap_s=900.0, reserve_s=60.0, t0=0.0)
+    ticks = iter([10.0, 20.0, 21.0, 30.0])
+    summary = {"coverage_complete": True, "label_verdict": "complete", "budget": {}}
+    facts = n0._write_summary_sealed(tmp_path / "s.json", summary, budget,
+                                     clock=lambda: next(ticks))
+    assert facts["status"] == "sealed_within_budget"
+    assert facts["measured_wall_s"] == 30.0
+    assert calls["n"] == 2
+    disk = json.loads((tmp_path / "s.json").read_text())
+    assert disk["seal"]["status"] == "sealed_within_budget"
+    assert disk["coverage_complete"] is True
+
+
+def test_summary_seal_slow_sealed_write_revokes(tmp_path, monkeypatch):
+    """P1-2: the sealed rewrite itself is verified; if its post-write sample
+    crosses the cap the completion claim is withdrawn to exceeded."""
+    calls = {"n": 0}
+    real = n0._write_json_fsync
+
+    def counting(path, doc):
+        calls["n"] += 1
+        real(path, doc)
+
+    monkeypatch.setattr(n0, "_write_json_fsync", counting)
+    budget = n0.N0Budget(wall_cap_s=900.0, reserve_s=60.0, t0=0.0)
+    ticks = iter([10.0, 20.0, 21.0, 905.0, 906.0, 910.0])
+    summary = {"coverage_complete": True, "label_verdict": "complete", "budget": {}}
+    facts = n0._write_summary_sealed(
+        tmp_path / "s.json", summary, budget,
+        withdraw={"coverage_complete": False,
+                  "label_verdict": "budget_exceeded_after_seal"},
+        clock=lambda: next(ticks))
+    assert facts["status"] == "budget_exceeded_after_seal"
+    assert calls["n"] == 3
+    disk = json.loads((tmp_path / "s.json").read_text())
+    assert disk["seal"]["status"] == "budget_exceeded_after_seal"
+    assert disk["coverage_complete"] is False
+    assert disk["label_verdict"] == "budget_exceeded_after_seal"
+
+
+def test_old_state_bound_column_delivered(world):
+    """P2-5: the 25 old bound events have no row of their own in the retest
+    result but must appear in the per-row comparison output."""
+    root, out, apath = world
+    summary = make_analyzer(root, out, analysis_path=apath).run()
+    import csv as _csv
+    with open(out / "gap_rows.csv") as f:
+        recs = {r["key"]: r for r in _csv.DictReader(f)}
+    assert recs["adamw:deterministic:u2:alpha"]["old_state_bound"] == "resolved"
+    assert recs["adamw:deterministic:u1:alpha"]["old_state_bound"] == ""
+    oc = summary["old_chain_comparison"]
+    assert oc["items_total"] == 3 and oc["new_only_total"] == 1
+    assert oc["rows_annotated"] == 3
+    assert oc["kinds"] == ["parameter_delta_precision_gap",
+                           "cross_path_sensitivity_gap",
+                           "cross_path_bound_unverifiable"]

@@ -14,9 +14,9 @@
 
 | 文档 | 用途与状态 |
 | --- | --- |
-| [N1 最小合成验证与有限数值收口说明](verification/omniretarget_w1_n1_synthetic_closure.md) | **N1已收口（2026-11-07，审阅修订后 attempt_002）**：C1 audited vs 独立节点图逐位对照、C5 三例门失败全区间内、C6 八偏差全经N0检测器检出；六类47用例全过，go=no_go→go_for_conditional_fit_diagnostics_review。I/R/D/F仍未授权 |
-| [N0 坐标级数值缺口分析记录](verification/omniretarget_w1_n0_coordinate_analysis.md) | **N0已收口（2026-11-07，v2格式 attempt_002）**：uint32新增存在性/单侧可辨识位（标出审阅核实的4行）；same_input公式门与delta_measured一致性消费；分侧写界重构；roster精确集合+封口SHA锚核验；旧629逐键对照424行附注。结论=350 precision_limited+189 cross_path_sensitive+0 implementation_issue_candidate |
-| [数值缺口有限收口与受控拟合诊断方案](plans/omniretarget_w1_numerics_closure_fit_diagnostic_plan.md) | **v0.4，N0/N1已完成（2026-11-07）、I待审阅后实施**：N0保存证据坐标级分析✓→N1最小合成验证/有限收口✓→I共享Trainer诊断实现→R新冻结/授权→D1单窗/D6六窗确定性拟合→F收口。平均门、预算和8206次/路径forward上限不放宽；真实拟合须新明确授权 |
+| [N1 最小合成验证与有限数值收口说明](verification/omniretarget_w1_n1_synthetic_closure.md) | **N1已收口（2026-11-07，二轮复阅修订后 attempt_003）**：C1 audited vs 独立节点图逐位对照、C5 三例门失败全区间内、C6 八偏差全经N0检测器检出；六类47用例全过，go=no_go→go_for_conditional_fit_diagnostics_review。封口改发布-核验循环（已用秒数vs cap、通过后零写盘），撤回同步撤销go建议、CLI以盘上为准。I/R/D/F仍未授权 |
+| [N0 坐标级数值缺口分析记录](verification/omniretarget_w1_n0_coordinate_analysis.md) | **N0已收口（2026-11-07，二轮复阅修订后 attempt_003）**：uint32存在性/单侧可辨识位（4行）；same_input公式门+delta_measured一致性；分侧写界；roster精确集合；来源闭链（journal return_observation→commits{P,I,F}→artifacts逐文件SHA+registration+F重放双锚）；旧629全三类交付（381/223/25，25行bound逐行）；封口发布-核验循环。结论=350 precision_limited+189 cross_path_sensitive+0 implementation_issue_candidate |
+| [数值缺口有限收口与受控拟合诊断方案](plans/omniretarget_w1_numerics_closure_fit_diagnostic_plan.md) | **v0.4+§14/§15修订对照，N0/N1已完成（2026-11-07 attempt_003权威）、I待复阅后实施**：N0保存证据坐标级分析✓→N1最小合成验证/有限收口✓→I共享Trainer诊断实现→R新冻结/授权→D1单窗/D6六窗确定性拟合→F收口。平均门、预算和8206次/路径forward上限不放宽；真实拟合须新明确授权 |
 | [最新T6执行报告](verification/omniretarget_w1_gradient_numerics_retest_report.md) | **已执行的基线，不是待执行任务**：329 failures清零，539 gaps保留；一次性授权已消费，完整目标与交互质量不通过 |
 | [项目整体实现方案](plans/interaction_retarget_impl_plan.md) | 总体目标、坐标/资产约定和最终质量/端到端加速标准；其历史完成快照不能覆盖最新裁决 |
 | [已完成阶段归档](archive/omniretarget_completed_20261106/README.md) | A2、W1训练/归因/融合、合成/真实目标与FK审计、更新审计/迁移、数值修复/T6的分组导航、实际结论和边界 |

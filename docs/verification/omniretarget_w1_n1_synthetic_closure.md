@@ -49,3 +49,12 @@
 - **attempt 独占创建**；测试 8 项反例全过（新增 C5 门失败下界与 C1 独立对照断言）。
 
 **go/no-go 维持 `go_for_conditional_fit_diagnostics_review`**，其余结论与 §3–§5 边界不变；计数不变（47 用例、fp32 求值 80、float64 参考 16、区间传播 16、状态推进 9，全部非零登记）。
+
+## 7. 修订记录（2026-11-07 第二轮复阅后，attempt_003 权威）
+
+第二轮独立复阅提出 2 P1+3 P2（其中涉及 N1 的为封口口径与 go 建议撤销），全部修复并以修正协议重跑：`attempt_001/002` 保留为被取代证据，权威为 **`attempt_003`**。
+
+- **封口重写（P1×2，与 N0 共享实现）**：`write_outputs` 改用发布-核验循环（已用秒数 vs `wall_cap_s`；通过采样后零写盘；越界撤回）。attempt_003 实测 seal=sealed_within_budget（round 1，3.95s 含导入）。
+- **go 建议随撤回同步撤销（P2）**：`N1_WITHDRAW_ON_EXCEED` 在封口撤回时把 `go_no_go` 一并改为 `no_go_budget_seal_exceeded`（原来只撤 all_cases_passed/label_verdict）；CLI 改为以盘上最终 summary 的 `seal.status` 与 `go_no_go` 决定退出码（0=sealed 且 go_*；3=未封口/预算越界；1=合成失败），不再使用写盘前内存值。
+- **测试**：N1 套件 11 passed（新增 go 撤回反例与两阶段正例；go 撤回反例同时钉死大 t0 下 901s 必触发 900s cap 的正确口径）。
+- 数值结论不变：六类 47 用例全过（计数 80/16/16/9），go=no_go 维持 `go_for_conditional_fit_diagnostics_review`；§3 有限收口说明与 §5 边界全部保持。

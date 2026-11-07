@@ -139,6 +139,15 @@ MAX_REPORT_BYTES = 32 * 1024 * 1024
 MAX_EXTREMA_PER_ROW_CATEGORY = 16
 MAX_EXTREMA_RECORD_BYTES = 2048
 
+# T6 retest sealed-chain anchors.  The analysis consumes generation_003
+# evidence (R0_003 / P_003 / I_002 / F_002); every consumed input file is
+# bound to the retest journal chain return_observation -> commits{P,I,F} ->
+# commit.json -> finish.json -> index_row_snapshot.artifacts.  These names
+# are frozen before execution, not discovered at runtime.
+RETEST_JOURNAL_INVOCATION = "w1-retest-20261106-003"
+RETEST_STAGE_SEQS = {"P": 8, "I": 9, "F": 10}
+SEAL_VERIFY_ROUNDS = 4
+
 EXTREMA_COLUMNS = [
     "row_key", "category", "model", "update", "parameter", "flat_index",
     "coord_index", "bits_hex", "score", "max_ratio", "max_abs_err",
@@ -154,10 +163,14 @@ GAP_ROWS_COLUMNS = [
     "n_presence_mismatch", "n_one_sided_observable",
     "labels", "saved_classification", "recomputed_classification",
     "classification_match", "old_state_precision", "old_state_sensitivity",
-    "old_new_only", "max_same_delta_ratio", "max_delta_ratio",
-    "max_theta_ratio", "max_m_ratio", "max_v_ratio",
+    "old_state_bound", "old_new_only", "max_same_delta_ratio",
+    "max_delta_ratio", "max_theta_ratio", "max_m_ratio", "max_v_ratio",
     "n_extrema_precision", "n_extrema_sensitivity",
 ]
+
+OLD_GAP_KINDS = ("parameter_delta_precision_gap",
+                 "cross_path_sensitivity_gap",
+                 "cross_path_bound_unverifiable")
 
 
 class N0Error(RuntimeError):
@@ -558,6 +571,138 @@ class N0Analyzer:
             "derived/audit/w1_real_training_update_audit/"
             "gradient_numerics_retest/real_analysis/attempt_001/analysis.json")
         self.notes: list[str] = []
+        self._project_root = self._find_project_root()
+
+    def _find_project_root(self) -> Path | None:
+        base = self.run_root.resolve()
+        for cand in (base, *base.parents):
+            if (cand / "pyproject.toml").is_file():
+                return cand
+        return None
+
+    def _resolve_journal_path(self, rel: str) -> Path:
+        for base in (self._project_root, self.run_root):
+            if base is None:
+                continue
+            cand = base / rel
+            if cand.exists():
+                return cand
+        raise N0Error(f"journal artifact path not found: {rel}")
+
+    def _verify_source_closure(self, shas: dict) -> dict:
+        """Bind every consumed input to the T6 retest sealed chain.
+
+        Chain: ``launch_journal/<inv>/return_observation.json`` (anchor root;
+        its SHA is recorded) -> ``commits[stage]`` {path, sha256} ->
+        commit.json -> ``finish`` {path, sha256} -> finish.json
+        ``index_row_snapshot.artifacts`` {rel_path: sha256}.  Each consumed
+        file's actual SHA must equal the sealed value; registration is
+        cross-checked against ``execution_registration_sha256`` in all three
+        stage snapshots, and the P NPZs against the F final report's replay
+        array anchors.  A coordinated modification of an NPZ and its own
+        report therefore no longer passes: both must still match the
+        journal-sealed values.  The post-chain analysis.json is not
+        journal-sealed; its SHA is recorded with an explicit note.
+        """
+        journal = self.run_root / "launch_journal" / RETEST_JOURNAL_INVOCATION
+        ret_path = journal / "return_observation.json"
+        if not ret_path.exists():
+            raise N0Error(f"T6 retest return_observation missing: {ret_path}")
+        facts: dict = {"journal_invocation": RETEST_JOURNAL_INVOCATION,
+                       "return_observation_sha256": sha256_file(ret_path),
+                       "stages": {}, "bindings": {},
+                       "analysis_journal_bound": False}
+        ret = json.loads(ret_path.read_text())
+        commits = ret.get("commits")
+        if not isinstance(commits, dict):
+            raise N0Error("return_observation.commits missing")
+        arts_by_stage: dict = {}
+        reg_shas: set = set()
+        for stage in RETEST_STAGE_SEQS:
+            ref = commits.get(stage)
+            if not (isinstance(ref, dict) and isinstance(ref.get("sha256"), str)
+                    and isinstance(ref.get("path"), str)):
+                raise N0Error(f"return_observation.commits.{stage} binding missing")
+            cpath = self._resolve_journal_path(ref["path"])
+            if sha256_file(cpath) != ref["sha256"]:
+                raise N0Error(f"journal {stage}: commit file SHA mismatch")
+            cdoc = json.loads(cpath.read_text())
+            fin = cdoc.get("finish")
+            if not (isinstance(fin, dict) and isinstance(fin.get("sha256"), str)
+                    and isinstance(fin.get("path"), str)):
+                raise N0Error(f"journal {stage}: finish binding missing")
+            fpath = self._resolve_journal_path(fin["path"])
+            if sha256_file(fpath) != fin["sha256"]:
+                raise N0Error(f"journal {stage}: finish file SHA mismatch")
+            fdoc = json.loads(fpath.read_text())
+            snap = fdoc.get("index_row_snapshot")
+            arts = snap.get("artifacts") if isinstance(snap, dict) else None
+            if not isinstance(arts, dict):
+                raise N0Error(f"journal {stage}: index_row_snapshot.artifacts missing")
+            arts_by_stage[stage] = arts
+            reg = snap.get("execution_registration_sha256") if isinstance(snap, dict) else None
+            if isinstance(reg, str):
+                reg_shas.add(reg)
+            facts["stages"][stage] = {"commit_sha256": ref["sha256"],
+                                      "finish_sha256": fin["sha256"]}
+        if len(reg_shas) != 1:
+            raise N0Error("execution_registration_sha256 disagrees across journal snapshots")
+        reg_sha = reg_shas.pop()
+
+        def _rel_for(name: str) -> str:
+            p = self.paths[name].resolve()
+            for base in (self._project_root, self.run_root):
+                if base is None:
+                    continue
+                try:
+                    return p.relative_to(base).as_posix()
+                except ValueError:
+                    continue
+            raise N0Error(f"input path outside journal bases: {self.paths[name]}")
+
+        stage_inputs = {"P": ("p_report", "p_npz", "p_npz_diffusion"),
+                        "I": ("i_report", "i_rows", "i_npz", "i_npz_diffusion")}
+        for stage, names in stage_inputs.items():
+            arts = arts_by_stage[stage]
+            for name in names:
+                rel = _rel_for(name)
+                sealed = arts.get(rel)
+                if not isinstance(sealed, str):
+                    raise N0Error(f"journal {stage}: consumed input not sealed: {rel}")
+                if sealed != shas[name]:
+                    raise N0Error(
+                        f"journal {stage} source closure mismatch for {rel}: "
+                        f"sealed {sealed[:16]} != current {shas[name][:16]}")
+                facts["bindings"][name] = {"stage": stage, "path": rel,
+                                           "sha256": shas[name]}
+        reg_rel = _rel_for("registration")
+        if sha256_file(self.paths["registration"]) != reg_sha:
+            raise N0Error("registration file SHA != journal execution_registration_sha256")
+        facts["bindings"]["registration"] = {"path": reg_rel, "sha256": reg_sha}
+
+        arts_f = arts_by_stage["F"]
+        final_rel = next((k for k in arts_f
+                          if k.endswith("/training_update_final.json")), None)
+        if final_rel is None:
+            raise N0Error("journal F: training_update_final.json not sealed")
+        final_path = self._resolve_journal_path(final_rel)
+        if sha256_file(final_path) != arts_f[final_rel]:
+            raise N0Error("journal F: final report file SHA mismatch")
+        fdoc = json.loads(final_path.read_text())
+        arrays = ((fdoc.get("worker_result") or {}).get("p_replay") or {}).get("arrays_sha256")
+        if not isinstance(arrays, dict):
+            raise N0Error("journal F final report: worker_result.p_replay.arrays_sha256 missing")
+        for model, name in (("deterministic", "p_npz"),
+                            ("diffusion", "p_npz_diffusion")):
+            if arrays.get(model) != shas[name]:
+                raise N0Error(
+                    f"journal F final report replay anchor mismatch for {model}: "
+                    f"sealed {str(arrays.get(model))[:16]} != current {shas[name][:16]}")
+            facts["bindings"][f"{name}_f_replay_anchor"] = {
+                "path": final_rel, "sha256": shas[name]}
+        facts["analysis_sha256"] = sha256_file(self.analysis_path)
+        facts["all_consumed_inputs_journal_bound"] = True
+        return facts
 
     # ------------------------------------------------------------------ load
     def load_inputs(self) -> dict:
@@ -621,7 +766,9 @@ class N0Analyzer:
                         f"{report_name} sealed anchor mismatch for {model}: "
                         f"recorded {entry['arrays_sha256'][:16]} != current "
                         f"{shas[npz_name][:16]}")
-        return {"registration": reg, "rows": rows, "selected": selected, "shas": shas}
+        source_closure = self._verify_source_closure(shas)
+        return {"registration": reg, "rows": rows, "selected": selected,
+                "shas": shas, "source_closure": source_closure}
 
     # ------------------------------------------------------- header prevalidation
     def prevalidate(self, selected: list) -> list:
@@ -722,21 +869,31 @@ class N0Analyzer:
         row_records: list[dict] = []
 
         # Old-chain cross-reference (read-only; keys are i_adamw_gap:*:kind).
+        # All three gap kinds are parsed, counted and delivered — the 25
+        # already-resolved bound events of the old 629 gaps have no row of
+        # their own in the retest result but must still appear in the
+        # comparison output.
         analysis = json.loads(self.analysis_path.read_text())
         old_state: dict = {}
         new_only_keys: set = set()
+        old_kind_counts = {k: 0 for k in OLD_GAP_KINDS}
+        new_only_kind_counts = {k: 0 for k in OLD_GAP_KINDS}
         for item in analysis.get("gaps", {}).get("items", []):
             parsed = parse_old_gap_key(item.get("key"))
             if parsed is None:
                 self.notes.append(f"unparsed_old_gap_key:{item.get('key')}")
                 continue
             old_state[parsed] = item.get("state")
+            if parsed[1] in old_kind_counts:
+                old_kind_counts[parsed[1]] += 1
         for item in analysis.get("gaps", {}).get("new_only_items", []):
             parsed = parse_old_gap_key(item.get("key"))
             if parsed is None:
                 self.notes.append(f"unparsed_new_only_key:{item.get('key')}")
                 continue
             new_only_keys.add(parsed)
+            if parsed[1] in new_only_kind_counts:
+                new_only_kind_counts[parsed[1]] += 1
 
         extrema_csv = io.StringIO()
         extrema_writer = csv.DictWriter(extrema_csv, fieldnames=EXTREMA_COLUMNS)
@@ -833,8 +990,9 @@ class N0Analyzer:
 
                 old_p = old_state.get((spec.key, "parameter_delta_precision_gap"), "")
                 old_s = old_state.get((spec.key, "cross_path_sensitivity_gap"), "")
-                old_note = "new_only" if ((spec.key, "parameter_delta_precision_gap") in new_only_keys
-                                          or (spec.key, "cross_path_sensitivity_gap") in new_only_keys) else ""
+                old_b = old_state.get((spec.key, "cross_path_bound_unverifiable"), "")
+                old_note = ("new_only" if any((spec.key, k) in new_only_keys
+                                              for k in OLD_GAP_KINDS) else "")
 
                 row_records.append({
                     "key": spec.key, "model": spec.model, "update": spec.update,
@@ -849,6 +1007,7 @@ class N0Analyzer:
                     "classification_match": classification_match,
                     "old_state_precision": old_p,
                     "old_state_sensitivity": old_s,
+                    "old_state_bound": old_b,
                     "old_new_only": old_note,
                     "max_same_delta_ratio": max_same, "max_delta_ratio": max_delta_ratio,
                     "max_theta_ratio": max_theta_ratio, "max_m_ratio": max_m_ratio,
@@ -994,6 +1153,19 @@ class N0Analyzer:
             "budget": self.budget.facts(),
             "notes": self.notes,
             "n_rows_with_anomalies": sum(1 for r in row_records if r["n_source_anomaly"] > 0),
+            "source_closure": loaded["source_closure"],
+            "old_chain_comparison": {
+                "analysis_sha256": sha256_file(self.analysis_path),
+                "items_total": sum(old_kind_counts.values()),
+                "items_by_kind": old_kind_counts,
+                "new_only_total": sum(new_only_kind_counts.values()),
+                "new_only_by_kind": new_only_kind_counts,
+                "rows_annotated": sum(
+                    1 for r in row_records
+                    if (r["old_state_precision"] or r["old_state_sensitivity"]
+                        or r["old_state_bound"])),
+                "kinds": list(OLD_GAP_KINDS),
+            },
         }
         complete = (not self.budget.exceeded) and all(
             r["classification_match"] for r in row_records)
@@ -1001,11 +1173,16 @@ class N0Analyzer:
         summary["label_verdict"] = ("complete" if summary["coverage_complete"]
                                     else "evidence_incomplete/resource_limit")
 
-        # Hard-deadline and return-coverage seal: costs only increase; a slow
-        # write that crosses the hard deadline revokes the completion claim.
+        # Publish-then-verify seal: costs only increase; a slow write that
+        # crosses the wall cap revokes the completion claim on disk and the
+        # CLI decides from the sealed on-disk summary, never from memory.
         summary_path = self.output_dir / "summary.json"
-        _write_summary_sealed(summary_path, summary, self.budget)
-        return summary
+        _write_summary_sealed(
+            summary_path, summary, self.budget,
+            withdraw={"budget_exceeded_after_seal": True,
+                      "coverage_complete": False,
+                      "label_verdict": "budget_exceeded_after_seal"})
+        return json.loads(summary_path.read_text())
 
 
 def _fsync_dir(path: Path) -> None:
@@ -1016,24 +1193,71 @@ def _fsync_dir(path: Path) -> None:
         __import__("os").close(fd)
 
 
-def _write_summary_sealed(summary_path: Path, summary: dict, budget: N0Budget) -> None:
-    """Write summary, then verify the write is covered by billed cost and
-    inside the hard deadline; a violation rewrites the summary as incomplete
-    (costs only increase, safety direction) with a final wall sample."""
-    now = time.perf_counter()
-    summary["budget"]["measured_wall_s_at_summary"] = now - budget.t0
-    summary["seal"] = {
-        "hard_deadline_s": budget.hard_deadline,
-        "measured_wall_s_before_summary_write": now - budget.t0,
-    }
-    summary_path.write_text(json.dumps(summary, indent=1))
-    _fsync_dir(summary_path.parent)
-    final = time.perf_counter() - budget.t0
-    summary["seal"]["measured_wall_s_final"] = final
-    if final > budget.hard_deadline:
-        summary["budget_exceeded_after_seal"] = True
-        summary["coverage_complete"] = False
-        summary["label_verdict"] = "budget_exceeded_after_seal"
-    summary["budget"]["measured_wall_s_at_summary"] = final
-    summary_path.write_text(json.dumps(summary, indent=1))
-    _fsync_dir(summary_path.parent)
+def _write_json_fsync(path: Path, doc: dict) -> None:
+    path.write_text(json.dumps(doc, indent=1))
+    _fsync_dir(path.parent)
+
+
+def _write_summary_sealed(summary_path: Path, summary: dict, budget: N0Budget,
+                          withdraw: dict | None = None, clock=None) -> dict:
+    """Publish-then-verify summary seal (costs only increase, safety direction).
+
+    Every time comparison uses *elapsed seconds* (``clock() - budget.t0``)
+    against ``budget.wall_cap_s`` — never against the absolute
+    ``hard_deadline`` perf-counter value.  Each write is followed by a
+    post-write sample; a completion claim may only remain on disk when that
+    sample is still inside the wall cap, and NO write happens after the
+    final passing sample.  A post-write sample that crosses the cap forces a
+    conservative rewrite to ``budget_exceeded_after_seal`` with the
+    ``withdraw`` fields applied (e.g. revoking go_no_go).  The returned
+    facts are authoritative; callers must not trust pre-write state.
+    """
+    now = clock if clock is not None else time.perf_counter
+    cap = float(budget.wall_cap_s)
+    samples: list[float] = []
+    stage = "publish"
+    for rnd in range(2 * SEAL_VERIFY_ROUNDS + 1):
+        pre = now() - budget.t0
+        if pre > cap:
+            status = "budget_exceeded_after_seal"
+        elif stage == "publish":
+            status = "sealing"
+        else:
+            status = "sealed_within_budget"
+        doc = dict(summary)
+        doc["budget"] = {**summary.get("budget", {}),
+                         "measured_wall_s_at_summary": pre}
+        doc["seal"] = {"round": rnd, "status": status, "wall_cap_s": cap,
+                       "t0_perf_counter": budget.t0, "pre_write_elapsed_s": pre,
+                       "terminal": status in ("sealed_within_budget",
+                                              "budget_exceeded_after_seal")}
+        if status == "budget_exceeded_after_seal" and withdraw:
+            doc.update(withdraw)
+        _write_json_fsync(summary_path, doc)
+        post = now() - budget.t0
+        samples.append(post)
+        if post > cap:
+            if status == "budget_exceeded_after_seal":
+                # exceeded claim verified on disk; conservative final state
+                return {"status": "budget_exceeded_after_seal",
+                        "measured_wall_s": post, "rounds": rnd + 1,
+                        "samples": samples}
+            stage = "withdraw"  # completion claim invalid; rewrite exceeded
+            continue
+        if status == "sealing":
+            stage = "seal"
+            continue
+        # sealed_within_budget or (already) exceeded, both verified landed
+        return {"status": status, "measured_wall_s": post,
+                "rounds": rnd + 1, "samples": samples}
+    # fail-closed guard (unreachable with a monotonic clock)
+    doc = dict(summary)
+    doc["seal"] = {"status": "budget_exceeded_after_seal", "wall_cap_s": cap,
+                   "t0_perf_counter": budget.t0, "terminal": True,
+                   "rounds_exhausted": True}
+    if withdraw:
+        doc.update(withdraw)
+    _write_json_fsync(summary_path, doc)
+    return {"status": "budget_exceeded_after_seal",
+            "measured_wall_s": now() - budget.t0,
+            "rounds": 2 * SEAL_VERIFY_ROUNDS + 1, "samples": samples}

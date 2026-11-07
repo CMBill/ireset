@@ -103,3 +103,13 @@
 - t0 前移至模块导入前；summary 写盘后最终墙钟封口（`measured_wall_s_final=54.251s`，硬截止 900s 内）。
 - 位分布（v2 重放，与 v1 一致部分不变）：UNOBSERVABLE P/I 1,214,768/1,214,770、V/M/DELTA/THETA 跨路径门失败 1499/1346/844/82、写擦除 203/201、m 零/符号 2、ONE_SIDED 4、同输入门失败/zero-invented/区间外/来源异常全部 0；分类重放 528/528、0 行 SOURCE_ANOMALY；`coverage_complete=true`。
 - 标签分布：203 `precision_limited` + 42 `cross_path_sensitive` + 147 `cross_path_sensitive|precision_limited` + 136 `no_gap`。**结论不变：全部 392 行 gap 均为 precision_limited 或 cross_path_sensitive，无实现问题候选**；测试 13 项反例全过（含 roster 替换、封口锚漂移、写界篡改、same_input 篡改、zero-invention 篡改、attempt 独占等新反例）。
+
+## 8. 修订记录（2026-11-07 第二轮复阅后，attempt_003 权威）
+
+第二轮独立复阅确认 v2 数值修复成立，另提出 2 P1+3 P2，全部修复并以修正协议重跑：`attempt_001/002` 保留为被取代证据，权威为 **`attempt_003`**。
+
+- **封口重写（P1×2）**：`_write_summary_sealed` 改为发布-核验循环——比较口径统一为**已用秒数 vs `wall_cap_s`**（修复原实现把已用秒数与绝对 `hard_deadline=t0+cap` 比较的口径错误，t0 大时 901s 不触发 900s 超限）；先写非权威 `sealing`，写盘后采样，cap 内写 `sealed_within_budget` 并再次采样；**通过采样之后无任何写盘**，采样越界即撤回为 `budget_exceeded_after_seal`。attempt_003 实测 seal=sealed_within_budget（round 1，55.47s 含导入）。
+- **来源闭链（P2）**：新增 `_verify_source_closure`，以 retest journal `return_observation.json`（SHA 入册）为锚根，经 `commits{P,I,F}` → `commit.json` → `finish.json`（逐级文件 SHA 核验）→ `index_row_snapshot.artifacts` 对全部 8 个消费输入逐文件 SHA 对照；registration 对照三个 stage 快照一致的 `execution_registration_sha256`（`87961838…`）；P NPZ 另对照 F 终局报告重放数组锚（`44bb2b19…`/`8d02383d…`）。attempt_003 实测全过，P/I/F commit SHA `773cb48c…`/`459ef764…`/`7ee1965b…` 与 journal 逐位一致；协调修改 NPZ+报告的反例被拒（未同步 journal 即 `source closure mismatch` 硬失败）。analysis.json 非 journal 封口件，SHA `d03f2d78…` 显式记录为 `analysis_journal_bound=false`。
+- **旧 629 对照补齐 bound 事件（P2）**：`gap_rows.csv` 新增 `old_state_bound` 列；summary 新增 `old_chain_comparison`。attempt_003 实测 items_total=**629**（381 precision+223 sensitivity+**25 bound**）、new_only 5（1+4）、rows_annotated=424；`old_state_bound` 恰 25 行 `resolved`（deterministic u1×6/u2×5、diffusion u1×6/u2×8，均为 k.bias 类与 root_in/out），629 事件全部交付。
+- **测试**：N0 套件 18 passed（新增 6 项反例：协调篡改拒、registration 篡改拒、封口时间口径、通过后零写盘、慢 sealed 写盘撤回、bound 列交付）。
+- 其余数值结论与 §4/§7 不变：coverage_complete=true、0 SOURCE_ANOMALY、528/528 分类重放一致、350/189/147/392 事件重放、位分布与 ONE_SIDED=4 不变。
