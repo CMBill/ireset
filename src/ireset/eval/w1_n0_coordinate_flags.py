@@ -147,6 +147,11 @@ MAX_EXTREMA_RECORD_BYTES = 2048
 RETEST_JOURNAL_INVOCATION = "w1-retest-20261106-003"
 RETEST_STAGE_SEQS = {"P": 8, "I": 9, "F": 10}
 SEAL_VERIFY_ROUNDS = 4
+# Plan §8.2: the registered cost must cover the sealing write AND the
+# process return.  The seal tail reserve = fixed return tail + 2x observed
+# write latency (min floor), registered in the same write as the claim.
+SEAL_TAIL_MIN_RESERVE_S = 1.0
+SEAL_PROCESS_RETURN_TAIL_S = 3.0
 
 EXTREMA_COLUMNS = [
     "row_key", "category", "model", "update", "parameter", "flat_index",
@@ -617,7 +622,7 @@ class N0Analyzer:
         if not isinstance(commits, dict):
             raise N0Error("return_observation.commits missing")
         arts_by_stage: dict = {}
-        reg_shas: set = set()
+        reg_values: dict[str, str] = {}
         for stage in RETEST_STAGE_SEQS:
             ref = commits.get(stage)
             if not (isinstance(ref, dict) and isinstance(ref.get("sha256"), str)
@@ -640,14 +645,24 @@ class N0Analyzer:
             if not isinstance(arts, dict):
                 raise N0Error(f"journal {stage}: index_row_snapshot.artifacts missing")
             arts_by_stage[stage] = arts
+            # Strict per-stage registration binding: the field must exist in
+            # EVERY stage snapshot, be a 64-char lowercase-hex string, and all
+            # three values must be equal — a missing/malformed field in one
+            # stage is a hard failure, never silently skipped.
             reg = snap.get("execution_registration_sha256") if isinstance(snap, dict) else None
-            if isinstance(reg, str):
-                reg_shas.add(reg)
+            if not (isinstance(reg, str) and len(reg) == 64
+                    and all(c in "0123456789abcdef" for c in reg)):
+                raise N0Error(
+                    f"journal {stage}: execution_registration_sha256 missing or malformed")
+            reg_values[stage] = reg
             facts["stages"][stage] = {"commit_sha256": ref["sha256"],
-                                      "finish_sha256": fin["sha256"]}
-        if len(reg_shas) != 1:
-            raise N0Error("execution_registration_sha256 disagrees across journal snapshots")
-        reg_sha = reg_shas.pop()
+                                      "finish_sha256": fin["sha256"],
+                                      "execution_registration_sha256": reg}
+        if len(set(reg_values.values())) != 1:
+            raise N0Error(
+                "execution_registration_sha256 disagrees across journal snapshots: "
+                + json.dumps(reg_values, sort_keys=True))
+        reg_sha = next(iter(reg_values.values()))
 
         def _rel_for(name: str) -> str:
             p = self.paths[name].resolve()
@@ -1200,25 +1215,43 @@ def _write_json_fsync(path: Path, doc: dict) -> None:
 
 def _write_summary_sealed(summary_path: Path, summary: dict, budget: N0Budget,
                           withdraw: dict | None = None, clock=None) -> dict:
-    """Publish-then-verify summary seal (costs only increase, safety direction).
+    """Publish-then-verify summary seal with covering cost registration.
 
-    Every time comparison uses *elapsed seconds* (``clock() - budget.t0``)
-    against ``budget.wall_cap_s`` — never against the absolute
-    ``hard_deadline`` perf-counter value.  Each write is followed by a
-    post-write sample; a completion claim may only remain on disk when that
-    sample is still inside the wall cap, and NO write happens after the
-    final passing sample.  A post-write sample that crosses the cap forces a
-    conservative rewrite to ``budget_exceeded_after_seal`` with the
-    ``withdraw`` fields applied (e.g. revoking go_no_go).  The returned
+    Plan §8.2: a completion claim may only be published once the sealing AND
+    return time are proven covered by the registered cost and inside the
+    hard deadline.  Every comparison uses *elapsed seconds*
+    (``clock() - budget.t0``) against ``budget.wall_cap_s`` — never against
+    the absolute perf-counter deadline.  Each write registers
+    ``measured_wall_s_at_summary = pre + seal_tail_reserve_s`` IN THE SAME
+    document, where the reserve covers 2x the observed write latency plus a
+    fixed process-return tail; the claim and its covering cost therefore
+    land atomically, so a kill mid-write leaves either an unparseable file
+    (fail-closed) or a non-terminal claim whose registered cost bounds the
+    write that produced it.  Each write is followed by a post-write sample:
+    a sample past the cap forces a conservative withdrawal rewrite
+    (``budget_exceeded_after_seal`` with ``withdraw`` applied); a sample
+    beyond the registered cost forces a billing update (reserve doubling,
+    costs only increase).  The terminal ``sealed_within_budget`` claim is
+    only written after the non-terminal ``sealing`` write passed both
+    checks, and its own write is verified the same way; NO write happens
+    after the final passing sample.  Residual exposure is bounded by the
+    registered reserve and documented as the audit boundary.  The returned
     facts are authoritative; callers must not trust pre-write state.
     """
     now = clock if clock is not None else time.perf_counter
     cap = float(budget.wall_cap_s)
     samples: list[float] = []
     stage = "publish"
-    for rnd in range(2 * SEAL_VERIFY_ROUNDS + 1):
+    observed_write_latency = 0.0
+    for rnd in range(3 * SEAL_VERIFY_ROUNDS + 1):
         pre = now() - budget.t0
-        if pre > cap:
+        reserve = (SEAL_PROCESS_RETURN_TAIL_S
+                   + max(SEAL_TAIL_MIN_RESERVE_S, 2.0 * observed_write_latency))
+        measured = pre + reserve
+        if pre > cap or measured > cap:
+            # sealing (plus its registered tail) cannot be billed inside the
+            # wall cap: a completion claim would be unaffordable, so the
+            # honest state is exceeded (plan §8.2, costs only increase).
             status = "budget_exceeded_after_seal"
         elif stage == "publish":
             status = "sealing"
@@ -1226,9 +1259,11 @@ def _write_summary_sealed(summary_path: Path, summary: dict, budget: N0Budget,
             status = "sealed_within_budget"
         doc = dict(summary)
         doc["budget"] = {**summary.get("budget", {}),
-                         "measured_wall_s_at_summary": pre}
+                         "measured_wall_s_at_summary": measured}
         doc["seal"] = {"round": rnd, "status": status, "wall_cap_s": cap,
                        "t0_perf_counter": budget.t0, "pre_write_elapsed_s": pre,
+                       "seal_tail_reserve_s": reserve,
+                       "measured_wall_s_at_summary": measured,
                        "terminal": status in ("sealed_within_budget",
                                               "budget_exceeded_after_seal")}
         if status == "budget_exceeded_after_seal" and withdraw:
@@ -1236,6 +1271,7 @@ def _write_summary_sealed(summary_path: Path, summary: dict, budget: N0Budget,
         _write_json_fsync(summary_path, doc)
         post = now() - budget.t0
         samples.append(post)
+        observed_write_latency = max(observed_write_latency, post - pre)
         if post > cap:
             if status == "budget_exceeded_after_seal":
                 # exceeded claim verified on disk; conservative final state
@@ -1244,10 +1280,15 @@ def _write_summary_sealed(summary_path: Path, summary: dict, budget: N0Budget,
                         "samples": samples}
             stage = "withdraw"  # completion claim invalid; rewrite exceeded
             continue
+        if post > measured:
+            # registered cost did not cover the actual write; retry with a
+            # grown reserve (billing update, costs only increase)
+            continue
         if status == "sealing":
             stage = "seal"
             continue
-        # sealed_within_budget or (already) exceeded, both verified landed
+        # sealed_within_budget (or already exceeded) verified: billing
+        # covered the write and the sample is inside the cap
         return {"status": status, "measured_wall_s": post,
                 "rounds": rnd + 1, "samples": samples}
     # fail-closed guard (unreachable with a monotonic clock)
@@ -1260,4 +1301,47 @@ def _write_summary_sealed(summary_path: Path, summary: dict, budget: N0Budget,
     _write_json_fsync(summary_path, doc)
     return {"status": "budget_exceeded_after_seal",
             "measured_wall_s": now() - budget.t0,
-            "rounds": 2 * SEAL_VERIFY_ROUNDS + 1, "samples": samples}
+            "rounds": 3 * SEAL_VERIFY_ROUNDS + 1, "samples": samples}
+
+
+def verify_return_coverage(summary_path: Path, budget: N0Budget,
+                           withdraw: dict | None = None, clock=None) -> dict:
+    """Independent post-print return-coverage proof (plan §8.2).
+
+    Samples the elapsed time AFTER the CLI output was produced and checks it
+    against the summary's registered cost (``measured_wall_s_at_summary``,
+    which already includes the process-return tail reserve) and the wall
+    cap.  If the actual return time is NOT covered, the completion claim on
+    disk is withdrawn to ``budget_exceeded_after_seal`` (conservative
+    direction; costs only increase) and ``covered=False`` is returned — the
+    caller must then fail closed.  The covered case performs no write.
+    """
+    now = clock if clock is not None else time.perf_counter
+    elapsed = now() - budget.t0
+    doc = json.loads(Path(summary_path).read_text())
+    seal = doc.get("seal") or {}
+    measured = seal.get("measured_wall_s_at_summary")
+    cap = float(budget.wall_cap_s)
+    covered = (isinstance(measured, (int, float))
+               and elapsed <= float(measured) and elapsed <= cap
+               and seal.get("status") == "sealed_within_budget")
+    if covered:
+        return {"covered": True, "elapsed_s": elapsed,
+                "registered_measured_s": float(measured),
+                "wall_cap_s": cap, "withdrawn": False}
+    withdrawn_doc = dict(doc)
+    withdrawn_doc["seal"] = {**seal, "status": "budget_exceeded_after_seal",
+                             "terminal": True,
+                             "return_coverage_elapsed_s": elapsed,
+                             "return_coverage_registered_s": measured,
+                             "note": "return_coverage_withdrawn"}
+    if isinstance(measured, (int, float)) and elapsed > float(measured):
+        withdrawn_doc["seal"]["measured_wall_s_at_summary"] = elapsed
+        withdrawn_doc["budget"] = {**doc.get("budget", {}),
+                                   "measured_wall_s_at_summary": elapsed}
+    if withdraw:
+        withdrawn_doc.update(withdraw)
+    _write_json_fsync(Path(summary_path), withdrawn_doc)
+    return {"covered": False, "elapsed_s": elapsed,
+            "registered_measured_s": measured if isinstance(measured, (int, float)) else None,
+            "wall_cap_s": cap, "withdrawn": True}

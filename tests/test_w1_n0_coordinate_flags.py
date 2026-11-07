@@ -688,9 +688,11 @@ def test_summary_seal_elapsed_vs_cap_withdrawal(tmp_path):
 
 
 def test_summary_seal_no_write_after_passing_sample(tmp_path, monkeypatch):
-    """P1-2: once a post-write sample is inside the cap with a sealed claim,
-    no further write may happen (a slow second write can no longer publish a
-    completion claim past the budget)."""
+    """P1-2 + P1-1: the terminal sealed claim is only written after the
+    non-terminal sealing write passed both checks; once the passing sample
+    lands, no further write may happen; and the on-disk registered cost
+    (pre + tail reserve, incl. process-return tail) must COVER the actual
+    post-write elapsed — not merely echo the pre-write sample."""
     calls = {"n": 0}
     real = n0._write_json_fsync
 
@@ -700,16 +702,23 @@ def test_summary_seal_no_write_after_passing_sample(tmp_path, monkeypatch):
 
     monkeypatch.setattr(n0, "_write_json_fsync", counting)
     budget = n0.N0Budget(wall_cap_s=900.0, reserve_s=60.0, t0=0.0)
-    ticks = iter([10.0, 20.0, 21.0, 30.0])
+    ticks = iter([10.0, 20.0, 21.0, 30.0, 31.0, 40.0])
     summary = {"coverage_complete": True, "label_verdict": "complete", "budget": {}}
     facts = n0._write_summary_sealed(tmp_path / "s.json", summary, budget,
                                      clock=lambda: next(ticks))
     assert facts["status"] == "sealed_within_budget"
-    assert facts["measured_wall_s"] == 30.0
-    assert calls["n"] == 2
+    assert facts["measured_wall_s"] == 40.0
+    assert calls["n"] == 3
     disk = json.loads((tmp_path / "s.json").read_text())
     assert disk["seal"]["status"] == "sealed_within_budget"
     assert disk["coverage_complete"] is True
+    # registered cost covers the actual write (30s) and the return tail:
+    # measured = 31 + (3 + 2x10) = 54 >= every observed sample
+    assert disk["seal"]["measured_wall_s_at_summary"] == 54.0
+    assert disk["budget"]["measured_wall_s_at_summary"] == 54.0
+    assert disk["seal"]["seal_tail_reserve_s"] == 23.0
+    assert disk["seal"]["measured_wall_s_at_summary"] >= facts["measured_wall_s"]
+    assert disk["seal"]["terminal"] is True
 
 
 def test_summary_seal_slow_sealed_write_revokes(tmp_path, monkeypatch):
@@ -755,3 +764,81 @@ def test_old_state_bound_column_delivered(world):
     assert oc["kinds"] == ["parameter_delta_precision_gap",
                            "cross_path_sensitivity_gap",
                            "cross_path_bound_unverifiable"]
+
+
+def test_return_coverage_covered_and_withdrawn(tmp_path):
+    """P1-1: the actual return time must be covered by the registered cost
+    (plan §8.2).  Covered -> no rewrite; uncovered -> conservative withdrawal
+    with the withdraw fields applied and the registered cost updated."""
+    budget = n0.N0Budget(wall_cap_s=900.0, reserve_s=60.0, t0=0.0)
+    doc = {"coverage_complete": True, "label_verdict": "complete",
+           "budget": {"measured_wall_s_at_summary": 100.0},
+           "seal": {"status": "sealed_within_budget", "terminal": True,
+                    "measured_wall_s_at_summary": 100.0, "wall_cap_s": 900.0}}
+    p = tmp_path / "s.json"
+    p.write_text(json.dumps(doc))
+    raw = p.read_bytes()
+    cov = n0.verify_return_coverage(p, budget, clock=lambda: 50.0)
+    assert cov == {"covered": True, "elapsed_s": 50.0,
+                   "registered_measured_s": 100.0, "wall_cap_s": 900.0,
+                   "withdrawn": False}
+    assert p.read_bytes() == raw  # covered case performs no write
+    cov2 = n0.verify_return_coverage(
+        p, budget,
+        withdraw={"coverage_complete": False,
+                  "label_verdict": "budget_exceeded_after_seal"},
+        clock=lambda: 200.0)
+    assert cov2["covered"] is False and cov2["withdrawn"] is True
+    disk = json.loads(p.read_text())
+    assert disk["seal"]["status"] == "budget_exceeded_after_seal"
+    assert disk["seal"]["note"] == "return_coverage_withdrawn"
+    assert disk["seal"]["measured_wall_s_at_summary"] == 200.0
+    assert disk["coverage_complete"] is False
+    assert disk["label_verdict"] == "budget_exceeded_after_seal"
+
+
+def test_registration_binding_strict(world):
+    """P2: a missing, malformed or disagreeing execution_registration_sha256
+    in ANY stage snapshot must be a hard failure, never silently skipped."""
+    root, out, apath = world
+
+    def cascade():
+        commits = {}
+        for stage, seq in (("P", 8), ("I", 9), ("F", 10)):
+            ev = root / "execution_events" / f"{seq:06d}"
+            (ev / "commit.json").write_text(json.dumps(
+                {"finish": {"path": f"execution_events/{seq:06d}/finish.json",
+                            "sha256": _sha(ev / "finish.json")}}))
+            commits[stage] = {"path": f"execution_events/{seq:06d}/commit.json",
+                              "sha256": _sha(ev / "commit.json")}
+        (root / "launch_journal" / RETEST_INV / "return_observation.json").write_text(
+            json.dumps({"commits": commits}))
+
+    # missing field in one stage
+    fin = root / "execution_events/000009/finish.json"
+    doc = json.loads(fin.read_text())
+    del doc["index_row_snapshot"]["execution_registration_sha256"]
+    fin.write_text(json.dumps(doc))
+    cascade()
+    with pytest.raises(n0.N0Error, match="execution_registration_sha256 missing or malformed"):
+        make_analyzer(root, out, analysis_path=apath).run()
+
+    # malformed (non-hex) value
+    _build_journal(root)
+    fin = root / "execution_events/000009/finish.json"
+    doc = json.loads(fin.read_text())
+    doc["index_row_snapshot"]["execution_registration_sha256"] = "XYZ" * 21 + "x"
+    fin.write_text(json.dumps(doc))
+    cascade()
+    with pytest.raises(n0.N0Error, match="missing or malformed"):
+        make_analyzer(root, out, analysis_path=apath).run()
+
+    # disagreeing values across stages
+    _build_journal(root)
+    fin = root / "execution_events/000008/finish.json"
+    doc = json.loads(fin.read_text())
+    doc["index_row_snapshot"]["execution_registration_sha256"] = "a" * 64
+    fin.write_text(json.dumps(doc))
+    cascade()
+    with pytest.raises(n0.N0Error, match="disagrees across journal snapshots"):
+        make_analyzer(root, out, analysis_path=apath).run()

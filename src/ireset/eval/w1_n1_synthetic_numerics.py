@@ -33,7 +33,8 @@ from ireset.eval.w1_n0_coordinate_flags import (BudgetExceeded,  # noqa: F401
                                                 compute_row_flags,
                                                 recompute_classification,
                                                 _write_json_fsync,
-                                                _write_summary_sealed)
+                                                _write_summary_sealed,
+                                                verify_return_coverage)
 from ireset.eval.w1_real_training_update_audit import (
     _cross_path_flags,
     _delta_observability,

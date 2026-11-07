@@ -58,3 +58,12 @@
 - **go 建议随撤回同步撤销（P2）**：`N1_WITHDRAW_ON_EXCEED` 在封口撤回时把 `go_no_go` 一并改为 `no_go_budget_seal_exceeded`（原来只撤 all_cases_passed/label_verdict）；CLI 改为以盘上最终 summary 的 `seal.status` 与 `go_no_go` 决定退出码（0=sealed 且 go_*；3=未封口/预算越界；1=合成失败），不再使用写盘前内存值。
 - **测试**：N1 套件 11 passed（新增 go 撤回反例与两阶段正例；go 撤回反例同时钉死大 t0 下 901s 必触发 900s cap 的正确口径）。
 - 数值结论不变：六类 47 用例全过（计数 80/16/16/9），go=no_go 维持 `go_for_conditional_fit_diagnostics_review`；§3 有限收口说明与 §5 边界全部保持。
+
+## 8. 修订记录（2026-11-07 第三轮复阅后，attempt_004 权威）
+
+第三轮独立复阅提出 2 P1+1 P2（涉及 N1 的为登记成本覆盖与终态时序，与 N0 共享实现），全部修复并以修正协议重跑：权威为 **`attempt_004`**。
+
+- **登记成本覆盖封口与返回（P1×2，与 N0 共享）**：登记成本 = 写前采样 + 尾部预留（固定返回尾部 3.0s + 2×已观测写盘延迟，下限 1.0s），与声明同盘；写后核验覆盖，未覆盖即增大预留重写；终态 `sealed` 仅在非终态 `sealing` 通过双核验后发布；CLI 打印后经 `verify_return_coverage` 独立核验实际返回时间，未覆盖即盘上撤回完成声明**与 go 建议**并 fail-closed 退出 3。attempt_004 实测：写盘前采样 3.87s、预留 4.0s、登记成本 **7.87s**，返回覆盖成立（exit 0）。
+- **registration 绑定严格性（P2，N0 侧闭链）**：逐阶段硬性校验（存在/64 位小写十六进制/三值相等），缺失、畸形、不一致均硬失败。
+- **测试**：N1 套件 11 passed（两阶段正例升级为同时断言盘上登记成本 54s 覆盖写后样本 40s）。
+- 数值结论不变：六类 47 用例全过（计数 80/16/16/9），go=no_go 维持 `go_for_conditional_fit_diagnostics_review`；§3 有限收口说明与 §5 边界全部保持。

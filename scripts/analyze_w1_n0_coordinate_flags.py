@@ -86,6 +86,18 @@ def main() -> int:
                    ("measured_wall_s_at_summary", "work_deadline_s", "hard_deadline_s",
                     "budget_exceeded", "stopped_at")},
     }, indent=1))
+    # Independent post-print return-coverage proof (plan §8.2): the actual
+    # return time must be covered by the registered cost; a violation
+    # withdraws the completion claim on disk and fails closed.
+    cov = n0.verify_return_coverage(
+        out_dir / "summary.json", budget,
+        withdraw={"budget_exceeded_after_seal": True,
+                  "coverage_complete": False,
+                  "label_verdict": "budget_exceeded_after_seal"})
+    if not cov["covered"]:
+        print(json.dumps({"return_coverage": cov, "decision": "fail_closed"}),
+              file=sys.stderr)
+        return 3
     # Fail-closed: run() re-reads the sealed summary from disk, so this
     # decision uses the on-disk terminal state, never pre-write memory.
     sealed = (summary.get("seal") or {}).get("status") == "sealed_within_budget"

@@ -90,6 +90,16 @@ def main() -> int:
     sealed = (disk.get("seal") or {}).get("status") == "sealed_within_budget"
     if not sealed or disk.get("budget", {}).get("budget_exceeded"):
         return 3
+    # Independent post-print return-coverage proof (plan §8.2): the actual
+    # return time must be covered by the registered cost; a violation
+    # withdraws the completion claim AND the go/no-go recommendation on disk
+    # and fails closed.
+    cov = n1.verify_return_coverage(Path(paths["summary"]), budget,
+                                    withdraw=dict(n1.N1_WITHDRAW_ON_EXCEED))
+    if not cov["covered"]:
+        print(json.dumps({"return_coverage": cov, "decision": "fail_closed"}),
+              file=sys.stderr)
+        return 3
     if disk.get("all_cases_passed") and str(disk.get("go_no_go") or "").startswith("go_"):
         return 0
     return 1

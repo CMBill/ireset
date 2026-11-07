@@ -345,3 +345,15 @@ N0 attempt_002（v2）结果：coverage_complete=true、0 异常、54.25s（预�
 | P2：旧 629 对照遗漏 25 项 bound 事件 | `gap_rows.csv` 新增 `old_state_bound` 列；summary 新增 `old_chain_comparison`（items_total/items_by_kind/new_only_by_kind/rows_annotated），三类事件全部交付 | 只读附注，不改写旧分类 |
 
 N0 attempt_003 结果：coverage_complete=true、0 异常、55.47s（seal=sealed_within_budget，round 1）；闭链全过——P/I/F commit SHA 与 journal 记录一致（`773cb48c…`/`459ef764…`/`7ee1965b…`）、registration SHA `87961838…`、F 重放锚 `44bb2b19…`/`8d02383d…`；事件重放 350/189/147/392 与标签 350/189/136 不变；旧对照 items_total=629（381 precision+223 sensitivity+25 bound）、new_only 5（1+4）、rows_annotated=424，`old_state_bound` 恰好 25 行 resolved。N1 attempt_003：六类 47 用例全过（计数 80/16/16/9），go=no_go 维持 `go_for_conditional_fit_diagnostics_review`，seal 3.95s（round 1）。测试 **29 passed**（N0 18+N1 11，新增 6 项：协调篡改/registration 篡改/封口时间口径/通过后零写盘/慢 sealed 写盘撤回/bound 列交付 + N1 go 撤回与两阶段正例）。I/R/D1/D6/F 仍未实施；真实拟合仍须 §8.3 新冻结材料与新明确授权。
+
+## 16. v0.5 第三轮复阅修订对照（登记成本覆盖、终态时序与 registration 严格性）
+
+2026-11-07 第三轮独立复阅确认前两轮修复与数值解释成立，另提出 2 P1+1 P2，全部修复并以修正协议重跑：`attempt_003` 保留为被取代证据，权威为 **attempt_004**。本轮只改 N0/N1 工具、测试与人读记录；旧 T6 材料、契约与授权不改写；暂不进入 I。
+
+| 复阅问题 | 修复 | 不变边界 |
+| --- | --- | --- |
+| P1：登记成本未覆盖封口与实际返回（盘上 `measured_wall_s_at_summary` 只存写前 `pre`，写后样本仅在返回字典，N0 丢弃/N1 仅打印，无绑定覆盖证明） | 登记成本改为 **`pre + seal_tail_reserve_s`** 并与声明**同一写盘原子落盘**（预留 = 固定返回尾部 `SEAL_PROCESS_RETURN_TAIL_S=3.0` + 2×已观测写盘延迟，下限 1.0s）；写后核验 `post ≤ measured`，不覆盖即增大预留重写（成本只升不降）；新增 `verify_return_coverage`——CLI 在打印后独立采样实际返回时间并对盘上登记成本核验，未覆盖即盘上撤回为 `budget_exceeded_after_seal` 并 fail-closed 退出 3 | 预算数值 900/60/840 不变；正常路径反例断言盘上 54s ≥ 写后 40s |
+| P1：完成声明先于最终核验落盘（`sealed/terminal=true` 在写后采样之前发布，写盘后/采样前被终止会残留未核验完成声明） | 三态时序：非终态 `sealing`（不可消费）→ 写后双核验（cap 与计费覆盖）→ 才写终态 `sealed_within_budget`，终态写盘自身的登记成本（含尾部预留）已先核验 ≤ cap 且与声明同盘；终态写盘后再采样核验，越界即撤回。残余暴露=写盘延迟超过登记预留的击杀窗口，以入册预留值定界（与 D/E 教义一致的审计口径） | 反例：慢 sealed 写盘仍被撤回（3 次写、终态 exceeded）；sealing 残留不可消费 |
+| P2：registration 绑定字段缺失/类型错误被跳过（只剩一个有效 SHA 也能通过） | 逐阶段硬性要求 `execution_registration_sha256` 存在、为 64 位小写十六进制，且 P/I/F 三值相等；任一缺失/畸形/不一致即硬失败并带阶段名与三值明细 | 真实三阶段字段均匹配（`87961838…`） |
+
+N0 attempt_004：coverage_complete=true、0 异常、54.29s 写盘前采样，登记成本 58.29s（=54.29+4.0 预留，覆盖封口与返回）且 CLI 返回覆盖核验通过（exit 0）；闭链、事件重放 350/189/147/392、标签 350/189/136、旧 629 对照（381/223/25）与 25 行 bound 全部不变。N1 attempt_004：六类 47 用例全过、go=no_go 维持 `go_for_conditional_fit_diagnostics_review`、seal 登记成本 7.87s 覆盖 3.87s 写前采样与返回、exit 0。测试 **31 passed**（N0 20+N1 11；新增返回覆盖覆盖/未覆盖两分支、registration 缺失/畸形/不一致三反例，并升级"通过后零写盘"反例为同时断言盘上计费覆盖写后样本）。I/R/D1/D6/F 仍未实施；真实拟合仍须 §8.3 新冻结材料与新明确授权。

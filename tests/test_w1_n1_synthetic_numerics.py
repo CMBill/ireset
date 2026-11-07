@@ -148,11 +148,14 @@ def test_seal_two_phase_normal(tmp_path):
     summary, cases = n1.run_synthetic_verification(
         N0Budget(wall_cap_s=900.0, reserve_s=60.0))
     budget = N0Budget(wall_cap_s=900.0, reserve_s=60.0, t0=0.0)
-    ticks = iter([10.0, 20.0, 21.0, 30.0])
+    ticks = iter([10.0, 20.0, 21.0, 30.0, 31.0, 40.0])
     paths = n1.write_outputs(tmp_path, summary, cases, budget=budget,
                              clock=lambda: next(ticks))
     disk = paths["summary_doc"]
     assert disk["seal"]["status"] == "sealed_within_budget"
     assert disk["seal"]["terminal"] is True
+    # registered cost covers the actual write and the return tail
+    assert disk["seal"]["measured_wall_s_at_summary"] == 54.0
+    assert disk["seal"]["measured_wall_s_at_summary"] >= 40.0
     assert disk["go_no_go"] == "go_for_conditional_fit_diagnostics_review"
     assert disk["all_cases_passed"] is True

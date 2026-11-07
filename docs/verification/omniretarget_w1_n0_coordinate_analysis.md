@@ -113,3 +113,14 @@
 - **旧 629 对照补齐 bound 事件（P2）**：`gap_rows.csv` 新增 `old_state_bound` 列；summary 新增 `old_chain_comparison`。attempt_003 实测 items_total=**629**（381 precision+223 sensitivity+**25 bound**）、new_only 5（1+4）、rows_annotated=424；`old_state_bound` 恰 25 行 `resolved`（deterministic u1×6/u2×5、diffusion u1×6/u2×8，均为 k.bias 类与 root_in/out），629 事件全部交付。
 - **测试**：N0 套件 18 passed（新增 6 项反例：协调篡改拒、registration 篡改拒、封口时间口径、通过后零写盘、慢 sealed 写盘撤回、bound 列交付）。
 - 其余数值结论与 §4/§7 不变：coverage_complete=true、0 SOURCE_ANOMALY、528/528 分类重放一致、350/189/147/392 事件重放、位分布与 ONE_SIDED=4 不变。
+
+## 9. 修订记录（2026-11-07 第三轮复阅后，attempt_004 权威）
+
+第三轮独立复阅确认闭链与 bound 交付成立，另提出 2 P1+1 P2，全部修复并以修正协议重跑：权威为 **`attempt_004`**（`attempt_001/002/003` 保留为被取代证据）。
+
+- **登记成本覆盖封口与返回（P1）**：summary 登记成本改为 `pre_write_elapsed_s + seal_tail_reserve_s`（预留 = `SEAL_PROCESS_RETURN_TAIL_S=3.0` + 2×已观测写盘延迟，下限 1.0s），与完成声明**同一写盘落盘**；写后核验 `post ≤ 登记成本`，未覆盖即增大预留重写（成本只升不降）。attempt_004 实测：写盘前采样 54.29s、预留 4.0s、登记成本 **58.29s**。
+- **返回覆盖证明（P1）**：新增 `verify_return_coverage`——CLI 在产出输出后独立采样实际返回时间，对盘上登记成本与 wall cap 核验；未覆盖即在盘上撤回完成声明（`note=return_coverage_withdrawn`，登记成本更新为实测值）并 fail-closed 退出 3；覆盖分支零写盘。attempt_004 实测覆盖成立（exit 0）。
+- **终态时序（P1）**：非终态 `sealing`（terminal=false，不可消费）→ 写后双核验（cap 与计费覆盖）→ 才写终态 `sealed_within_budget`；终态写盘自身的成本已在写前核验 ≤ cap 且与声明同盘，写盘后再采样核验，越界即撤回。残余暴露=写盘延迟超过登记预留的击杀窗口，以入册预留值定界。
+- **registration 绑定严格性（P2）**：`execution_registration_sha256` 改为逐阶段硬性校验——必须存在于 P/I/F 三个 stage 快照、为 64 位小写十六进制、三值相等；缺失/畸形/不一致均硬失败（反例覆盖三种形态）。attempt_004 实测三阶段均为 `87961838…`。
+- **测试**：N0 套件 20 passed（新增返回覆盖两分支反例、registration 缺失/畸形/不一致三反例；"通过后零写盘"反例升级为同时断言盘上计费（54s）覆盖写后样本（40s））。
+- 其余结论与 §4/§7/§8 不变：coverage_complete=true、0 SOURCE_ANOMALY、闭链全绑定、350/189/147/392 事件重放、旧 629 对照（381/223/25）、25 行 bound resolved。
