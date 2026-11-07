@@ -98,6 +98,15 @@ def main() -> int:
     if not cov["covered"]:
         print(json.dumps({"return_coverage": cov, "decision": "fail_closed"}),
               file=sys.stderr, flush=True)
+        # The stderr diagnostic must be inside the checked window too: the
+        # second verification pass re-reads the summary and re-samples AFTER
+        # the diagnostic, so the withdrawal record on disk covers the
+        # diagnostic output time as well (costs only increase).
+        n0.verify_return_coverage(
+            out_dir / "summary.json", budget,
+            withdraw={"budget_exceeded_after_seal": True,
+                      "coverage_complete": False,
+                      "label_verdict": "budget_exceeded_after_seal"})
         return 3
     # Fail-closed: run() re-reads the sealed summary from disk, so this
     # decision uses the on-disk terminal state, never pre-write memory.

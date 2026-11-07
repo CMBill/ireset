@@ -368,3 +368,14 @@ N0 attempt_004：coverage_complete=true、0 异常、54.29s 写盘前采样，�
 | P1：撤回写盘自身漏计（登记成本直接更新为写前 elapsed 后写撤回文件，无尾部预留、无写后覆盖核验；封口函数 `status=exceeded` 且 `post>cap` 直接返回也不查该次写盘计费） | **封口循环计费检查前移**：任何状态（含 exceeded）写盘后先核验 `post ≤ measured`，不覆盖即增大预留重写（成本只升不降），超限状态也须自身写盘计费覆盖后才返回；**撤回路径改覆盖成本循环**——每次重写登记 `measured = elapsed + reserve`（reserve = 返回尾部 + max(下限, 前次预留)，成本只升不降），写盘后核验覆盖，最多 SEAL_VERIFY_ROUNDS 轮；**不能证明时**保持最高观测成本并显式记 `cost_coverage_unproven=true`，状态维持 exceeded 不可消费（fail-closed） | 撤回后完成声明维持撤销；预算数值不变 |
 
 N0 attempt_005：coverage_complete=true、0 异常、写盘前采样 54.13s、登记成本 **58.13s**、`return_observation.json` covered=true（elapsed 54.14 ≤ 登记 58.13，`summary_sha256` 与盘上 summary 一致、`checked_after_output_flush=true`，exit 0）；闭链、事件重放 350/189/147/392、旧 629 对照（381/223/25+25 行 bound）全部不变。N1 attempt_005：六类 47 用例全过、go=no_go 维持、登记成本 7.88s、返回观察 covered=true（elapsed 3.886 ≤ 7.885，SHA 绑定一致，exit 0）。测试 **31 passed**（新增/重写：返回覆盖覆盖分支证明绑定与 summary 零重写、复阅静态路径（早采样 99s→proof 写盘耗至 901s→写后再核验翻转为撤回→撤回成本覆盖证明）、迟采样（901s>cap 直接撤回且登记成本覆盖）、cap 内计费不足（150>100→撤回且登记≥写后样本）、封口超限写盘计费覆盖断言（盘上 2687s ≥ 905s）、两个 CLI 观察文件断言）。方案新增 §17、N0 §10/N1 §9 修订节、docs/README.md 已更新。**边界：T6 audit_incomplete/covered_contract_passed=false、539 gaps、cohort 34 次更新/1347.195507s、一次性授权已消费、partial/null/false/not_ready/不接入全部保持；I/R/D1/D6/F 未实施，真实拟合仍须 §8.3 新冻结材料与新明确授权；本轮未提交 git、未运行全项目套件。**
+
+## 18. v0.5 第五轮复阅修订对照（诊断输出纳入核验与耗尽分支成本下界）
+
+2026-11-07 第五轮独立复阅确认两项主修复成立，另提出 1 P1+1 P2，全部修复并以修正协议重跑：`attempt_005` 保留为被取代证据，权威为 **attempt_006**。本轮只改 N0/N1 工具、测试与人读记录；旧 T6 材料、契约与授权不改写；暂不进入 I。
+
+| 复阅问题 | 修复 | 不变边界 |
+| --- | --- | --- |
+| P1：撤回后的诊断输出仍在成本核验之外（CLI 在 `verify_return_coverage` 返回后又执行 stderr 输出并 flush，此后不再采样；静态路径：撤回登记 163s、核验样本 160s 通过、诊断输出阻塞至 170s，仍留下"成本覆盖已证明"的低估记录） | 两个 CLI 的失败分支在 stderr 诊断输出（flush）之后**追加第二次 `verify_return_coverage`**：第二次核验重新读盘并在诊断输出之后采样，撤回覆盖成本循环以更高登记成本重写（成本只升不降）并写后核验——诊断输出耗时纳入被检窗口，低估记录被覆盖记录取代 | 成功路径无核验后输出；外层 wait 收口模式仍留待 I 阶段真实链采用 |
+| P2：封口循环耗尽分支丢失成本下界（兜底分支重新复制原始 summary 并以不含登记成本的 seal 覆盖，可能把已增长成本降回最初值，也未标记 cost_coverage_unproven；单调时钟下每轮写盘都超预留即可耗尽轮数） | 兜底分支改为**保留最高已登记/已观测成本**（`max(highest_registered, highest_observed, now()-t0)`）写入 budget 与 seal 的 `measured_wall_s_at_summary`，并显式标记 `cost_coverage_unproven=true`、`rounds_exhausted=true`，状态维持 exceeded 不可消费（fail-closed）；返回事实带 `cost_coverage_proven=false` | 循环计费检查前移（第四轮）不变 |
+
+N0 attempt_006：coverage_complete=true、0 异常、写盘前采样 53.91s、登记成本 **57.91s**、返回观察 covered=true（elapsed 53.91 ≤ 57.91、SHA 绑定一致、exit 0）；闭链、事件重放 350/189/147/392、旧 629 对照（381/223/25+25 行 bound）全部不变。N1 attempt_006：六类 47 用例全过、go=no_go 维持、登记成本 7.88s、返回观察 covered=true（elapsed 3.884 ≤ 7.883+、SHA 一致、exit 0）。测试 **33 passed**（新增：对抗时钟钉死轮数耗尽路径——兜底分支保留最高成本、`cost_coverage_unproven` 标记、不回写较小成本；第二次核验覆盖诊断输出——复阅静态路径（登记 163s/核验 160s/诊断至 170s→第二次核验重登记 ≥170s 且只升不降））。方案新增 §18、N0 §11/N1 §10 修订节、docs/README.md 已更新。**边界：T6 audit_incomplete/covered_contract_passed=false、539 gaps、cohort 34 次更新/1347.195507s、一次性授权已消费、partial/null/false/not_ready/不接入全部保持；I/R/D1/D6/F 未实施，真实拟合仍须 §8.3 新冻结材料与新明确授权；本轮未提交 git、未运行全项目套件。**

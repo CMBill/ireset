@@ -133,3 +133,12 @@
 - **撤回成本覆盖（P1）**：封口循环计费检查前移到 cap 判定之前——任何状态（含 exceeded）的写盘都必须 `post ≤ 登记成本` 才返回，未覆盖即增大预留重写；撤回路径改覆盖成本循环（每次登记 `elapsed + reserve`，成本只升不降，写后核验），不能证明时保持最高观测成本并记 `cost_coverage_unproven=true`、状态维持 exceeded 不可消费。反例断言：超限写盘盘上计费 2687s ≥ 写后 905s；撤回重写登记成本 ≥ 其写后样本。
 - **测试**：N0 套件 20 passed（返回覆盖四分支重写：覆盖+SHA 绑定+summary 零重写、复阅静态路径、迟采样、cap 内计费不足；封口超限计费断言；CLI 观察文件断言）。
 - 其余结论与 §4/§7–§9 不变：coverage_complete=true、0 SOURCE_ANOMALY、闭链全绑定、350/189/147/392、旧 629 对照（381/223/25）、25 行 bound resolved、登记成本 58.13s 覆盖封口与返回。
+
+## 11. 修订记录（2026-11-07 第五轮复阅后，attempt_006 权威）
+
+第五轮独立复阅确认两项主修复成立，另提出 1 P1+1 P2，全部修复并以修正协议重跑：权威为 **`attempt_006`**（001–005 保留为被取代证据）。
+
+- **诊断输出纳入核验（P1）**：两个 CLI 失败分支在 stderr 诊断输出（flush）之后追加**第二次 `verify_return_coverage`**——第二次核验重新读盘并在诊断输出之后采样，撤回覆盖成本循环以更高登记成本重写（成本只升不降）并写后核验；复阅静态路径（登记 163s、核验 160s 通过、诊断阻塞至 170s）现被第二次核验以 ≥170s 的覆盖记录取代。
+- **耗尽分支成本下界（P2）**：`_write_summary_sealed` 兜底分支改为保留最高已登记/已观测成本（`max(highest_registered, highest_observed, now()-t0)`）写入 budget 与 seal，并显式标记 `cost_coverage_unproven=true`、`rounds_exhausted=true`；对抗时钟反例（每轮写盘均超预留）钉死该路径可达且不回写较小成本。
+- **测试**：N0 套件 21 passed（新增上述两反例）。
+- 其余结论与 §4/§7–§10 不变：coverage_complete=true、0 SOURCE_ANOMALY、闭链全绑定、350/189/147/392、旧 629 对照（381/223/25）、25 行 bound resolved、登记成本 57.91s 覆盖封口与返回。

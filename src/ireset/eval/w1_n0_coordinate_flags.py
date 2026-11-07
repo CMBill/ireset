@@ -1243,6 +1243,8 @@ def _write_summary_sealed(summary_path: Path, summary: dict, budget: N0Budget,
     samples: list[float] = []
     stage = "publish"
     observed_write_latency = 0.0
+    highest_registered = 0.0
+    highest_observed = 0.0
     for rnd in range(3 * SEAL_VERIFY_ROUNDS + 1):
         pre = now() - budget.t0
         reserve = (SEAL_PROCESS_RETURN_TAIL_S
@@ -1272,6 +1274,8 @@ def _write_summary_sealed(summary_path: Path, summary: dict, budget: N0Budget,
         post = now() - budget.t0
         samples.append(post)
         observed_write_latency = max(observed_write_latency, post - pre)
+        highest_registered = max(highest_registered, measured)
+        highest_observed = max(highest_observed, post)
         if post > measured:
             # registered cost did not cover this write — for EVERY status
             # (including exceeded: a failure claim's cost must still be
@@ -1293,17 +1297,26 @@ def _write_summary_sealed(summary_path: Path, summary: dict, budget: N0Budget,
         # covered the write and the sample is inside the cap
         return {"status": status, "measured_wall_s": post,
                 "rounds": rnd + 1, "samples": samples}
-    # fail-closed guard (unreachable with a monotonic clock)
+    # fail-closed guard: rounds exhausted — every write exceeded its own
+    # reserve (reachable even with a monotonic clock under adversarial
+    # latency).  Preserve the highest registered/observed cost as the lower
+    # bound and mark the cost explicitly unproven; the state stays exceeded
+    # and non-consumable (never reset to a smaller earlier cost).
+    final_cost = max(highest_registered, highest_observed, now() - budget.t0)
     doc = dict(summary)
+    doc["budget"] = {**summary.get("budget", {}),
+                     "measured_wall_s_at_summary": final_cost}
     doc["seal"] = {"status": "budget_exceeded_after_seal", "wall_cap_s": cap,
                    "t0_perf_counter": budget.t0, "terminal": True,
-                   "rounds_exhausted": True}
+                   "rounds_exhausted": True, "cost_coverage_unproven": True,
+                   "measured_wall_s_at_summary": final_cost}
     if withdraw:
         doc.update(withdraw)
     _write_json_fsync(summary_path, doc)
     return {"status": "budget_exceeded_after_seal",
             "measured_wall_s": now() - budget.t0,
-            "rounds": 3 * SEAL_VERIFY_ROUNDS + 1, "samples": samples}
+            "rounds": 3 * SEAL_VERIFY_ROUNDS + 1, "samples": samples,
+            "cost_coverage_proven": False}
 
 
 def verify_return_coverage(summary_path: Path, budget: N0Budget,

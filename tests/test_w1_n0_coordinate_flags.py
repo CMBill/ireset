@@ -887,3 +887,74 @@ def test_registration_binding_strict(world):
     cascade()
     with pytest.raises(n0.N0Error, match="disagrees across journal snapshots"):
         make_analyzer(root, out, analysis_path=apath).run()
+
+
+def test_summary_seal_rounds_exhaustion_preserves_cost_bound(tmp_path):
+    """P2 (round 5): when every write exceeds its own reserve the bounded
+    loop exhausts; the fallback must NOT reset the cost to an earlier value
+    and must flag cost_coverage_unproven (state stays exceeded, frozen)."""
+    budget = n0.N0Budget(wall_cap_s=900.0, reserve_s=60.0, t0=0.0)
+
+    class AdvClock:
+        """Every post-write sample is slower than 2x the observed latency,
+        so no round ever passes the billing check."""
+
+        def __init__(self, t0, start=10.0, w0=10.0):
+            self.t = t0 + start
+            self.w = w0
+            self.calls = 0
+
+        def __call__(self):
+            self.calls += 1
+            if self.calls % 2 == 0:
+                self.t += 3.0 * self.w
+                self.w *= 3.0
+            else:
+                self.t += self.w
+            return self.t
+
+    summary = {"coverage_complete": True, "label_verdict": "complete", "budget": {}}
+    facts = n0._write_summary_sealed(
+        tmp_path / "s.json", summary, budget,
+        withdraw={"coverage_complete": False,
+                  "label_verdict": "budget_exceeded_after_seal"},
+        clock=AdvClock(0.0))
+    assert facts["status"] == "budget_exceeded_after_seal"
+    assert facts["cost_coverage_proven"] is False
+    disk = json.loads((tmp_path / "s.json").read_text())
+    assert disk["seal"]["status"] == "budget_exceeded_after_seal"
+    assert disk["seal"]["rounds_exhausted"] is True
+    assert disk["seal"]["cost_coverage_unproven"] is True
+    assert disk["seal"]["terminal"] is True
+    # the highest registered/observed cost is preserved, never reset
+    assert disk["seal"]["measured_wall_s_at_summary"] == disk["budget"]["measured_wall_s_at_summary"]
+    assert disk["seal"]["measured_wall_s_at_summary"] >= max(facts["samples"])
+    assert disk["coverage_complete"] is False
+    assert disk["label_verdict"] == "budget_exceeded_after_seal"
+
+
+def test_return_coverage_second_pass_covers_diagnostics(tmp_path):
+    """P1 (round 5): diagnostics emitted after pass 1 (the CLI stderr failure
+    note) are inside the checked window of the SECOND verification pass — the
+    withdrawal record must cover the diagnostic output time (review's static
+    path: registered 163, checked 160, diagnostics block to 170)."""
+    budget = n0.N0Budget(wall_cap_s=900.0, reserve_s=60.0, t0=0.0)
+    doc = {"coverage_complete": False, "label_verdict": "budget_exceeded_after_seal",
+           "budget": {"measured_wall_s_at_summary": 163.0},
+           "seal": {"status": "budget_exceeded_after_seal", "terminal": True,
+                    "measured_wall_s_at_summary": 163.0, "wall_cap_s": 900.0,
+                    "seal_tail_reserve_s": 13.0,
+                    "note": "return_coverage_withdrawn"}}
+    p = tmp_path / "s.json"
+    p.write_text(json.dumps(doc))
+    # pass 2 after the diagnostic output blocked until 170s
+    cov = n0.verify_return_coverage(p, budget, clock=lambda: 170.0)
+    assert cov["covered"] is False and cov["cost_coverage_proven"] is True
+    disk = json.loads(p.read_text())
+    assert disk["seal"]["status"] == "budget_exceeded_after_seal"
+    # the re-registered cost covers the diagnostic time and only increases
+    assert disk["seal"]["measured_wall_s_at_summary"] >= 170.0
+    assert disk["seal"]["measured_wall_s_at_summary"] > 163.0
+    obs = json.loads((tmp_path / "return_observation.json").read_text())
+    assert obs["covered"] is False
+    assert obs["registered_measured_s"] == disk["seal"]["measured_wall_s_at_summary"]

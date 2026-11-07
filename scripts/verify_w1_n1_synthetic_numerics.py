@@ -97,6 +97,13 @@ def main() -> int:
     if not cov["covered"]:
         print(json.dumps({"return_coverage": cov, "decision": "fail_closed"}),
               file=sys.stderr, flush=True)
+        # The stderr diagnostic must be inside the checked window too: the
+        # second verification pass re-reads the summary and re-samples AFTER
+        # the diagnostic, so the withdrawal record on disk covers the
+        # diagnostic output time as well (costs only increase; the go/no-go
+        # revocation is re-applied).
+        n1.verify_return_coverage(Path(paths["summary"]), budget,
+                                  withdraw=dict(n1.N1_WITHDRAW_ON_EXCEED))
         return 3
     sealed = (disk.get("seal") or {}).get("status") == "sealed_within_budget"
     if not sealed or disk.get("budget", {}).get("budget_exceeded"):

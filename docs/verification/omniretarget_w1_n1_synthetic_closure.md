@@ -76,3 +76,12 @@
 - **撤回成本覆盖（P1）**：与 N0 共享——封口循环计费检查前移（exceeded 写盘亦须自身计费覆盖）、撤回路径覆盖成本循环、不能证明时 `cost_coverage_unproven=true` 保持不可消费。
 - **测试**：N1 套件 11 passed（CLI 测试新增观察文件断言：covered、SHA 绑定、elapsed ≤ 登记成本）。
 - 数值结论不变：六类 47 用例全过（80/16/16/9），go=no_go 维持 `go_for_conditional_fit_diagnostics_review`；§3 有限收口说明与 §5 边界全部保持。
+
+## 10. 修订记录（2026-11-07 第五轮复阅后，attempt_006 权威）
+
+第五轮独立复阅提出 1 P1+1 P2（与 N0 共享实现），全部修复并以修正协议重跑：权威为 **`attempt_006`**。
+
+- **诊断输出纳入核验（P1）**：CLI 失败分支 stderr 诊断后追加第二次核验（读盘+采样在诊断之后，撤回覆盖成本循环重写并写后核验，go/no-go 撤销随重写保持）。
+- **耗尽分支成本下界（P2）**：与 N0 共享——兜底分支保留最高已登记/已观测成本并标记 `cost_coverage_unproven=true`，状态维持 exceeded 不可消费。
+- **测试**：N1 套件 11 passed（与 N0 共享反例覆盖）。
+- 数值结论不变：六类 47 用例全过（80/16/16/9），go=no_go 维持 `go_for_conditional_fit_diagnostics_review`；§3 有限收口说明与 §5 边界全部保持。
