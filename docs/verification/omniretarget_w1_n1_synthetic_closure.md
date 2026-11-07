@@ -67,3 +67,12 @@
 - **registration 绑定严格性（P2，N0 侧闭链）**：逐阶段硬性校验（存在/64 位小写十六进制/三值相等），缺失、畸形、不一致均硬失败。
 - **测试**：N1 套件 11 passed（两阶段正例升级为同时断言盘上登记成本 54s 覆盖写后样本 40s）。
 - 数值结论不变：六类 47 用例全过（计数 80/16/16/9），go=no_go 维持 `go_for_conditional_fit_diagnostics_review`；§3 有限收口说明与 §5 边界全部保持。
+
+## 9. 修订记录（2026-11-07 第四轮复阅后，attempt_005 权威）
+
+第四轮独立复阅提出 2 项 P1（返回核验时序与撤回成本覆盖，与 N0 共享实现），全部修复并以修正协议重跑：权威为 **`attempt_005`**。
+
+- **返回核验时序与绑定证明（P1）**：核验先读盘解析再采样；CLI 输出 flush 后核验；`return_observation.json` 绑定证明（含 summary SHA 与 `checked_after_output_flush`），证明写盘后再核验；CLI 所有退出路径执行核验，未覆盖即 fail-closed（撤回时 go_no_go 一并撤销）。attempt_005 实测：covered=true、elapsed 3.886s ≤ 登记 7.885s、SHA 绑定一致。
+- **撤回成本覆盖（P1）**：与 N0 共享——封口循环计费检查前移（exceeded 写盘亦须自身计费覆盖）、撤回路径覆盖成本循环、不能证明时 `cost_coverage_unproven=true` 保持不可消费。
+- **测试**：N1 套件 11 passed（CLI 测试新增观察文件断言：covered、SHA 绑定、elapsed ≤ 登记成本）。
+- 数值结论不变：六类 47 用例全过（80/16/16/9），go=no_go 维持 `go_for_conditional_fit_diagnostics_review`；§3 有限收口说明与 §5 边界全部保持。

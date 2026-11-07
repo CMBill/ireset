@@ -32,6 +32,7 @@ from ireset.eval.w1_n0_coordinate_flags import (BudgetExceeded,  # noqa: F401
                                                 SOURCE_ANOMALY,
                                                 compute_row_flags,
                                                 recompute_classification,
+                                                sha256_file,
                                                 _write_json_fsync,
                                                 _write_summary_sealed,
                                                 verify_return_coverage)

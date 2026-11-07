@@ -1272,17 +1272,19 @@ def _write_summary_sealed(summary_path: Path, summary: dict, budget: N0Budget,
         post = now() - budget.t0
         samples.append(post)
         observed_write_latency = max(observed_write_latency, post - pre)
+        if post > measured:
+            # registered cost did not cover this write — for EVERY status
+            # (including exceeded: a failure claim's cost must still be
+            # honest).  Grow the reserve and rewrite; costs only increase.
+            continue
         if post > cap:
             if status == "budget_exceeded_after_seal":
-                # exceeded claim verified on disk; conservative final state
+                # exceeded claim on disk, its own write billing-covered;
+                # conservative final state
                 return {"status": "budget_exceeded_after_seal",
                         "measured_wall_s": post, "rounds": rnd + 1,
                         "samples": samples}
             stage = "withdraw"  # completion claim invalid; rewrite exceeded
-            continue
-        if post > measured:
-            # registered cost did not cover the actual write; retry with a
-            # grown reserve (billing update, costs only increase)
             continue
         if status == "sealing":
             stage = "seal"
@@ -1306,42 +1308,112 @@ def _write_summary_sealed(summary_path: Path, summary: dict, budget: N0Budget,
 
 def verify_return_coverage(summary_path: Path, budget: N0Budget,
                            withdraw: dict | None = None, clock=None) -> dict:
-    """Independent post-print return-coverage proof (plan §8.2).
+    """Independent post-output return-coverage proof (plan §8.2).
 
-    Samples the elapsed time AFTER the CLI output was produced and checks it
-    against the summary's registered cost (``measured_wall_s_at_summary``,
-    which already includes the process-return tail reserve) and the wall
-    cap.  If the actual return time is NOT covered, the completion claim on
-    disk is withdrawn to ``budget_exceeded_after_seal`` (conservative
-    direction; costs only increase) and ``covered=False`` is returned — the
-    caller must then fail closed.  The covered case performs no write.
+    The necessary disk read AND the CLI output (flushed by the caller before
+    this call) are all inside the checked elapsed time: the summary is read
+    and parsed FIRST, only then is elapsed sampled and judged against the
+    on-disk registered cost and the wall cap.  On success a
+    ``return_observation.json`` proof (bound to the summary bytes by SHA)
+    is written and re-checked: if the proof write itself blows the
+    registered cost, the judgment flips to withdrawal.  On failure the
+    completion claim on disk is withdrawn to ``budget_exceeded_after_seal``
+    via a covering-cost rewrite loop — each rewrite registers
+    ``measured = elapsed + reserve`` (costs only increase) and is followed
+    by a post-write coverage check; if coverage cannot be proven within the
+    bounded rounds, the cost is kept at the highest observed sample with an
+    explicit ``cost_coverage_unproven`` flag and the state stays
+    non-consumable (fail-closed).  Callers must fail closed on
+    ``covered=False``.
     """
     now = clock if clock is not None else time.perf_counter
-    elapsed = now() - budget.t0
-    doc = json.loads(Path(summary_path).read_text())
+    summary_path = Path(summary_path)
+    # necessary disk read happens BEFORE the coverage sample
+    doc = json.loads(summary_path.read_text())
     seal = doc.get("seal") or {}
     measured = seal.get("measured_wall_s_at_summary")
     cap = float(budget.wall_cap_s)
+    obs_path = summary_path.parent / "return_observation.json"
+
+    def _registered() -> float | None:
+        return float(measured) if isinstance(measured, (int, float)) else None
+
+    elapsed = now() - budget.t0
     covered = (isinstance(measured, (int, float))
-               and elapsed <= float(measured) and elapsed <= cap
-               and seal.get("status") == "sealed_within_budget")
+               and seal.get("status") == "sealed_within_budget"
+               and elapsed <= float(measured) and elapsed <= cap)
     if covered:
-        return {"covered": True, "elapsed_s": elapsed,
-                "registered_measured_s": float(measured),
-                "wall_cap_s": cap, "withdrawn": False}
+        # bind the proof to the exact summary bytes; the proof write itself
+        # is re-checked — if it blows the registered cost, withdraw below
+        proof = {"schema": "n0_return_observation_v1", "covered": True,
+                 "elapsed_s": elapsed, "registered_measured_s": float(measured),
+                 "seal_tail_reserve_s": seal.get("seal_tail_reserve_s"),
+                 "wall_cap_s": cap, "checked_after_output_flush": True,
+                 "summary_sha256": sha256_file(summary_path)}
+        _write_json_fsync(obs_path, proof)
+        post = now() - budget.t0
+        if post <= float(measured) and post <= cap:
+            return {"covered": True, "elapsed_s": elapsed,
+                    "registered_measured_s": float(measured),
+                    "wall_cap_s": cap, "withdrawn": False,
+                    "cost_coverage_proven": True,
+                    "return_observation": str(obs_path)}
+        elapsed = post  # the proof write itself was not covered
+
+    # withdrawal: covering-cost rewrite loop with post-write checks
+    prior_reserve = seal.get("seal_tail_reserve_s")
+    prior_reserve = (float(prior_reserve)
+                     if isinstance(prior_reserve, (int, float))
+                     else SEAL_TAIL_MIN_RESERVE_S)
+    reserve = SEAL_PROCESS_RETURN_TAIL_S + max(SEAL_TAIL_MIN_RESERVE_S,
+                                               prior_reserve)
     withdrawn_doc = dict(doc)
     withdrawn_doc["seal"] = {**seal, "status": "budget_exceeded_after_seal",
                              "terminal": True,
                              "return_coverage_elapsed_s": elapsed,
-                             "return_coverage_registered_s": measured,
+                             "return_coverage_registered_s": _registered(),
                              "note": "return_coverage_withdrawn"}
-    if isinstance(measured, (int, float)) and elapsed > float(measured):
-        withdrawn_doc["seal"]["measured_wall_s_at_summary"] = elapsed
-        withdrawn_doc["budget"] = {**doc.get("budget", {}),
-                                   "measured_wall_s_at_summary": elapsed}
     if withdraw:
         withdrawn_doc.update(withdraw)
-    _write_json_fsync(Path(summary_path), withdrawn_doc)
+    for _rnd in range(SEAL_VERIFY_ROUNDS):
+        new_measured = elapsed + reserve
+        reg = _registered()
+        if reg is not None:
+            new_measured = max(new_measured, reg)
+        withdrawn_doc["seal"]["measured_wall_s_at_summary"] = new_measured
+        withdrawn_doc["seal"]["seal_tail_reserve_s"] = reserve
+        withdrawn_doc["budget"] = {**doc.get("budget", {}),
+                                   "measured_wall_s_at_summary": new_measured}
+        _write_json_fsync(summary_path, withdrawn_doc)
+        _write_json_fsync(obs_path, {
+            "schema": "n0_return_observation_v1", "covered": False,
+            "elapsed_s": elapsed, "registered_measured_s": new_measured,
+            "wall_cap_s": cap, "note": "return_coverage_withdrawn",
+            "summary_sha256": sha256_file(summary_path)})
+        post = now() - budget.t0
+        # cost-coverage check only: the cap was already violated (that is why
+        # we are withdrawing); the registered cost must cover the actual
+        # withdrawal writes, which is a separate, achievable requirement.
+        if post <= new_measured:
+            return {"covered": False, "elapsed_s": elapsed,
+                    "registered_measured_s": new_measured, "wall_cap_s": cap,
+                    "withdrawn": True, "cost_coverage_proven": True,
+                    "return_observation": str(obs_path)}
+        reserve = SEAL_PROCESS_RETURN_TAIL_S + max(
+            SEAL_TAIL_MIN_RESERVE_S, 2.0 * (post - elapsed))
+        elapsed = post
+    # coverage cannot be proven: keep the highest observed cost with an
+    # explicit flag; the state stays exceeded and non-consumable
+    withdrawn_doc["seal"]["measured_wall_s_at_summary"] = elapsed
+    withdrawn_doc["seal"]["cost_coverage_unproven"] = True
+    withdrawn_doc["budget"] = {**doc.get("budget", {}),
+                               "measured_wall_s_at_summary": elapsed}
+    _write_json_fsync(summary_path, withdrawn_doc)
+    _write_json_fsync(obs_path, {
+        "schema": "n0_return_observation_v1", "covered": False,
+        "elapsed_s": elapsed, "registered_measured_s": elapsed,
+        "wall_cap_s": cap, "note": "cost_coverage_unproven"})
     return {"covered": False, "elapsed_s": elapsed,
-            "registered_measured_s": measured if isinstance(measured, (int, float)) else None,
-            "wall_cap_s": cap, "withdrawn": True}
+            "registered_measured_s": elapsed, "wall_cap_s": cap,
+            "withdrawn": True, "cost_coverage_proven": False,
+            "return_observation": str(obs_path)}

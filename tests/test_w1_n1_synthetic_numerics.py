@@ -123,6 +123,13 @@ def test_cli(tmp_path):
     assert payload["all_cases_passed"] is True
     summary = json.loads(Path(payload["outputs"]["summary"]).read_text())
     assert summary["label_verdict"] == "complete"
+    # bound return-coverage proof exists and agrees with the sealed summary
+    obs = json.loads((Path(payload["outputs"]["summary"]).parent
+                      / "return_observation.json").read_text())
+    assert obs["covered"] is True
+    assert obs["summary_sha256"] == n1.sha256_file(Path(payload["outputs"]["summary"]))
+    assert obs["registered_measured_s"] == summary["seal"]["measured_wall_s_at_summary"]
+    assert obs["registered_measured_s"] >= obs["elapsed_s"]
 
 
 def test_seal_withdraws_go_no_go(tmp_path):

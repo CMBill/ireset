@@ -85,10 +85,11 @@ def main() -> int:
         "budget": {k: summary["budget"][k] for k in
                    ("measured_wall_s_at_summary", "work_deadline_s", "hard_deadline_s",
                     "budget_exceeded", "stopped_at")},
-    }, indent=1))
-    # Independent post-print return-coverage proof (plan §8.2): the actual
-    # return time must be covered by the registered cost; a violation
-    # withdraws the completion claim on disk and fails closed.
+    }, indent=1), flush=True)
+    # Independent post-output return-coverage proof (plan §8.2): the summary
+    # read, this flushed output and the check itself are all inside the
+    # checked elapsed time; the proof is bound to return_observation.json.
+    # A violation withdraws the completion claim on disk and fails closed.
     cov = n0.verify_return_coverage(
         out_dir / "summary.json", budget,
         withdraw={"budget_exceeded_after_seal": True,
@@ -96,7 +97,7 @@ def main() -> int:
                   "label_verdict": "budget_exceeded_after_seal"})
     if not cov["covered"]:
         print(json.dumps({"return_coverage": cov, "decision": "fail_closed"}),
-              file=sys.stderr)
+              file=sys.stderr, flush=True)
         return 3
     # Fail-closed: run() re-reads the sealed summary from disk, so this
     # decision uses the on-disk terminal state, never pre-write memory.

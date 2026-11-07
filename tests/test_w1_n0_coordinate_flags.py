@@ -639,6 +639,15 @@ def test_cli_exclusive_attempts(world, tmp_path):
     # existing 001/003 must never be overwritten: next exclusive attempt is 004
     assert payload["output_dir"].endswith("attempt_004")
     assert payload["coverage_complete"] is True
+    # bound return-coverage proof exists and agrees with the sealed summary
+    obs = json.loads((Path(payload["output_dir"]) / "return_observation.json")
+                     .read_text())
+    assert obs["covered"] is True
+    assert obs["summary_sha256"] == n0.sha256_file(
+        Path(payload["output_dir"]) / "summary.json")
+    summary = json.loads((Path(payload["output_dir"]) / "summary.json").read_text())
+    assert obs["registered_measured_s"] == summary["seal"]["measured_wall_s_at_summary"]
+    assert obs["registered_measured_s"] >= obs["elapsed_s"]
 
 
 def test_coordinated_report_npz_tamper_rejected(world):
@@ -685,6 +694,10 @@ def test_summary_seal_elapsed_vs_cap_withdrawal(tmp_path):
     assert disk["seal"]["terminal"] is True
     assert disk["coverage_complete"] is False
     assert disk["label_verdict"] == "budget_exceeded_after_seal"
+    # the exceeded write's own cost is billing-covered on disk:
+    # measured = 902 + (3 + 2x891) = 2687 >= post-write sample 905
+    assert disk["seal"]["measured_wall_s_at_summary"] == 2687.0
+    assert disk["seal"]["measured_wall_s_at_summary"] >= facts["measured_wall_s"]
 
 
 def test_summary_seal_no_write_after_passing_sample(tmp_path, monkeypatch):
@@ -767,34 +780,66 @@ def test_old_state_bound_column_delivered(world):
 
 
 def test_return_coverage_covered_and_withdrawn(tmp_path):
-    """P1-1: the actual return time must be covered by the registered cost
-    (plan §8.2).  Covered -> no rewrite; uncovered -> conservative withdrawal
-    with the withdraw fields applied and the registered cost updated."""
+    """P1 (round 4): the necessary disk read happens BEFORE the coverage
+    sample; the proof is bound to return_observation.json (with the summary
+    SHA) and re-checked after its own write; the withdrawal path registers a
+    covering cost (elapsed + reserve) verified by a post-write check."""
     budget = n0.N0Budget(wall_cap_s=900.0, reserve_s=60.0, t0=0.0)
     doc = {"coverage_complete": True, "label_verdict": "complete",
            "budget": {"measured_wall_s_at_summary": 100.0},
            "seal": {"status": "sealed_within_budget", "terminal": True,
-                    "measured_wall_s_at_summary": 100.0, "wall_cap_s": 900.0}}
+                    "measured_wall_s_at_summary": 100.0, "wall_cap_s": 900.0,
+                    "seal_tail_reserve_s": 10.0}}
     p = tmp_path / "s.json"
     p.write_text(json.dumps(doc))
     raw = p.read_bytes()
     cov = n0.verify_return_coverage(p, budget, clock=lambda: 50.0)
-    assert cov == {"covered": True, "elapsed_s": 50.0,
-                   "registered_measured_s": 100.0, "wall_cap_s": 900.0,
-                   "withdrawn": False}
-    assert p.read_bytes() == raw  # covered case performs no write
+    assert cov["covered"] is True and cov["elapsed_s"] == 50.0
+    assert cov["cost_coverage_proven"] is True
+    assert p.read_bytes() == raw  # the summary itself is not rewritten
+    obs = json.loads((tmp_path / "return_observation.json").read_text())
+    assert obs["covered"] is True and obs["elapsed_s"] == 50.0
+    assert obs["summary_sha256"] == n0.sha256_file(p)
+    assert obs["checked_after_output_flush"] is True
+
+    # review's static path: an early sample (99) would have said covered,
+    # but the proof write runs until 901 — the post-check must catch it
+    ticks = iter([99.0, 901.0, 905.0])
     cov2 = n0.verify_return_coverage(
         p, budget,
         withdraw={"coverage_complete": False,
                   "label_verdict": "budget_exceeded_after_seal"},
-        clock=lambda: 200.0)
-    assert cov2["covered"] is False and cov2["withdrawn"] is True
+        clock=lambda: next(ticks))
+    assert cov2["covered"] is False and cov2["cost_coverage_proven"] is True
     disk = json.loads(p.read_text())
     assert disk["seal"]["status"] == "budget_exceeded_after_seal"
     assert disk["seal"]["note"] == "return_coverage_withdrawn"
-    assert disk["seal"]["measured_wall_s_at_summary"] == 200.0
     assert disk["coverage_complete"] is False
     assert disk["label_verdict"] == "budget_exceeded_after_seal"
+    # the withdrawal rewrite registered a cost covering its own writes
+    assert disk["seal"]["measured_wall_s_at_summary"] >= 901.0
+    obs2 = json.loads((tmp_path / "return_observation.json").read_text())
+    assert obs2["covered"] is False
+
+    # a late first sample (read done, elapsed already past the cap) is
+    # judged on the post-read sample, not a pre-read one
+    p.write_text(json.dumps(doc))
+    ticks = iter([901.0, 905.0])
+    cov3 = n0.verify_return_coverage(p, budget, clock=lambda: next(ticks))
+    assert cov3["covered"] is False and cov3["elapsed_s"] == 901.0
+    disk3 = json.loads(p.read_text())
+    assert disk3["seal"]["measured_wall_s_at_summary"] >= 901.0
+
+    # billing-uncovered within cap: registered 100, actual 150 -> withdrawal
+    # with a grown covering cost, proven by the post-write sample
+    doc3 = dict(doc)
+    p.write_text(json.dumps(doc3))
+    ticks = iter([150.0, 160.0, 170.0])
+    cov4 = n0.verify_return_coverage(p, budget, clock=lambda: next(ticks))
+    assert cov4["covered"] is False and cov4["cost_coverage_proven"] is True
+    disk4 = json.loads(p.read_text())
+    assert disk4["seal"]["measured_wall_s_at_summary"] >= 160.0
+    assert disk4["seal"]["measured_wall_s_at_summary"] == cov4["registered_measured_s"]
 
 
 def test_registration_binding_strict(world):

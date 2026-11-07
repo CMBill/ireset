@@ -357,3 +357,14 @@ N0 attempt_003 结果：coverage_complete=true、0 异常、55.47s（seal=sealed
 | P2：registration 绑定字段缺失/类型错误被跳过（只剩一个有效 SHA 也能通过） | 逐阶段硬性要求 `execution_registration_sha256` 存在、为 64 位小写十六进制，且 P/I/F 三值相等；任一缺失/畸形/不一致即硬失败并带阶段名与三值明细 | 真实三阶段字段均匹配（`87961838…`） |
 
 N0 attempt_004：coverage_complete=true、0 异常、54.29s 写盘前采样，登记成本 58.29s（=54.29+4.0 预留，覆盖封口与返回）且 CLI 返回覆盖核验通过（exit 0）；闭链、事件重放 350/189/147/392、标签 350/189/136、旧 629 对照（381/223/25）与 25 行 bound 全部不变。N1 attempt_004：六类 47 用例全过、go=no_go 维持 `go_for_conditional_fit_diagnostics_review`、seal 登记成本 7.87s 覆盖 3.87s 写前采样与返回、exit 0。测试 **31 passed**（N0 20+N1 11；新增返回覆盖覆盖/未覆盖两分支、registration 缺失/畸形/不一致三反例，并升级"通过后零写盘"反例为同时断言盘上计费覆盖写后样本）。I/R/D1/D6/F 仍未实施；真实拟合仍须 §8.3 新冻结材料与新明确授权。
+
+## 17. v0.5 第四轮复阅修订对照（返回核验时序与撤回成本覆盖）
+
+2026-11-07 第四轮独立复阅确认封口预留与 registration 严格校验修复成立，另提出 2 项 P1，全部修复并以修正协议重跑：`attempt_004` 保留为被取代证据，权威为 **attempt_005**。本轮只改 N0/N1 工具、测试与人读记录；旧 T6 材料、契约与授权不改写；暂不进入 I。
+
+| 复阅问题 | 修复 | 不变边界 |
+| --- | --- | --- |
+| P1：返回核验采样过早（读盘/解析之前采样后不再查时；静态路径：采样 99s、登记 100s、读盘耗至 901s 仍判 covered；CLI 输出未 flush，采样不能称为实际返回证明） | `verify_return_coverage` 重写：**先读盘并解析，再采样判定**（必要读盘纳入被检时长）；两个 CLI 的 JSON 输出显式 `flush=True` 后才调用核验（打印耗时纳入被检时长）；**新增 `return_observation.json` 绑定证明**——覆盖成功时写入 `{covered, elapsed_s, registered_measured_s, seal_tail_reserve_s, wall_cap_s, checked_after_output_flush, summary_sha256}`（与 summary 字节 SHA 绑定），且证明写盘后**再采样核验**：证明写盘自身耗尽登记成本即翻转为撤回；两个 CLI 在所有退出路径上执行该核验，未覆盖即 fail-closed 退出 3 | 覆盖分支不重写 summary；非覆盖分支维持撤回 |
+| P1：撤回写盘自身漏计（登记成本直接更新为写前 elapsed 后写撤回文件，无尾部预留、无写后覆盖核验；封口函数 `status=exceeded` 且 `post>cap` 直接返回也不查该次写盘计费） | **封口循环计费检查前移**：任何状态（含 exceeded）写盘后先核验 `post ≤ measured`，不覆盖即增大预留重写（成本只升不降），超限状态也须自身写盘计费覆盖后才返回；**撤回路径改覆盖成本循环**——每次重写登记 `measured = elapsed + reserve`（reserve = 返回尾部 + max(下限, 前次预留)，成本只升不降），写盘后核验覆盖，最多 SEAL_VERIFY_ROUNDS 轮；**不能证明时**保持最高观测成本并显式记 `cost_coverage_unproven=true`，状态维持 exceeded 不可消费（fail-closed） | 撤回后完成声明维持撤销；预算数值不变 |
+
+N0 attempt_005：coverage_complete=true、0 异常、写盘前采样 54.13s、登记成本 **58.13s**、`return_observation.json` covered=true（elapsed 54.14 ≤ 登记 58.13，`summary_sha256` 与盘上 summary 一致、`checked_after_output_flush=true`，exit 0）；闭链、事件重放 350/189/147/392、旧 629 对照（381/223/25+25 行 bound）全部不变。N1 attempt_005：六类 47 用例全过、go=no_go 维持、登记成本 7.88s、返回观察 covered=true（elapsed 3.886 ≤ 7.885，SHA 绑定一致，exit 0）。测试 **31 passed**（新增/重写：返回覆盖覆盖分支证明绑定与 summary 零重写、复阅静态路径（早采样 99s→proof 写盘耗至 901s→写后再核验翻转为撤回→撤回成本覆盖证明）、迟采样（901s>cap 直接撤回且登记成本覆盖）、cap 内计费不足（150>100→撤回且登记≥写后样本）、封口超限写盘计费覆盖断言（盘上 2687s ≥ 905s）、两个 CLI 观察文件断言）。方案新增 §17、N0 §10/N1 §9 修订节、docs/README.md 已更新。**边界：T6 audit_incomplete/covered_contract_passed=false、539 gaps、cohort 34 次更新/1347.195507s、一次性授权已消费、partial/null/false/not_ready/不接入全部保持；I/R/D1/D6/F 未实施，真实拟合仍须 §8.3 新冻结材料与新明确授权；本轮未提交 git、未运行全项目套件。**

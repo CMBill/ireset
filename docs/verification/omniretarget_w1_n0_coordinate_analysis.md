@@ -124,3 +124,12 @@
 - **registration 绑定严格性（P2）**：`execution_registration_sha256` 改为逐阶段硬性校验——必须存在于 P/I/F 三个 stage 快照、为 64 位小写十六进制、三值相等；缺失/畸形/不一致均硬失败（反例覆盖三种形态）。attempt_004 实测三阶段均为 `87961838…`。
 - **测试**：N0 套件 20 passed（新增返回覆盖两分支反例、registration 缺失/畸形/不一致三反例；"通过后零写盘"反例升级为同时断言盘上计费（54s）覆盖写后样本（40s））。
 - 其余结论与 §4/§7/§8 不变：coverage_complete=true、0 SOURCE_ANOMALY、闭链全绑定、350/189/147/392 事件重放、旧 629 对照（381/223/25）、25 行 bound resolved。
+
+## 10. 修订记录（2026-11-07 第四轮复阅后，attempt_005 权威）
+
+第四轮独立复阅确认封口预留与 registration 严格校验成立，另提出 2 项 P1，全部修复并以修正协议重跑：权威为 **`attempt_005`**（001–004 保留为被取代证据）。
+
+- **返回核验时序（P1）**：`verify_return_coverage` 改为**先读盘解析、再采样判定**（必要读盘纳入被检时长）；CLI 的 JSON 输出显式 flush 后才核验（打印耗时纳入）；新增 `return_observation.json` 绑定证明（covered/elapsed/registered/wall_cap/`checked_after_output_flush`/`summary_sha256` 与 summary 字节绑定），证明写盘后再采样核验——证明写盘自身耗尽登记成本即翻转为撤回；两个 CLI 在所有退出路径执行核验，未覆盖即 fail-closed 退出 3。attempt_005 实测：covered=true、elapsed 54.14s ≤ 登记 58.13s、SHA 与盘上 summary 一致。
+- **撤回成本覆盖（P1）**：封口循环计费检查前移到 cap 判定之前——任何状态（含 exceeded）的写盘都必须 `post ≤ 登记成本` 才返回，未覆盖即增大预留重写；撤回路径改覆盖成本循环（每次登记 `elapsed + reserve`，成本只升不降，写后核验），不能证明时保持最高观测成本并记 `cost_coverage_unproven=true`、状态维持 exceeded 不可消费。反例断言：超限写盘盘上计费 2687s ≥ 写后 905s；撤回重写登记成本 ≥ 其写后样本。
+- **测试**：N0 套件 20 passed（返回覆盖四分支重写：覆盖+SHA 绑定+summary 零重写、复阅静态路径、迟采样、cap 内计费不足；封口超限计费断言；CLI 观察文件断言）。
+- 其余结论与 §4/§7–§9 不变：coverage_complete=true、0 SOURCE_ANOMALY、闭链全绑定、350/189/147/392、旧 629 对照（381/223/25）、25 行 bound resolved、登记成本 58.13s 覆盖封口与返回。

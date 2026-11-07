@@ -86,19 +86,20 @@ def main() -> int:
                    ("measured_wall_s_at_summary", "work_deadline_s",
                     "hard_deadline_s", "budget_exceeded", "stopped_at")},
         "outputs": {"cases": paths["cases"], "summary": paths["summary"]},
-    }, indent=1))
-    sealed = (disk.get("seal") or {}).get("status") == "sealed_within_budget"
-    if not sealed or disk.get("budget", {}).get("budget_exceeded"):
-        return 3
-    # Independent post-print return-coverage proof (plan §8.2): the actual
-    # return time must be covered by the registered cost; a violation
-    # withdraws the completion claim AND the go/no-go recommendation on disk
-    # and fails closed.
+    }, indent=1), flush=True)
+    # Independent post-output return-coverage proof (plan §8.2), on every
+    # exit path: the summary read, this flushed output and the check itself
+    # are inside the checked elapsed time; the proof is bound to
+    # return_observation.json.  A violation withdraws the completion claim
+    # AND the go/no-go recommendation on disk and fails closed.
     cov = n1.verify_return_coverage(Path(paths["summary"]), budget,
                                     withdraw=dict(n1.N1_WITHDRAW_ON_EXCEED))
     if not cov["covered"]:
         print(json.dumps({"return_coverage": cov, "decision": "fail_closed"}),
-              file=sys.stderr)
+              file=sys.stderr, flush=True)
+        return 3
+    sealed = (disk.get("seal") or {}).get("status") == "sealed_within_budget"
+    if not sealed or disk.get("budget", {}).get("budget_exceeded"):
         return 3
     if disk.get("all_cases_passed") and str(disk.get("go_no_go") or "").startswith("go_"):
         return 0
