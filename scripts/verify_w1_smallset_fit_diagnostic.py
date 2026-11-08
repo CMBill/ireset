@@ -90,16 +90,11 @@ def main() -> int:
         facts["label_verdict"] = "complete"
     paths = diag.write_acceptance_outputs(out_dir, facts, budget,
                                           withdraw=dict(WITHDRAW_ON_EXCEED))
-    cov = diag.verify_return_coverage(Path(paths["summary"]), budget,
-                                      withdraw=dict(WITHDRAW_ON_EXCEED))
-    if not cov["covered"]:
-        print(json.dumps({"return_coverage": cov, "decision": "fail_closed"}),
-              file=sys.stderr, flush=True)
-        diag.verify_return_coverage(Path(paths["summary"]), budget,
-                                    withdraw=dict(WITHDRAW_ON_EXCEED))
-        return 3
-
-    # Fail-closed: the on-disk sealed summary is the authority.
+    # P1 (round-2 review): the flushed stdout output is part of the process
+    # return and must be INSIDE the checked window.  Print the disk-derived
+    # payload FIRST (flush=True), only then sample the return coverage; the
+    # failure branch re-verifies after its stderr diagnostic so the
+    # diagnostic time is covered too (costs only increase).
     disk = paths["summary_doc"]
     print(json.dumps({
         "output_dir": str(out_dir),
@@ -117,6 +112,17 @@ def main() -> int:
                              "budget_exceeded", "stopped_at")},
         "outputs": {"summary": paths["summary"]},
     }, indent=1), flush=True)
+    cov = diag.verify_return_coverage(Path(paths["summary"]), budget,
+                                      withdraw=dict(WITHDRAW_ON_EXCEED))
+    if not cov["covered"]:
+        print(json.dumps({"return_coverage": cov, "decision": "fail_closed"}),
+              file=sys.stderr, flush=True)
+        diag.verify_return_coverage(Path(paths["summary"]), budget,
+                                    withdraw=dict(WITHDRAW_ON_EXCEED))
+        return 3
+    # Fail-closed: re-read the on-disk sealed summary AFTER the coverage
+    # proof — the final disk state, not pre-write memory, decides the exit.
+    disk = json.loads(Path(paths["summary"]).read_text())
     sealed = (disk.get("seal") or {}).get("status") == "sealed_within_budget"
     if not sealed or (disk.get("budget") or {}).get("budget_exceeded"):
         return 3

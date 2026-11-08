@@ -576,7 +576,8 @@ def normalized_group_errors(x0_pred: np.ndarray, x0_tgt: np.ndarray) -> dict:
 def aggregate_local_verdicts(final_windows: list[dict]) -> dict:
     """Step-final aggregation: the macro average NEVER substitutes the
     per-window conjunction."""
-    per_window = [bool(w.get("window_mean_fit_passed")) for w in final_windows]
+    per_window = [bool((w.get("metrics") or {}).get("window_mean_fit_passed"))
+                  for w in final_windows]
     macro = None
     if final_windows:
         values = [w.get("metrics", {}).get("root_position_rmse_m")
@@ -739,20 +740,37 @@ def read_npz_records(path: Path, table: dict, prefix_map: dict[str, str]) -> dic
     return out
 
 
+# late artifacts whose bytes are bound by SHA FIELDS elsewhere (report ←
+# return proof + candidate; proof ← report bytes; candidate ← consumed by
+# resolve_handoff): they are written after the index and must never appear
+# in it, or the index↔report SHA chain would be circular
+LATE_BOUND_ARTIFACTS = ("stage_report.json", "return_observation.json",
+                        "handoff_candidate.json")
+
+
 def build_artifacts_index(stage_dir: Path) -> dict:
     files = {}
     for p in sorted(Path(stage_dir).rglob("*")):
-        if p.is_file() and p.name != "artifacts_index.json":
-            files[str(p.relative_to(stage_dir))] = {
-                "sha256": sha256_file(p), "bytes": p.stat().st_size}
+        if not p.is_file() or p.name == "artifacts_index.json" \
+                or p.name in LATE_BOUND_ARTIFACTS:
+            continue
+        files[str(p.relative_to(stage_dir))] = {
+            "sha256": sha256_file(p), "bytes": p.stat().st_size}
     return {"schema": ARTIFACTS_INDEX_SCHEMA, "files": files}
 
 
-def verify_artifacts_index(stage_dir: Path, index: dict) -> list[str]:
+def verify_artifacts_index(stage_dir: Path, index: dict,
+                           required: Sequence[str] | None = None) -> list[str]:
     problems: list[str] = []
     if not isinstance(index, dict) or index.get("schema") != ARTIFACTS_INDEX_SCHEMA:
         return ["artifacts_index_schema"]
-    for rel, meta in (index.get("files") or {}).items():
+    files = index.get("files") or {}
+    # a required file absent from the index is a structural failure even
+    # though the (possibly empty) iteration below finds nothing to check
+    for rel in required or ():
+        if rel not in files:
+            problems.append(f"artifact_required_missing:{rel}")
+    for rel, meta in files.items():
         p = Path(stage_dir) / rel
         if not p.is_file():
             problems.append(f"artifact_missing:{rel}")
@@ -1126,12 +1144,13 @@ class FitDriver:
                 "window_consumptions_total": micros * plan.micro_batch,
                 "epochs_restarted": None}
 
-    def call_matrix_problems(self) -> list[str]:
+    def call_matrix_problems(self, snapshot: dict | None = None) -> list[str]:
         problems = []
+        source = self.counters if snapshot is None else snapshot
         for key, want in self.expected_matrix.items():
             if want is None:
                 continue
-            got = self.counters.get(key, 0)
+            got = source.get(key, 0)
             if got != want:
                 problems.append(f"call_matrix:{key}:actual{got}:expected{want}")
         return problems
@@ -1176,6 +1195,8 @@ class FitDriver:
                 f"w{b}__prod_q": prod[b][2], f"w{b}__fk_tgt": fk[b]})
 
     def _run_probe(self, step: int, idx: int) -> None:
+        self.budget.check(f"probe_{idx}_step_{step}_start")
+        self.runtime_guard.check_unit(f"probe_{idx}_step_{step}_start")
         self._ensure_teacher()
         self.counters["probe_calls"] = self.counters.get("probe_calls", 0) + 1
         gen = torch.Generator()
@@ -1191,6 +1212,7 @@ class FitDriver:
 
     def _save_checkpoint(self, name: str, step: int) -> None:
         self.budget.check(f"checkpoint_{name}_start")
+        self.runtime_guard.check_unit(f"checkpoint_{name}_start")
         self.counters["checkpoint_saves"] = \
             self.counters.get("checkpoint_saves", 0) + 1
         self.trainer.save(name, step, {"step": step}, identity=self.identity)
@@ -1208,10 +1230,18 @@ class FitDriver:
             self._preflight()
             self._train_and_probe()
             self._write_stage_artifacts()
+            # the matrix is judged on the units the STAGE itself executed;
+            # the local verification's own decode work is counted separately
+            matrix_snapshot = dict(self.counters)
+            verification_counters: dict = {"production_decode_calls": 0,
+                                           "metric_decode_calls": 0}
             verification = verify_stage_local(
-                self.stage_dir, self.plan, self.registration, self.decoder)
+                self.stage_dir, self.plan, self.registration, self.decoder,
+                production_decoder=self.loss_fn,
+                counters=verification_counters)
             self.budget.check("local_verification_complete")
             summary.update(verification)
+            summary["verification_counters"] = verification_counters
             summary["failure"] = None
             summary["local_complete_evidence"] = bool(verification["problems"] == [])
             summary["local_mean_fit_passed"] = verification["local_mean_fit_passed"]
@@ -1220,8 +1250,8 @@ class FitDriver:
                 else ("fit_insufficient" if summary["local_mean_fit_passed"] is False
                       else "complete_fit"))
             summary["call_matrix"] = {
-                "expected": self.expected_matrix, "actual": dict(self.counters),
-                "problems": self.call_matrix_problems()}
+                "expected": self.expected_matrix, "actual": matrix_snapshot,
+                "problems": self.call_matrix_problems(snapshot=matrix_snapshot)}
             if summary["call_matrix"]["problems"]:
                 summary["local_complete_evidence"] = False
                 summary["local_conclusion"] = "incomplete"
@@ -1284,6 +1314,8 @@ class FitDriver:
             for micro in range(plan.grad_accum):
                 self._phase = f"step_{step}_micro_{micro + 1}"
                 self.budget.check(f"step_{step}_micro_{micro + 1}_start")
+                self.runtime_guard.check_unit(
+                    f"step_{step}_micro_{micro + 1}_start")
                 try:
                     batch = next(data_iter)
                 except StopIteration:
@@ -1301,22 +1333,29 @@ class FitDriver:
 
                 def pre_backward(_s=step, _m=micro):
                     self.budget.check(f"step_{_s}_micro_{_m + 1}_pre_backward")
+                    self.runtime_guard.check_unit(
+                        f"step_{_s}_micro_{_m + 1}_pre_backward")
 
                 def post_backward():
                     self.counters["backward_calls"] += 1
 
                 loss, parts = trainer.accumulate_micro(
                     batch, pre_backward=pre_backward, post_backward=post_backward)
+                n_micro += 1
                 for k, v in parts.items():
                     parts_acc[k] = parts_acc.get(k, 0.0) + float(v) / plan.grad_accum
                 self.budget.check(f"step_{step}_micro_{micro + 1}_backward")
+                self.runtime_guard.check_unit(
+                    f"step_{step}_micro_{micro + 1}_backward")
             self._phase = f"step_{step}_clip"
             self.budget.check(f"step_{step}_clip")
+            self.runtime_guard.check_unit(f"step_{step}_clip")
             self._check_clip_coverage_pre()
             self.counters["clip_calls"] += 1
             gnorm = trainer.clip_gradients()
             self._check_clip_coverage_post()
             self.budget.check(f"step_{step}_pre_optimizer_step")
+            self.runtime_guard.check_unit(f"step_{step}_pre_optimizer_step")
             self._phase = f"step_{step}_optimizer_update"
             self.counters["adamw_step_calls"] += 1
             trainer.step_optimizer()
@@ -1402,8 +1441,68 @@ class FitDriver:
             json.dumps(index, indent=1, allow_nan=False))
 
 
+def _return_proof_problems(stage_dir: Path) -> list[str]:
+    """Full consumption of the outer return observation: existence, covered,
+    byte-bound to the sealed report, and an internally consistent coverage
+    chain (elapsed <= registered <= wall cap)."""
+    stage_dir = Path(stage_dir)
+    path = stage_dir / "return_observation.json"
+    if not path.is_file():
+        return ["return_observation_missing"]
+    try:
+        proof = json.loads(path.read_text())
+    except Exception as exc:  # noqa: BLE001
+        return [f"return_observation_unreadable:{type(exc).__name__}"]
+    problems: list[str] = []
+    if proof.get("covered") is not True:
+        problems.append("return_observation_not_covered")
+    report_path = stage_dir / "stage_report.json"
+    want = sha256_file(report_path) if report_path.is_file() else None
+    if want is None or proof.get("summary_sha256") != want:
+        problems.append("return_observation_summary_sha_mismatch")
+    for name in ("elapsed_s", "registered_measured_s", "wall_cap_s"):
+        v = proof.get(name)
+        if not isinstance(v, (int, float)) or isinstance(v, bool) \
+                or not math.isfinite(float(v)) or float(v) < 0:
+            problems.append(f"return_observation_field_invalid:{name}")
+    if not problems:
+        if not (float(proof["elapsed_s"]) <= float(proof["registered_measured_s"])
+                <= float(proof["wall_cap_s"])):
+            problems.append("return_observation_coverage_invalid")
+    return problems
+
+
+def write_handoff_candidate(stage_dir: Path, summary: dict) -> dict | None:
+    """Write the D1 receipt candidate AFTER the sealed report exists: it
+    binds the report bytes but is NOT consumable alone (plan §7.4 item 3)."""
+    stage_dir = Path(stage_dir)
+    if summary.get("stage") != "D1":
+        return None
+    report_path = stage_dir / "stage_report.json"
+    candidate = {
+        "schema": HANDOFF_SCHEMA, "stage": "D1",
+        "stage_report_sha256": sha256_file(report_path)
+        if report_path.is_file() else None,
+        "artifacts_index_sha256": summary.get("artifacts_index_sha256"),
+        "local_complete_evidence": summary.get("local_complete_evidence"),
+        "local_mean_fit_passed": summary.get("local_mean_fit_passed"),
+        "coverage": summary.get("coverage"),
+        "final_windows": [
+            {"window_id": w.get("window_id"),
+             "window_mean_fit_passed":
+                 (w.get("metrics") or {}).get("window_mean_fit_passed")}
+            for w in summary.get("final_windows") or []],
+        "note": "candidate_only; handoff_ready is resolved from disk facts "
+                "(seal + return observation + re-verification + authorization)",
+    }
+    (stage_dir / "handoff_candidate.json").write_text(
+        json.dumps(candidate, indent=1, allow_nan=False))
+    return candidate
+
+
 def finish_stage(stage_dir: Path, summary: dict, budget: StageBudget) -> dict:
-    """Seal the stage report (publish-verify seal + return coverage proof)."""
+    """Seal the stage report (publish-verify seal + return coverage proof)
+    and, for D1, write the handoff candidate binding the sealed report."""
     stage_dir = Path(stage_dir)
     index_path = stage_dir / "artifacts_index.json"
     summary = {**summary, "artifacts_index_sha256":
@@ -1413,7 +1512,9 @@ def finish_stage(stage_dir: Path, summary: dict, budget: StageBudget) -> dict:
                                  withdraw=dict(I_WITHDRAW_ON_EXCEED))
     cov = verify_return_coverage(path, budget,
                                  withdraw=dict(I_WITHDRAW_ON_EXCEED))
+    candidate = write_handoff_candidate(stage_dir, summary)
     return {"stage_report": str(path), "seal": seal, "return_coverage": cov,
+            "handoff_candidate": candidate,
             "summary_doc": json.loads(path.read_text())}
 
 
@@ -1447,25 +1548,81 @@ def _metrics_equal(saved: dict, recomputed: dict, path: str = "") -> list[str]:
     return problems
 
 
+def _required_stage_artifacts(plan: FitPlan) -> list[str]:
+    """The frozen per-stage artifact set; an index missing any entry is a
+    structural failure (P1: an empty index must never verify)."""
+    required = ["teacher_reference.npz", "probe_inputs.npz",
+                "probe_index.json", "initial.pt", "last.pt"]
+    required += [f"probes/probe_{i:04d}_step_{s:06d}.npz"
+                 for i, s in enumerate(plan.probe_steps)]
+    return required
+
+
+def _production_decode_binding_problems(saved: dict, raw: np.ndarray,
+                                        production_decoder, counters: dict | None,
+                                        tag: str) -> list[str]:
+    """Re-derive the production FP32 decode from the saved raw x0 through the
+    SAME production ``decode_clip`` and bitwise-bind the saved quantities.
+
+    The production decode is not model/FK/optimizer work, so this stays
+    inside the §7.4 item-2 recompute; FK points remain production-registered
+    observations (state binding stays ``not_evaluated``)."""
+    if production_decoder is None:
+        return []
+    with torch.no_grad():
+        x = torch.as_tensor(np.ascontiguousarray(raw),
+                            device=production_decoder.mean.device)
+        pos, quat, q = production_decoder.decode_clip(x)
+    if counters is not None:
+        counters["production_decode_calls"] = \
+            counters.get("production_decode_calls", 0) + 1
+    problems: list[str] = []
+    for key, arr in (("prod_pos", pos), ("prod_quat", quat), ("prod_q", q)):
+        saved_arr = saved.get(key)
+        fresh = arr.detach().cpu().numpy()
+        if saved_arr is None or saved_arr.dtype != fresh.dtype \
+                or saved_arr.shape != fresh.shape \
+                or not np.array_equal(saved_arr.view(np.uint32),
+                                      fresh.view(np.uint32)):
+            problems.append(f"production_decode_binding_mismatch:{tag}:{key}")
+    return problems
+
+
 def verify_stage_local(stage_dir: Path, plan: FitPlan,
                        registration: FitRegistration,
-                       decoder: MetricDecoder) -> dict:
+                       decoder: MetricDecoder,
+                       production_decoder=None,
+                       counters: dict | None = None) -> dict:
     """§7.4 items 1-3 for one stage: coverage multiset, full CPU recompute of
-    every saved probe from disk raw x0, checkpoint role/step binding."""
+    every saved probe AND the frozen teacher references from disk raw x0
+    (bitwise decode bindings on both sides), production-decode re-derivation
+    bindings when the production chain is available, and checkpoint
+    role/step/dtype binding."""
     stage_dir = Path(stage_dir)
     problems: list[str] = []
     incomplete = {"problems": problems, "coverage": None,
                   "local_mean_fit_passed": None, "final_windows": [],
                   "decode_binding_status": "not_evaluated",
+                  "teacher_decode_binding_status": "not_evaluated",
+                  "production_decode_binding_status": "not_evaluated",
                   "fk_metric_reduction_status": "not_evaluated",
                   "intermediate_fk_state_binding_status": "not_evaluated",
+                  "teacher_fk_state_binding_status": "not_evaluated",
                   "spike_gate_status": SPIKE_GATE_STATUS}
     index_path = stage_dir / "artifacts_index.json"
     if not index_path.is_file():
         problems.append("artifacts_index_missing")
         return dict(incomplete)
     index = json.loads(index_path.read_text())
-    problems += verify_artifacts_index(stage_dir, index)
+    problems += verify_artifacts_index(stage_dir, index,
+                                       required=_required_stage_artifacts(plan))
+    # the stage report registers the index SHA; consume it whenever the
+    # report already exists (F / handoff contexts)
+    report_path = stage_dir / "stage_report.json"
+    if report_path.is_file():
+        report = json.loads(report_path.read_text())
+        if report.get("artifacts_index_sha256") != sha256_file(index_path):
+            problems.append("artifacts_index_sha_mismatch")
     probe_index_path = stage_dir / "probe_index.json"
     if not probe_index_path.is_file():
         problems.append("probe_index_missing")
@@ -1497,7 +1654,11 @@ def verify_stage_local(stage_dir: Path, plan: FitPlan,
             problems.append(f"{tag}:{items[:4]}")
 
     # 2. teacher reference + probe inputs --------------------------------------
+    # the teacher metric decode is re-derived from the SAVED RAW teacher x0
+    # and bitwise-bound against the saved md_* arrays; a teacher-derived
+    # replacement (e.g. the last prediction) can never pass silently
     teacher_records: dict[int, dict] = {}
+    teacher_ok: dict[int, bool] = {}
     teacher_path = stage_dir / "teacher_reference.npz"
     if teacher_path.is_file():
         for b in range(len(window_ids)):
@@ -1510,6 +1671,30 @@ def verify_stage_local(stage_dir: Path, plan: FitPlan,
                 break
     else:
         problems.append("teacher_reference_missing")
+    re_teacher: dict[int, dict] = {}
+    for b, recs in teacher_records.items():
+        raw_tgt = recs["raw_x0_tgt"]
+        problems += [f"teacher_raw_invalid:w{b}:{p}"
+                     for p in decoder.verify_x0(raw_tgt)]
+        problems += verify_rotation_matrix(recs["md_R"])
+        try:
+            re_tmd = decoder.decode(raw_tgt)
+        except FitDiagnosticError:
+            teacher_ok[b] = False
+            continue
+        if counters is not None:
+            counters["metric_decode_calls"] = \
+                counters.get("metric_decode_calls", 0) + 1
+        re_teacher[b] = re_tmd
+        bound = all(np.array_equal(recs[key].view(np.uint64), arr.view(np.uint64))
+                    for key, arr in (("md_pos", re_tmd["pos"]),
+                                     ("md_R", re_tmd["R"]),
+                                     ("md_q", re_tmd["q"])))
+        teacher_ok[b] = bound
+        if not bound:
+            problems.append(f"teacher_decode_binding_mismatch:w{b}")
+        problems += _production_decode_binding_problems(
+            recs, raw_tgt, production_decoder, counters, f"teacher:w{b}")
     inputs_path = stage_dir / "probe_inputs.npz"
     if inputs_path.is_file():
         for b in range(len(window_ids)):
@@ -1532,6 +1717,7 @@ def verify_stage_local(stage_dir: Path, plan: FitPlan,
     final_windows: list[dict] = []
     final_step = plan.steps
     any_redecode = False
+    any_prod_binding = production_decoder is not None
     for entry in pidx.get("probes") or []:
         step, idx = entry.get("step"), entry.get("idx")
         npz_path = stage_dir / "probes" / f"probe_{idx:04d}_step_{step:06d}.npz"
@@ -1555,34 +1741,45 @@ def verify_stage_local(stage_dir: Path, plan: FitPlan,
             raw_problems = decoder.verify_x0(raw)
             problems += [f"probe_raw_invalid:idx{idx}:{p}" for p in raw_problems]
             problems += verify_rotation_matrix(recs["md_R"])
-            tgt = teacher_records.get(b)
-            if tgt is None or raw_problems:
+            problems += _production_decode_binding_problems(
+                recs, raw, production_decoder, counters, f"probe{idx}:w{b}")
+            if not teacher_ok.get(b, False):
+                # the teacher binding failed for this window: its saved
+                # derived quantities are untrusted, so nothing may be
+                # consumed from them (no metrics, no final window)
+                continue
+            if raw_problems:
+                continue
+            tgt_md = re_teacher.get(b)
+            if tgt_md is None:
                 continue
             # bitwise decode binding: re-decode from disk raw x0
             re_md = decoder.decode(raw)
             any_redecode = True
+            if counters is not None:
+                counters["metric_decode_calls"] = \
+                    counters.get("metric_decode_calls", 0) + 1
             for key, arr in (("md_pos", re_md["pos"]), ("md_R", re_md["R"]),
                              ("md_q", re_md["q"])):
                 saved = recs[key]
                 if not np.array_equal(saved.view(np.uint64), arr.view(np.uint64)):
                     problems.append(f"decode_binding_mismatch:idx{idx}:w{b}:{key}")
-            # error curves recompute from the re-decoded values
+            # error curves recompute from the re-decoded values on BOTH sides
             re_err = {
                 "err_root_pos_t": np.linalg.norm(
-                    re_md["pos"] - tgt["md_pos"], axis=1),
+                    re_md["pos"] - tgt_md["pos"], axis=1),
                 "err_root_rot_t": so3_geodesic_angles_rad(
-                    re_md["R"], tgt["md_R"]),
-                "err_joint_tj": np.abs(re_md["q"] - tgt["md_q"]),
+                    re_md["R"], tgt_md["R"]),
+                "err_joint_tj": np.abs(re_md["q"] - tgt_md["q"]),
                 "err_fk_ts": np.linalg.norm(
                     recs["fk_pred"].astype(np.float64)
-                    - tgt["fk_tgt"].astype(np.float64), axis=-1)}
+                    - teacher_records[b]["fk_tgt"].astype(np.float64), axis=-1)}
             for key, arr in re_err.items():
                 if not np.array_equal(recs[key], arr):
                     problems.append(f"error_curve_mismatch:idx{idx}:w{b}:{key}")
             # metrics recompute (float64, from re-decoded + saved FK points)
             re_metrics = compute_window_metrics(
-                re_md, {"pos": tgt["md_pos"], "R": tgt["md_R"], "q": tgt["md_q"]},
-                recs["fk_pred"], tgt["fk_tgt"])
+                re_md, tgt_md, recs["fk_pred"], teacher_records[b]["fk_tgt"])
             problems += [f"probe_metrics_mismatch:idx{idx}:w{b}:{p}"
                          for p in _metrics_equal(wout.get("metrics") or {},
                                                  re_metrics)]
@@ -1608,9 +1805,14 @@ def verify_stage_local(stage_dir: Path, plan: FitPlan,
             "macro": macro,
             "decode_binding_status": ("recomputed_bitwise" if any_redecode
                                       else "not_evaluated"),
+            "teacher_decode_binding_status": ("recomputed_bitwise"
+                                              if re_teacher else "not_evaluated"),
+            "production_decode_binding_status":
+                ("recomputed_bitwise" if any_prod_binding else "not_evaluated"),
             "fk_metric_reduction_status": ("recomputed_from_saved_fk_points"
                                            if final_windows else "not_evaluated"),
             "intermediate_fk_state_binding_status": "not_evaluated",
+            "teacher_fk_state_binding_status": "not_evaluated",
             "spike_gate_status": SPIKE_GATE_STATUS}
 
 
@@ -1647,6 +1849,21 @@ def _checkpoint_binding_problems(stage_dir: Path, plan: FitPlan,
             problems.append(f"checkpoint_config_mismatch:{name}")
         if isinstance(ck, dict) and ck.get("parameters_finite") is not True:
             problems.append(f"checkpoint_params_nonfinite:{name}")
+        # the frozen contract is CUDA/float32 parameters: any saved floating
+        # tensor that is not float32 must be refused BEFORE a strict load can
+        # silently down-cast it (P1: dtype tamper)
+        if isinstance(ck, dict):
+            for side in ("model", "conditioner"):
+                tensors = ck.get(side)
+                if not isinstance(tensors, dict):
+                    problems.append(f"checkpoint_{side}_not_a_mapping:{name}")
+                    continue
+                for key, tensor in tensors.items():
+                    if torch.is_tensor(tensor) and tensor.is_floating_point() \
+                            and tensor.dtype != torch.float32:
+                        problems.append(
+                            f"checkpoint_param_dtype:{name}:{side}.{key}:"
+                            f"{tensor.dtype}")
     return problems
 
 
@@ -1694,12 +1911,17 @@ def build_handoff_candidate(stage_dir: Path, plan: FitPlan,
 
 def resolve_handoff(stage_dir: Path, plan: FitPlan, decoder: MetricDecoder,
                     registration: FitRegistration, authorization: dict | None,
-                    budget: StageBudget) -> dict:
+                    budget: StageBudget,
+                    production_decoder=None) -> dict:
     """D6-entry re-verification of the D1 receipt INSIDE D6's billed window.
 
-    ``handoff_ready`` requires: local recompute passes, the sealed stage
-    report is consumable (seal + return observation), the mean-fit gate
-    passed locally, and the authorization explicitly includes D6."""
+    ``handoff_ready`` requires ALL of: the sealed stage report is consumable,
+    the bound outer return observation exists and is internally consistent
+    (covered, byte-bound to the report, elapsed <= registered <= cap), the
+    handoff candidate exists and binds the current report bytes with
+    complete/passing local facts, the full local recompute (from disk raw x0,
+    teacher side included) passes, the mean-fit gate passed locally, and the
+    authorization explicitly includes D6."""
     stage_dir = Path(stage_dir)
     problems: list[str] = []
     budget.check("handoff_reverify")
@@ -1710,11 +1932,20 @@ def resolve_handoff(stage_dir: Path, plan: FitPlan, decoder: MetricDecoder,
     seal = doc.get("seal") or {}
     if seal.get("status") != "sealed_within_budget" or not seal.get("terminal"):
         problems.append("stage_seal_not_consumable")
-    obs_path = stage_dir / "return_observation.json"
-    if not obs_path.is_file() or \
-            json.loads(obs_path.read_text()).get("covered") is not True:
-        problems.append("return_observation_missing_or_uncovered")
-    verification = verify_stage_local(stage_dir, plan, registration, decoder)
+    problems += _return_proof_problems(stage_dir)
+    candidate_path = stage_dir / "handoff_candidate.json"
+    if not candidate_path.is_file():
+        problems.append("handoff_candidate_missing")
+    else:
+        candidate = json.loads(candidate_path.read_text())
+        if candidate.get("stage_report_sha256") != sha256_file(report_path):
+            problems.append("handoff_candidate_report_sha_mismatch")
+        if candidate.get("local_complete_evidence") is not True:
+            problems.append("handoff_candidate_not_complete")
+        if candidate.get("local_mean_fit_passed") is not True:
+            problems.append("handoff_candidate_mean_fit_not_passed")
+    verification = verify_stage_local(stage_dir, plan, registration, decoder,
+                                      production_decoder=production_decoder)
     problems += verification["problems"]
     mean_fit = verification["local_mean_fit_passed"]
     if mean_fit is not True:
@@ -1777,15 +2008,50 @@ def _fresh_probe(model, conditioner, batch: dict, plan: FitPlan,
     return x0_np, per_window
 
 
-def _load_state_dicts(path: Path, model, conditioner) -> None:
+def _checkpoint_tensor_problems(ck: dict, model, conditioner) -> list[str]:
+    """P1: full key-set/shape/dtype/finiteness contract against the FRESH
+    modules BEFORE any ``load_state_dict`` copy — strict load would silently
+    down-cast a float64 tensor and the post-load check could never see it."""
+    problems: list[str] = []
+    for side, module in (("model", model), ("conditioner", conditioner)):
+        want = module.state_dict()
+        got = ck.get(side)
+        if not isinstance(got, dict):
+            problems.append(f"checkpoint_{side}_not_a_mapping")
+            continue
+        if set(got) != set(want):
+            problems.append(f"checkpoint_{side}_key_set_mismatch")
+            continue
+        for key, want_t in want.items():
+            got_t = got[key]
+            if not torch.is_tensor(got_t):
+                problems.append(f"checkpoint_{side}.{key}_not_tensor")
+                continue
+            if got_t.shape != want_t.shape:
+                problems.append(f"checkpoint_{side}.{key}_shape")
+            if got_t.dtype != want_t.dtype:
+                problems.append(f"checkpoint_{side}.{key}_dtype:{got_t.dtype}")
+            if got_t.is_floating_point() and not bool(torch.isfinite(got_t).all()):
+                problems.append(f"checkpoint_{side}.{key}_nonfinite")
+    return problems
+
+
+def _load_state_dicts_checked(path: Path, model, conditioner) -> list[str]:
+    """Verify the saved tensor contract FIRST; only a clean checkpoint is
+    copied into the live modules."""
     ck = torch.load(path, map_location="cpu", weights_only=False)
+    problems = _checkpoint_tensor_problems(ck, model, conditioner)
+    if problems:
+        return problems
     model.load_state_dict(ck["model"], strict=True)
     conditioner.load_state_dict(ck["conditioner"], strict=True)
+    return []
 
 
 def _f_identity_problems(stage_dir: Path, plan: FitPlan,
                          decoder: MetricDecoder, index: dict) -> list[str]:
-    problems = verify_artifacts_index(Path(stage_dir), index)
+    problems = verify_artifacts_index(
+        Path(stage_dir), index, required=_required_stage_artifacts(plan))
     for name, want_step in (("initial.pt", 0), ("last.pt", plan.steps)):
         path = Path(stage_dir) / name
         if not path.is_file():
@@ -1833,6 +2099,28 @@ def _teacher_records(stage_dir: Path, b: int) -> dict:
         {r: f"w{b}__{r}" for r in TEACHER_RECORDS})
 
 
+def _teacher_reference_checked(stage_dir: Path, decoder: MetricDecoder,
+                               b: int, counters: dict | None = None) -> tuple[dict, list[str]]:
+    """Teacher reference with the metric decode re-derived from the saved RAW
+    teacher x0 and bitwise-bound against the saved md_* arrays (P1: a
+    teacher-derived replacement can never feed the F metrics)."""
+    problems: list[str] = []
+    recs = _teacher_records(stage_dir, b)
+    problems += [f"teacher_raw_invalid:w{b}:{p}"
+                 for p in decoder.verify_x0(recs["raw_x0_tgt"])]
+    re_tmd = decoder.decode(recs["raw_x0_tgt"])
+    if counters is not None:
+        counters["metric_decode_calls"] = \
+            counters.get("metric_decode_calls", 0) + 1
+    for key, arr in (("md_pos", re_tmd["pos"]), ("md_R", re_tmd["R"]),
+                     ("md_q", re_tmd["q"])):
+        if not np.array_equal(recs[key].view(np.uint64), arr.view(np.uint64)):
+            problems.append(f"teacher_decode_binding_mismatch:w{b}:{key}")
+    recs = {**recs, "md_pos": re_tmd["pos"], "md_R": re_tmd["R"],
+            "md_q": re_tmd["q"]}
+    return recs, problems
+
+
 def run_f_verification(*, stage_specs: list[dict], out_dir: Path,
                        budget: StageBudget, runtime_guard, build_modules,
                        authorization: dict | None) -> dict:
@@ -1868,10 +2156,25 @@ def run_f_verification(*, stage_specs: list[dict], out_dir: Path,
             stages_out.append(res)
             evidence_all_ok = False
             continue
-        verification = verify_stage_local(stage_dir, plan, registration, decoder)
+        proof_problems = _return_proof_problems(stage_dir)
+        if proof_problems:
+            res.update({"replay_enabled": False, "replay_passed": None,
+                        "skip_reason": "return_observation_missing_or_uncovered",
+                        "return_proof_problems": proof_problems[:6]})
+            stages_out.append(res)
+            evidence_all_ok = False
+            continue
+        f_verify_counters: dict = {"production_decode_calls": 0,
+                                   "metric_decode_calls": 0}
+        verification = verify_stage_local(
+            stage_dir, plan, registration, decoder,
+            production_decoder=loss_fn, counters=f_verify_counters)
         res["local_reverify_problems"] = verification["problems"][:10]
+        res["verification_counters"] = dict(f_verify_counters)
         res["intermediate_fk_state_binding_status"] = \
             verification["intermediate_fk_state_binding_status"]
+        res["teacher_fk_state_binding_status"] = \
+            verification["teacher_fk_state_binding_status"]
         res["fk_replay_scope"] = FK_REPLAY_SCOPE
         if verification["problems"]:
             res.update({"replay_enabled": False, "replay_passed": None,
@@ -1915,7 +2218,15 @@ def run_f_verification(*, stage_specs: list[dict], out_dir: Path,
         try:
             for role, want_step in (("initial", 0), ("last", plan.steps)):
                 budget.check(f"f_probe_{role}")
-                _load_state_dicts(stage_dir / f"{role}.pt", model, conditioner)
+                load_problems = _load_state_dicts_checked(
+                    stage_dir / f"{role}.pt", model, conditioner)
+                if load_problems:
+                    # refuse BEFORE any copy: a strict load would silently
+                    # down-cast mistyped tensors (P1: dtype tamper)
+                    replay_problems.append(
+                        f"checkpoint_tensor_contract:{load_problems[:3]}")
+                    continue
+                budget.check(f"f_probe_{role}_loaded")
                 runtime_guard.check_unit(f"f_probe_{role}_loaded")
                 param_problems = parameter_contract_problems(
                     {"model": model, "conditioner": conditioner},
@@ -1940,8 +2251,10 @@ def run_f_verification(*, stage_specs: list[dict], out_dir: Path,
                          for k, v in batch_arrays.items()}
                 device = next(model.parameters()).device
                 batch = {k: v.to(device) for k, v in batch.items()}
+                budget.check(f"f_probe_{role}_inputs_ready")
                 x0_fresh, fresh_prod = _fresh_probe(
                     model, conditioner, batch, plan, loss_fn, f_counters)
+                budget.check(f"f_probe_{role}_fresh_complete")
                 idx = 0 if role == "initial" else plan.n_probes - 1
                 saved_entry = _saved_probe_entry(stage_dir, idx, want_step)
                 if saved_entry is None:
@@ -1964,10 +2277,13 @@ def run_f_verification(*, stage_specs: list[dict], out_dir: Path,
                                 saved[key].view(np.uint32)):
                             replay_problems.append(
                                 f"replay_mismatch:{key}:{role}:w{b}")
-                    # fresh metric_decode + metrics from the fresh x0
+                    # fresh metric_decode + metrics from the fresh x0 against
+                    # the RE-DERIVED teacher decode (never the saved md_*)
+                    teacher, teacher_problems = _teacher_reference_checked(
+                        stage_dir, decoder, b, f_counters)
+                    replay_problems += teacher_problems[:3]
                     f_counters["metric_decode_calls"] += 1
                     fresh_md = decoder.decode(raw_f)
-                    teacher = _teacher_records(stage_dir, b)
                     fresh_metrics = compute_window_metrics(
                         fresh_md, {"pos": teacher["md_pos"], "R": teacher["md_R"],
                                    "q": teacher["md_q"]},
@@ -2316,7 +2632,8 @@ def run_synthetic_acceptance(budget: StageBudget, out_dir: Path,
     d6_plan = None
     if facts["d1"]["local_mean_fit_passed"] is True:
         handoff = resolve_handoff(out_dir / "d1", d1_plan, world.decoder,
-                                  world.registration_for("D1"), auth, budget)
+                                  world.registration_for("D1"), auth, budget,
+                                  production_decoder=world.loss_fn)
         facts["d1_handoff"] = {"handoff_ready": handoff["handoff_ready"],
                                "problems": handoff["problems"][:5]}
         if handoff["handoff_ready"]:
@@ -2392,6 +2709,12 @@ COUNTEREXAMPLE_IDS = (
     "f_failure_preserves_local_facts", "replay_mismatch_no_loosening",
     "decode_tamper_synced_rejected",
     "fk_self_consistent_replacement_keeps_limitation",
+    "teacher_derived_replacement_rejected",
+    "return_proof_binding_rejected",
+    "empty_artifacts_index_rejected",
+    "checkpoint_dtype_tamper_rejected",
+    "runtime_drift_mid_micro_stops",
+    "f_forward_after_deadline_refused",
 )
 
 
@@ -2403,9 +2726,33 @@ class _FakeClock:
         return self.t
 
 
-def _re_sign_index(sdir: Path) -> None:
+def _full_resign(sdir: Path) -> None:
+    """Re-sign the whole derived binding chain so the on-disk state is
+    SELF-CONSISTENT after a value tamper.  Order is strictly one-way
+    (index → report → return proof → candidate): the index excludes the
+    late-bound files, the report registers the index SHA, the proof binds
+    the final report bytes and the candidate binds the report as well.
+    Only re-derivation from primary quantities (raw x0, constants, fresh
+    replay) can still catch the fault — which is exactly what the reviewed
+    gates must do."""
     (sdir / "artifacts_index.json").write_text(
         json.dumps(build_artifacts_index(sdir), indent=1, allow_nan=False))
+    report_path = sdir / "stage_report.json"
+    if not report_path.is_file():
+        return
+    report = json.loads(report_path.read_text())
+    report["artifacts_index_sha256"] = sha256_file(sdir / "artifacts_index.json")
+    report_path.write_text(json.dumps(report, indent=1, allow_nan=False))
+    obs_path = sdir / "return_observation.json"
+    if obs_path.is_file():
+        obs = json.loads(obs_path.read_text())
+        obs["summary_sha256"] = sha256_file(report_path)
+        obs_path.write_text(json.dumps(obs, indent=1))
+    cand_path = sdir / "handoff_candidate.json"
+    if cand_path.is_file():
+        cand = json.loads(cand_path.read_text())
+        cand["stage_report_sha256"] = sha256_file(report_path)
+        cand_path.write_text(json.dumps(cand, indent=1))
 
 
 def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dict:
@@ -2627,7 +2974,7 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
         ck["root_stats"] = {"mean": ck["root_stats"]["mean"] + 100.0,
                             "std": ck["root_stats"]["std"]}
         torch.save(ck, sdir_k / "last.pt")
-        _re_sign_index(sdir_k)
+        _full_resign(sdir_k)
         ver = verify_stage_local(sdir_k, plan_k, world_k.registration_for("D1"),
                                  world_k.decoder)
         record("checkpoint_root_stats_misbinding",
@@ -2720,7 +3067,7 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
         ck["root_stats"] = {"mean": ck["root_stats"]["mean"] + 5.0,
                             "std": ck["root_stats"]["std"]}
         torch.save(ck, sdir_f / "last.pt")
-        _re_sign_index(sdir_f)
+        _full_resign(sdir_f)
         built = {"count": 0}
 
         def counting_build():
@@ -2751,11 +3098,14 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
         ] + [{"window_id": "w5",
               "metrics": {"window_mean_fit_passed": False}}]
         agg = aggregate_local_verdicts(final_windows)
+        agg_pass = aggregate_local_verdicts(final_windows[:1])
         record("window_gate_not_masked_by_macro",
                agg["local_mean_fit_passed"] is False
                and agg["macro_root_position_rmse_m"] is None
-               and agg["macro_is_not_a_gate"] is True,
-               f"conjunction={agg['local_mean_fit_passed']}")
+               and agg["macro_is_not_a_gate"] is True
+               and agg_pass["local_mean_fit_passed"] is True,
+               f"conjunction={agg['local_mean_fit_passed']} "
+               f"(all-pass control={agg_pass['local_mean_fit_passed']})")
 
         tgt_dec = {"pos": np.zeros((T_WINDOW, 3)),
                    "R": np.tile(np.eye(3), (T_WINDOW, 1, 1)),
@@ -2799,7 +3149,7 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
             arrays = {k: data[k] for k in data.files}
         arrays.pop("w0__md_q")
         write_npz_records(npz_path, arrays)
-        _re_sign_index(sdir_s)
+        _full_resign(sdir_s)
         ver = verify_stage_local(sdir_s, plan_s, world_s.registration_for("D1"),
                                  world_s.decoder)
         record("metric_schema_row_offset_truncation",
@@ -2830,6 +3180,15 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
         arrays["w0__err_root_rot_t"] = so3_geodesic_angles_rad(
             dec["R"], tgt["md_R"])
         arrays["w0__err_joint_tj"] = np.abs(dec["q"] - tgt["md_q"])
+        # a fully self-consistent tamper also re-derives the production
+        # decode of the perturbed raw x0 (the production-decode binding
+        # would otherwise catch the swap already)
+        with torch.no_grad():
+            _pos, _quat, _q = world_b.loss_fn.decode_clip(
+                torch.as_tensor(perturbed))
+        arrays["w0__prod_pos"] = _pos.numpy()
+        arrays["w0__prod_quat"] = _quat.numpy()
+        arrays["w0__prod_q"] = _q.numpy()
         write_npz_records(npz_path, arrays)
         pidx = json.loads((sdir_b / "probe_index.json").read_text())
         re_metrics = compute_window_metrics(
@@ -2838,7 +3197,7 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
         pidx["probes"][0]["windows"][0]["metrics"] = re_metrics
         (sdir_b / "probe_index.json").write_text(
             json.dumps(pidx, indent=1, allow_nan=False))
-        _re_sign_index(sdir_b)
+        _full_resign(sdir_b)
         ver = verify_stage_local(sdir_b, plan_b, world_b.registration_for("D1"),
                                  world_b.decoder)
         self_consistent = ver["problems"] == []
@@ -2915,7 +3274,7 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
             arrays = {k: data[k] for k in data.files}
         arrays["w0__md_pos"] = arrays["w0__md_pos"] + 0.001
         write_npz_records(npz_path, arrays)
-        _re_sign_index(sdir_dt)
+        _full_resign(sdir_dt)
         ver = verify_stage_local(sdir_dt, plan_dt,
                                  world_dt.registration_for("D1"),
                                  world_dt.decoder)
@@ -2948,7 +3307,7 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
         pidx["probes"][0]["windows"][0]["metrics"] = re_metrics
         (sdir_fk / "probe_index.json").write_text(
             json.dumps(pidx, indent=1, allow_nan=False))
-        _re_sign_index(sdir_fk)
+        _full_resign(sdir_fk)
         ver = verify_stage_local(sdir_fk, plan_fk,
                                  world_fk.registration_for("D1"),
                                  world_fk.decoder)
@@ -3007,7 +3366,8 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
                          and doc.get("final_verification_status") == "pending_F")
         handoff = resolve_handoff(sdir_h, plan_h, world_h.decoder,
                                   world_h.registration_for("D1"),
-                                  {"includes": []}, StageBudget("D6", 60.0, 5.0))
+                                  {"includes": []}, StageBudget("D6", 60.0, 5.0),
+                                  production_decoder=world_h.loss_fn)
         record("d1_handoff_cannot_publish_final",
                report_ok and final_blocked and handoff["handoff_ready"] is False
                and any("authorization_does_not_include_d6" in p
@@ -3048,6 +3408,253 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
                == "bitwise_no_tolerance",
                "identity-failed stage never reaches a fresh probe; no "
                "tolerance loosening path exists")
+
+        # --- P1: teacher-derived quantities replaced by the last prediction ---
+        world_t, plan_t, _, _, sdir_t, _, _ = _mini_stage(
+            tmp / "teacher_swap", "D1", n_windows=1, steps=2, probe_every=1,
+            seed=seed + 30, finish=True)
+        pidx_t = json.loads((sdir_t / "probe_index.json").read_text())
+        last_entry = pidx_t["probes"][-1]
+        last_npz = (sdir_t / "probes" /
+                    f"probe_{last_entry['idx']:04d}_step_{last_entry['step']:06d}.npz")
+        with np.load(last_npz) as data:
+            last_arrays = {k: data[k] for k in data.files}
+        # keep raw_x0_tgt; replace every teacher-derived quantity with the
+        # last prediction's derived quantities, then re-sync every probe's
+        # metrics against the fake teacher and re-sign the whole chain
+        with np.load(sdir_t / "teacher_reference.npz") as data:
+            teacher_arrays = {k: data[k] for k in data.files}
+        for key in ("md_pos", "md_R", "md_q", "prod_pos", "prod_quat",
+                    "prod_q", "fk_tgt"):
+            src_key = "w0__fk_pred" if key == "fk_tgt" else f"w0__{key}"
+            teacher_arrays[f"w0__{key}"] = last_arrays[src_key]
+        write_npz_records(sdir_t / "teacher_reference.npz", teacher_arrays)
+        fake_md = {"pos": teacher_arrays["w0__md_pos"],
+                   "R": teacher_arrays["w0__md_R"],
+                   "q": teacher_arrays["w0__md_q"]}
+        for entry in pidx_t["probes"]:
+            npz_p = (sdir_t / "probes" /
+                     f"probe_{entry['idx']:04d}_step_{entry['step']:06d}.npz")
+            with np.load(npz_p) as data:
+                p_arrays = {k: data[k] for k in data.files}
+            p_arrays["w0__err_root_pos_t"] = np.linalg.norm(
+                p_arrays["w0__md_pos"] - fake_md["pos"], axis=1)
+            p_arrays["w0__err_root_rot_t"] = so3_geodesic_angles_rad(
+                p_arrays["w0__md_R"], fake_md["R"])
+            p_arrays["w0__err_joint_tj"] = np.abs(
+                p_arrays["w0__md_q"] - fake_md["q"])
+            p_arrays["w0__err_fk_ts"] = np.linalg.norm(
+                p_arrays["w0__fk_pred"].astype(np.float64)
+                - teacher_arrays["w0__fk_tgt"].astype(np.float64), axis=-1)
+            write_npz_records(npz_p, p_arrays)
+            for w in entry["windows"]:
+                w["metrics"] = compute_window_metrics(
+                    {"pos": p_arrays["w0__md_pos"], "R": p_arrays["w0__md_R"],
+                     "q": p_arrays["w0__md_q"]}, fake_md,
+                    p_arrays["w0__fk_pred"], teacher_arrays["w0__fk_tgt"])
+        (sdir_t / "probe_index.json").write_text(
+            json.dumps(pidx_t, indent=1, allow_nan=False))
+        _full_resign(sdir_t)
+        ver = verify_stage_local(sdir_t, plan_t,
+                                 world_t.registration_for("D1"),
+                                 world_t.decoder,
+                                 production_decoder=world_t.loss_fn)
+        f_out = run_f_verification(
+            stage_specs=[{"stage_dir": sdir_t, "plan": plan_t,
+                          "registration": world_t.registration_for("D1"),
+                          "decoder": world_t.decoder,
+                          "loss_fn": world_t.loss_fn}],
+            out_dir=tmp / "teacher_swap_f", budget=StageBudget("F", 300.0, 10.0),
+            runtime_guard=SyntheticRuntimeGuard(),
+            build_modules=build_modules_factory(world_t, plan_t),
+            authorization=None)
+        caught = (any("teacher_decode_binding_mismatch" in p
+                      for p in ver["problems"])
+                  and ver["local_mean_fit_passed"] is None
+                  and f_out["summary_doc"]["complete_evidence"] is False
+                  and f_out["summary_doc"]["mean_fit_passed"] is None)
+        record("teacher_derived_replacement_rejected", caught,
+               f"teacher=last-prediction swap fully re-signed; verify: "
+               f"{[p for p in ver['problems'] if 'teacher' in p][:1]}")
+
+        # --- P1: return-proof binding / existence ---------------------------------
+        world_r2, plan_r2, _, _, sdir_r2, _, _ = _mini_stage(
+            tmp / "proof", "D1", n_windows=1, steps=1, seed=seed + 31,
+            finish=True)
+        obs = json.loads((sdir_r2 / "return_observation.json").read_text())
+        obs["summary_sha256"] = "0" * 64
+        (sdir_r2 / "return_observation.json").write_text(
+            json.dumps(obs, indent=1))
+        handoff = resolve_handoff(sdir_r2, plan_r2, world_r2.decoder,
+                                  world_r2.registration_for("D1"),
+                                  {"includes": ["D6"]},
+                                  StageBudget("D6", 60.0, 5.0),
+                                  production_decoder=world_r2.loss_fn)
+        proof_bound = (handoff["handoff_ready"] is False
+                       and any("return_observation_summary_sha_mismatch" in p
+                               for p in handoff["problems"]))
+        (sdir_r2 / "return_observation.json").unlink()
+        f_out = run_f_verification(
+            stage_specs=[{"stage_dir": sdir_r2, "plan": plan_r2,
+                          "registration": world_r2.registration_for("D1"),
+                          "decoder": world_r2.decoder,
+                          "loss_fn": world_r2.loss_fn}],
+            out_dir=tmp / "proof_f", budget=StageBudget("F", 300.0, 10.0),
+            runtime_guard=SyntheticRuntimeGuard(),
+            build_modules=build_modules_factory(world_r2, plan_r2),
+            authorization=None)
+        s0 = f_out["summary_doc"]["stages"][0]
+        caught = (proof_bound
+                  and s0.get("replay_enabled") is False
+                  and s0.get("skip_reason") == "return_observation_missing_or_uncovered"
+                  and f_out["summary_doc"]["complete_evidence"] is False)
+        record("return_proof_binding_rejected", caught,
+               f"zero-SHA proof refused by handoff; deleted proof refused by F "
+               f"(skip={s0.get('skip_reason')})")
+
+        # --- P1: empty artifacts index ------------------------------------------------
+        world_e, plan_e, _, _, sdir_e, _, _ = _mini_stage(
+            tmp / "emptyidx", "D1", n_windows=1, steps=1, seed=seed + 32,
+            finish=True)
+        (sdir_e / "artifacts_index.json").write_text(json.dumps(
+            {"schema": ARTIFACTS_INDEX_SCHEMA, "files": {}}))
+        ver = verify_stage_local(sdir_e, plan_e,
+                                 world_e.registration_for("D1"),
+                                 world_e.decoder,
+                                 production_decoder=world_e.loss_fn)
+        caught = (any("artifact_required_missing" in p for p in ver["problems"])
+                  and any("artifacts_index_sha_mismatch" in p
+                          for p in ver["problems"])
+                  and ver["local_mean_fit_passed"] is None)
+        record("empty_artifacts_index_rejected", caught,
+               f"empty index + unbound report SHA; "
+               f"{len(ver['problems'])} problems")
+
+        # --- P1: checkpoint dtype tamper ------------------------------------------------
+        world_c4, plan_c4, _, _, sdir_c4, _, _ = _mini_stage(
+            tmp / "ckptdtype", "D1", n_windows=1, steps=1, seed=seed + 33,
+            finish=True)
+        for name in ("initial.pt", "last.pt"):
+            ck = torch.load(sdir_c4 / name, map_location="cpu",
+                            weights_only=False)
+            ck["model"] = {k: v.double() for k, v in ck["model"].items()}
+            ck["conditioner"] = {k: v.double()
+                                 for k, v in ck["conditioner"].items()}
+            torch.save(ck, sdir_c4 / name)
+        _full_resign(sdir_c4)
+        ver = verify_stage_local(sdir_c4, plan_c4,
+                                 world_c4.registration_for("D1"),
+                                 world_c4.decoder,
+                                 production_decoder=world_c4.loss_fn)
+        built = {"count": 0}
+
+        def counting_build_c4():
+            built["count"] += 1
+            return build_modules_factory(world_c4, plan_c4)()
+
+        f_out = run_f_verification(
+            stage_specs=[{"stage_dir": sdir_c4, "plan": plan_c4,
+                          "registration": world_c4.registration_for("D1"),
+                          "decoder": world_c4.decoder,
+                          "loss_fn": world_c4.loss_fn}],
+            out_dir=tmp / "ckptdtype_f", budget=StageBudget("F", 300.0, 10.0),
+            runtime_guard=SyntheticRuntimeGuard(),
+            build_modules=counting_build_c4, authorization=None)
+        s0 = f_out["summary_doc"]["stages"][0]
+        caught = (any("checkpoint_param_dtype" in p for p in ver["problems"])
+                  and ver["local_mean_fit_passed"] is None
+                  and s0.get("replay_enabled") is False
+                  and s0.get("fresh_counters") is None
+                  and built["count"] == 0)
+        record("checkpoint_dtype_tamper_rejected", caught,
+               f"float64 checkpoint refused before any load; "
+               f"builds={built['count']} skip={s0.get('skip_reason')}")
+
+        # --- P1: runtime drift between micro units ----------------------------------------
+        world_r5 = make_synthetic_world(seed=seed + 34, n_windows=1, d_model=16)
+        plan_r5 = FitPlan("D1", steps=2, probe_every=2, synthetic=True,
+                          d_model=16, n_layers=1, n_heads=4, ffn_mult=2,
+                          lr=0.02)
+        view_r5 = world_r5.view_for("D1")
+        budget_r5 = StageBudget("D1", 300.0, 10.0)
+        trainer_r5 = world_r5.build_trainer(plan_r5, tmp / "runtimedrift",
+                                            budget_deadline=None,
+                                            train_ds=view_r5["ds"])
+
+        class _DriftAfter(SyntheticRuntimeGuard):
+            def __init__(self, fail_after: int) -> None:
+                super().__init__()
+                self._fail_after = fail_after
+                self.calls = 0
+
+            def check_unit(self, point: str) -> None:
+                self.calls += 1
+                if self.calls > self._fail_after:
+                    raise FitDiagnosticError(
+                        f"runtime_drift:{point}:tf32_enabled_simulated")
+
+        guard_r5 = _DriftAfter(fail_after=6)  # preflight, step-0 probe,
+        # initial checkpoint, step start, micro-1 start and its pre-backward
+        # pass; the post-backward unit check refuses (drift mid-step)
+        driver_r5 = FitDriver(
+            trainer=trainer_r5, plan=plan_r5,
+            registration=view_r5["registration"],
+            loss_fn=world_r5.loss_fn, decoder=world_r5.decoder,
+            probe_batch=view_r5["probe_batch"], budget=budget_r5,
+            runtime_guard=guard_r5, identity={}, stage_dir=tmp / "runtimedrift",
+            training_gen=torch.Generator().manual_seed(plan_r5.seed))
+        summary_r5 = driver_r5.run()
+        caught = (summary_r5["local_complete_evidence"] is False
+                  and "runtime_drift" in str(
+                      (summary_r5.get("failure") or {}).get("message", ""))
+                  and summary_r5["counters"]["backward_calls"] == 1
+                  and summary_r5["counters"]["adamw_step_calls"] == 0)
+        record("runtime_drift_mid_micro_stops", caught,
+               f"drift after micro 1; backward_calls="
+               f"{summary_r5['counters']['backward_calls']}, steps="
+               f"{summary_r5['counters']['adamw_step_calls']}")
+
+        # --- P1: F forward after the work deadline -----------------------------------------
+        world_f6, plan_f6, _, _, sdir_f6, _, _ = _mini_stage(
+            tmp / "fdeadline", "D1", n_windows=1, steps=1, seed=seed + 35,
+            finish=True)
+
+        class _JumpClock:
+            """Pass the first two budget checks (stage entry, probe start),
+            then jump past the work deadline — the load and input reads land
+            beyond it and no fresh forward may start."""
+
+            def __init__(self, passes: int, t_jump: float) -> None:
+                self.n = 0
+                self.passes = passes
+                self.t_jump = t_jump
+
+            def __call__(self) -> float:
+                self.n += 1
+                return 0.0 if self.n <= self.passes else self.t_jump
+
+        budget_f6 = StageBudget(stage="F", wall_cap_s=300.0, reserve_s=10.0,
+                                t0=0.0, clock=_JumpClock(passes=2,
+                                                         t_jump=1e9))
+        f_out = run_f_verification(
+            stage_specs=[{"stage_dir": sdir_f6, "plan": plan_f6,
+                          "registration": world_f6.registration_for("D1"),
+                          "decoder": world_f6.decoder,
+                          "loss_fn": world_f6.loss_fn}],
+            out_dir=tmp / "fdeadline_f", budget=budget_f6,
+            runtime_guard=SyntheticRuntimeGuard(),
+            build_modules=build_modules_factory(world_f6, plan_f6),
+            authorization=None)
+        s0 = f_out["summary_doc"]["stages"][0]
+        fc6 = s0.get("fresh_counters") or {}
+        caught = (fc6.get("conditioner_forward_calls") == 0
+                  and fc6.get("backbone_forward_calls") == 0
+                  and any("deadline" in p
+                          for p in s0.get("replay_problems", []))
+                  and f_out["summary_doc"]["complete_evidence"] is False)
+        record("f_forward_after_deadline_refused", caught,
+               f"load crossed the deadline; fresh forwards="
+               f"{fc6.get('conditioner_forward_calls')}")
 
     return results
 
