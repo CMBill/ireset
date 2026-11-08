@@ -38,6 +38,7 @@ from __future__ import annotations
 import json
 import math
 import random
+import sys
 import tempfile
 import time
 import types
@@ -1441,33 +1442,76 @@ class FitDriver:
             json.dumps(index, indent=1, allow_nan=False))
 
 
+RETURN_OBSERVATION_SCHEMA = "n0_return_observation_v1"
+
+
+def _read_json_object(path: Path) -> tuple[dict | None, list[str]]:
+    """Parse a JSON artifact that MUST be an object; parseable but
+    non-object payloads are structural verification failures, never
+    crashes (P2: a list-shaped return proof must fail closed)."""
+    try:
+        doc = json.loads(Path(path).read_text())
+    except Exception as exc:  # noqa: BLE001
+        return None, [f"{Path(path).name}_unreadable:{type(exc).__name__}"]
+    if not isinstance(doc, dict):
+        return None, [f"{Path(path).name}_not_a_mapping"]
+    return doc, []
+
+
 def _return_proof_problems(stage_dir: Path) -> list[str]:
-    """Full consumption of the outer return observation: existence, covered,
-    byte-bound to the sealed report, and an internally consistent coverage
-    chain (elapsed <= registered <= wall cap)."""
+    """Full consumption of the outer return observation: existence, object
+    shape and schema, covered, byte-bound to the sealed report, the proof's
+    registered cost and wall cap BOUND to the report's sealed values, and an
+    internally consistent coverage chain (elapsed <= registered <= cap)."""
     stage_dir = Path(stage_dir)
     path = stage_dir / "return_observation.json"
     if not path.is_file():
         return ["return_observation_missing"]
-    try:
-        proof = json.loads(path.read_text())
-    except Exception as exc:  # noqa: BLE001
-        return [f"return_observation_unreadable:{type(exc).__name__}"]
-    problems: list[str] = []
+    proof, problems = _read_json_object(path)
+    if proof is None:
+        return problems
+    if proof.get("schema") != RETURN_OBSERVATION_SCHEMA:
+        problems.append(f"return_observation_schema:{proof.get('schema')!r}")
     if proof.get("covered") is not True:
         problems.append("return_observation_not_covered")
     report_path = stage_dir / "stage_report.json"
-    want = sha256_file(report_path) if report_path.is_file() else None
-    if want is None or proof.get("summary_sha256") != want:
+    report, rep_problems = _read_json_object(report_path)
+    problems += [f"report_{p}" for p in rep_problems]
+    if report is None:
+        problems.append("return_observation_report_unreadable")
+        return problems
+    if proof.get("summary_sha256") != sha256_file(report_path):
         problems.append("return_observation_summary_sha_mismatch")
-    for name in ("elapsed_s", "registered_measured_s", "wall_cap_s"):
-        v = proof.get(name)
+    seal = report.get("seal") or {}
+    registered = seal.get("measured_wall_s_at_summary")
+    cap = seal.get("wall_cap_s")
+    if not isinstance(registered, (int, float)) or isinstance(registered, bool) \
+            or not math.isfinite(float(registered)) or float(registered) < 0:
+        problems.append("report_registered_cost_invalid")
+        registered = None
+    if not isinstance(cap, (int, float)) or isinstance(cap, bool) \
+            or not math.isfinite(float(cap)) or float(cap) < 0:
+        problems.append("report_wall_cap_invalid")
+        cap = None
+    proof_reg = proof.get("registered_measured_s")
+    proof_cap = proof.get("wall_cap_s")
+    # the proof's budget numbers are claims; the SEALED REPORT is the
+    # authority — a self-consistent proof with invented cost/cap values is
+    # refused even when its internal chain looks covered
+    if registered is not None and proof_reg != registered:
+        problems.append(f"return_observation_registered_mismatch:"
+                        f"{proof_reg!r}:report{registered!r}")
+    if cap is not None and proof_cap != cap:
+        problems.append(f"return_observation_wall_cap_mismatch:"
+                        f"{proof_cap!r}:report{cap!r}")
+    elapsed = proof.get("elapsed_s")
+    for name, v in (("elapsed_s", elapsed), ("registered_measured_s", proof_reg),
+                    ("wall_cap_s", proof_cap)):
         if not isinstance(v, (int, float)) or isinstance(v, bool) \
                 or not math.isfinite(float(v)) or float(v) < 0:
             problems.append(f"return_observation_field_invalid:{name}")
     if not problems:
-        if not (float(proof["elapsed_s"]) <= float(proof["registered_measured_s"])
-                <= float(proof["wall_cap_s"])):
+        if not (float(elapsed) <= float(proof_reg) <= float(proof_cap)):
             problems.append("return_observation_coverage_invalid")
     return problems
 
@@ -1501,8 +1545,11 @@ def write_handoff_candidate(stage_dir: Path, summary: dict) -> dict | None:
 
 
 def finish_stage(stage_dir: Path, summary: dict, budget: StageBudget) -> dict:
-    """Seal the stage report (publish-verify seal + return coverage proof)
-    and, for D1, write the handoff candidate binding the sealed report."""
+    """Seal the stage report (publish-verify seal), write the D1 handoff
+    candidate, and only then run the final return-coverage verification —
+    the coverage sample lands AFTER the candidate write (and the candidate's
+    own write/read), so no per-stage tail write escapes the checked window
+    (P1: a slow candidate write can no longer hide behind a covered proof)."""
     stage_dir = Path(stage_dir)
     index_path = stage_dir / "artifacts_index.json"
     summary = {**summary, "artifacts_index_sha256":
@@ -1510,9 +1557,9 @@ def finish_stage(stage_dir: Path, summary: dict, budget: StageBudget) -> dict:
     path = stage_dir / "stage_report.json"
     seal = _write_summary_sealed(path, summary, budget,
                                  withdraw=dict(I_WITHDRAW_ON_EXCEED))
+    candidate = write_handoff_candidate(stage_dir, summary)
     cov = verify_return_coverage(path, budget,
                                  withdraw=dict(I_WITHDRAW_ON_EXCEED))
-    candidate = write_handoff_candidate(stage_dir, summary)
     return {"stage_report": str(path), "seal": seal, "return_coverage": cov,
             "handoff_candidate": candidate,
             "summary_doc": json.loads(path.read_text())}
@@ -1620,8 +1667,10 @@ def verify_stage_local(stage_dir: Path, plan: FitPlan,
     # report already exists (F / handoff contexts)
     report_path = stage_dir / "stage_report.json"
     if report_path.is_file():
-        report = json.loads(report_path.read_text())
-        if report.get("artifacts_index_sha256") != sha256_file(index_path):
+        report, report_problems = _read_json_object(report_path)
+        if report is None:
+            problems.append(f"stage_report_invalid:{report_problems[:2]}")
+        elif report.get("artifacts_index_sha256") != sha256_file(index_path):
             problems.append("artifacts_index_sha_mismatch")
     probe_index_path = stage_dir / "probe_index.json"
     if not probe_index_path.is_file():
@@ -1928,7 +1977,10 @@ def resolve_handoff(stage_dir: Path, plan: FitPlan, decoder: MetricDecoder,
     report_path = stage_dir / "stage_report.json"
     if not report_path.is_file():
         return {"handoff_ready": False, "problems": ["stage_report_missing"]}
-    doc = json.loads(report_path.read_text())
+    doc, report_problems = _read_json_object(report_path)
+    if doc is None:
+        return {"handoff_ready": False,
+                "problems": ["stage_report_invalid"] + report_problems[:3]}
     seal = doc.get("seal") or {}
     if seal.get("status") != "sealed_within_budget" or not seal.get("terminal"):
         problems.append("stage_seal_not_consumable")
@@ -2142,7 +2194,14 @@ def run_f_verification(*, stage_specs: list[dict], out_dir: Path,
         res: dict = {"stage": plan.stage, "stage_dir": str(stage_dir)}
         budget.check(f"f_stage_{plan.stage}_entry")
         report_path = stage_dir / "stage_report.json"
-        doc = json.loads(report_path.read_text()) if report_path.is_file() else {}
+        doc, report_problems = _read_json_object(report_path)
+        if doc is None:
+            res.update({"replay_enabled": False, "replay_passed": None,
+                        "skip_reason": "stage_report_invalid",
+                        "report_problems": report_problems[:4]})
+            stages_out.append(res)
+            evidence_all_ok = False
+            continue
         seal = doc.get("seal") or {}
         if seal.get("status") != "sealed_within_budget":
             res.update({"replay_enabled": False, "replay_passed": None,
@@ -2198,24 +2257,27 @@ def run_f_verification(*, stage_specs: list[dict], out_dir: Path,
                             "production_fk_batch_calls": 0,
                             "production_decode_calls": 0,
                             "metric_decode_calls": 0, "probe_calls": 0}
-        model, conditioner = build_modules()
-        patch_conditioner_leak_guard(conditioner)
-        runtime_guard.check_unit("f_modules_constructed")
-        problems = parameter_contract_problems(
-            {"model": model, "conditioner": conditioner},
-            getattr(runtime_guard, "expected_device", "cpu"),
-            getattr(runtime_guard, "expected_dtype", torch.float32))
-        if problems:
-            res.update({"replay_enabled": False, "replay_passed": None,
-                        "skip_reason": "f_parameter_contract",
-                        "parameter_problems": problems[:10]})
-            stages_out.append(res)
-            evidence_all_ok = False
-            continue
         replay_problems: list[str] = []
         mean_fit_values: list[bool] = []
         window_ids = list(registration.window_ids)
+        # construction sits INSIDE the guarded region: a deadline crossed by
+        # the pre-verification checks refuses BEFORE any module exists (P1)
         try:
+            budget.check(f"f_stage_{plan.stage}_pre_construct")
+            model, conditioner = build_modules()
+            patch_conditioner_leak_guard(conditioner)
+            runtime_guard.check_unit("f_modules_constructed")
+            problems = parameter_contract_problems(
+                {"model": model, "conditioner": conditioner},
+                getattr(runtime_guard, "expected_device", "cpu"),
+                getattr(runtime_guard, "expected_dtype", torch.float32))
+            if problems:
+                res.update({"replay_enabled": False, "replay_passed": None,
+                            "skip_reason": "f_parameter_contract",
+                            "parameter_problems": problems[:10]})
+                stages_out.append(res)
+                evidence_all_ok = False
+                continue
             for role, want_step in (("initial", 0), ("last", plan.steps)):
                 budget.check(f"f_probe_{role}")
                 load_problems = _load_state_dicts_checked(
@@ -2252,9 +2314,14 @@ def run_f_verification(*, stage_specs: list[dict], out_dir: Path,
                 device = next(model.parameters()).device
                 batch = {k: v.to(device) for k, v in batch.items()}
                 budget.check(f"f_probe_{role}_inputs_ready")
+                # a precision drift during the input reads must refuse the
+                # fresh numeric call itself (P1: budget-only checks are not
+                # enough at this boundary)
+                runtime_guard.check_unit(f"f_probe_{role}_inputs_ready")
                 x0_fresh, fresh_prod = _fresh_probe(
                     model, conditioner, batch, plan, loss_fn, f_counters)
                 budget.check(f"f_probe_{role}_fresh_complete")
+                runtime_guard.check_unit(f"f_probe_{role}_fresh_complete")
                 idx = 0 if role == "initial" else plan.n_probes - 1
                 saved_entry = _saved_probe_entry(stage_dir, idx, want_step)
                 if saved_entry is None:
@@ -2715,6 +2782,11 @@ COUNTEREXAMPLE_IDS = (
     "checkpoint_dtype_tamper_rejected",
     "runtime_drift_mid_micro_stops",
     "f_forward_after_deadline_refused",
+    "proof_budget_binding_rejected",
+    "candidate_write_after_covered_refused",
+    "f_construct_after_deadline_refused",
+    "f_runtime_drift_before_fresh_refused",
+    "proof_not_a_mapping_survives_f",
 )
 
 
@@ -3655,6 +3727,183 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
         record("f_forward_after_deadline_refused", caught,
                f"load crossed the deadline; fresh forwards="
                f"{fc6.get('conditioner_forward_calls')}")
+
+        # --- P1(r3): proof budget numbers must bind the SEALED report ---------
+        world_p3, plan_p3, _, _, sdir_p3, _, _ = _mini_stage(
+            tmp / "proofbudget", "D1", n_windows=1, steps=1, seed=seed + 36,
+            finish=True)
+        obs = json.loads((sdir_p3 / "return_observation.json").read_text())
+        # self-consistent invented chain 700<=800<=900 while the sealed
+        # report registers a much smaller cost under a smaller cap
+        obs["elapsed_s"] = 700.0
+        obs["registered_measured_s"] = 800.0
+        obs["wall_cap_s"] = 900.0
+        (sdir_p3 / "return_observation.json").write_text(json.dumps(obs, indent=1))
+        proof_problems = _return_proof_problems(sdir_p3)
+        handoff = resolve_handoff(sdir_p3, plan_p3, world_p3.decoder,
+                                  world_p3.registration_for("D1"),
+                                  {"includes": ["D6"]},
+                                  StageBudget("D6", 60.0, 5.0),
+                                  production_decoder=world_p3.loss_fn)
+        f_out = run_f_verification(
+            stage_specs=[{"stage_dir": sdir_p3, "plan": plan_p3,
+                          "registration": world_p3.registration_for("D1"),
+                          "decoder": world_p3.decoder,
+                          "loss_fn": world_p3.loss_fn}],
+            out_dir=tmp / "proofbudget_f", budget=StageBudget("F", 300.0, 10.0),
+            runtime_guard=SyntheticRuntimeGuard(),
+            build_modules=build_modules_factory(world_p3, plan_p3),
+            authorization=None)
+        s0 = f_out["summary_doc"]["stages"][0]
+        caught = (any("return_observation_registered_mismatch" in p
+                      or "return_observation_wall_cap_mismatch" in p
+                      for p in proof_problems)
+                  and handoff["handoff_ready"] is False
+                  and s0.get("replay_enabled") is False
+                  and f_out["summary_doc"]["complete_evidence"] is False)
+        record("proof_budget_binding_rejected", caught,
+               f"proof 700<=800<=900 vs sealed report; handoff refused, "
+               f"F skip={s0.get('skip_reason')}")
+
+        # --- P1(r3): the candidate write is inside the final coverage window --
+        world_c3, plan_c3, _, summary_c3, sdir_c3, _, _ = _mini_stage(
+            tmp / "candslow", "D1", n_windows=1, steps=1, seed=seed + 37)
+        clock_holder = {"t": 0.0}
+        slow_budget = StageBudget(stage="D1", wall_cap_s=600.0, reserve_s=10.0,
+                                  t0=0.0, clock=lambda: clock_holder["t"])
+        # inject the latency INTO the candidate write: with the fixed order
+        # (seal -> candidate -> coverage) the jump lands before the final
+        # sample and withdraws the completion claim; a coverage check that
+        # ran before the candidate write would have stayed covered
+        mod = sys.modules[__name__]
+        real_writer = mod.write_handoff_candidate
+
+        def _slow_writer(sdir_, summary_):
+            out = real_writer(sdir_, summary_)
+            clock_holder["t"] = 1000.0
+            return out
+
+        mod.write_handoff_candidate = _slow_writer
+        try:
+            fin = finish_stage(sdir_c3, summary_c3, slow_budget)
+        finally:
+            mod.write_handoff_candidate = real_writer
+        doc_c3 = fin["summary_doc"]
+        handoff = resolve_handoff(sdir_c3, plan_c3, world_c3.decoder,
+                                  world_c3.registration_for("D1"),
+                                  {"includes": ["D6"]},
+                                  StageBudget("D6", 60.0, 5.0),
+                                  production_decoder=world_c3.loss_fn)
+        caught = (doc_c3["seal"]["status"] == "budget_exceeded_after_seal"
+                  and fin["return_coverage"]["covered"] is False
+                  and handoff["handoff_ready"] is False)
+        record("candidate_write_after_covered_refused", caught,
+               f"slow candidate write lands inside the checked window; "
+               f"seal={doc_c3['seal']['status']} handoff="
+               f"{handoff['handoff_ready']}")
+
+        # --- P1(r3): F refuses BEFORE construction past the deadline ----------
+        world_f4, plan_f4, _, _, sdir_f4, _, _ = _mini_stage(
+            tmp / "fconstruct", "D1", n_windows=1, steps=1, seed=seed + 38,
+            finish=True)
+        built = {"count": 0}
+
+        def counting_build_f4():
+            built["count"] += 1
+            return build_modules_factory(world_f4, plan_f4)()
+
+        # one passing budget check (stage entry), then everything refused:
+        # the pre-construct check fires before any module exists
+        budget_f4 = StageBudget(stage="F", wall_cap_s=300.0, reserve_s=10.0,
+                                t0=0.0, clock=_JumpClock(passes=1, t_jump=1e9))
+        f_out = run_f_verification(
+            stage_specs=[{"stage_dir": sdir_f4, "plan": plan_f4,
+                          "registration": world_f4.registration_for("D1"),
+                          "decoder": world_f4.decoder,
+                          "loss_fn": world_f4.loss_fn}],
+            out_dir=tmp / "fconstruct_f", budget=budget_f4,
+            runtime_guard=SyntheticRuntimeGuard(),
+            build_modules=counting_build_f4, authorization=None)
+        s0 = f_out["summary_doc"]["stages"][0]
+        fc4 = s0.get("fresh_counters") or {}
+        caught = (built["count"] == 0
+                  and fc4.get("conditioner_forward_calls", 0) == 0
+                  and any("deadline" in p
+                          for p in s0.get("replay_problems", []))
+                  and f_out["summary_doc"]["complete_evidence"] is False)
+        record("f_construct_after_deadline_refused", caught,
+               f"deadline crossed by the pre-verification phase; builds="
+               f"{built['count']}, fresh forwards="
+               f"{fc4.get('conditioner_forward_calls')}, problems="
+               f"{s0.get('replay_problems', [])[:1]}")
+
+        # --- P1(r3): runtime drift during the input reads refuses the fresh call
+        world_f5, plan_f5, _, _, sdir_f5, _, _ = _mini_stage(
+            tmp / "fdriftfresh", "D1", n_windows=1, steps=1, seed=seed + 39,
+            finish=True)
+
+        class _DriftAtInputsReady(SyntheticRuntimeGuard):
+            def __init__(self) -> None:
+                super().__init__()
+                self.calls = 0
+
+            def check_unit(self, point: str) -> None:
+                self.calls += 1
+                if point.endswith("_inputs_ready"):
+                    raise FitDiagnosticError(
+                        f"runtime_drift:{point}:tf32_enabled_simulated")
+
+        f_out = run_f_verification(
+            stage_specs=[{"stage_dir": sdir_f5, "plan": plan_f5,
+                          "registration": world_f5.registration_for("D1"),
+                          "decoder": world_f5.decoder,
+                          "loss_fn": world_f5.loss_fn}],
+            out_dir=tmp / "fdriftfresh_f",
+            budget=StageBudget("F", 300.0, 10.0),
+            runtime_guard=_DriftAtInputsReady(),
+            build_modules=build_modules_factory(world_f5, plan_f5),
+            authorization=None)
+        s0 = f_out["summary_doc"]["stages"][0]
+        fc5 = s0.get("fresh_counters") or {}
+        caught = (fc5.get("conditioner_forward_calls") == 0
+                  and fc5.get("backbone_forward_calls") == 0
+                  and any("runtime_drift" in p
+                          for p in s0.get("replay_problems", []))
+                  and f_out["summary_doc"]["complete_evidence"] is False)
+        record("f_runtime_drift_before_fresh_refused", caught,
+               f"drift at inputs_ready; fresh forwards="
+               f"{fc5.get('conditioner_forward_calls')}")
+
+        # --- P2(r3): a list-shaped return proof must fail closed, not crash ---
+        world_p6, plan_p6, _, _, sdir_p6, _, _ = _mini_stage(
+            tmp / "prooflist", "D1", n_windows=1, steps=1, seed=seed + 40,
+            finish=True)
+        (sdir_p6 / "return_observation.json").write_text("[]")
+        f_out = run_f_verification(
+            stage_specs=[{"stage_dir": sdir_p6, "plan": plan_p6,
+                          "registration": world_p6.registration_for("D1"),
+                          "decoder": world_p6.decoder,
+                          "loss_fn": world_p6.loss_fn}],
+            out_dir=tmp / "prooflist_f", budget=StageBudget("F", 300.0, 10.0),
+            runtime_guard=SyntheticRuntimeGuard(),
+            build_modules=build_modules_factory(world_p6, plan_p6),
+            authorization=None)
+        s0 = f_out["summary_doc"]["stages"][0]
+        report_written = (Path(tmp) / "prooflist_f" / "f_report.json").is_file()
+        handoff = resolve_handoff(sdir_p6, plan_p6, world_p6.decoder,
+                                  world_p6.registration_for("D1"),
+                                  {"includes": ["D6"]},
+                                  StageBudget("D6", 60.0, 5.0),
+                                  production_decoder=world_p6.loss_fn)
+        caught = (report_written
+                  and s0.get("replay_enabled") is False
+                  and any("not_a_mapping" in p
+                          for p in s0.get("return_proof_problems", []))
+                  and handoff["handoff_ready"] is False
+                  and f_out["summary_doc"]["complete_evidence"] is False)
+        record("proof_not_a_mapping_survives_f", caught,
+               f"list-shaped proof -> structured refusal; f_report written="
+               f"{report_written}")
 
     return results
 

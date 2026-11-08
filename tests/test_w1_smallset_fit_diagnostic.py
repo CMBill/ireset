@@ -14,6 +14,7 @@ import json
 import math
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -423,3 +424,54 @@ def test_counterexample_battery_all_caught():
     assert set(results) == set(diag.COUNTEREXAMPLE_IDS)
     failures = {cid: r for cid, r in results.items() if not r["caught"]}
     assert failures == {}, json.dumps(failures, indent=1)[:2000]
+
+
+def test_cli_output_and_reread_inside_return_coverage(tmp_path, monkeypatch):
+    """P1 (round-2 review): the flushed stdout AND the necessary final
+    summary re-read must both happen BEFORE the final coverage sample — a
+    1000s stall in either must flip the run to a withdrawn exit 3."""
+    import importlib.util
+    import sys as _sys
+    from unittest.mock import patch
+
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "review_cli_r2", root / "scripts" / "verify_w1_smallset_fit_diagnostic.py")
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+    cdir = tmp_path / "cli"
+    fake_facts = {"frozen_plan_defaults_problems": [],
+                  "all_counterexamples_caught": True,
+                  "d1": {"local_complete_evidence": True,
+                         "call_matrix_problems": [], "report_problems": []},
+                  "f": {"replay_passed": True}}
+    ct = cli._T0
+    ticks = {"t": ct + 1.0}
+
+    def fake_time():
+        return ticks["t"]
+
+    real_read_text = Path.read_text
+
+    def slow_summary_read(path, *a, **kw):
+        value = real_read_text(path, *a, **kw)
+        if path.name == "acceptance_summary.json":
+            ticks["t"] = ct + 1000.0  # the necessary re-read blocks for 1000s
+        return value
+
+    with patch.object(_sys, "argv", ["verify", "--output-root", str(cdir),
+                                     "--wall-cap-s", "100",
+                                     "--reserve-s", "10"]), \
+         patch.object(cli.diag, "run_synthetic_acceptance",
+                      lambda *a, **kw: json.loads(json.dumps(fake_facts))), \
+         patch.object(time, "perf_counter", fake_time), \
+         patch.object(Path, "read_text", slow_summary_read), \
+         patch("builtins.print", lambda *a, **kw: None):
+        rc = cli.main()
+    assert rc == 3
+    cs = json.loads((cdir / "attempt_001" / "acceptance_summary.json").read_text())
+    assert cs["seal"]["status"] == "budget_exceeded_after_seal"
+    co = json.loads((cdir / "attempt_001" / "return_observation.json").read_text())
+    assert co["covered"] is False
+    # the withdrawal's registered cost covers the 1000s tail (costs only rise)
+    assert cs["seal"]["measured_wall_s_at_summary"] >= 1000.0

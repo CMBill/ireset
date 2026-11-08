@@ -16,7 +16,7 @@
 
 | 文档 | 用途与状态 |
 | --- | --- |
-| [I 阶段小集拟合诊断器验证记录](verification/omniretarget_w1_smallset_fit_diagnostic.md) | **I已实施；第二轮独立审阅（2026-11-08）7 P1+2 P2 全部修复、41 项反例全捕获、attempt_002 权威**：复用Trainer更新单元的D1/D6驱动、metric_decode_v1（教师/预测双侧原始x0重解码绑定+生产解码重推导绑定）、四平均门+尖峰可见性、§7.4本地核验（必需工件集合+报告索引SHA闭链）、封口/返回证明完整消费的D1交接候选、F逐位重放（加载前dtype契约+加载后截止守卫）、逐micro运行时守卫、CLI输出先于核验；真实R/D1/D6/F未授权 |
+| [I 阶段小集拟合诊断器验证记录](verification/omniretarget_w1_smallset_fit_diagnostic.md) | **I已实施；三轮独立审阅（最新 2026-11-08）5 P1+1 P2 全部修复、46 项反例全捕获、attempt_003 权威**：复用Trainer更新单元的D1/D6驱动、metric_decode_v1（教师/预测双侧原始x0重解码绑定+生产解码重推导绑定）、四平均门+尖峰可见性、§7.4本地核验（必需工件集合+报告索引SHA闭链）、封口/返回证明完整消费（证明registered/cap逐项绑定报告+交接候选纳入最终覆盖采样）、F逐位重放（加载前dtype契约+构造/加载/输入后预算与运行时双检）、逐micro运行时守卫、CLI输出与回读先于最终采样；真实R/D1/D6/F未授权 |
 | [N1 最小合成验证与有限数值收口说明](verification/omniretarget_w1_n1_synthetic_closure.md) | **N1已收口（2026-11-07，五轮复阅修订后 attempt_006）**：C1 audited vs 独立节点图逐位对照、C5 三例门失败全区间内、C6 八偏差全经N0检测器检出；六类47用例全过，go=no_go→go_for_conditional_fit_diagnostics_review。封口=登记成本同盘覆盖+写后核验；返回核验先读盘后采样、return_observation.json SHA绑定证明且所有退出路径核验；撤回走覆盖成本循环 |
 | [N0 坐标级数值缺口分析记录](verification/omniretarget_w1_n0_coordinate_analysis.md) | **N0已收口（2026-11-07，五轮复阅修订后 attempt_006）**：uint32存在性/单侧可辨识位（4行）；same_input公式门+delta_measured一致性；分侧写界；roster精确集合；来源闭链（journal逐级SHA+registration三阶段严格校验+F重放双锚）；旧629全三类交付（381/223/25）；封口=登记成本覆盖封口与返回+终态时序；返回核验先读盘后采样+SHA绑定观察文件+撤回覆盖成本循环。结论=350 precision_limited+189 cross_path_sensitive+0 implementation_issue_candidate |
 | [数值缺口有限收口与受控拟合诊断方案](plans/omniretarget_w1_numerics_closure_fit_diagnostic_plan.md) | **v0.4+§14–§18修订对照，N0/N1/I已完成（2026-11-07）**：N0保存证据坐标级分析✓→N1最小合成验证/有限收口✓→I共享Trainer诊断实现+合成反例✓→R新冻结/授权→D1单窗/D6六窗确定性拟合→F收口。平均门、预算和8206次/路径forward上限不放宽；真实拟合须新明确授权 |

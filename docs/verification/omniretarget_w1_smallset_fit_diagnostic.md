@@ -112,3 +112,20 @@
 - F 逐位重放是事前验收要求而非已证明的可重现性结果；真实 CUDA 路径首现合法漂移时按 §7.4 第 5 项 `replay_mismatch` 收口。
 - T6 `audit_incomplete`/0 failures/539 gaps、旧 629 分类、cohort 34 次更新/1347.195507s、一次性授权已消费、`partial/null/false/not_ready/不接入` 全部保持。
 - 本轮未提交 git、未运行全项目测试套件（仅运行本交付测试文件与方案相关既有文件的冒烟）。
+
+## 10. 第三轮独立审阅修订（2026-11-08：5 P1 + 1 P2 全部修复）
+
+第二轮修订经独立复审确认有效（attempt_002 的 SHA/宏合取/`n_micro=4` 已核实），但新增隔离反例发现 5 P1 + 1 P2（复现脚本 `/tmp/opencode/review_i_round2_20261108.py`）。全部接受并修复，电池扩至 **46 项**（测试 17 passed），审阅者脚本在修复后代码上全部呈现 fail-closed。attempt_002 自本轮起为被取代证据，权威验收重跑为 attempt_003。
+
+| # | 复审发现 | 修复 |
+| --- | --- | --- |
+| P1-1 | 返回证明的预算数值未与权威报告对账（自洽的 700≤800≤900 证明在报告 cap=600 时仍通过 F 与交接） | `_return_proof_problems` 现在读取**封口报告**的 `seal.measured_wall_s_at_summary` 与 `seal.wall_cap_s` 并**逐项绑定**证明的 `registered_measured_s`/`wall_cap_s`（`return_observation_registered_mismatch`/`return_observation_wall_cap_mismatch`）；覆盖链用报告的权威值复核 |
+| P1-2 | 交接候选写盘发生在最后一次返回覆盖核验之后（慢候选写盘不可见） | `finish_stage` 重排为 **seal → 候选写盘 → 最终 `verify_return_coverage`**：覆盖采样落在候选写盘（含其必要回读）之后；注入候选写盘 1000s 延迟的反例现以 `budget_exceeded_after_seal`+covered=false+handoff 拒绝收口 |
+| P1-3 | CLI 成功分支的新增最终回读再次留下未计费尾部 | CLI 时序改为 **flush stdout → 回读 summary → 最终覆盖采样**，采样后零 I/O；注入回读 1000s 延迟的 CLI 用例（pytest，镜像审阅者注入点）现 exit 3、盘上撤回、登记成本 ≥1000s |
+| P1-4 | F 前置核验越过工作截止后仍构造模型 | 构造移入守卫区：`budget.check(f_stage_*_pre_construct)` 在 `build_modules()` **之前**执行；审阅者的慢核验+受控时钟攻击现 `construct_events=[]`（零构造）、零 forward，于 `f_stage_D1_pre_construct` 即停 |
+| P1-5 | F 输入重建后的 fresh 调用仍缺运行时硬门 | `_inputs_ready` 处**同时**执行 `budget.check` 与 `runtime_guard.check_unit`；fresh 返回后同样双检（`_fresh_complete`）；审阅者在 last 输入读取期间注入 TF32 漂移的攻击现 `bad_forwards=0`、`complete_evidence=false` |
+| P2-6 | 可解析但非对象的返回证明使 F 崩溃（`[]` → AttributeError，无 f_report） | 新增 `_read_json_object`：解析成功但非 Mapping 一律转为结构化失败（`*_not_a_mapping`）；F 的报告/证明读取、`resolve_handoff`、`verify_stage_local` 的报告读取全部改用该守卫；list 形证明现以 `return_observation_not_a_mapping` 拒绝且 f_report.json 正常落盘（verdict=incomplete） |
+
+新增 5 项电池反例：`proof_budget_binding_rejected`（自洽伪造 700/800/900 证明拒 F+拒交接）、`candidate_write_after_covered_refused`（候选写盘注入延迟→撤回+拒交接）、`f_construct_after_deadline_refused`（构造前零调用）、`f_runtime_drift_before_fresh_refused`（inputs_ready 漂移→零 fresh forward）、`proof_not_a_mapping_survives_f`（list 证明结构化拒绝）；新增 1 项 pytest 用例 `test_cli_output_and_reread_inside_return_coverage`（CLI 回读注入 1000s → exit 3 撤回）。
+
+**权威合成验收 `derived/audit/w1_smallset_fit_diagnostic/attempt_003/`**（2026-11-08，第三轮修复后代码，独占创建，工件 7.0MB，CLI exit 0）：封口 `sealed_within_budget`、登记成本 **1504.31s** ≤ 3300s、返回覆盖 covered=true；微型 D1（300 步，wall 240.4s）四门全过（RMSE 0.00115m / 0.00288rad / 0.00186rad / FK 0.00121m）、`handoff_ready=true`（候选经 D6 入口消费）；微型 D6（wall 1472.5s）六窗四门全过（macro RMSE 0.00211m）；F 两阶段逐位重放通过（`fit_pass`）；46/46 反例捕获。`attempt_002` 保留为被取代证据（其证据不含第三轮的证明预算绑定/候选时序/构造前截止/输入期运行时双检修复项）。

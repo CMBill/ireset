@@ -112,6 +112,10 @@ def main() -> int:
                              "budget_exceeded", "stopped_at")},
         "outputs": {"summary": paths["summary"]},
     }, indent=1), flush=True)
+    # P1 (round-2 review): the necessary final disk read happens HERE —
+    # after the flushed stdout and BEFORE the final coverage sample — so no
+    # I/O remains after the passing sample.
+    disk = json.loads(Path(paths["summary"]).read_text())
     cov = diag.verify_return_coverage(Path(paths["summary"]), budget,
                                       withdraw=dict(WITHDRAW_ON_EXCEED))
     if not cov["covered"]:
@@ -120,9 +124,10 @@ def main() -> int:
         diag.verify_return_coverage(Path(paths["summary"]), budget,
                                     withdraw=dict(WITHDRAW_ON_EXCEED))
         return 3
-    # Fail-closed: re-read the on-disk sealed summary AFTER the coverage
-    # proof — the final disk state, not pre-write memory, decides the exit.
-    disk = json.loads(Path(paths["summary"]).read_text())
+    # P1 (round-2 review): the necessary final disk read happened BEFORE the
+    # coverage sample above (flushed stdout → re-read → sample); after the
+    # passing sample there is NO further I/O — the exit decision uses the
+    # already-read disk state.
     sealed = (disk.get("seal") or {}).get("status") == "sealed_within_budget"
     if not sealed or (disk.get("budget") or {}).get("budget_exceeded"):
         return 3
