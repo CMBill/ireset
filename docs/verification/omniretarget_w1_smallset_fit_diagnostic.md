@@ -1,0 +1,97 @@
+# W1 I 阶段：小集拟合诊断器实现与合成反例验证记录
+
+日期：2026-11-07。方案：[数值缺口有限收口与受控拟合诊断方案 v0.4](../plans/omniretarget_w1_numerics_closure_fit_diagnostic_plan.md) §6/§7（I 阶段交付）。
+
+**性质：纯合成实现与验证交付。本记录不含任何真实数据读取、真实 checkpoint、真实模型/优化器构造、真实 forward/backward/FK/AdamW 或真实训练更新；全部模块与测试在合成世界（合成 tokenizer/关节限位/教师窗/15-site FK 替身）上离线运行，不声称与生产 CUDA/foreach 等价。** 真实 R 冻结与真实 D1/D6/F 执行仍须方案 §8.3 的新冻结材料与新明确授权，本交付不创建 cohort/attempt/授权，不恢复旧 T6 一次性授权。
+
+## 1. 交付物
+
+| 文件 | 内容 |
+| --- | --- |
+| [src/ireset/eval/w1_smallset_fit_diagnostic.py](../../src/ireset/eval/w1_smallset_fit_diagnostic.py) | I 阶段独立诊断模块：FitPlan/FitRegistration、StageBudget、运行时硬门、`metric_decode_v1`、§7.1/§7.2 物理指标、probe 机制、FitDriver（复用已审计 Trainer 更新单元）、§7.4 第 1–3 项本地核验、D1→D6 交接、F 逐位重放、attempt 台账、R 只读元数据守卫、35 项合成反例电池、合成验收运行器 |
+| [scripts/verify_w1_smallset_fit_diagnostic.py](../../scripts/verify_w1_smallset_fit_diagnostic.py) | 合成验收 CLI（唯一入口，synthetic-only）：微型 D1→本地核验→交接判定→（D1 过门时）微型 D6→F 逐位重放→反例电池；t0 先于重导入、独占 attempt 目录、封口发布-核验、返回覆盖证明、fail-closed 退出码 |
+| [tests/test_w1_smallset_fit_diagnostic.py](../../tests/test_w1_smallset_fit_diagnostic.py) | 16 项测试：冻结常量、注册校验、解码/公式/尖峰、状态分层校验器、台账/R 守卫/参数契约、D6 数据分母、微型阶段+F 逐位重放、交接门、预算停止，及完整 35 项反例电池 |
+
+## 2. 复用边界（方案 §6.1）
+
+驱动**只通过已审计 Trainer 更新单元**执行训练：每个 micro 经 `Trainer.accumulate_micro`（内部 `_forward`→`predict`→损失→`(loss/N).backward`+有限性检查），裁剪经 `Trainer.clip_gradients`，更新经 `Trainer.step_optimizer`；AdamW/loss 装配均由 Trainer 构造，驱动不重写任何前向/反向/优化器算术。共享单元本身不查截止时间——驱动在每个单元边界（step/micro 开始、加载后、pre_backward 钩子、backward 后、clip、step、probe、checkpoint、写盘）插入 `StageBudget.check`，并把 `work_deadline` 传给 Trainer 构造器使 `save()` 的内部检查同口径。`scripts/w1_s0.py` 的独立手写更新循环**未被沿用**；probe 语义（专用 generator、固定 t/noise、eval+no_grad、RNG 保存恢复）参考 S0 并经由 `Trainer.predict` 执行。
+
+## 3. 冻结契约（I 阶段确定，R 阶段绑定）
+
+- **FitPlan 冻结默认值**（非 synthetic 计划偏离即拒绝）：steps=1000、probe_every=10（101 次 probe，step 0 与 10..1000）、grad_accum=4、D1 micro_batch=1 / D6 micro_batch=6、seed/val_seed=20261008、lr=1e-4、weight_decay=1e-5、grad_clip=1、d240/4层/6头/time_window31；`frozen_plan_defaults_problems()` 由 CLI 与测试断言为空。
+- **FitRegistration**：D1 恰 1 窗、D6 恰 6 窗、规范字典序、start=0、跨度=T_WINDOW=60、split 全为 train；驱动另做**注册↔物化数据集窗键绑定**（`dataset_registration_window_mismatch`），并绑定 trainer 配置与计划（steps/micro/grad_accum/lr/wd/clip/seed/架构）。
+- **metric_decode_v1**（域 `cpu_float64_from_saved_x0`）：对保存的 FP32 x0 先做合法性核验（dtype/形状 (60,38)/有限性/rot6d 非退化），再精确提升为 CPU float64；mean/std/lo/hi 取生产实际生效 FP32 常数的精确提升；6D 解码复用 dtype 泛型的 `rot6d_to_mat_torch`；关节走干净限位映射（clamp[-1,1]）。固定保存根位置 (60,3)、根旋转**矩阵** (60,3,3)、29 关节角 (60,29)，全部冻结 clip 系。
+- **保存记录表**（冻结形状/dtype）：每窗每 probe 12 个数组（raw_x0_pred/prod_*/fk_pred/md_*/err_*），教师参考每阶段一份（raw_x0_tgt/fk_tgt 等 8 类）；npz 键前缀 `w{b}__`；`artifacts_index.json` 登记全部文件 SHA-256+字节。
+- **§7.1 四门**：root_position_rmse_m≤0.01、root_rotation_mean_rad≤π/180、joint_rmse_rad≤0.05、teacher_fk_mpjpe_m≤0.01；度量归约 float64；根/旋转/关节只消费重解码量，FK MPJPE 只消费保存的生产 FP32 FK 点。**逐窗四门合取**才记 `window_mean_fit_passed`；宏平均仅展示且 `macro_is_not_a_gate=true`。
+- **§7.2 尖峰可见性**：每窗保存逐帧根位置距离、逐帧根旋转角、逐帧×关节绝对误差、逐帧×site FK 距离；p95（linear 分位）+ max（并列取最小帧号、再按关节/site 固定序取首项）+ 最坏坐标；`spike_gate_status="not_evaluated"` 冻结——平均门通过不宣称窗内尖峰已排除。
+- **§7.6 状态分层**：阶段报告只发布 `local_complete_evidence`/`local_mean_fit_passed`/`local_conclusion` 与 `final_verification_status="pending_F"`；`local_report_problems()` 校验器拒绝任何未加前缀的 `complete_evidence`/`mean_fit_passed`/`replay_passed` 字段。
+- **调用矩阵**：驱动按计划推导期望矩阵（D1：4000 训练+101 probe=4101 次/路径 conditioner/backbone、4000 loss、FK 批调用=2×micro+probe窗+教师窗、metric_decode=窗×(probe+1) 等），run 结束时**实际计数（钩子/包装实测，非名义）与期望逐项相等**，不符即 `local_complete_evidence=false`。
+
+## 4. 运行时硬门（§6.3）
+
+- `ProductionRuntimeGuard` 导入并调用 `w1_real_fk_audit.configure_production_runtime()`（TF32 off、float32_matmul_precision=highest、autocast off、deterministic=false 的绑定字节），每单元 `check_unit` 重采样 `environment_facts` 并按 `RUNTIME_REQUIREMENTS` 逐项比对，漂移即 `runtime_drift` 停止。
+- 构造/strict 加载后、下一构造或 forward 前执行 `parameter_contract_problems`：全部浮点参数**与缓冲**的 dtype/device 必须匹配冻结契约（真实路径 cuda/float32；合成路径 cpu/float32），错误即停、不静默 cast。
+- 合成路径使用 `SyntheticRuntimeGuard`：只记录单元数，明确 `production_equivalence_claimed=false`，不冒充生产运行时。
+
+## 5. 反例电池（§6.2/v0.3/v0.4 全清单，35 项）
+
+| 方案要求 | 反例 ID（捕获断言） |
+| --- | --- |
+| 注册名单/窗键篡改 | `registration_tamper`（结构校验+注册↔数据集窗键绑定） |
+| 少窗/重窗/val-test 混入 | `missing_window` / `duplicate_window` / `val_test_mixing` |
+| target 泄漏进 conditioner | `conditioner_target_leak`（访问追踪守卫：直接单元+端到端，x0/监督掩码即拒） |
+| drop_last 空 loader | `empty_loader_drop_last`（数据集窗数绑定+首单元 StopIteration 拒绝） |
+| 空/缺项/非有限指标 | `nonfinite_prediction_stops`（NaN 预测即停）+ `saved_metric_missing_or_nonfinite` |
+| 参数未进联合 clip | `param_outside_joint_clip`（clip 触发时逐参数 |post|=coef×|pre| 核验） |
+| 跳过 micro/更新多计少计 | `call_matrix_miscount` |
+| probe 改变训练 RNG | `probe_uses_training_generator`（训练 generator 身份拒绝+全局 RNG 前后相等记录） |
+| checkpoint/root_stats 错绑定 | `checkpoint_root_stats_misbinding` |
+| 工作截止后继续构造/forward/backward/step | `work_after_deadline_stops`（受控时钟） |
+| 末次写盘越界仍声明 complete | `complete_claim_after_deadline_withdrawn`（封口撤回+成本只升不降） |
+| R 偷读数组值 / 阶段间物化未计费 | `r_metadata_array_read_forbidden` / `unbilled_materialization_refused` |
+| SIGKILL 遗留 running | `sigkill_running_row_stops`（未知历史=停止） |
+| 失败后新 attempt 重置预算 | `new_attempt_budget_not_reset` |
+| F 身份失败仍执行模型 | `f_identity_failure_no_forward`（跳过 fresh 路径且 build_modules 零调用） |
+| 总 loss 下降但单窗未过门 | `window_gate_not_masked_by_macro` |
+| RMSE/MPJPE、米/厘米、弧度/度混用 | `metric_formula_and_units`（解析用例逐公式核对） |
+| 宏平均掩盖单窗失败、60° 单帧尖峰 | `rotation_spike_visibility`（方案原例：均值过 1° 门而 max=60°@frame17 保持可见） |
+| 坐标标记缺行/offset 错/截断 | `metric_schema_row_offset_truncation`（冻结记录表逐记录形状/dtype/有限性） |
+| v0.3：保存与 fresh 均过门但数组不同 | `fresh_gate_pass_but_bitwise_mismatch`（1-ULP 扰动+自洽重导出后 F 仍 `replay_mismatch:x0`） |
+| 只篡改中间 probe 曲线/p95/max | `intermediate_curve_tamper` |
+| 伪造 D1 通过布尔 | `d1_forge_pass_boolean` |
+| initial/last 角色或 step 对调 | `initial_last_role_swap` |
+| TF32/autocast/运行时漂移 | `tf32_runtime_drift`（真实 `runtime_facts_problems` 逐单元） |
+| 构造后 dtype/device 错误仍 forward | `param_dtype_device_mismatch`（preflight 拒绝，零 forward） |
+| D6 逐窗六次记一次 probe | `probe_forward_count_violation`（每 probe delta 必须 1+1） |
+| 重放不一致后放宽/补跑/发布 mean_fit | `replay_mismatch_no_loosening`（`bitwise_no_tolerance`、mean_fit=null、无重试路径） |
+| v0.4：D1 无 F 合法交接但不发最终验收 | `d1_handoff_cannot_publish_final`（pending_F+无最终字段+无授权拒交接） |
+| v0.4：F 失败不回写/不洗本地 | `f_failure_preserves_local_facts`（F 失败后阶段报告 SHA 不变） |
+| v0.4：step-N metric_decode 篡改同步仍拒 | `decode_tamper_synced_rejected`（原始 x0 重解码逐位绑定） |
+| v0.4：中间 FK 自洽替换保留限制 | `fk_self_consistent_replacement_keeps_limitation`（核验通过但 `intermediate_fk_state_binding_status="not_evaluated"` 不升级） |
+
+## 6. 测试结果
+
+- `tests/test_w1_smallset_fit_diagnostic.py`：**16 passed**（CPU，离线；含完整 35 项电池 `test_counterexample_battery_all_caught`）。
+- 反例电池独立运行：**35/35 caught**，ID 集合与冻结清单精确相等。
+
+## 7. 权威合成验收运行
+
+**`derived/audit/w1_smallset_fit_diagnostic/attempt_001/`**（2026-11-08，独占创建，工件 7.0MB，CLI exit 0）：单一单调时钟 t0 先于重导入，硬截止 3300s/预留 120s；summary 经发布-核验封口 `sealed_within_budget`（登记成本 **1512.79s** 覆盖封口与返回）+ `return_observation.json` SHA 绑定 covered=true。
+
+- **微型 D1**（300 步/probe_every 30/lr 0.03，d16 合成世界，wall 242.2s）：`local_complete_evidence=true`、调用矩阵实际=期望零偏差、本地核验零问题；step-300 四门全过（root RMSE **0.00115m**、root 旋转均值 **0.00288rad**、joint RMSE **0.00186rad**、teacher FK MPJPE **0.00121m**）→ `local_mean_fit_passed=true`、`complete_fit`；封口合法+返回覆盖。
+- **交接**：D6 入口在 D6 计费区间内重推 D1 落盘证据 → `handoff_ready=true`（problems=[]）。
+- **微型 D6**（300 步/lr 0.02，六注册窗，wall 1493.4s）：606 覆盖行（11 probe×6 窗）多重集精确、**六窗四门全过**（macro RMSE 0.00211m）、`local_mean_fit_passed=true`。
+- **F**：对两阶段各 fresh 构造+initial/last 各一次 strict 加载 probe（每阶段恰 2 次 fresh 预测），原始 x0、生产 FP32 解码量与 FK 点对保存数组**逐位一致**（dtype/shape/字节），fresh metric_decode 重导出指标精确对账 → `replay_passed=true`、`complete_evidence=true`、`mean_fit_passed=true`、`verdict=fit_pass`、`tolerance_policy=bitwise_no_tolerance`、`fk_replay_scope=initial_last_only`。
+- **反例电池**：35/35 caught（ID 集合与冻结清单精确相等）。
+
+同代码预验证运行（/tmp 沙箱 attempt_002，1528.5s，exit 0）结果一致。**该结果只证明 I 阶段管线机制与门实现本身在合成世界上自洽；不外推到真实 W1 训练窗（真实可达性属 R/D1/D6 的授权后问题）。**
+
+## 8. 边界与不主张
+
+- 本交付只覆盖 I 阶段退出条件（复用实际 Trainer 更新单元；身份/计费/数据分母测试通过）。**R（新冻结/授权材料）、真实 D1/D6/F 均未实施、未授权、未运行**；本模块不含真实数据入口，CLI 拒绝一切真实输入。
+- 合成 D1/D6 的四门通过只证明管线机制与门实现本身，**不说明真实 W1 训练窗可达这些目标**（真实 S0 历史只支持训练/normalized 误差下降）。
+- `spike_gate_status="not_evaluated"` 冻结；平均拟合通过不排除窗内尖峰，不代表泛化、严格碰撞、持续抓握、生产接入或端到端加速。
+- 中间 FK 只保存生产来源登记/工件哈希与保存点距离的度量自洽核验；`fk_replay_scope="initial_last_only"`，不宣称全部 101 次物理/FK 链已独立验证。
+- F 逐位重放是事前验收要求而非已证明的可重现性结果；真实 CUDA 路径首现合法漂移时按 §7.4 第 5 项 `replay_mismatch` 收口。
+- T6 `audit_incomplete`/0 failures/539 gaps、旧 629 分类、cohort 34 次更新/1347.195507s、一次性授权已消费、`partial/null/false/not_ready/不接入` 全部保持。
+- 本轮未提交 git、未运行全项目测试套件（仅运行本交付测试文件与方案相关既有文件的冒烟）。
