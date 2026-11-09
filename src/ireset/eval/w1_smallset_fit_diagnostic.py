@@ -1231,6 +1231,12 @@ class FitDriver:
                          "identity": self.identity,
                          "runtime": self.runtime_guard.facts(),
                          "budget": self.budget.facts()}
+        # P2 (round-7): the verification's executed-unit counters are kept
+        # OUTSIDE the stage training matrix and are recorded on BOTH the
+        # success and the failure path — a deadline stop must not erase how
+        # many verification units actually ran.
+        verification_counters: dict = {"production_decode_calls": 0,
+                                       "metric_decode_calls": 0}
         try:
             self._preflight()
             self._train_and_probe()
@@ -1238,8 +1244,6 @@ class FitDriver:
             # the matrix is judged on the units the STAGE itself executed;
             # the local verification's own decode work is counted separately
             matrix_snapshot = dict(self.counters)
-            verification_counters: dict = {"production_decode_calls": 0,
-                                           "metric_decode_calls": 0}
             # P1 (round-6): the local recompute runs under the SAME stage
             # budget — a deadline crossed inside it refuses the next decode
             # instead of finishing the verification first (the driver's
@@ -1273,6 +1277,7 @@ class FitDriver:
                 "type": type(exc).__name__, "message": str(exc)[:500],
                 "phase": self._phase, "step": self._step,
                 "counters": dict(self.counters)}
+            summary["verification_counters"] = dict(verification_counters)
             summary["local_complete_evidence"] = False
             summary["local_mean_fit_passed"] = None
             summary["local_conclusion"] = "incomplete"
@@ -1751,6 +1756,9 @@ def verify_stage_local(stage_dir: Path, plan: FitPlan,
     teacher_path = stage_dir / "teacher_reference.npz"
     if teacher_path.is_file():
         for b in range(len(window_ids)):
+            # P1 (round-7): every disk read is a unit — a read returning
+            # past the work deadline refuses the NEXT read
+            check(f"saved_teacher_read_w{b}")
             try:
                 teacher_records[b] = read_npz_records(
                     teacher_path, TEACHER_TABLE,
@@ -1789,6 +1797,7 @@ def verify_stage_local(stage_dir: Path, plan: FitPlan,
     inputs_path = stage_dir / "probe_inputs.npz"
     if inputs_path.is_file():
         for b in range(len(window_ids)):
+            check(f"saved_inputs_read_w{b}")
             try:
                 recs = read_npz_records(
                     inputs_path,
@@ -1821,6 +1830,7 @@ def verify_stage_local(stage_dir: Path, plan: FitPlan,
         for b, wout in enumerate(entry.get("windows") or []):
             if wout.get("window_id") != window_ids[b]:
                 problems.append(f"probe_window_order:idx{idx}:w{b}")
+            check(f"saved_probe_read_{idx}")
             try:
                 recs = read_npz_records(
                     npz_path, RECORD_SHAPES,
@@ -1887,7 +1897,8 @@ def verify_stage_local(stage_dir: Path, plan: FitPlan,
                 "missing": missing, "extra": extra, "duplicated": duplicated}
 
     # 4. checkpoint role/step binding -------------------------------------------
-    problems += _checkpoint_binding_problems(stage_dir, plan, decoder)
+    problems += _checkpoint_binding_problems(stage_dir, plan, decoder,
+                                             budget=budget)
 
     complete = problems == [] and len(final_windows) == len(window_ids)
     mean_fit = (bool(all(w["metrics"]["window_mean_fit_passed"]
@@ -1911,13 +1922,19 @@ def verify_stage_local(stage_dir: Path, plan: FitPlan,
 
 
 def _checkpoint_binding_problems(stage_dir: Path, plan: FitPlan,
-                                 decoder: MetricDecoder) -> list[str]:
+                                 decoder: MetricDecoder,
+                                 budget: StageBudget | None = None) -> list[str]:
+    """Checkpoint role/step/root-stats binding; when ``budget`` is given,
+    every checkpoint read is guarded (P1 round-7: a reduction returning past
+    the work deadline refuses the checkpoint loads)."""
+    check = budget.check if budget is not None else (lambda _point: None)
     problems: list[str] = []
     for name, want_step in (("initial.pt", 0), ("last.pt", plan.steps)):
         path = Path(stage_dir) / name
         if not path.is_file():
             problems.append(f"checkpoint_missing:{name}")
             continue
+        check(f"saved_checkpoint_read_{name}")
         try:
             ck = torch.load(path, map_location="cpu", weights_only=False)
         except Exception as exc:  # noqa: BLE001
@@ -2055,6 +2072,13 @@ def resolve_handoff(stage_dir: Path, plan: FitPlan, decoder: MetricDecoder,
                 "local_mean_fit_passed": None, "coverage": None}
     problems += verification["problems"]
     mean_fit = verification["local_mean_fit_passed"]
+    # P1 (round-7): the handoff claim itself must be affordable inside the
+    # work deadline — a claim sampled past it refuses the handoff (the
+    # verification may have returned from a slow final unit at the edge)
+    if budget.clock() >= budget.work_deadline:
+        budget.exceeded = True
+        budget.stopped_at = budget.stopped_at or "handoff_final_claim"
+        problems.append("handoff_deadline_exceeded:handoff_final_claim")
     if mean_fit is not True:
         problems.append("d1_mean_fit_gate_not_passed")
     includes = (authorization or {}).get("includes") or []
@@ -2072,10 +2096,14 @@ def resolve_handoff(stage_dir: Path, plan: FitPlan, decoder: MetricDecoder,
 # --------------------------------------------------------------------------
 
 def _fresh_probe(model, conditioner, batch: dict, plan: FitPlan,
-                 loss_fn, counters: dict) -> tuple[np.ndarray, list[dict]]:
+                 loss_fn, counters: dict,
+                 budget: StageBudget | None = None) -> tuple[np.ndarray, list[dict]]:
     """Fresh probe through the SAME production interfaces: exactly one
     conditioner + one backbone forward, then the fresh production FP32
-    decode + FK points per window."""
+    decode + FK points per window.  When ``budget`` is given, every window's
+    production decode and FK call is guarded (P1 round-7: a decode returning
+    past the work deadline refuses the following decode/FK units)."""
+    check = budget.check if budget is not None else (lambda _point: None)
     device = batch["x0"].device
     with torch.no_grad():
         conditioner.eval()
@@ -2099,9 +2127,11 @@ def _fresh_probe(model, conditioner, batch: dict, plan: FitPlan,
     per_window = []
     flat = lambda a: a.reshape(-1, a.shape[-1])
     for b in range(x0_np.shape[0]):
+        check(f"f_fresh_prod_decode_w{b}")
         counters["production_decode_calls"] = \
             counters.get("production_decode_calls", 0) + 1
         pos, quat, q = loss_fn.decode_clip(x0_pred.detach()[b:b + 1])
+        check(f"f_fresh_fk_w{b}")
         counters["production_fk_batch_calls"] = \
             counters.get("production_fk_batch_calls", 0) + 1
         kp = loss_fn.fk.site_world_positions(
@@ -2207,14 +2237,19 @@ def _teacher_records(stage_dir: Path, b: int) -> dict:
 
 
 def _teacher_reference_checked(stage_dir: Path, decoder: MetricDecoder,
-                               b: int, counters: dict | None = None) -> tuple[dict, list[str]]:
+                               b: int, counters: dict | None = None,
+                               budget: StageBudget | None = None) -> tuple[dict, list[str]]:
     """Teacher reference with the metric decode re-derived from the saved RAW
     teacher x0 and bitwise-bound against the saved md_* arrays (P1: a
-    teacher-derived replacement can never feed the F metrics)."""
+    teacher-derived replacement can never feed the F metrics).  When
+    ``budget`` is given, the teacher decode is guarded: a read returning
+    past the work deadline refuses it (P1 round-7)."""
+    check = budget.check if budget is not None else (lambda _point: None)
     problems: list[str] = []
     recs = _teacher_records(stage_dir, b)
     problems += [f"teacher_raw_invalid:w{b}:{p}"
                  for p in decoder.verify_x0(recs["raw_x0_tgt"])]
+    check(f"f_teacher_decode_w{b}")
     re_tmd = decoder.decode(recs["raw_x0_tgt"])
     if counters is not None:
         counters["metric_decode_calls"] = \
@@ -2399,7 +2434,8 @@ def run_f_verification(*, stage_specs: list[dict], out_dir: Path,
                 # enough at this boundary)
                 runtime_guard.check_unit(f"f_probe_{role}_inputs_ready")
                 x0_fresh, fresh_prod = _fresh_probe(
-                    model, conditioner, batch, plan, loss_fn, f_counters)
+                    model, conditioner, batch, plan, loss_fn, f_counters,
+                    budget=budget)
                 budget.check(f"f_probe_{role}_fresh_complete")
                 runtime_guard.check_unit(f"f_probe_{role}_fresh_complete")
                 idx = 0 if role == "initial" else plan.n_probes - 1
@@ -2432,7 +2468,7 @@ def run_f_verification(*, stage_specs: list[dict], out_dir: Path,
                     # follows (and be caught below as a replay failure).
                     budget.check(f"f_teacher_recheck_{role}_w{b}")
                     teacher, teacher_problems = _teacher_reference_checked(
-                        stage_dir, decoder, b, f_counters)
+                        stage_dir, decoder, b, f_counters, budget=budget)
                     replay_problems += teacher_problems[:3]
                     # P1 (round-4): the fresh metric decode is a numeric unit
                     # of its own — the work deadline is re-checked at this
@@ -2915,6 +2951,11 @@ COUNTEREXAMPLE_IDS = (
     "f_fresh_metrics_reduce_deadline_stop",
     "withdrawal_view_matches_disk_multi_round",
     "withdrawal_view_matches_disk_exhausted",
+    "f_fresh_probe_deadline_stop",
+    "f_teacher_decode_deadline_stop",
+    "saved_teacher_read_deadline_stop",
+    "handoff_checkpoint_read_deadline_stop",
+    "handoff_final_claim_deadline_refused",
     "f_construct_after_deadline_refused",
     "f_runtime_drift_before_fresh_refused",
     "proof_not_a_mapping_survives_f",
@@ -4245,6 +4286,8 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
         caught = (failure_h1.get("type") == "BudgetExceeded"
                   and failure_h1.get("phase") == "local_verification"
                   and d_calls["n"] == 1
+                  and (summary_h1.get("verification_counters") or {}).get(
+                      "metric_decode_calls") == 1
                   and summary_h1.get("local_complete_evidence") is False
                   and summary_h1.get("local_conclusion") == "incomplete"
                   and (summary_h1.get("budget") or {}).get("budget_exceeded")
@@ -4444,6 +4487,227 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
                "exhausted withdrawal: returned doc == disk doc incl. "
                f"cost_coverage_unproven="
                f"{disk_x['seal'].get('cost_coverage_unproven')}")
+
+        # --- P1(r7): the fresh probe's per-window production decode + FK are
+        # guarded — a decode returning past the deadline refuses both ---------
+        world_i1, plan_i1, _, _, sdir_i1, _, _ = _mini_stage(
+            tmp / "ffreshdl", "D6", n_windows=6, steps=1, seed=seed + 50,
+            finish=True)
+        i_holder = {"t": 0.0}
+        i_budget = StageBudget(stage="F", wall_cap_s=100.0, reserve_s=10.0,
+                               t0=0.0, clock=lambda: i_holder["t"])
+        real_clip_i = type(world_i1.loss_fn).decode_clip
+        real_site_i = type(world_i1.loss_fn.fk).site_world_positions
+        clip_calls = {"n": 0}
+        site_calls = {"n": 0}
+
+        def _jump_clip(self, *a, **kw):
+            out = real_clip_i(self, *a, **kw)
+            if sys._getframe(1).f_code.co_name == "_fresh_probe":
+                clip_calls["n"] += 1
+                if clip_calls["n"] == 1:
+                    i_holder["t"] = i_budget.work_deadline + 5.0
+            return out
+
+        def _count_site(self, *a, **kw):
+            site_calls["n"] += 1
+            return real_site_i(self, *a, **kw)
+
+        type(world_i1.loss_fn).decode_clip = _jump_clip
+        type(world_i1.loss_fn.fk).site_world_positions = _count_site
+        try:
+            f_out = run_f_verification(
+                stage_specs=[{"stage_dir": sdir_i1, "plan": plan_i1,
+                              "registration": world_i1.registration_for("D6"),
+                              "decoder": world_i1.decoder,
+                              "loss_fn": world_i1.loss_fn}],
+                out_dir=tmp / "ffreshdl_f", budget=i_budget,
+                runtime_guard=SyntheticRuntimeGuard(),
+                build_modules=build_modules_factory(world_i1, plan_i1),
+                authorization=None)
+        finally:
+            type(world_i1.loss_fn).decode_clip = real_clip_i
+            type(world_i1.loss_fn.fk).site_world_positions = real_site_i
+        s0 = f_out["summary_doc"]["stages"][0]
+        fc_i = s0.get("fresh_counters") or {}
+        caught = (clip_calls["n"] == 1
+                  and site_calls["n"] == 0
+                  and fc_i.get("production_decode_calls") == 1
+                  and fc_i.get("production_fk_batch_calls") == 0
+                  and any("f_fresh_fk" in p
+                          for p in s0.get("replay_problems", []))
+                  and f_out["summary_doc"]["verdict"] == "incomplete")
+        record("f_fresh_probe_deadline_stop", caught,
+               "first fresh production decode crossed the deadline; the next "
+               f"decode/FK were refused (decodes={clip_calls['n']}, "
+               f"fk={site_calls['n']})")
+
+        # --- P1(r7): the teacher re-check's read→decode boundary is guarded ----
+        world_i2, plan_i2, _, _, sdir_i2, _, _ = _mini_stage(
+            tmp / "fteachdec", "D1", n_windows=1, steps=1, seed=seed + 51,
+            finish=True)
+        j_holder = {"t": 0.0}
+        j_budget = StageBudget(stage="F", wall_cap_s=100.0, reserve_s=10.0,
+                               t0=0.0, clock=lambda: j_holder["t"])
+        real_trec_i = mod._teacher_records
+        real_decode_t = type(world_i2.decoder).decode
+        tdec_calls = {"n": 0}
+
+        def _slow_trec(*a, **kw):
+            out = real_trec_i(*a, **kw)
+            if sys._getframe(1).f_code.co_name == "_teacher_reference_checked":
+                j_holder["t"] = j_budget.work_deadline + 5.0
+            return out
+
+        def _count_tdecode(self, *a, **kw):
+            if sys._getframe(1).f_code.co_name == "_teacher_reference_checked":
+                tdec_calls["n"] += 1
+            return real_decode_t(self, *a, **kw)
+
+        mod._teacher_records = _slow_trec
+        type(world_i2.decoder).decode = _count_tdecode
+        try:
+            f_out = run_f_verification(
+                stage_specs=[{"stage_dir": sdir_i2, "plan": plan_i2,
+                              "registration": world_i2.registration_for("D1"),
+                              "decoder": world_i2.decoder,
+                              "loss_fn": world_i2.loss_fn}],
+                out_dir=tmp / "fteachdec_f", budget=j_budget,
+                runtime_guard=SyntheticRuntimeGuard(),
+                build_modules=build_modules_factory(world_i2, plan_i2),
+                authorization=None)
+        finally:
+            mod._teacher_records = real_trec_i
+            type(world_i2.decoder).decode = real_decode_t
+        s0 = f_out["summary_doc"]["stages"][0]
+        caught = (tdec_calls["n"] == 0
+                  and any("f_teacher_decode" in p
+                          for p in s0.get("replay_problems", []))
+                  and f_out["summary_doc"]["verdict"] == "incomplete")
+        record("f_teacher_decode_deadline_stop", caught,
+               "teacher read crossed the deadline; the teacher decode never "
+               f"started (teacher decodes={tdec_calls['n']})")
+
+        # --- P1(r7): the saved-quantity per-window reads are guarded ----------
+        world_i3, plan_i3, _, _, sdir_i3, _, _ = _mini_stage(
+            tmp / "savedreads", "D6", n_windows=6, steps=1, seed=seed + 52,
+            finish=True)
+        k_holder = {"t": 0.0}
+        k_budget = StageBudget(stage="F", wall_cap_s=100.0, reserve_s=10.0,
+                               t0=0.0, clock=lambda: k_holder["t"])
+        real_npz_read = mod.read_npz_records
+        read_calls = {"n": 0}
+
+        def _slow_npz_read(path, *a, **kw):
+            out = real_npz_read(path, *a, **kw)
+            if sys._getframe(1).f_code.co_name == "verify_stage_local":
+                read_calls["n"] += 1
+                if read_calls["n"] == 1:
+                    k_holder["t"] = k_budget.work_deadline + 5.0
+            return out
+
+        mod.read_npz_records = _slow_npz_read
+        try:
+            f_out = run_f_verification(
+                stage_specs=[{"stage_dir": sdir_i3, "plan": plan_i3,
+                              "registration": world_i3.registration_for("D6"),
+                              "decoder": world_i3.decoder,
+                              "loss_fn": world_i3.loss_fn}],
+                out_dir=tmp / "savedreads_f", budget=k_budget,
+                runtime_guard=SyntheticRuntimeGuard(),
+                build_modules=build_modules_factory(world_i3, plan_i3),
+                authorization=None)
+        finally:
+            mod.read_npz_records = real_npz_read
+        s0 = f_out["summary_doc"]["stages"][0]
+        caught = (read_calls["n"] == 1
+                  and s0.get("skip_reason") == "stage_deadline_stop"
+                  and "saved_teacher_read_w1" in str(s0.get("deadline_stop") or ""))
+        record("saved_teacher_read_deadline_stop", caught,
+               "first saved teacher read crossed the deadline; the second "
+               f"read was refused (reads={read_calls['n']})")
+
+        # --- P1(r7): handoff checkpoint reads and the final claim are guarded -
+        world_i4, plan_i4, _, _, sdir_i4, _, _ = _mini_stage(
+            tmp / "hdlckpt", "D1", n_windows=1, steps=1, seed=seed + 53,
+            finish=True)
+        plan_i4_windows = len(world_i4.registration_for("D1").window_ids)
+        total_reductions = len(plan_i4.probe_steps) * plan_i4_windows
+        l_holder = {"t": 0.0}
+        l_budget = StageBudget(stage="D6", wall_cap_s=100.0, reserve_s=10.0,
+                               t0=0.0, clock=lambda: l_holder["t"])
+        real_metrics_i = mod.compute_window_metrics
+        real_load_i = mod.torch.load
+        red_calls = {"n": 0}
+        load_calls = {"n": 0}
+
+        def _jump_metrics(*a, **kw):
+            out = real_metrics_i(*a, **kw)
+            if sys._getframe(1).f_code.co_name == "verify_stage_local":
+                red_calls["n"] += 1
+                if red_calls["n"] >= total_reductions:
+                    l_holder["t"] = l_budget.work_deadline + 5.0
+            return out
+
+        def _count_ckpt_load(*a, **kw):
+            if sys._getframe(1).f_code.co_name == "_checkpoint_binding_problems":
+                load_calls["n"] += 1
+            return real_load_i(*a, **kw)
+
+        mod.compute_window_metrics = _jump_metrics
+        mod.torch.load = _count_ckpt_load
+        try:
+            handoff_l = resolve_handoff(
+                sdir_i4, plan_i4, world_i4.decoder,
+                world_i4.registration_for("D1"), {"includes": ["D6"]},
+                l_budget, production_decoder=world_i4.loss_fn)
+        finally:
+            mod.compute_window_metrics = real_metrics_i
+            mod.torch.load = real_load_i
+        caught = (handoff_l["handoff_ready"] is False
+                  and any("handoff_deadline_exceeded" in p
+                          for p in handoff_l["problems"])
+                  and load_calls["n"] == 0
+                  and l_budget.exceeded is True)
+        record("handoff_checkpoint_read_deadline_stop", caught,
+               "last metric reduction crossed the deadline; the checkpoint "
+               f"reads never started (loads={load_calls['n']})")
+
+        # --- P1(r7): the handoff claim itself is re-checked after the loads ---
+        world_i5, plan_i5, _, _, sdir_i5, _, _ = _mini_stage(
+            tmp / "hdlclaim", "D1", n_windows=1, steps=1, seed=seed + 54,
+            finish=True)
+        m_holder = {"t": 0.0}
+        m_budget = StageBudget(stage="D6", wall_cap_s=100.0, reserve_s=10.0,
+                               t0=0.0, clock=lambda: m_holder["t"])
+        real_load_m = mod.torch.load
+        loads_m = {"n": 0}
+
+        def _jump_after_last_load(*a, **kw):
+            out = real_load_m(*a, **kw)
+            if sys._getframe(1).f_code.co_name == "_checkpoint_binding_problems":
+                loads_m["n"] += 1
+                if loads_m["n"] >= 2:
+                    m_holder["t"] = m_budget.work_deadline + 5.0
+            return out
+
+        mod.torch.load = _jump_after_last_load
+        try:
+            handoff_m = resolve_handoff(
+                sdir_i5, plan_i5, world_i5.decoder,
+                world_i5.registration_for("D1"), {"includes": ["D6"]},
+                m_budget, production_decoder=world_i5.loss_fn)
+        finally:
+            mod.torch.load = real_load_m
+        caught = (handoff_m["handoff_ready"] is False
+                  and any("handoff_deadline_exceeded:handoff_final_claim" in p
+                          for p in handoff_m["problems"])
+                  and loads_m["n"] == 2
+                  and m_budget.exceeded is True)
+        record("handoff_final_claim_deadline_refused", caught,
+               "last checkpoint read crossed the deadline; the handoff claim "
+               f"was refused (loads={loads_m['n']}, "
+               f"problems={handoff_m['problems'][:1]})")
 
         # --- P1(r3): F refuses BEFORE construction past the deadline ----------
         world_f4, plan_f4, _, _, sdir_f4, _, _ = _mini_stage(
