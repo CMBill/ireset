@@ -33,7 +33,7 @@
 - 构造/strict 加载后、下一构造或 forward 前执行 `parameter_contract_problems`：全部浮点参数**与缓冲**的 dtype/device 必须匹配冻结契约（真实路径 cuda/float32；合成路径 cpu/float32），错误即停、不静默 cast。
 - 合成路径使用 `SyntheticRuntimeGuard`：只记录单元数，明确 `production_equivalence_claimed=false`，不冒充生产运行时。
 
-## 5. 反例电池（§6.2/v0.3/v0.4 全清单；首轮 35 项 + 第二轮 6 项 + 第三轮 5 项 + 第四轮 4 项 + 第五轮 2 项 + 第六轮 6 项 + 第七轮 5 项 + 第八轮 5 项 = 68 项）
+## 5. 反例电池（§6.2/v0.3/v0.4 全清单；首轮 35 项 + 第二轮 6 项 + 第三轮 5 项 + 第四轮 4 项 + 第五轮 2 项 + 第六轮 6 项 + 第七轮 5 项 + 第八轮 5 项 + 第九轮 8 项 = 76 项）
 
 | 方案要求 | 反例 ID（捕获断言） |
 | --- | --- |
@@ -68,23 +68,28 @@
 | v0.4：F 失败不回写/不洗本地 | `f_failure_preserves_local_facts`（F 失败后阶段报告 SHA 不变） |
 | v0.4：step-N metric_decode 篡改同步仍拒 | `decode_tamper_synced_rejected`（原始 x0 重解码逐位绑定） |
 | v0.4：中间 FK 自洽替换保留限制 | `fk_self_consistent_replacement_keeps_limitation`（核验通过但 `intermediate_fk_state_binding_status="not_evaluated"` 不升级） |
+| 第九轮：checkpoint 有效配置/身份语义绑定 | `checkpoint_config_binding_rejected`（重签 `lr=123`/`grad_accum=99` 被 14 字段冻结配置逐项对账拒绝）+ `checkpoint_identity_binding_rejected`（外来 identity 对阶段声明身份拒绝） |
+| 第九轮：D 内部多窗单元链越截止 | `teacher_window_units_deadline_stop` / `probe_window_units_deadline_stop`（首窗解码越线后逐窗生产解码/FK/归约零启动）+ `training_micro_internal_deadline_stop`（conditioner 越线→backbone/loss/FK 零启动） |
+| 第九轮：F 身份 helper 的 checkpoint 读取 | `f_identity_checkpoint_read_deadline_stop`（入口与两次读取之间均守卫，越线零晚读取、零构造） |
+| 第九轮：已完成 conditioner 计数保留 | `f_completed_conditioner_counter_kept`（backbone 被拒时 conditioner=1 保留在返回与盘上报告） |
+| 第九轮：嵌套坏结构结构化收口 | `nested_probe_schema_containers_report_incomplete`（step 字符串/window_id 列表/forward_counts 列表/多一窗四形态均落 f_report+返回证明） |
 
 ## 6. 测试结果
 
-- `tests/test_w1_smallset_fit_diagnostic.py`：**17 passed**（CPU，离线；含完整 68 项电池 `test_counterexample_battery_all_caught`）。
-- 反例电池独立运行：**68/68 caught**，ID 集合与冻结清单精确相等（§15 第八轮审阅修订后）。
+- `tests/test_w1_smallset_fit_diagnostic.py`：**17 passed**（CPU，离线；含完整 76 项电池 `test_counterexample_battery_all_caught`）。
+- 反例电池独立运行：**76/76 caught**，ID 集合与冻结清单精确相等（§16 第九轮审阅修订后）。
 - N0/N1 回归：**33 passed**（N0 `verify_return_coverage` 的加法性 `final_doc` 返回不改变 N0/N1 行为）。
 
 ## 7. 权威合成验收运行
 
-**`derived/audit/w1_smallset_fit_diagnostic/attempt_009/`**（2026-11-08，§15 第八轮审阅修订后代码，独占创建，CLI exit 0）：单一单调时钟 t0 先于重导入，硬截止 3300s/预留 300s；summary 经发布-核验封口 `sealed_within_budget`（round 1，登记成本 **1383.51s** 覆盖封口、候选写盘、必要回读与返回）+ `return_observation.json` SHA 绑定 covered=true（elapsed 1379.51 ≤ 1383.51）。`attempt_001–004`、`attempt_006–008`（修复前/二轮/三轮/四轮/五轮/六轮/七轮代码）保留为被取代证据；`attempt_005` 为第五轮修复运行中途实现字节再次变更而终止的残缺目录（无 acceptance_summary/return_observation，不消费）。
+**`derived/audit/w1_smallset_fit_diagnostic/attempt_010/`**（2026-11-09，§16 第九轮审阅修订后代码，独占创建，CLI exit 0）：单一单调时钟 t0 先于重导入，硬截止 3300s/预留 300s；summary 经发布-核验封口 `sealed_within_budget`（round 1，登记成本 **1468.88s** 覆盖封口、候选写盘、必要回读与返回）+ `return_observation.json` SHA 绑定 covered=true（elapsed 1464.88 ≤ 1468.88）。`attempt_001–004`、`attempt_006–009`（修复前/二轮/三轮/四轮/五轮/六轮/七轮/八轮代码）保留为被取代证据；`attempt_005` 为第五轮修复运行中途实现字节再次变更而终止的残缺目录（无 acceptance_summary/return_observation，不消费）。
 
-- **微型 D1**（300 步/probe_every 30/lr 0.03，d16 合成世界，登记成本 225.96s，返回覆盖 covered）：`local_complete_evidence=true`、调用矩阵实际=期望零偏差、本地核验零问题（forward/backbone、strict 加载、逐次读取、解码/FK、checkpoint 读取均在逐单元截止守卫下通过；截止异常路径的核验计数已随报告保存）；教师与预测双侧 metric_decode **重解码逐位绑定**、生产 FP32 解码量**重推导逐位绑定**；step-300 四门全过（root RMSE **0.00115m**、root 旋转均值 **0.00288rad**、joint RMSE **0.00186rad**、teacher FK MPJPE **0.00121m**）→ `local_mean_fit_passed=true`、`complete_fit`；`handoff_candidate.json` 落盘且经 D6 入口消费 → `handoff_ready=true`（problems=[]，交接声明前复查通过）。
-- **微型 D6**（300 步/lr 0.02，六注册窗，登记成本 1313.61s，返回覆盖 covered）：覆盖行多重集精确、**六窗四门全过**（macro RMSE 0.00633m，`macro_is_not_a_gate` 显式登记）、`local_mean_fit_passed=true`。
+- **微型 D1**（300 步/probe_every 30/lr 0.03，d16 合成世界，登记成本 235.34s，返回覆盖 covered=true（elapsed 231.34））：`local_complete_evidence=true`、调用矩阵实际=期望零偏差、本地核验零问题（checkpoint 逐项配置/身份绑定、forward/backbone、strict 加载、逐次读取、解码/FK、checkpoint 读取均在逐单元截止守卫下通过）；教师与预测双侧 metric_decode **重解码逐位绑定**、生产 FP32 解码量**重推导逐位绑定**；step-300 四门全过（root RMSE **0.00115m**、root 旋转均值 **0.00288rad**、joint RMSE **0.00186rad**、teacher FK MPJPE **0.00121m**）→ `local_mean_fit_passed=true`、`complete_fit`；`handoff_candidate.json` 落盘且经 D6 入口消费 → `handoff_ready=true`（problems=[]，交接声明前复查通过）。
+- **微型 D6**（300 步/lr 0.02，六注册窗，登记成本 1388.25s，返回覆盖 covered=true（elapsed 1384.25））：覆盖行多重集精确、**六窗四门全过**（逐窗 `window_mean_fit_passed` 全 true，macro RMSE 0.00633m，`macro_is_not_a_gate` 显式登记）、`local_mean_fit_passed=true`。
 - **F**：返回证明前置核验通过；对两阶段各 fresh 构造+initial/last 各一次契约核验后 strict 加载 probe（每阶段恰 2 次 fresh 预测）；输入重建逐次读取、conditioner→backbone、strict 加载、教师重读、fresh 解码/FK、指标归约与 checkpoint 读取均在逐单元截止守卫下通过；原始 x0、生产 FP32 解码量与 FK 点对保存数组**逐位一致**，教师侧从原始 x0 重解码绑定后对账；完成声明门 `claim_deadline_exceeded` 本轮未触发；F 自身对 f_report.json 的封口后回读执行**独立返回覆盖核验**（covered=true）→ `replay_passed=true`、`complete_evidence=true`、`mean_fit_passed=true`、`verdict=fit_pass`、`tolerance_policy=bitwise_no_tolerance`。
-- **反例电池**：68/68 caught（ID 集合与冻结清单精确相等，含 §15 新增 5 项）。
+- **反例电池**：76/76 caught（ID 集合与冻结清单精确相等，含 §16 新增 8 项）。
 
-历史运行 `attempt_001`（修复前代码）、`attempt_002`（§8 修订后）、`attempt_003`（§10 修订后）、`attempt_004`（§11 修订后）、`attempt_006`（§12 修订后）、`attempt_007`（§13 修订后）、`attempt_008`（§14 修订后）保留为被取代证据：其证据分别不含后续轮次的修复项（教师解码绑定/必需工件集合 → 证明预算绑定/候选时序 → 回读入窗/F 自身覆盖/声明门 → 保存量重算截止守卫/阶段停止收口/撤回成本同步 → 驱动与交接预算守卫/F 端点边界/撤回最终文档快照 → helper 内部逐单元守卫/交接声明复查/驱动截断计数 → forward 与 strict 加载边界/输入重建与端点逐读/坏容器结构化收口），不可消费为本轮结论。**合成四门通过只证明 I 阶段管线机制与门实现本身在合成世界上自洽；不外推到真实 W1 训练窗（真实可达性属 R/D1/D6 的授权后问题）。**
+历史运行 `attempt_001`（修复前代码）、`attempt_002`（§8 修订后）、`attempt_003`（§10 修订后）、`attempt_004`（§11 修订后）、`attempt_006`（§12 修订后）、`attempt_007`（§13 修订后）、`attempt_008`（§14 修订后）、`attempt_009`（§15 修订后）保留为被取代证据：其证据分别不含后续轮次的修复项（教师解码绑定/必需工件集合 → 证明预算绑定/候选时序 → 回读入窗/F 自身覆盖/声明门 → 保存量重算截止守卫/阶段停止收口/撤回成本同步 → 驱动与交接预算守卫/F 端点边界/撤回最终文档快照 → helper 内部逐单元守卫/交接声明复查/驱动截断计数 → forward 与 strict 加载边界/输入重建与端点逐读/坏容器结构化收口 → checkpoint 配置/身份语义绑定/D 内部单元链/F 身份读取/计数边界/嵌套坏结构），不可消费为本轮结论。**合成四门通过只证明 I 阶段管线机制与门实现本身在合成世界上自洽；不外推到真实 W1 训练窗（真实可达性属 R/D1/D6 的授权后问题）。**
 
 ## 8. 第二轮独立审阅修订（2026-11-08：7 P1 + 2 P2 全部修复）
 
@@ -202,3 +207,21 @@
 新增 5 项电池反例：`f_fresh_backbone_deadline_stop`（conditioner 返回越线→backbone 零调用）、`f_strict_load_deadline_stop`（读取越线→0 次 strict 加载；model 加载越线→conditioner 加载被拒，仅 1 次加载）、`f_input_rebuild_deadline_stop`（D6 六窗：首原始量读取越线→条件读取 0 次、原始读取 1 次）、`f_saved_probe_read_deadline_stop`（D6 六窗：首窗归约越线→下一窗端点读取被拒，仅 1 次读取）、`bad_containers_report_incomplete_f`（probe_index=[] 与 seal=[1] 均正常落盘 incomplete 报告与证明，无崩溃）。
 
 **权威合成验收 `derived/audit/w1_smallset_fit_diagnostic/attempt_009/`**（2026-11-08，第八轮修复后代码，独占创建，CLI exit 0）：封口 `sealed_within_budget`（round 1）、登记成本 **1383.51s** ≤ 3300s、返回覆盖 covered=true（elapsed 1379.51 ≤ 1383.51）；微型 D1（300 步，登记成本 225.96s，返回覆盖 covered）四门全过（RMSE 0.00115m / 0.00288rad / 0.00186rad / FK 0.00121m）→ `handoff_ready=true`（候选经 D6 入口消费，交接声明前复查通过）；微型 D6（登记成本 1313.61s，返回覆盖 covered）六窗四门全过（macro RMSE 0.00633m）；F 两阶段逐位重放通过（`fit_pass`、`claim_deadline_exceeded` 未触发、F 自身返回覆盖 covered=true）；68/68 反例捕获。`attempt_008` 保留为被取代证据（其证据不含第八轮的 forward/strict 加载内部边界、输入重建与端点逐读、坏容器结构化收口修复项）。
+
+## 16. 第九轮独立审阅修订（2026-11-09：3 P1 + 2 P2 全部修复）
+
+第八轮修订经独立复审确认有效（attempt_009 四份证明、保存量、调用矩阵、交接及 68/68 电池记录成立，登记成本 1383.51s≤3300s），但新隔离反例复现 3 P1 + 2 P2（复现脚本 `/tmp/opencode/review_i_round8_new_boundaries_20261109.py`、结果 `/tmp/opencode/review_i_round8_new_boundaries_20261109_results.json`）。全部接受并修复，电池扩至 **76 项**（测试 17 passed、N0/N1 回归 33 passed），审阅者四类攻击形态在修复后代码上全部 fail-closed（定点验证脚本 `/tmp/opencode/verify_round9_fixes.py`、结果 `/tmp/opencode/verify_round9_fixes_results.json`）。attempt_009 自本轮起为被取代证据。
+
+| # | 复审发现 | 修复 |
+| --- | --- | --- |
+| P1-1 | checkpoint 配置/身份未完整绑定：重签文件绑定链后，checkpoint `lr=123`、`grad_accum=99` 或外来 `identity` 均使本地核验 `problems=[]`、F 发布 `complete_evidence=true/replay_passed=true` | 新增 `CHECKPOINT_CONFIG_FIELDS`/`_checkpoint_config_problems`：checkpoint 内嵌 `config` 对冻结 `FitPlan` **14 字段逐项对账**（steps/micro_batch/grad_accum/seed/lr/weight_decay/grad_clip/model_type/d_model/n_layers/n_heads/ffn_mult/time_window/val_seed，含 bool 型伪造拒绝）；新增 `_checkpoint_identity_problems`：checkpoint `identity` 必须等于阶段声明身份——`FitDriver.run` 向本地核验传 `expected_identity=self.identity`，F/交接以**阶段报告 `identity`** 为锚（报告身份非映射→`stage_report_identity_invalid`；driver 身份与报告身份并存时须相等）。`_checkpoint_binding_problems` 与 `_f_identity_problems` 均执行同一语义契约，F 在**构造/加载前**拒绝 |
+| P1-2 | D 内部调用链仍可越截止继续执行：教师首窗规范解码越线后仍执行 5 次规范解码+6 次生产解码+6 次 FK；probe 首窗解码越线后另有 6 次指标归约；训练 conditioner 越线后仍启动 1 次 backbone+1 次 loss+2 次 FK（直到 pre_backward 才停） | `_ensure_teacher` 逐窗 `teacher_window_w{b}_decode/_prod_decode/_fk`；`run_probe` 逐窗 `{point}_w{b}_decode/_prod_decode/_fk/_metrics`；训练 micro 经驱动注册的 model **pre-forward/forward 钩子**守卫 `{micro_point}_pre_backbone`/`{micro_point}_pre_loss`（共享 Trainer 字节与数值路径不变；probe predict 同样受钩子保护）。越线后下一单元零启动 |
+| P1-3 | F 身份 helper 的 checkpoint 读取未守卫：本地核验末次读取越线后仍 2 次身份读取；身份 helper 首读越线后仍启动第二次读取 | `_f_identity_problems` 新增 `budget`/`report_identity` 参数，每次 checkpoint 读取前 **`f_identity_checkpoint_read_{name}`**；调用处捕获 `BudgetExceeded` → `stage_deadline_stop` 并停止后续阶段（不构造、报告/证明照常落盘）；artifacts_index 读取改经 `_read_json_object` |
+| P2-4 | 新截止出口丢失已完成 conditioner 计数：conditioner 实际完成 1 次、backbone 被正确阻断，但返回值与盘上报告记 `conditioner_forward_calls=0` | `_fresh_probe` 把 conditioner/backbone 计数移到**各自 forward 返回后的实际调用边界**，截止异常路径的计数快照保留已完成调用 |
+| P2-5 | 嵌套坏结构仍使 F 无报告退出：`step` 字符串→`ValueError`、`window_id=[]`→`TypeError`、`forward_counts=[1]`→`AttributeError`、多一窗→`IndexError` | `verify_stage_local` 在任何格式化/哈希键/下标前校验类型与长度：entry `step`/`idx` 必须 JSON 整数（bool 拒绝）、`window_id` 必须字符串、每 entry 窗口数必须等于注册窗数、`forward_counts` 必须映射；F 端点重放另校验保存窗口数。四形态均落 `f_report.json`+`return_observation.json`（`local_reverify_failed`→incomplete） |
+
+新增 8 项电池反例：`checkpoint_config_binding_rejected`（lr/grad_accum 重签篡改）、`checkpoint_identity_binding_rejected`（外来 identity）、`teacher_window_units_deadline_stop`（首窗解码越线→后续零单元）、`probe_window_units_deadline_stop`（含归约）、`training_micro_internal_deadline_stop`（conditioner→backbone/loss/FK 零启动、backward/adamw=0）、`f_identity_checkpoint_read_deadline_stop`（两个跳变点均零晚读取/零构造）、`f_completed_conditioner_counter_kept`（返回与盘上均 conditioner=1/backbone=0）、`nested_probe_schema_containers_report_incomplete`（四形态均落报告与证明）。定点复现（修复后）实测：教师/探针晚解码、晚生产解码、晚 FK、晚归约均为 0；训练晚 backbone/loss/FK 均为 0；身份读取晚读 0、构造 0。
+
+**权威合成验收 `derived/audit/w1_smallset_fit_diagnostic/attempt_010/`**（2026-11-09，第九轮修复后代码，独占创建，CLI exit 0）：封口 `sealed_within_budget`（round 1）、登记成本 **1468.88s** ≤ 3300s、返回覆盖 covered=true（elapsed 1464.88 ≤ 1468.88）；微型 D1（300 步，登记成本 235.34s，返回覆盖 covered（231.34））四门全过（RMSE 0.00115m / 0.00288rad / 0.00186rad / FK 0.00121m）→ `handoff_ready=true`（候选经 D6 入口消费，交接声明前复查通过）；微型 D6（登记成本 1388.25s，返回覆盖 covered（1384.25））六窗四门全过（逐窗 true，macro RMSE 0.00633m）；F 两阶段逐位重放通过（`fit_pass`、`claim_deadline_exceeded` 未触发、F 自身返回覆盖 covered=true）；**76/76 反例捕获**。`attempt_009` 保留为被取代证据（其证据不含第九轮的 checkpoint 配置/身份语义绑定、D 内部单元链、F 身份读取、conditioner 计数边界与嵌套坏结构收口修复项）。
+
+**边界（与前轮一致）：R/真实 D1/D6/F 未实施、未授权、未运行；真实拟合仍须 §8.3 新冻结材料与新明确授权；T6 旧结论与 partial/null/false/not_ready/不接入全部保持；本轮未运行全项目套件（仅本交付 17 passed + N0/N1 回归 33 passed）。**

@@ -38,6 +38,7 @@ from __future__ import annotations
 import json
 import math
 import random
+import shutil
 import sys
 import tempfile
 import time
@@ -45,6 +46,7 @@ import types
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Sequence
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -976,6 +978,10 @@ def run_probe(*, trainer: Trainer, probe_batch: dict, plan: FitPlan, step: int,
         raise FitDiagnosticError("probe_batch_shape_changed")
     windows_out, arrays = [], {}
     for b in range(B):
+        # P1 (round-9): each window's decode/production-decode/FK/reduction
+        # is its own numeric unit — a completed unit returning past the work
+        # deadline refuses the NEXT unit instead of finishing the batch
+        budget.check(f"{point}_w{b}_decode")
         raw = np.ascontiguousarray(x0_pred_np[b])
         tgt = np.ascontiguousarray(x0_tgt_np[b])
         problems = decoder.verify_x0(raw) + decoder.verify_x0(tgt)
@@ -985,15 +991,18 @@ def run_probe(*, trainer: Trainer, probe_batch: dict, plan: FitPlan, step: int,
             counters.get("metric_decode_calls", 0) + 1
         dec_p = decoder.decode(raw)
         dec_t = teacher["md"][b]
+        budget.check(f"{point}_w{b}_prod_decode")
         counters["production_decode_calls"] = \
             counters.get("production_decode_calls", 0) + 1
         pos_p, quat_p, q_p = loss_fn.decode_clip(x0_pred.detach()[b:b + 1])
         flat = lambda a: a.reshape(-1, a.shape[-1])
+        budget.check(f"{point}_w{b}_fk")
         kp_p = loss_fn.fk.site_world_positions(
             flat(pos_p), flat(quat_p), flat(q_p), list(KPT_TO_SMPLH)
         ).view(T_WINDOW, S_SITES, 3)
         kp_p_np = kp_p.detach().cpu().numpy()
         kp_t_np = np.asarray(teacher["fk_tgt"][b])
+        budget.check(f"{point}_w{b}_metrics")
         metrics = compute_window_metrics(dec_p, dec_t, kp_p_np, kp_t_np)
         err_fk_ts = np.linalg.norm(kp_p_np.astype(np.float64)
                                    - kp_t_np.astype(np.float64), axis=-1)
@@ -1099,6 +1108,16 @@ class FitDriver:
             trainer.conditioner, self.counters, "conditioner_forward_calls")
         self.back_handle = _forward_hook_counter(
             trainer.model, self.counters, "backbone_forward_calls")
+        # P1 (round-9): the conditioner→backbone and backbone→loss boundaries
+        # INSIDE the shared micro/predict unit are guarded with module-level
+        # hooks (the shared Trainer itself is untouched): a completed unit
+        # returning past the work deadline refuses the next unit of the
+        # chain instead of only stopping at pre_backward.
+        self._guard_point: str | None = None
+        self.guard_pre_handle = trainer.model.register_forward_pre_hook(
+            self._pre_backbone_gate)
+        self.guard_post_handle = trainer.model.register_forward_hook(
+            self._pre_loss_gate)
         self.training_gen = training_gen
         self.probe_batch = probe_batch
         self.probes: list[dict] = []
@@ -1171,6 +1190,14 @@ class FitDriver:
         return {k: (v.to(self.trainer.cfg.device) if torch.is_tensor(v) else v)
                 for k, v in batch.items()}
 
+    def _pre_backbone_gate(self, _module, _inputs) -> None:
+        if self._guard_point is not None:
+            self.budget.check(self._guard_point + "_pre_backbone")
+
+    def _pre_loss_gate(self, _module, _inputs, _output) -> None:
+        if self._guard_point is not None:
+            self.budget.check(self._guard_point + "_pre_loss")
+
     def _ensure_teacher(self) -> None:
         if self.teacher is not None:
             return
@@ -1179,15 +1206,21 @@ class FitDriver:
         md, prod, fk = [], [], []
         with torch.no_grad():
             for b in range(x0_tgt.shape[0]):
+                # P1 (round-9): every window is its own decode/production/
+                # FK unit chain; a completed decode returning past the work
+                # deadline refuses the units that follow
+                self.budget.check(f"teacher_window_w{b}_decode")
                 self.counters["metric_decode_calls"] = \
                     self.counters.get("metric_decode_calls", 0) + 1
                 md.append(self.decoder.decode(np.ascontiguousarray(x0_tgt[b])))
+                self.budget.check(f"teacher_window_w{b}_prod_decode")
                 self.counters["production_decode_calls"] = \
                     self.counters.get("production_decode_calls", 0) + 1
                 pos, quat, q = self.loss_fn.decode_clip(
                     self.probe_batch["x0"].detach()[b:b + 1]
                     .to(self.trainer.cfg.device))
                 flat = lambda a: a.reshape(-1, a.shape[-1])
+                self.budget.check(f"teacher_window_w{b}_fk")
                 kp = self.loss_fn.fk.site_world_positions(
                     flat(pos), flat(quat), flat(q), list(KPT_TO_SMPLH)
                 ).view(T_WINDOW, S_SITES, 3)
@@ -1210,13 +1243,17 @@ class FitDriver:
         self._ensure_teacher()
         self.counters["probe_calls"] = self.counters.get("probe_calls", 0) + 1
         gen = torch.Generator()
-        entry, arrays = run_probe(
-            trainer=self.trainer, probe_batch=self.probe_batch, plan=self.plan,
-            step=step, probe_idx=idx, probe_gen=gen,
-            training_gen=self.training_gen, loss_fn=self.loss_fn,
-            budget=self.budget, counters=self.counters, decoder=self.decoder,
-            teacher=self.teacher,
-            window_ids=self.registration.window_ids)
+        self._guard_point = f"probe_{idx}_step_{step}"
+        try:
+            entry, arrays = run_probe(
+                trainer=self.trainer, probe_batch=self.probe_batch, plan=self.plan,
+                step=step, probe_idx=idx, probe_gen=gen,
+                training_gen=self.training_gen, loss_fn=self.loss_fn,
+                budget=self.budget, counters=self.counters, decoder=self.decoder,
+                teacher=self.teacher,
+                window_ids=self.registration.window_ids)
+        finally:
+            self._guard_point = None
         self.probes.append(entry)
         self.probe_arrays_by_idx[idx] = arrays
 
@@ -1257,7 +1294,8 @@ class FitDriver:
             verification = verify_stage_local(
                 self.stage_dir, self.plan, self.registration, self.decoder,
                 production_decoder=self.loss_fn,
-                counters=verification_counters, budget=self.budget)
+                counters=verification_counters, budget=self.budget,
+                expected_identity=self.identity)
             self.budget.check("local_verification_complete")
             summary.update(verification)
             summary["verification_counters"] = verification_counters
@@ -1294,6 +1332,8 @@ class FitDriver:
         finally:
             self.cond_handle.remove()
             self.back_handle.remove()
+            self.guard_pre_handle.remove()
+            self.guard_post_handle.remove()
             summary["counters"] = dict(self.counters)
             summary["budget"] = self.budget.facts()
         return summary
@@ -1359,8 +1399,16 @@ class FitDriver:
                 def post_backward():
                     self.counters["backward_calls"] += 1
 
-                loss, parts = trainer.accumulate_micro(
-                    batch, pre_backward=pre_backward, post_backward=post_backward)
+                # P1 (round-9): the guard point arms the model pre-forward /
+                # forward hooks, so a conditioner returning past the deadline
+                # refuses the backbone (and the backbone the loss/FK chain)
+                self._guard_point = f"step_{step}_micro_{micro + 1}"
+                try:
+                    loss, parts = trainer.accumulate_micro(
+                        batch, pre_backward=pre_backward,
+                        post_backward=post_backward)
+                finally:
+                    self._guard_point = None
                 n_micro += 1
                 for k, v in parts.items():
                     parts_acc[k] = parts_acc.get(k, 0.0) + float(v) / plan.grad_accum
@@ -1681,12 +1729,18 @@ def _production_decode_binding_problems(saved: dict, raw: np.ndarray,
     return problems
 
 
+def _is_json_int(value) -> bool:
+    """A JSON integer (bools are ints in Python but never valid indices)."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def verify_stage_local(stage_dir: Path, plan: FitPlan,
                        registration: FitRegistration,
                        decoder: MetricDecoder,
                        production_decoder=None,
                        counters: dict | None = None,
-                       budget: StageBudget | None = None) -> dict:
+                       budget: StageBudget | None = None,
+                       expected_identity: dict | None = None) -> dict:
     """§7.4 items 1-3 for one stage: coverage multiset, full CPU recompute of
     every saved probe AND the frozen teacher references from disk raw x0
     (bitwise decode bindings on both sides), production-decode re-derivation
@@ -1724,12 +1778,27 @@ def verify_stage_local(stage_dir: Path, plan: FitPlan,
     # the stage report registers the index SHA; consume it whenever the
     # report already exists (F / handoff contexts)
     report_path = stage_dir / "stage_report.json"
+    report_identity: dict | None = None
     if report_path.is_file():
         report, report_problems = _read_json_object(report_path)
         if report is None:
             problems.append(f"stage_report_invalid:{report_problems[:2]}")
-        elif report.get("artifacts_index_sha256") != sha256_file(index_path):
-            problems.append("artifacts_index_sha_mismatch")
+        else:
+            if report.get("artifacts_index_sha256") != sha256_file(index_path):
+                problems.append("artifacts_index_sha_mismatch")
+            # P1 (round-9): the stage's declared identity is the semantic
+            # anchor the checkpoint identities must equal
+            declared = report.get("identity")
+            if isinstance(declared, dict):
+                report_identity = declared
+            else:
+                problems.append("stage_report_identity_invalid")
+    if expected_identity is not None:
+        if report_identity is not None and report_identity != expected_identity:
+            problems.append("stage_report_identity_mismatch")
+        identity_to_bind = expected_identity
+    else:
+        identity_to_bind = report_identity
     probe_index_path = stage_dir / "probe_index.json"
     if not probe_index_path.is_file():
         problems.append("probe_index_missing")
@@ -1762,15 +1831,27 @@ def verify_stage_local(stage_dir: Path, plan: FitPlan,
             problems.append("probe_entry_not_a_mapping")
             continue
         step = entry.get("step")
+        idx_raw = entry.get("idx")
+        # P2 (round-9): type-check BEFORE hash-key construction — a list
+        # step/window_id used to raise TypeError and kill F without a report
+        if not _is_json_int(step) or not _is_json_int(idx_raw):
+            problems.append(
+                f"probe_entry_index_invalid:idx{idx_raw!r}:step{step!r}")
+            continue
         windows_raw = entry.get("windows")
         if not isinstance(windows_raw, list):
-            problems.append(f"probe_windows_not_a_list:idx{entry.get('idx')}")
+            problems.append(f"probe_windows_not_a_list:idx{idx_raw}")
             continue
         for w in windows_raw:
             if not isinstance(w, dict):
-                problems.append(f"probe_window_not_a_mapping:idx{entry.get('idx')}")
+                problems.append(f"probe_window_not_a_mapping:idx{idx_raw}")
                 continue
-            key = (step, w.get("window_id"))
+            wid = w.get("window_id")
+            if not isinstance(wid, str):
+                problems.append(
+                    f"probe_window_id_invalid:idx{idx_raw}:{wid!r}")
+                continue
+            key = (step, wid)
             got[key] = got.get(key, 0) + 1
     missing = sorted(f"{k[0]}:{k[1]}" for k in want if want[k] > got.get(k, 0))
     extra = sorted(f"{k[0]}:{k[1]}" for k in got if k not in want)
@@ -1857,16 +1938,29 @@ def verify_stage_local(stage_dir: Path, plan: FitPlan,
         if not isinstance(entry, dict):
             continue
         step, idx = entry.get("step"), entry.get("idx")
+        # P2 (round-9): index/step must be JSON integers BEFORE any format
+        # spec; a wrong-typed entry is a structural problem, never a
+        # ValueError/TypeError that escapes the incomplete closure
+        if not _is_json_int(step) or not _is_json_int(idx):
+            problems.append(
+                f"probe_entry_index_invalid:idx{idx!r}:step{step!r}")
+            continue
+        windows_raw = entry.get("windows")
+        if not isinstance(windows_raw, list):
+            continue  # already reported by the coverage pass
+        if len(windows_raw) != len(window_ids):
+            problems.append(f"probe_windows_count:idx{idx}:"
+                            f"{len(windows_raw)}:want{len(window_ids)}")
+            continue
         npz_path = stage_dir / "probes" / f"probe_{idx:04d}_step_{step:06d}.npz"
         if not npz_path.is_file():
             problems.append(f"probe_npz_missing:idx{idx}")
             continue
-        fc = entry.get("forward_counts") or {}
-        if fc.get("conditioner") != 1 or fc.get("backbone") != 1:
-            problems.append(f"probe_forward_counts:idx{idx}:{fc}")
-        windows_raw = entry.get("windows")
-        windows_iter = windows_raw if isinstance(windows_raw, list) else []
-        for b, wout in enumerate(windows_iter):
+        fc = entry.get("forward_counts")
+        if not isinstance(fc, dict) or fc.get("conditioner") != 1 \
+                or fc.get("backbone") != 1:
+            problems.append(f"probe_forward_counts:idx{idx}:{fc!r}")
+        for b, wout in enumerate(windows_raw):
             if not isinstance(wout, dict):
                 problems.append(f"probe_window_not_a_mapping:idx{idx}:w{b}")
                 continue
@@ -1938,9 +2032,10 @@ def verify_stage_local(stage_dir: Path, plan: FitPlan,
     coverage = {"expected_rows": sum(want.values()), "actual_rows": total_rows,
                 "missing": missing, "extra": extra, "duplicated": duplicated}
 
-    # 4. checkpoint role/step binding -------------------------------------------
+    # 4. checkpoint role/step/config/identity binding ---------------------------
     problems += _checkpoint_binding_problems(stage_dir, plan, decoder,
-                                             budget=budget)
+                                             budget=budget,
+                                             expected_identity=identity_to_bind)
 
     complete = problems == [] and len(final_windows) == len(window_ids)
     mean_fit = (bool(all(w["metrics"]["window_mean_fit_passed"]
@@ -1963,12 +2058,50 @@ def verify_stage_local(stage_dir: Path, plan: FitPlan,
             "spike_gate_status": SPIKE_GATE_STATUS}
 
 
+# P1 (round-9): file-hash self-consistency is not a semantic binding — the
+# checkpoint's embedded effective configuration and stage identity must be
+# reconciled ITEM BY ITEM against the frozen plan and the stage's declared
+# identity before any construction/load can lean on them.
+CHECKPOINT_CONFIG_FIELDS = ("steps", "micro_batch", "grad_accum", "seed",
+                            "lr", "weight_decay", "grad_clip", "model_type",
+                            "d_model", "n_layers", "n_heads", "ffn_mult",
+                            "time_window", "val_seed")
+
+
+def _checkpoint_config_problems(cfg, plan: FitPlan, name: str) -> list[str]:
+    """Full frozen-config contract of one saved checkpoint."""
+    if not isinstance(cfg, dict):
+        return [f"checkpoint_config_missing:{name}"]
+    problems: list[str] = []
+    for key in CHECKPOINT_CONFIG_FIELDS:
+        want = getattr(plan, key)
+        got = cfg.get(key)
+        if isinstance(got, bool) != isinstance(want, bool) or got != want:
+            problems.append(
+                f"checkpoint_config_mismatch:{name}:{key}:{got!r}:want{want!r}")
+    return problems
+
+
+def _checkpoint_identity_problems(ck: dict, name: str,
+                                  expected_identity: dict | None) -> list[str]:
+    """A saved stage identity is only meaningful when it EQUALS the stage's
+    declared identity; a foreign (re-signed) identity is a semantic refusal."""
+    if expected_identity is None:
+        return []
+    got = ck.get("identity")
+    if not isinstance(got, dict) or got != expected_identity:
+        return [f"checkpoint_identity_mismatch:{name}"]
+    return []
+
+
 def _checkpoint_binding_problems(stage_dir: Path, plan: FitPlan,
                                  decoder: MetricDecoder,
-                                 budget: StageBudget | None = None) -> list[str]:
-    """Checkpoint role/step/root-stats binding; when ``budget`` is given,
-    every checkpoint read is guarded (P1 round-7: a reduction returning past
-    the work deadline refuses the checkpoint loads)."""
+                                 budget: StageBudget | None = None,
+                                 expected_identity: dict | None = None) -> list[str]:
+    """Checkpoint role/step/root-stats/config/identity binding; when
+    ``budget`` is given, every checkpoint read is guarded (P1 round-7: a
+    reduction returning past the work deadline refuses the checkpoint
+    loads)."""
     check = budget.check if budget is not None else (lambda _point: None)
     problems: list[str] = []
     for name, want_step in (("initial.pt", 0), ("last.pt", plan.steps)):
@@ -1982,10 +2115,12 @@ def _checkpoint_binding_problems(stage_dir: Path, plan: FitPlan,
         except Exception as exc:  # noqa: BLE001
             problems.append(f"checkpoint_unreadable:{name}:{type(exc).__name__}")
             continue
-        if not isinstance(ck, dict) or ck.get("step") != want_step:
-            problems.append(f"checkpoint_step_mismatch:{name}:"
-                            f"{ck.get('step') if isinstance(ck, dict) else '?'}")
-        rs = ck.get("root_stats") if isinstance(ck, dict) else None
+        if not isinstance(ck, dict):
+            problems.append(f"checkpoint_not_a_mapping:{name}")
+            continue
+        if ck.get("step") != want_step:
+            problems.append(f"checkpoint_step_mismatch:{name}:{ck.get('step')!r}")
+        rs = ck.get("root_stats")
         if not isinstance(rs, dict) or "mean" not in rs or "std" not in rs:
             problems.append(f"checkpoint_root_stats_missing:{name}")
         else:
@@ -1995,12 +2130,9 @@ def _checkpoint_binding_problems(stage_dir: Path, plan: FitPlan,
                         np.ascontiguousarray(rs[key], dtype=np.float32).view(np.uint32),
                         src[key].view(np.uint32)):
                     problems.append(f"checkpoint_root_stats_mismatch:{name}:{key}")
-        cfg = ck.get("config") if isinstance(ck, dict) else None
-        if not isinstance(cfg, dict) or cfg.get("model_type") != plan.model_type \
-                or cfg.get("steps") != plan.steps \
-                or cfg.get("micro_batch") != plan.micro_batch:
-            problems.append(f"checkpoint_config_mismatch:{name}")
-        if isinstance(ck, dict) and ck.get("parameters_finite") is not True:
+        problems += _checkpoint_config_problems(ck.get("config"), plan, name)
+        problems += _checkpoint_identity_problems(ck, name, expected_identity)
+        if ck.get("parameters_finite") is not True:
             problems.append(f"checkpoint_params_nonfinite:{name}")
         # the frozen contract is CUDA/float32 parameters: any saved floating
         # tensor that is not float32 must be refused BEFORE a strict load can
@@ -2156,6 +2288,11 @@ def _fresh_probe(model, conditioner, batch: dict, plan: FitPlan,
         conditioner.eval()
         model.eval()
         memory = conditioner(batch)
+        # P2 (round-9): counters land at the ACTUAL call boundary — a
+        # completed conditioner call stays recorded even when the following
+        # backbone gate refuses the rest of the fresh probe
+        counters["conditioner_forward_calls"] = \
+            counters.get("conditioner_forward_calls", 0) + 1
         # P1 (round-8): the conditioner and backbone are independent numeric
         # units — a conditioner returning past the work deadline refuses the
         # backbone forward that follows.
@@ -2170,10 +2307,8 @@ def _fresh_probe(model, conditioner, batch: dict, plan: FitPlan,
             x0_pred = model(x_t, t, memory)
         else:
             x0_pred = model(memory, batch["x0"].shape[1])
-    counters["conditioner_forward_calls"] = \
-        counters.get("conditioner_forward_calls", 0) + 1
-    counters["backbone_forward_calls"] = \
-        counters.get("backbone_forward_calls", 0) + 1
+        counters["backbone_forward_calls"] = \
+            counters.get("backbone_forward_calls", 0) + 1
     x0_np = x0_pred.detach().to("cpu").numpy()
     per_window = []
     flat = lambda a: a.reshape(-1, a.shape[-1])
@@ -2244,7 +2379,14 @@ def _load_state_dicts_checked(path: Path, model, conditioner,
 
 
 def _f_identity_problems(stage_dir: Path, plan: FitPlan,
-                         decoder: MetricDecoder, index: dict) -> list[str]:
+                         decoder: MetricDecoder, index: dict,
+                         budget: StageBudget | None = None,
+                         report_identity: dict | None = None) -> list[str]:
+    """P1 (round-9): the identity helper's checkpoint reads are units too —
+    each read is guarded, the embedded configuration is reconciled against
+    the frozen plan FIELD BY FIELD and the embedded stage identity against
+    the report's declared identity."""
+    check = budget.check if budget is not None else (lambda _point: None)
     problems = verify_artifacts_index(
         Path(stage_dir), index, required=_required_stage_artifacts(plan))
     for name, want_step in (("initial.pt", 0), ("last.pt", plan.steps)):
@@ -2252,19 +2394,29 @@ def _f_identity_problems(stage_dir: Path, plan: FitPlan,
         if not path.is_file():
             problems.append(f"checkpoint_missing:{name}")
             continue
-        ck = torch.load(path, map_location="cpu", weights_only=False)
-        if not isinstance(ck, dict) or ck.get("step") != want_step:
+        check(f"f_identity_checkpoint_read_{name}")
+        try:
+            ck = torch.load(path, map_location="cpu", weights_only=False)
+        except Exception as exc:  # noqa: BLE001
+            problems.append(f"checkpoint_unreadable:{name}:{type(exc).__name__}")
+            continue
+        if not isinstance(ck, dict):
+            problems.append(f"checkpoint_not_a_mapping:{name}")
+            continue
+        if ck.get("step") != want_step:
             problems.append(f"checkpoint_step_mismatch:{name}")
-        cfg = ck.get("config") or {}
-        if cfg.get("model_type") != plan.model_type:
-            problems.append(f"checkpoint_model_type:{name}")
-        rs = ck.get("root_stats") or {}
-        src = decoder.source_constants_f32
-        for key in ("mean", "std"):
-            if not np.array_equal(
-                    np.ascontiguousarray(rs.get(key), dtype=np.float32).view(np.uint32),
-                    src[key].view(np.uint32)):
-                problems.append(f"checkpoint_root_stats_mismatch:{name}:{key}")
+        problems += _checkpoint_config_problems(ck.get("config"), plan, name)
+        problems += _checkpoint_identity_problems(ck, name, report_identity)
+        rs = ck.get("root_stats")
+        if not isinstance(rs, dict) or "mean" not in rs or "std" not in rs:
+            problems.append(f"checkpoint_root_stats_missing:{name}")
+        else:
+            src = decoder.source_constants_f32
+            for key in ("mean", "std"):
+                if not np.array_equal(
+                        np.ascontiguousarray(rs[key], dtype=np.float32).view(np.uint32),
+                        src[key].view(np.uint32)):
+                    problems.append(f"checkpoint_root_stats_mismatch:{name}:{key}")
     return problems
 
 
@@ -2436,9 +2588,28 @@ def run_f_verification(*, stage_specs: list[dict], out_dir: Path,
             stages_out.append(res)
             evidence_all_ok = False
             continue
-        identity_problems = _f_identity_problems(
-            stage_dir, plan, decoder,
-            json.loads((stage_dir / "artifacts_index.json").read_text()))
+        # P1 (round-9): every checkpoint read inside the identity helper is
+        # a unit; a read returning past the deadline refuses the next one and
+        # closes this AND every later stage as a deadline stop (no build).
+        index_doc, index_problems = _read_json_object(
+            stage_dir / "artifacts_index.json")
+        if index_doc is None:
+            identity_problems = [
+                f"artifacts_index_invalid:{index_problems[:2]}"]
+        else:
+            try:
+                identity_problems = _f_identity_problems(
+                    stage_dir, plan, decoder, index_doc, budget=budget,
+                    report_identity=(doc.get("identity")
+                                     if isinstance(doc.get("identity"), dict)
+                                     else None))
+            except BudgetExceeded as exc:
+                res.update({"replay_enabled": False, "replay_passed": None,
+                            "skip_reason": "stage_deadline_stop",
+                            "deadline_stop": str(exc)})
+                stages_out.append(res)
+                evidence_all_ok = False
+                break
         if identity_problems:
             res.update({"replay_enabled": False, "replay_passed": None,
                         "skip_reason": "f_identity_problems",
@@ -2528,7 +2699,16 @@ def run_f_verification(*, stage_specs: list[dict], out_dir: Path,
                 if saved_entry is None:
                     replay_problems.append(f"saved_probe_missing:{role}")
                     continue
-                for b, wout in enumerate(saved_entry["windows"]):
+                # P2 (round-9): a saved window list longer/shorter than the
+                # registered batch is a structural replay failure, never an
+                # IndexError that escapes the F report
+                saved_windows = saved_entry["windows"]
+                if len(saved_windows) != len(window_ids):
+                    replay_problems.append(
+                        f"saved_probe_windows_count:{role}:"
+                        f"{len(saved_windows)}:want{len(window_ids)}")
+                    continue
+                for b, wout in enumerate(saved_windows):
                     if not isinstance(wout, dict):
                         replay_problems.append(
                             f"saved_probe_window_not_a_mapping:{role}:w{b}")
@@ -3057,6 +3237,14 @@ COUNTEREXAMPLE_IDS = (
     "f_construct_after_deadline_refused",
     "f_runtime_drift_before_fresh_refused",
     "proof_not_a_mapping_survives_f",
+    "checkpoint_config_binding_rejected",
+    "checkpoint_identity_binding_rejected",
+    "teacher_window_units_deadline_stop",
+    "probe_window_units_deadline_stop",
+    "training_micro_internal_deadline_stop",
+    "f_identity_checkpoint_read_deadline_stop",
+    "f_completed_conditioner_counter_kept",
+    "nested_probe_schema_containers_report_incomplete",
 )
 
 
@@ -5171,6 +5359,387 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
         record("proof_not_a_mapping_survives_f", caught,
                f"list-shaped proof -> structured refusal; f_report written="
                f"{report_written}")
+
+        # ==================================================================
+        # Round-9 review counterexamples
+        # ==================================================================
+        trainer_mod = sys.modules[Trainer.__module__]
+
+        def _r9_world(tag_seed: int):
+            return make_synthetic_world(seed=tag_seed, n_windows=6, d_model=16)
+
+        def _r9_driver(root: Path, role: str, budget_,
+                       world_) -> tuple[FitPlan, "FitDriver", Path]:
+            plan_ = FitPlan(role, steps=1, probe_every=1, synthetic=True,
+                            d_model=16, n_layers=1, n_heads=4, ffn_mult=2,
+                            lr=0.02)
+            sdir_ = Path(root) / role.lower()
+            view_ = world_.view_for(role)
+            trainer_ = world_.build_trainer(
+                plan_, sdir_, budget_deadline=budget_.work_deadline,
+                train_ds=view_["ds"])
+            driver_ = FitDriver(
+                trainer=trainer_, plan=plan_,
+                registration=view_["registration"], loss_fn=world_.loss_fn,
+                decoder=world_.decoder, probe_batch=view_["probe_batch"],
+                budget=budget_, runtime_guard=SyntheticRuntimeGuard(),
+                identity={"synthetic": True}, stage_dir=sdir_,
+                training_gen=torch.Generator().manual_seed(plan_.seed),
+                dataset_window_keys=view_["ds"].window_keys,
+                authorization_includes_d6=True)
+            return plan_, driver_, sdir_
+
+        # --- P1(r9): checkpoint config/identity semantic binding -----------
+        world_r9 = _r9_world(seed + 61)
+        fixtures_r9: dict = {}
+        for role in ("D1", "D6"):
+            _, plan_r9, _, report_r9, sdir_r9, _, _ = _mini_stage(
+                tmp / "r9fixtures", role, n_windows=6, steps=1,
+                world=world_r9, finish=True)
+            assert report_r9["local_complete_evidence"] is True
+            fixtures_r9[role] = (plan_r9, sdir_r9)
+
+        def _run_f_r9(name: str, budget_, factory=None,
+                      directory=None) -> dict:
+            plan_r9, sdir_r9 = fixtures_r9["D1"]
+            return run_f_verification(
+                stage_specs=[{"stage_dir": directory or sdir_r9,
+                              "plan": plan_r9,
+                              "registration": world_r9.registration_for("D1"),
+                              "decoder": world_r9.decoder,
+                              "loss_fn": world_r9.loss_fn}],
+                out_dir=tmp / name, budget=budget_,
+                runtime_guard=SyntheticRuntimeGuard(),
+                build_modules=(factory
+                               or build_modules_factory(world_r9, plan_r9)),
+                authorization={"includes": ["D6"]})
+
+        config_bind: dict = {}
+        identity_bind = False
+        for variant in ("lr", "grad_accum", "identity"):
+            copydir = tmp / f"r9bind_{variant}"
+            shutil.copytree(fixtures_r9["D1"][1], copydir)
+            for ck_name in ("initial.pt", "last.pt"):
+                path = copydir / ck_name
+                ck = torch.load(path, map_location="cpu", weights_only=False)
+                if variant == "lr":
+                    ck["config"]["lr"] = 123.0
+                elif variant == "grad_accum":
+                    ck["config"]["grad_accum"] = 99
+                else:
+                    ck["identity"] = {"foreign_stage": True}
+                torch.save(ck, path)
+            _full_resign(copydir)
+            local = verify_stage_local(
+                copydir, fixtures_r9["D1"][0],
+                world_r9.registration_for("D1"), world_r9.decoder,
+                production_decoder=world_r9.loss_fn)
+            out = _run_f_r9(f"r9bind_{variant}_f",
+                            StageBudget("F", 300.0, 10.0), directory=copydir)
+            if variant == "identity":
+                identity_bind = (
+                    any("checkpoint_identity_mismatch" in p
+                        for p in local["problems"])
+                    and out["summary_doc"]["complete_evidence"] is False)
+            else:
+                config_bind[variant] = (
+                    any("checkpoint_config_mismatch" in p
+                        for p in local["problems"])
+                    and out["summary_doc"]["complete_evidence"] is False)
+        caught = config_bind.get("lr", False) \
+            and config_bind.get("grad_accum", False)
+        record("checkpoint_config_binding_rejected", caught,
+               "re-signed lr=123 / grad_accum=99 checkpoints refused by the "
+               f"full frozen-config contract (lr={config_bind.get('lr')}, "
+               f"accum={config_bind.get('grad_accum')})")
+        record("checkpoint_identity_binding_rejected", identity_bind,
+               "re-signed foreign checkpoint identity refused against the "
+               "stage's declared identity")
+
+        # --- P1(r9): teacher/probe multi-window unit chains ----------------
+        def _stack_has(code) -> bool:
+            frame = sys._getframe(1)
+            while frame is not None:
+                if frame.f_code is code:
+                    return True
+                frame = frame.f_back
+            return False
+
+        tail_results: dict = {}
+        for context in ("teacher", "probe"):
+            world_t = _r9_world(seed + 62)
+            holder_t = {"t": 0.0}
+            budget_t = StageBudget("D6", 100.0, 10.0, t0=0.0,
+                                   clock=lambda: holder_t["t"])
+            _, driver_t, _ = _r9_driver(tmp / f"r9tail_{context}", "D6",
+                                        budget_t, world_t)
+            scope = (FitDriver._ensure_teacher.__code__ if context == "teacher"
+                     else run_probe.__code__)
+            counts_t = dict(metric_decodes=0, late_metric_decodes=0,
+                            production_decodes=0, late_production_decodes=0,
+                            fk_calls=0, late_fk_calls=0,
+                            metric_reductions=0, late_metric_reductions=0)
+            real_md = world_t.decoder.decode
+            real_pd = world_t.loss_fn.decode_clip
+            real_fk_t = world_t.fk_inner.site_world_positions
+            real_metrics_t = compute_window_metrics
+
+            def md_tail(*a, _scope=scope, _counts=counts_t, _real=real_md,
+                        _holder=holder_t, _budget=budget_t, **kw):
+                in_scope = _stack_has(_scope)
+                if in_scope:
+                    _counts["metric_decodes"] += 1
+                    _counts["late_metric_decodes"] += int(
+                        _holder["t"] >= _budget.work_deadline)
+                value = _real(*a, **kw)
+                if in_scope and _counts["metric_decodes"] == 1:
+                    _holder["t"] = 91
+                return value
+
+            def pd_observe(*a, _scope=scope, _counts=counts_t,
+                           _real=real_pd, _holder=holder_t,
+                           _budget=budget_t, **kw):
+                if _stack_has(_scope):
+                    _counts["production_decodes"] += 1
+                    _counts["late_production_decodes"] += int(
+                        _holder["t"] >= _budget.work_deadline)
+                return _real(*a, **kw)
+
+            def fk_observe_t(*a, _scope=scope, _counts=counts_t,
+                             _real=real_fk_t, _holder=holder_t,
+                             _budget=budget_t, **kw):
+                if _stack_has(_scope):
+                    _counts["fk_calls"] += 1
+                    _counts["late_fk_calls"] += int(
+                        _holder["t"] >= _budget.work_deadline)
+                return _real(*a, **kw)
+
+            def metric_observe_t(*a, _scope=scope, _counts=counts_t,
+                                 _real=real_metrics_t, _holder=holder_t,
+                                 _budget=budget_t, **kw):
+                if _stack_has(_scope):
+                    _counts["metric_reductions"] += 1
+                    _counts["late_metric_reductions"] += int(
+                        _holder["t"] >= _budget.work_deadline)
+                return _real(*a, **kw)
+
+            with patch.object(trainer_mod, "time",
+                              types.SimpleNamespace(
+                                  perf_counter=budget_t.clock)), \
+                    patch.object(world_t.decoder, "decode", md_tail), \
+                    patch.object(world_t.loss_fn, "decode_clip", pd_observe), \
+                    patch.object(world_t.fk_inner, "site_world_positions",
+                                 fk_observe_t), \
+                    patch.object(mod, "compute_window_metrics",
+                                 metric_observe_t):
+                summary_t = driver_t.run()
+            tail_results[context] = {
+                **counts_t,
+                "failure": (summary_t.get("failure") or {}).get("type")}
+        teacher_ok = (tail_results["teacher"]["late_metric_decodes"] == 0
+                      and tail_results["teacher"]["late_production_decodes"] == 0
+                      and tail_results["teacher"]["late_fk_calls"] == 0
+                      and tail_results["teacher"]["failure"] == "BudgetExceeded")
+        probe_ok = (tail_results["probe"]["late_metric_decodes"] == 0
+                    and tail_results["probe"]["late_production_decodes"] == 0
+                    and tail_results["probe"]["late_fk_calls"] == 0
+                    and tail_results["probe"]["late_metric_reductions"] == 0
+                    and tail_results["probe"]["failure"] == "BudgetExceeded")
+        record("teacher_window_units_deadline_stop", teacher_ok,
+               "first teacher decode crossed the deadline; the following "
+               f"per-window units never started ({tail_results['teacher']})")
+        record("probe_window_units_deadline_stop", probe_ok,
+               "first probe decode crossed the deadline; the following "
+               f"per-window units never started ({tail_results['probe']})")
+
+        # --- P1(r9): conditioner -> backbone -> loss inside the micro ------
+        world_u = _r9_world(seed + 63)
+        holder_u = {"t": 0.0}
+        budget_u = StageBudget("D1", 100.0, 10.0, t0=0.0,
+                               clock=lambda: holder_u["t"])
+        _, driver_u, _ = _r9_driver(tmp / "r9micro", "D1", budget_u, world_u)
+        counts_u = dict(training_conditioner_calls=0,
+                        training_backbone_calls=0,
+                        late_training_backbone_calls=0,
+                        training_loss_calls=0, late_training_loss_calls=0,
+                        training_fk_calls=0, late_training_fk_calls=0)
+        real_fk_u = world_u.fk_inner.site_world_positions
+        real_loss_u = CountingLoss.__call__
+
+        def conditioner_tail_u(module, _inputs, _output):
+            if module.training:
+                counts_u["training_conditioner_calls"] += 1
+                holder_u["t"] = 91
+
+        def backbone_start_u(module, _inputs):
+            if module.training:
+                counts_u["training_backbone_calls"] += 1
+                counts_u["late_training_backbone_calls"] += int(
+                    holder_u["t"] >= budget_u.work_deadline)
+
+        def loss_start_u(self, *a, **kw):
+            if _stack_has(Trainer.accumulate_micro.__code__):
+                counts_u["training_loss_calls"] += 1
+                counts_u["late_training_loss_calls"] += int(
+                    holder_u["t"] >= budget_u.work_deadline)
+            return real_loss_u(self, *a, **kw)
+
+        def train_fk_u(*a, **kw):
+            if _stack_has(Trainer.accumulate_micro.__code__):
+                counts_u["training_fk_calls"] += 1
+                counts_u["late_training_fk_calls"] += int(
+                    holder_u["t"] >= budget_u.work_deadline)
+            return real_fk_u(*a, **kw)
+
+        handle_cu = driver_u.trainer.conditioner.register_forward_hook(
+            conditioner_tail_u)
+        handle_bu = driver_u.trainer.model.register_forward_pre_hook(
+            backbone_start_u)
+        with patch.object(trainer_mod, "time",
+                          types.SimpleNamespace(
+                              perf_counter=budget_u.clock)), \
+                patch.object(CountingLoss, "__call__", loss_start_u), \
+                patch.object(world_u.fk_inner, "site_world_positions",
+                             train_fk_u):
+            summary_u = driver_u.run()
+        handle_cu.remove()
+        handle_bu.remove()
+        caught = (counts_u["late_training_backbone_calls"] == 0
+                  and counts_u["late_training_loss_calls"] == 0
+                  and counts_u["late_training_fk_calls"] == 0
+                  and (summary_u.get("failure") or {}).get("type")
+                  == "BudgetExceeded"
+                  and summary_u["counters"]["backward_calls"] == 0
+                  and summary_u["counters"]["adamw_step_calls"] == 0)
+        record("training_micro_internal_deadline_stop", caught,
+               "conditioner returned past the deadline; the backbone/loss/FK "
+               f"chain never started ({counts_u})")
+
+        # --- P1(r9): F identity helper checkpoint reads are guarded --------
+        identity_tail: dict = {}
+        for jump_at in ("local_last_checkpoint", "identity_first_checkpoint"):
+            clock_i = _FakeClock(1)
+            budget_i = StageBudget("F", 100.0, 10.0, t0=0.0, clock=clock_i)
+            counts_i = dict(identity_checkpoint_reads=0,
+                            late_identity_checkpoint_reads=0,
+                            module_builds=0)
+            real_load_i = torch.load
+            base_factory_i = build_modules_factory(world_r9,
+                                                   fixtures_r9["D1"][0])
+
+            def count_factory_i(_counts=counts_i, _factory=base_factory_i):
+                _counts["module_builds"] += 1
+                return _factory()
+
+            def identity_reads_i(path, *a, _jump=jump_at, _counts=counts_i,
+                                 _real=real_load_i, _clock=clock_i,
+                                 _budget=budget_i, **kw):
+                caller = sys._getframe(1).f_code
+                is_identity = caller is _f_identity_problems.__code__
+                if is_identity:
+                    _counts["identity_checkpoint_reads"] += 1
+                    _counts["late_identity_checkpoint_reads"] += int(
+                        _clock.t >= _budget.work_deadline)
+                ck = _real(path, *a, **kw)
+                if (_jump == "local_last_checkpoint"
+                        and caller is _checkpoint_binding_problems.__code__
+                        and Path(path).name == "last.pt"):
+                    _clock.t = 91
+                elif (_jump == "identity_first_checkpoint" and is_identity
+                        and _counts["identity_checkpoint_reads"] == 1):
+                    _clock.t = 91
+                return ck
+
+            with patch.object(torch, "load", identity_reads_i):
+                out_i = _run_f_r9(f"r9identity_{jump_at}_f", budget_i,
+                                  factory=count_factory_i)
+            s0 = out_i["summary_doc"]["stages"][0]
+            identity_tail[jump_at] = (
+                counts_i["late_identity_checkpoint_reads"] == 0
+                and counts_i["module_builds"] == 0
+                and s0.get("skip_reason") == "stage_deadline_stop"
+                and out_i["summary_doc"]["complete_evidence"] is False)
+        caught = all(identity_tail.values())
+        record("f_identity_checkpoint_read_deadline_stop", caught,
+               "identity-helper checkpoint reads are guarded at both the "
+               f"entry and inter-read boundaries ({identity_tail})")
+
+        # --- P2(r9): the completed conditioner count survives ---------------
+        clock_c = _FakeClock(1)
+        budget_c = StageBudget("F", 100.0, 10.0, t0=0.0, clock=clock_c)
+        forward_counts = dict(conditioner_actual=0, backbone_actual=0)
+        base_factory_c = build_modules_factory(world_r9,
+                                               fixtures_r9["D1"][0])
+
+        def forward_factory_c(_factory=base_factory_c, _counts=forward_counts,
+                              _clock=clock_c):
+            model_, cond_ = _factory()
+
+            def cond_end(*_a):
+                _counts["conditioner_actual"] += 1
+                _clock.t = 91
+
+            def model_start(*_a):
+                _counts["backbone_actual"] += 1
+
+            cond_.register_forward_hook(cond_end)
+            model_.register_forward_pre_hook(model_start)
+            return model_, cond_
+
+        out_c = _run_f_r9("r9count_f", budget_c, factory=forward_factory_c)
+        disk_c = json.loads(
+            (tmp / "r9count_f" / "f_report.json").read_text())
+        ret_count = out_c["summary_doc"]["stages"][0]["fresh_counters"]
+        disk_count = disk_c["stages"][0]["fresh_counters"]
+        caught = (forward_counts["conditioner_actual"] == 1
+                  and forward_counts["backbone_actual"] == 0
+                  and ret_count.get("conditioner_forward_calls") == 1
+                  and disk_count.get("conditioner_forward_calls") == 1
+                  and ret_count.get("backbone_forward_calls") == 0
+                  and disk_count.get("backbone_forward_calls") == 0)
+        record("f_completed_conditioner_counter_kept", caught,
+               "the completed conditioner call stays recorded when the "
+               f"backbone gate refuses (returned={ret_count.get('conditioner_forward_calls')}, "
+               f"disk={disk_count.get('conditioner_forward_calls')})")
+
+        # --- P2(r9): nested wrong-shaped probe containers -------------------
+        schema_results: dict = {}
+        for variant in ("step_string", "window_id_list",
+                        "forward_counts_list", "extra_window"):
+            copydir = tmp / f"r9schema_{variant}"
+            shutil.copytree(fixtures_r9["D1"][1], copydir)
+            path = copydir / "probe_index.json"
+            pidx = json.loads(path.read_text())
+            entry = pidx["probes"][0]
+            if variant == "step_string":
+                entry["step"] = "bad"
+            elif variant == "window_id_list":
+                entry["windows"][0]["window_id"] = []
+            elif variant == "forward_counts_list":
+                entry["forward_counts"] = [1]
+            else:
+                entry["windows"].append(dict(entry["windows"][0]))
+            path.write_text(json.dumps(pidx))
+            _full_resign(copydir)
+            error = None
+            out_s = None
+            try:
+                out_s = _run_f_r9(f"r9schema_{variant}_f",
+                                  StageBudget("F", 300.0, 10.0),
+                                  directory=copydir)
+            except Exception as exc:  # noqa: BLE001
+                error = f"{type(exc).__name__}:{exc}"
+            fdir = tmp / f"r9schema_{variant}_f"
+            schema_results[variant] = (
+                error is None
+                and (fdir / "f_report.json").is_file()
+                and (fdir / "return_observation.json").is_file()
+                and out_s is not None
+                and out_s["summary_doc"]["verdict"] == "incomplete")
+        caught = all(schema_results.values())
+        record("nested_probe_schema_containers_report_incomplete", caught,
+               "step/window_id/forward_counts/extra-window shape faults all "
+               f"close as incomplete F reports ({schema_results})")
 
     return results
 
