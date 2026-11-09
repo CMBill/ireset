@@ -769,13 +769,18 @@ def verify_artifacts_index(stage_dir: Path, index: dict,
     problems: list[str] = []
     if not isinstance(index, dict) or index.get("schema") != ARTIFACTS_INDEX_SCHEMA:
         return ["artifacts_index_schema"]
-    files = index.get("files") or {}
+    files = index.get("files")
+    if not isinstance(files, dict):
+        return ["artifacts_index_files_not_a_mapping"]
     # a required file absent from the index is a structural failure even
     # though the (possibly empty) iteration below finds nothing to check
     for rel in required or ():
         if rel not in files:
             problems.append(f"artifact_required_missing:{rel}")
     for rel, meta in files.items():
+        if not isinstance(meta, dict):
+            problems.append(f"artifact_meta_not_a_mapping:{rel}")
+            continue
         p = Path(stage_dir) / rel
         if not p.is_file():
             problems.append(f"artifact_missing:{rel}")
@@ -1496,7 +1501,12 @@ def _return_proof_problems(stage_dir: Path) -> list[str]:
         return problems
     if proof.get("summary_sha256") != sha256_file(report_path):
         problems.append("return_observation_summary_sha_mismatch")
-    seal = report.get("seal") or {}
+    # P2 (round-8): a parseable but wrong-shaped seal is a structural
+    # failure, never an AttributeError
+    seal = report.get("seal")
+    if not isinstance(seal, dict):
+        problems.append("report_seal_not_a_mapping")
+        seal = {}
     registered = seal.get("measured_wall_s_at_summary")
     cap = seal.get("wall_cap_s")
     if not isinstance(registered, (int, float)) or isinstance(registered, bool) \
@@ -1705,7 +1715,10 @@ def verify_stage_local(stage_dir: Path, plan: FitPlan,
     if not index_path.is_file():
         problems.append("artifacts_index_missing")
         return dict(incomplete)
-    index = json.loads(index_path.read_text())
+    index, index_problems = _read_json_object(index_path)
+    if index is None:
+        problems.append(f"artifacts_index_unreadable:{index_problems[:2]}")
+        return dict(incomplete)
     problems += verify_artifacts_index(stage_dir, index,
                                        required=_required_stage_artifacts(plan))
     # the stage report registers the index SHA; consume it whenever the
@@ -1721,9 +1734,21 @@ def verify_stage_local(stage_dir: Path, plan: FitPlan,
     if not probe_index_path.is_file():
         problems.append("probe_index_missing")
         return dict(incomplete)
-    pidx = json.loads(probe_index_path.read_text())
+    # P2 (round-8): a parseable but WRONG-SHAPE container is a structural
+    # failure routed into the normal incomplete closure — never an
+    # uncaught AttributeError that would leave F without a report.
+    pidx, pidx_problems = _read_json_object(probe_index_path)
+    if pidx is None:
+        problems.append(f"probe_index_invalid:{pidx_problems[:2]}")
+        return dict(incomplete)
     if pidx.get("schema") != PROBE_INDEX_SCHEMA:
         problems.append("probe_index_schema")
+    probes_raw = pidx.get("probes")
+    if not isinstance(probes_raw, list):
+        problems.append("probe_index_probes_not_a_list")
+        probes: list = []
+    else:
+        probes = probes_raw
 
     # 1. coverage multiset ----------------------------------------------------
     want: dict = {}
@@ -1732,9 +1757,19 @@ def verify_stage_local(stage_dir: Path, plan: FitPlan,
             want[(step, wid)] = want.get((step, wid), 0) + 1
     got: dict = {}
     window_ids = list(registration.window_ids)
-    for entry in pidx.get("probes") or []:
+    for entry in probes:
+        if not isinstance(entry, dict):
+            problems.append("probe_entry_not_a_mapping")
+            continue
         step = entry.get("step")
-        for w in entry.get("windows") or []:
+        windows_raw = entry.get("windows")
+        if not isinstance(windows_raw, list):
+            problems.append(f"probe_windows_not_a_list:idx{entry.get('idx')}")
+            continue
+        for w in windows_raw:
+            if not isinstance(w, dict):
+                problems.append(f"probe_window_not_a_mapping:idx{entry.get('idx')}")
+                continue
             key = (step, w.get("window_id"))
             got[key] = got.get(key, 0) + 1
     missing = sorted(f"{k[0]}:{k[1]}" for k in want if want[k] > got.get(k, 0))
@@ -1818,7 +1853,9 @@ def verify_stage_local(stage_dir: Path, plan: FitPlan,
     final_step = plan.steps
     any_redecode = False
     any_prod_binding = production_decoder is not None
-    for entry in pidx.get("probes") or []:
+    for entry in probes:
+        if not isinstance(entry, dict):
+            continue
         step, idx = entry.get("step"), entry.get("idx")
         npz_path = stage_dir / "probes" / f"probe_{idx:04d}_step_{step:06d}.npz"
         if not npz_path.is_file():
@@ -1827,7 +1864,12 @@ def verify_stage_local(stage_dir: Path, plan: FitPlan,
         fc = entry.get("forward_counts") or {}
         if fc.get("conditioner") != 1 or fc.get("backbone") != 1:
             problems.append(f"probe_forward_counts:idx{idx}:{fc}")
-        for b, wout in enumerate(entry.get("windows") or []):
+        windows_raw = entry.get("windows")
+        windows_iter = windows_raw if isinstance(windows_raw, list) else []
+        for b, wout in enumerate(windows_iter):
+            if not isinstance(wout, dict):
+                problems.append(f"probe_window_not_a_mapping:idx{idx}:w{b}")
+                continue
             if wout.get("window_id") != window_ids[b]:
                 problems.append(f"probe_window_order:idx{idx}:w{b}")
             check(f"saved_probe_read_{idx}")
@@ -2043,7 +2085,12 @@ def resolve_handoff(stage_dir: Path, plan: FitPlan, decoder: MetricDecoder,
     if doc is None:
         return {"handoff_ready": False,
                 "problems": ["stage_report_invalid"] + report_problems[:3]}
-    seal = doc.get("seal") or {}
+    seal = doc.get("seal")
+    if not isinstance(seal, dict):
+        # P2 (round-8): wrong-shaped seal is a structural refusal, never a
+        # crash on the following attribute access
+        return {"handoff_ready": False,
+                "problems": problems + ["stage_seal_not_a_mapping"]}
     if seal.get("status") != "sealed_within_budget" or not seal.get("terminal"):
         problems.append("stage_seal_not_consumable")
     problems += _return_proof_problems(stage_dir)
@@ -2109,6 +2156,10 @@ def _fresh_probe(model, conditioner, batch: dict, plan: FitPlan,
         conditioner.eval()
         model.eval()
         memory = conditioner(batch)
+        # P1 (round-8): the conditioner and backbone are independent numeric
+        # units — a conditioner returning past the work deadline refuses the
+        # backbone forward that follows.
+        check("f_fresh_backbone")
         if plan.model_type == "diffusion":
             gen = torch.Generator()
             gen.manual_seed(probe_generator_seed(plan))
@@ -2173,14 +2224,21 @@ def _checkpoint_tensor_problems(ck: dict, model, conditioner) -> list[str]:
     return problems
 
 
-def _load_state_dicts_checked(path: Path, model, conditioner) -> list[str]:
+def _load_state_dicts_checked(path: Path, model, conditioner,
+                              budget: StageBudget | None = None) -> list[str]:
     """Verify the saved tensor contract FIRST; only a clean checkpoint is
-    copied into the live modules."""
+    copied into the live modules.  When ``budget`` is given, the read→load
+    and model→conditioner boundaries are guarded (P1 round-8: each strict
+    load is an independent unit)."""
+    check = budget.check if budget is not None else (lambda _point: None)
     ck = torch.load(path, map_location="cpu", weights_only=False)
+    check(f"f_strict_load_{Path(path).stem}_pre")
     problems = _checkpoint_tensor_problems(ck, model, conditioner)
     if problems:
         return problems
+    check(f"f_strict_load_{Path(path).stem}_model")
     model.load_state_dict(ck["model"], strict=True)
+    check(f"f_strict_load_{Path(path).stem}_conditioner")
     conditioner.load_state_dict(ck["conditioner"], strict=True)
     return []
 
@@ -2211,16 +2269,35 @@ def _f_identity_problems(stage_dir: Path, plan: FitPlan,
 
 
 def _saved_probe_entry(stage_dir: Path, idx: int, want_step: int) -> dict | None:
-    pidx = json.loads((Path(stage_dir) / "probe_index.json").read_text())
-    for entry in pidx.get("probes") or []:
-        if entry.get("idx") == idx and entry.get("step") == want_step:
+    """Saved probe index entry; a wrong-shaped container is treated as a
+    missing entry (P2 round-8: structural failures close as skips, never
+    AttributeError)."""
+    pidx, _problems = _read_json_object(Path(stage_dir) / "probe_index.json")
+    if pidx is None:
+        return None
+    probes = pidx.get("probes")
+    if not isinstance(probes, list):
+        return None
+    for entry in probes:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("idx") == idx and entry.get("step") == want_step \
+                and isinstance(entry.get("windows"), list):
             return entry
     return None
 
 
 def _saved_probe_records(stage_dir: Path, idx: int, b: int) -> dict:
-    pidx = json.loads((Path(stage_dir) / "probe_index.json").read_text())
-    entry = next(e for e in pidx["probes"] if e.get("idx") == idx)
+    pidx, _problems = _read_json_object(Path(stage_dir) / "probe_index.json")
+    if pidx is None:
+        raise FitDiagnosticError("probe_index_invalid")
+    probes = pidx.get("probes")
+    if not isinstance(probes, list):
+        raise FitDiagnosticError("probe_index_probes_not_a_list")
+    entry = next((e for e in probes
+                  if isinstance(e, dict) and e.get("idx") == idx), None)
+    if entry is None or not isinstance(entry.get("step"), int):
+        raise FitDiagnosticError(f"probe_entry_invalid:idx{idx}")
     npz_path = (Path(stage_dir) / "probes" /
                 f"probe_{idx:04d}_step_{entry['step']:06d}.npz")
     return read_npz_records(
@@ -2303,8 +2380,11 @@ def run_f_verification(*, stage_specs: list[dict], out_dir: Path,
             stages_out.append(res)
             evidence_all_ok = False
             continue
-        seal = doc.get("seal") or {}
-        if seal.get("status") != "sealed_within_budget":
+        # P2 (round-8): a parseable but wrong-shaped seal must land in the
+        # normal incomplete closure (skip + report), never crash the run
+        seal = doc.get("seal")
+        if not isinstance(seal, dict) or \
+                seal.get("status") != "sealed_within_budget":
             res.update({"replay_enabled": False, "replay_passed": None,
                         "skip_reason": "stage_seal_not_consumable"})
             stages_out.append(res)
@@ -2396,7 +2476,8 @@ def run_f_verification(*, stage_specs: list[dict], out_dir: Path,
             for role, want_step in (("initial", 0), ("last", plan.steps)):
                 budget.check(f"f_probe_{role}")
                 load_problems = _load_state_dicts_checked(
-                    stage_dir / f"{role}.pt", model, conditioner)
+                    stage_dir / f"{role}.pt", model, conditioner,
+                    budget=budget)
                 if load_problems:
                     # refuse BEFORE any copy: a strict load would silently
                     # down-cast mistyped tensors (P1: dtype tamper)
@@ -2414,13 +2495,17 @@ def run_f_verification(*, stage_specs: list[dict], out_dir: Path,
                     continue
                 f_counters["probe_calls"] += 1
                 # rebuild the probe batch from the SAVED inputs (disk binding)
+                # P1 (round-8): EVERY read is a unit — a read returning past
+                # the work deadline refuses the next raw/condition read
                 batch_arrays = {}
                 for b in range(len(window_ids)):
+                    budget.check(f"f_probe_{role}_input_w{b}_raw")
                     recs = read_npz_records(
                         stage_dir / "probe_inputs.npz", RECORD_SHAPES,
                         {"raw_x0_pred": f"w{b}__x0"})
                     batch_arrays.setdefault("x0", []).append(recs["raw_x0_pred"])
                     for key in COND_KEYS:
+                        budget.check(f"f_probe_{role}_input_w{b}_{key}")
                         with np.load(stage_dir / "probe_inputs.npz") as data:
                             batch_arrays.setdefault(key, []).append(
                                 np.asarray(data[f"w{b}__{key}"]))
@@ -2444,9 +2529,17 @@ def run_f_verification(*, stage_specs: list[dict], out_dir: Path,
                     replay_problems.append(f"saved_probe_missing:{role}")
                     continue
                 for b, wout in enumerate(saved_entry["windows"]):
+                    if not isinstance(wout, dict):
+                        replay_problems.append(
+                            f"saved_probe_window_not_a_mapping:{role}:w{b}")
+                        continue
                     raw_f = np.ascontiguousarray(x0_fresh[b])
                     problems += [f"fresh_x0_invalid:{p}"
                                  for p in decoder.verify_x0(raw_f)]
+                    # P1 (round-8): the per-window endpoint artifact read is
+                    # its own unit — a reduction returning past the deadline
+                    # refuses the next window's read
+                    budget.check(f"f_saved_probe_read_{role}_w{b}")
                     saved = _saved_probe_records(stage_dir, idx, b)
                     if not np.array_equal(raw_f.view(np.uint32),
                                           saved["raw_x0_pred"].view(np.uint32)):
@@ -2956,6 +3049,11 @@ COUNTEREXAMPLE_IDS = (
     "saved_teacher_read_deadline_stop",
     "handoff_checkpoint_read_deadline_stop",
     "handoff_final_claim_deadline_refused",
+    "f_fresh_backbone_deadline_stop",
+    "f_strict_load_deadline_stop",
+    "f_input_rebuild_deadline_stop",
+    "f_saved_probe_read_deadline_stop",
+    "bad_containers_report_incomplete_f",
     "f_construct_after_deadline_refused",
     "f_runtime_drift_before_fresh_refused",
     "proof_not_a_mapping_survives_f",
@@ -4708,6 +4806,268 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
                "last checkpoint read crossed the deadline; the handoff claim "
                f"was refused (loads={loads_m['n']}, "
                f"problems={handoff_m['problems'][:1]})")
+
+        # --- P1(r8): a conditioner returning past the deadline refuses the
+        # backbone forward (independent unit boundary) ------------------------
+        world_n1, plan_n1, _, _, sdir_n1, _, _ = _mini_stage(
+            tmp / "fbackbone", "D1", n_windows=1, steps=1, seed=seed + 55,
+            finish=True)
+        n_holder = {"t": 0.0}
+        n_budget = StageBudget(stage="F", wall_cap_s=100.0, reserve_s=10.0,
+                               t0=0.0, clock=lambda: n_holder["t"])
+        base_factory = build_modules_factory(world_n1, plan_n1)
+        cond_calls = {"n": 0}
+        backbone_calls = {"n": 0}
+
+        def _wrapped_factory():
+            model_, cond_ = base_factory()
+            real_cond_fwd = cond_.forward
+            real_model_fwd = model_.forward
+
+            def cond_forward(*a, **kw):
+                out = real_cond_fwd(*a, **kw)
+                cond_calls["n"] += 1
+                n_holder["t"] = n_budget.work_deadline + 5.0
+                return out
+
+            def model_forward(*a, **kw):
+                backbone_calls["n"] += 1
+                return real_model_fwd(*a, **kw)
+
+            cond_.forward = cond_forward
+            model_.forward = model_forward
+            return model_, cond_
+
+        f_out = run_f_verification(
+            stage_specs=[{"stage_dir": sdir_n1, "plan": plan_n1,
+                          "registration": world_n1.registration_for("D1"),
+                          "decoder": world_n1.decoder,
+                          "loss_fn": world_n1.loss_fn}],
+            out_dir=tmp / "fbackbone_f", budget=n_budget,
+            runtime_guard=SyntheticRuntimeGuard(),
+            build_modules=_wrapped_factory, authorization=None)
+        s0 = f_out["summary_doc"]["stages"][0]
+        caught = (cond_calls["n"] == 1
+                  and backbone_calls["n"] == 0
+                  and any("f_fresh_backbone" in p
+                          for p in s0.get("replay_problems", []))
+                  and f_out["summary_doc"]["verdict"] == "incomplete")
+        record("f_fresh_backbone_deadline_stop", caught,
+               "conditioner returned past the deadline; the backbone forward "
+               f"never started (cond={cond_calls['n']}, "
+               f"backbone={backbone_calls['n']})")
+
+        # --- P1(r8): checkpoint-read→strict-load and model→conditioner load
+        # boundaries are guarded ---------------------------------------------
+        world_n2, plan_n2, _, _, sdir_n2, _, _ = _mini_stage(
+            tmp / "fstrict", "D1", n_windows=1, steps=1, seed=seed + 56,
+            finish=True)
+        real_load_n = mod.torch.load
+        real_lsd_n = torch.nn.Module.load_state_dict
+
+        def _strict_run(out_name: str, jump_after_load: bool) -> tuple[dict, dict]:
+            holder = {"t": 0.0}
+            budget_ = StageBudget(stage="F", wall_cap_s=100.0, reserve_s=10.0,
+                                  t0=0.0, clock=lambda: holder["t"])
+            loads = {"n": 0}
+
+            def _jump_after_read(*a, **kw):
+                value = real_load_n(*a, **kw)
+                if not jump_after_load \
+                        and sys._getframe(1).f_code.co_name \
+                        == "_load_state_dicts_checked":
+                    holder["t"] = budget_.work_deadline + 5.0
+                return value
+
+            def _count_lsd(self, *a, **kw):
+                out = real_lsd_n(self, *a, **kw)
+                if sys._getframe(1).f_code.co_name == "_load_state_dicts_checked":
+                    loads["n"] += 1
+                    if jump_after_load and loads["n"] == 1:
+                        holder["t"] = budget_.work_deadline + 5.0
+                return out
+
+            mod.torch.load = _jump_after_read
+            torch.nn.Module.load_state_dict = _count_lsd
+            try:
+                result = run_f_verification(
+                    stage_specs=[{"stage_dir": sdir_n2, "plan": plan_n2,
+                                  "registration": world_n2.registration_for("D1"),
+                                  "decoder": world_n2.decoder,
+                                  "loss_fn": world_n2.loss_fn}],
+                    out_dir=tmp / out_name, budget=budget_,
+                    runtime_guard=SyntheticRuntimeGuard(),
+                    build_modules=build_modules_factory(world_n2, plan_n2),
+                    authorization=None)
+            finally:
+                mod.torch.load = real_load_n
+                torch.nn.Module.load_state_dict = real_lsd_n
+            return result, loads
+
+        f_read, loads_read = _strict_run("fstrict_read_f", False)
+        s0 = f_read["summary_doc"]["stages"][0]
+        read_ok = (loads_read["n"] == 0
+                   and any("f_strict_load_initial_pre" in p
+                           for p in s0.get("replay_problems", [])))
+        f_model, loads_model = _strict_run("fstrict_model_f", True)
+        s0 = f_model["summary_doc"]["stages"][0]
+        model_ok = (loads_model["n"] == 1
+                    and any("f_strict_load_initial_conditioner" in p
+                            for p in s0.get("replay_problems", [])))
+        caught = (read_ok and model_ok
+                  and f_read["summary_doc"]["verdict"] == "incomplete"
+                  and f_model["summary_doc"]["verdict"] == "incomplete")
+        record("f_strict_load_deadline_stop", caught,
+               "read past deadline: 0 strict loads; model load past deadline: "
+               f"conditioner load refused (loads={loads_read['n']}/"
+               f"{loads_model['n']})")
+
+        # --- P1(r8): every input-rebuild read is guarded (D6 six windows) ----
+        world_n3, plan_n3, _, _, sdir_n3, _, _ = _mini_stage(
+            tmp / "finputs", "D6", n_windows=6, steps=1, seed=seed + 57,
+            finish=True)
+        o_holder = {"t": 0.0}
+        o_budget = StageBudget(stage="F", wall_cap_s=100.0, reserve_s=10.0,
+                               t0=0.0, clock=lambda: o_holder["t"])
+        real_read_o = mod.read_npz_records
+        real_np_load = np.load
+        raw_reads = {"n": 0}
+        cond_reads = {"n": 0}
+
+        def _slow_raw_read(path, *a, **kw):
+            out = real_read_o(path, *a, **kw)
+            if sys._getframe(1).f_code.co_name == "run_f_verification":
+                raw_reads["n"] += 1
+                if raw_reads["n"] == 1:
+                    o_holder["t"] = o_budget.work_deadline + 5.0
+            return out
+
+        def _count_cond_read(*a, **kw):
+            if sys._getframe(1).f_code.co_name == "run_f_verification":
+                cond_reads["n"] += 1
+            return real_np_load(*a, **kw)
+
+        mod.read_npz_records = _slow_raw_read
+        np.load = _count_cond_read
+        try:
+            f_out = run_f_verification(
+                stage_specs=[{"stage_dir": sdir_n3, "plan": plan_n3,
+                              "registration": world_n3.registration_for("D6"),
+                              "decoder": world_n3.decoder,
+                              "loss_fn": world_n3.loss_fn}],
+                out_dir=tmp / "finputs_f", budget=o_budget,
+                runtime_guard=SyntheticRuntimeGuard(),
+                build_modules=build_modules_factory(world_n3, plan_n3),
+                authorization=None)
+        finally:
+            mod.read_npz_records = real_read_o
+            np.load = real_np_load
+        s0 = f_out["summary_doc"]["stages"][0]
+        caught = (raw_reads["n"] == 1
+                  and cond_reads["n"] == 0
+                  and any("f_probe_initial_input_w0_kps_obj" in p
+                          for p in s0.get("replay_problems", []))
+                  and f_out["summary_doc"]["verdict"] == "incomplete")
+        record("f_input_rebuild_deadline_stop", caught,
+               "first raw input read crossed the deadline; the condition "
+               f"reads and windows never started "
+               f"(raw={raw_reads['n']}, cond={cond_reads['n']})")
+
+        # --- P1(r8): the per-window endpoint artifact read is guarded --------
+        world_n4, plan_n4, _, _, sdir_n4, _, _ = _mini_stage(
+            tmp / "fendpoint", "D6", n_windows=6, steps=1, seed=seed + 58,
+            finish=True)
+        p_holder = {"t": 0.0}
+        p_budget = StageBudget(stage="F", wall_cap_s=100.0, reserve_s=10.0,
+                               t0=0.0, clock=lambda: p_holder["t"])
+        real_saved_p = mod._saved_probe_records
+        real_metrics_p = mod.compute_window_metrics
+        saved_reads = {"n": 0}
+
+        def _count_saved_read(*a, **kw):
+            out = real_saved_p(*a, **kw)
+            if sys._getframe(1).f_code.co_name == "run_f_verification":
+                saved_reads["n"] += 1
+            return out
+
+        def _jump_after_first_reduction(*a, **kw):
+            out = real_metrics_p(*a, **kw)
+            if sys._getframe(1).f_code.co_name == "run_f_verification":
+                p_holder["t"] = p_budget.work_deadline + 5.0
+            return out
+
+        mod._saved_probe_records = _count_saved_read
+        mod.compute_window_metrics = _jump_after_first_reduction
+        try:
+            f_out = run_f_verification(
+                stage_specs=[{"stage_dir": sdir_n4, "plan": plan_n4,
+                              "registration": world_n4.registration_for("D6"),
+                              "decoder": world_n4.decoder,
+                              "loss_fn": world_n4.loss_fn}],
+                out_dir=tmp / "fendpoint_f", budget=p_budget,
+                runtime_guard=SyntheticRuntimeGuard(),
+                build_modules=build_modules_factory(world_n4, plan_n4),
+                authorization=None)
+        finally:
+            mod._saved_probe_records = real_saved_p
+            mod.compute_window_metrics = real_metrics_p
+        s0 = f_out["summary_doc"]["stages"][0]
+        caught = (saved_reads["n"] == 1
+                  and any("f_saved_probe_read_initial_w1" in p
+                          for p in s0.get("replay_problems", []))
+                  and f_out["summary_doc"]["verdict"] == "incomplete")
+        record("f_saved_probe_read_deadline_stop", caught,
+               "first reduction crossed the deadline; the next window's "
+               f"endpoint read was refused (reads={saved_reads['n']})")
+
+        # --- P2(r8): wrong-shaped containers close as incomplete reports,
+        # never crash F without a report -------------------------------------
+        world_n5, plan_n5, _, _, sdir_n5, _, _ = _mini_stage(
+            tmp / "badidx", "D1", n_windows=1, steps=1, seed=seed + 59,
+            finish=True)
+        (sdir_n5 / "probe_index.json").write_text("[]")
+        f_bad_idx = run_f_verification(
+            stage_specs=[{"stage_dir": sdir_n5, "plan": plan_n5,
+                          "registration": world_n5.registration_for("D1"),
+                          "decoder": world_n5.decoder,
+                          "loss_fn": world_n5.loss_fn}],
+            out_dir=tmp / "badidx_f", budget=StageBudget("F", 300.0, 10.0),
+            runtime_guard=SyntheticRuntimeGuard(),
+            build_modules=build_modules_factory(world_n5, plan_n5),
+            authorization=None)
+        s0 = f_bad_idx["summary_doc"]["stages"][0]
+        idx_ok = ((Path(tmp) / "badidx_f" / "f_report.json").is_file()
+                  and (Path(tmp) / "badidx_f" /
+                       "return_observation.json").is_file()
+                  and s0.get("skip_reason") == "local_reverify_failed"
+                  and any("probe_index_invalid" in p
+                          for p in s0.get("local_reverify_problems", []))
+                  and f_bad_idx["summary_doc"]["verdict"] == "incomplete")
+        world_n6, plan_n6, _, _, sdir_n6, _, _ = _mini_stage(
+            tmp / "badseal", "D1", n_windows=1, steps=1, seed=seed + 60,
+            finish=True)
+        rep = json.loads((sdir_n6 / "stage_report.json").read_text())
+        rep["seal"] = [1]
+        (sdir_n6 / "stage_report.json").write_text(json.dumps(rep))
+        f_bad_seal = run_f_verification(
+            stage_specs=[{"stage_dir": sdir_n6, "plan": plan_n6,
+                          "registration": world_n6.registration_for("D1"),
+                          "decoder": world_n6.decoder,
+                          "loss_fn": world_n6.loss_fn}],
+            out_dir=tmp / "badseal_f", budget=StageBudget("F", 300.0, 10.0),
+            runtime_guard=SyntheticRuntimeGuard(),
+            build_modules=build_modules_factory(world_n6, plan_n6),
+            authorization=None)
+        s0 = f_bad_seal["summary_doc"]["stages"][0]
+        seal_ok = ((Path(tmp) / "badseal_f" / "f_report.json").is_file()
+                   and (Path(tmp) / "badseal_f" /
+                        "return_observation.json").is_file()
+                   and s0.get("skip_reason") == "stage_seal_not_consumable"
+                   and f_bad_seal["summary_doc"]["verdict"] == "incomplete")
+        caught = idx_ok and seal_ok
+        record("bad_containers_report_incomplete_f", caught,
+               "probe_index=[] and seal=[1] both close as incomplete F "
+               f"reports with proofs (idx={s0.get('skip_reason')})")
 
         # --- P1(r3): F refuses BEFORE construction past the deadline ----------
         world_f4, plan_f4, _, _, sdir_f4, _, _ = _mini_stage(
