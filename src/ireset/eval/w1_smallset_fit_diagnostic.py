@@ -148,6 +148,10 @@ I_WITHDRAW_ON_EXCEED = {
     "label_verdict": "budget_exceeded_after_seal",
 }
 
+F_WITHDRAW_ON_EXCEED = {
+    "complete_evidence": False, "replay_passed": False,
+    "mean_fit_passed": None, "verdict": "budget_exceeded_after_seal"}
+
 
 class FitDiagnosticError(RuntimeError):
     """Fail-closed diagnostic error; the stage records it as a failure."""
@@ -1546,23 +1550,36 @@ def write_handoff_candidate(stage_dir: Path, summary: dict) -> dict | None:
 
 def finish_stage(stage_dir: Path, summary: dict, budget: StageBudget) -> dict:
     """Seal the stage report (publish-verify seal), write the D1 handoff
-    candidate, and only then run the final return-coverage verification —
-    the coverage sample lands AFTER the candidate write (and the candidate's
-    own write/read), so no per-stage tail write escapes the checked window
-    (P1: a slow candidate write can no longer hide behind a covered proof)."""
+    candidate, re-read the sealed report (the necessary post-seal read), and
+    only then run the final return-coverage verification — every ordinary
+    I/O lands BEFORE the coverage sample, so no per-stage tail write or
+    tail read escapes the checked window (P1: a slow candidate write or a
+    slow final read can no longer hide behind a covered proof; P1 round-4:
+    the report re-read itself moved inside the window).  When the coverage
+    fails, ``verify_return_coverage`` withdraws the on-disk report
+    fail-closed; the returned view mirrors that deterministic rewrite
+    (costs only increase) instead of spending post-sample I/O on a
+    re-read."""
     stage_dir = Path(stage_dir)
     index_path = stage_dir / "artifacts_index.json"
     summary = {**summary, "artifacts_index_sha256":
                sha256_file(index_path) if index_path.is_file() else None}
     path = stage_dir / "stage_report.json"
     seal = _write_summary_sealed(path, summary, budget,
-                                 withdraw=dict(I_WITHDRAW_ON_EXCEED))
+                                 withdraw=dict(I_WITHDRAW_ON_EXCEED),
+                                 clock=budget.clock)
     candidate = write_handoff_candidate(stage_dir, summary)
+    doc = json.loads(path.read_text())
     cov = verify_return_coverage(path, budget,
-                                 withdraw=dict(I_WITHDRAW_ON_EXCEED))
+                                 withdraw=dict(I_WITHDRAW_ON_EXCEED),
+                                 clock=budget.clock)
+    if not cov["covered"]:
+        doc = {**doc, **I_WITHDRAW_ON_EXCEED,
+               "seal": {**(doc.get("seal") or {}),
+                        "status": "budget_exceeded_after_seal",
+                        "return_coverage_withdrawn": True}}
     return {"stage_report": str(path), "seal": seal, "return_coverage": cov,
-            "handoff_candidate": candidate,
-            "summary_doc": json.loads(path.read_text())}
+            "handoff_candidate": candidate, "summary_doc": doc}
 
 
 # --------------------------------------------------------------------------
@@ -2349,6 +2366,12 @@ def run_f_verification(*, stage_specs: list[dict], out_dir: Path,
                     teacher, teacher_problems = _teacher_reference_checked(
                         stage_dir, decoder, b, f_counters)
                     replay_problems += teacher_problems[:3]
+                    # P1 (round-4): the fresh metric decode is a numeric unit
+                    # of its own — the work deadline is re-checked at this
+                    # boundary, so a deadline crossed during the teacher
+                    # re-verification refuses the decode (the BudgetExceeded
+                    # is caught below and the stage closes as incomplete).
+                    budget.check(f"f_fresh_metrics_{role}_w{b}")
                     f_counters["metric_decode_calls"] += 1
                     fresh_md = decoder.decode(raw_f)
                     fresh_metrics = compute_window_metrics(
@@ -2381,6 +2404,13 @@ def run_f_verification(*, stage_specs: list[dict], out_dir: Path,
         stages_out.append(res)
     all_replayed = bool(stages_out) and all(
         s.get("replay_passed") is True for s in stages_out)
+    # P1 (round-4): the completion claim must itself be affordable inside
+    # the work deadline — a claim sampled past the deadline closes as
+    # incomplete (replay facts stay recorded; the verdict cannot pass).
+    claim_ok = budget.clock() < budget.work_deadline
+    if not claim_ok and not budget.exceeded:
+        budget.exceeded = True
+        budget.stopped_at = "f_final_claim"
     final = {
         "schema": F_REPORT_SCHEMA,
         "stages": stages_out,
@@ -2396,7 +2426,12 @@ def run_f_verification(*, stage_specs: list[dict], out_dir: Path,
         "budget": budget.facts(),
         "identity": {"module": "ireset.eval.w1_smallset_fit_diagnostic"},
     }
-    if final["complete_evidence"] is True and final["replay_passed"] is True:
+    if not claim_ok:
+        final["claim_deadline_exceeded"] = True
+        final["complete_evidence"] = False
+        final["mean_fit_passed"] = None
+        final["verdict"] = "incomplete"
+    elif final["complete_evidence"] is True and final["replay_passed"] is True:
         values = [s.get("mean_fit_passed") for s in stages_out]
         final["mean_fit_passed"] = (bool(all(v is True for v in values))
                                     if all(v is not None for v in values) else None)
@@ -2405,10 +2440,24 @@ def run_f_verification(*, stage_specs: list[dict], out_dir: Path,
     else:
         final["verdict"] = "incomplete"
     path = out_dir / "f_report.json"
-    _write_summary_sealed(path, final, budget, withdraw={
-        "complete_evidence": False, "replay_passed": False,
-        "mean_fit_passed": None, "verdict": "budget_exceeded_after_seal"})
-    return {"f_report": str(path), "summary_doc": json.loads(path.read_text())}
+    # P1 (round-4): F covers its OWN final report re-read with a return-
+    # coverage verification — the outer acceptance budget alone must not be
+    # the only guard against a slow tail read; the necessary read happens
+    # BEFORE the coverage sample and no I/O follows the passing sample.
+    seal = _write_summary_sealed(path, final, budget,
+                                 withdraw=dict(F_WITHDRAW_ON_EXCEED),
+                                 clock=budget.clock)
+    doc = json.loads(path.read_text())
+    cov = verify_return_coverage(path, budget,
+                                 withdraw=dict(F_WITHDRAW_ON_EXCEED),
+                                 clock=budget.clock)
+    if not cov["covered"]:
+        doc = {**doc, **F_WITHDRAW_ON_EXCEED,
+               "seal": {**(doc.get("seal") or {}),
+                        "status": "budget_exceeded_after_seal",
+                        "return_coverage_withdrawn": True}}
+    return {"f_report": str(path), "seal": seal, "return_coverage": cov,
+            "summary_doc": doc}
 
 
 # --------------------------------------------------------------------------
@@ -2583,7 +2632,8 @@ def write_acceptance_outputs(out_dir: Path, facts: dict, budget: StageBudget,
     out_dir = Path(out_dir)
     path = out_dir / "acceptance_summary.json"
     seal = _write_summary_sealed(path, facts, budget,
-                                 withdraw=dict(withdraw or {}))
+                                 withdraw=dict(withdraw or {}),
+                                 clock=budget.clock)
     return {"summary": str(path), "seal": seal,
             "summary_doc": json.loads(path.read_text())}
 
@@ -2743,6 +2793,7 @@ def run_synthetic_acceptance(budget: StageBudget, out_dir: Path,
         facts["f"] = {k: f_out["summary_doc"].get(k)
                       for k in ("complete_evidence", "replay_passed",
                                 "mean_fit_passed", "verdict")}
+        facts["f"]["return_coverage"] = f_out["return_coverage"]["covered"]
         facts["f"]["stages"] = [
             {k: s.get(k) for k in ("stage", "replay_enabled", "replay_passed",
                                    "skip_reason", "replay_problems")}
@@ -2784,6 +2835,10 @@ COUNTEREXAMPLE_IDS = (
     "f_forward_after_deadline_refused",
     "proof_budget_binding_rejected",
     "candidate_write_after_covered_refused",
+    "candidate_write_chain_control_passes",
+    "f_claim_deadline_refused",
+    "stage_report_reread_inside_coverage_window",
+    "f_report_reread_covered_by_f",
     "f_construct_after_deadline_refused",
     "f_runtime_drift_before_fresh_refused",
     "proof_not_a_mapping_survives_f",
@@ -3073,7 +3128,8 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
         seal_path = tmp / "seal" / "stage_report.json"
         seal_path.parent.mkdir(parents=True, exist_ok=True)
         _write_summary_sealed(seal_path, summary_fake, seal_budget,
-                              withdraw=dict(I_WITHDRAW_ON_EXCEED))
+                              withdraw=dict(I_WITHDRAW_ON_EXCEED),
+                              clock=seal_budget.clock)
         doc = json.loads(seal_path.read_text())
         caught = (doc["seal"]["terminal"] is True
                   and doc["seal"]["status"] == "budget_exceeded_after_seal"
@@ -3765,16 +3821,41 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
                f"proof 700<=800<=900 vs sealed report; handoff refused, "
                f"F skip={s0.get('skip_reason')}")
 
-        # --- P1(r3): the candidate write is inside the final coverage window --
+        # --- P1(r4): the candidate write is inside the final coverage window --
+        # control FIRST: with no injected latency the same seal → candidate →
+        # read → coverage chain must close clean; the attack below is only
+        # meaningful against a path that passes when nothing is injected.
         world_c3, plan_c3, _, summary_c3, sdir_c3, _, _ = _mini_stage(
             tmp / "candslow", "D1", n_windows=1, steps=1, seed=seed + 37)
         clock_holder = {"t": 0.0}
-        slow_budget = StageBudget(stage="D1", wall_cap_s=600.0, reserve_s=10.0,
-                                  t0=0.0, clock=lambda: clock_holder["t"])
+
+        def _holder_clock() -> float:
+            return clock_holder["t"]
+
+        control_budget = StageBudget(stage="D1", wall_cap_s=600.0,
+                                     reserve_s=10.0, t0=0.0,
+                                     clock=_holder_clock)
+        fin_ok = finish_stage(sdir_c3, summary_c3, control_budget)
+        control_ok = (fin_ok["summary_doc"]["seal"]["status"]
+                      == "sealed_within_budget"
+                      and fin_ok["return_coverage"]["covered"] is True
+                      and (sdir_c3 / "handoff_candidate.json").is_file())
+        record("candidate_write_chain_control_passes", control_ok,
+               "no injected latency: seal covered, candidate written "
+               f"(seal={fin_ok['summary_doc']['seal']['status']}, "
+               f"covered={fin_ok['return_coverage']['covered']})")
+
         # inject the latency INTO the candidate write: with the fixed order
-        # (seal -> candidate -> coverage) the jump lands before the final
-        # sample and withdraws the completion claim; a coverage check that
-        # ran before the candidate write would have stayed covered
+        # (seal → candidate → read → coverage) the jump lands before the
+        # final sample and withdraws the completion claim; a coverage check
+        # that ran before the candidate write would have stayed covered.
+        # The clock is SHARED with the budget so the seal/coverage loops see
+        # the same timeline as the budget checks (P2 round-4: a fake budget
+        # clock next to a real seal clock makes the case pass vacuously).
+        world_c4, plan_c4, _, summary_c4, sdir_c4, _, _ = _mini_stage(
+            tmp / "candslow2", "D1", n_windows=1, steps=1, seed=seed + 37)
+        slow_budget = StageBudget(stage="D1", wall_cap_s=600.0, reserve_s=10.0,
+                                  t0=0.0, clock=_holder_clock)
         mod = sys.modules[__name__]
         real_writer = mod.write_handoff_candidate
 
@@ -3785,22 +3866,144 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
 
         mod.write_handoff_candidate = _slow_writer
         try:
-            fin = finish_stage(sdir_c3, summary_c3, slow_budget)
+            fin = finish_stage(sdir_c4, summary_c4, slow_budget)
         finally:
             mod.write_handoff_candidate = real_writer
         doc_c3 = fin["summary_doc"]
-        handoff = resolve_handoff(sdir_c3, plan_c3, world_c3.decoder,
-                                  world_c3.registration_for("D1"),
+        on_disk = json.loads((sdir_c4 / "stage_report.json").read_text())
+        handoff = resolve_handoff(sdir_c4, plan_c4, world_c4.decoder,
+                                  world_c4.registration_for("D1"),
                                   {"includes": ["D6"]},
                                   StageBudget("D6", 60.0, 5.0),
-                                  production_decoder=world_c3.loss_fn)
-        caught = (doc_c3["seal"]["status"] == "budget_exceeded_after_seal"
+                                  production_decoder=world_c4.loss_fn)
+        caught = (control_ok
+                  and doc_c3["seal"]["status"] == "budget_exceeded_after_seal"
+                  and on_disk["seal"]["status"] == "budget_exceeded_after_seal"
                   and fin["return_coverage"]["covered"] is False
                   and handoff["handoff_ready"] is False)
         record("candidate_write_after_covered_refused", caught,
-               f"slow candidate write lands inside the checked window; "
+               "slow candidate write lands inside the checked window; "
                f"seal={doc_c3['seal']['status']} handoff="
                f"{handoff['handoff_ready']}")
+
+        # --- P1(r4): a deadline crossed at the teacher re-check return refuses
+        # the fresh metric decode and the claim itself cannot pass -----------
+        world_f7, plan_f7, _, _, sdir_f7, _, _ = _mini_stage(
+            tmp / "fclaimdl", "D1", n_windows=1, steps=1, seed=seed + 41,
+            finish=True)
+        claim_holder = {"t": 0.0}
+        claim_budget = StageBudget(stage="F", wall_cap_s=300.0, reserve_s=10.0,
+                                   t0=0.0, clock=lambda: claim_holder["t"])
+        tchk_calls = {"n": 0}
+        real_tchk = mod._teacher_reference_checked
+
+        def _jumping_teacher(*a, **kw):
+            out = real_tchk(*a, **kw)
+            tchk_calls["n"] += 1
+            if tchk_calls["n"] >= 2:
+                # the LAST endpoint's teacher re-check just returned: jump
+                # inside the wall cap but past the WORK deadline
+                claim_holder["t"] = claim_budget.work_deadline + 5.0
+            return out
+
+        mod._teacher_reference_checked = _jumping_teacher
+        try:
+            f_out = run_f_verification(
+                stage_specs=[{"stage_dir": sdir_f7, "plan": plan_f7,
+                              "registration": world_f7.registration_for("D1"),
+                              "decoder": world_f7.decoder,
+                              "loss_fn": world_f7.loss_fn}],
+                out_dir=tmp / "fclaimdl_f", budget=claim_budget,
+                runtime_guard=SyntheticRuntimeGuard(),
+                build_modules=build_modules_factory(world_f7, plan_f7),
+                authorization=None)
+        finally:
+            mod._teacher_reference_checked = real_tchk
+        s0 = f_out["summary_doc"]["stages"][0]
+        fc7 = s0.get("fresh_counters") or {}
+        caught = (s0.get("replay_passed") is False
+                  and any("f_fresh_metrics_last" in p
+                          for p in s0.get("replay_problems", []))
+                  and (fc7.get("metric_decode_calls") or 0) < 4
+                  and f_out["summary_doc"].get("claim_deadline_exceeded") is True
+                  and f_out["summary_doc"]["complete_evidence"] is False
+                  and f_out["summary_doc"]["verdict"] == "incomplete"
+                  and f_out["return_coverage"]["covered"] is True)
+        record("f_claim_deadline_refused", caught,
+               "deadline crossed at the teacher re-check return; the fresh "
+               "metric decode refused and the claim closed incomplete "
+               f"(problems={s0.get('replay_problems', [])[:1]})")
+
+        # --- P1(r4): the post-seal report RE-READ is inside the window too ----
+        # (the reviewer's round-4 attack: a slow final read used to hide
+        # behind an already-covered proof; the read now precedes the sample)
+        world_c5, plan_c5, _, summary_c5, sdir_c5, _, _ = _mini_stage(
+            tmp / "candslow3", "D1", n_windows=1, steps=1, seed=seed + 37)
+        read_holder = {"t": 0.0}
+        read_budget = StageBudget(stage="D1", wall_cap_s=600.0, reserve_s=10.0,
+                                  t0=0.0, clock=lambda: read_holder["t"])
+        real_read_text_b = Path.read_text
+
+        def _slow_report_read(path, *a, **kw):
+            value = real_read_text_b(path, *a, **kw)
+            if path.name == "stage_report.json" \
+                    and sys._getframe(1).f_code.co_name == "finish_stage":
+                read_holder["t"] = 1000.0
+            return value
+
+        mod.Path.read_text = _slow_report_read
+        try:
+            fin_r = finish_stage(sdir_c5, summary_c5, read_budget)
+        finally:
+            mod.Path.read_text = real_read_text_b
+        on_disk_r = json.loads((sdir_c5 / "stage_report.json").read_text())
+        caught = (control_ok
+                  and fin_r["summary_doc"]["seal"]["status"]
+                  == "budget_exceeded_after_seal"
+                  and on_disk_r["seal"]["status"] == "budget_exceeded_after_seal"
+                  and fin_r["return_coverage"]["covered"] is False)
+        record("stage_report_reread_inside_coverage_window", caught,
+               "slow post-seal report read lands inside the checked window; "
+               f"seal={fin_r['summary_doc']['seal']['status']} "
+               f"covered={fin_r['return_coverage']['covered']}")
+
+        # --- P1(r4): F's own final report re-read is covered by F's own
+        # return-coverage verification (not just the outer budget) -----------
+        world_f8, plan_f8, _, _, sdir_f8, _, _ = _mini_stage(
+            tmp / "freread", "D1", n_windows=1, steps=1, seed=seed + 42,
+            finish=True)
+        f_holder = {"t": 0.0}
+        f_read_budget = StageBudget(stage="F", wall_cap_s=300.0, reserve_s=10.0,
+                                    t0=0.0, clock=lambda: f_holder["t"])
+        real_read_text_c = Path.read_text
+
+        def _slow_f_report_read(path, *a, **kw):
+            value = real_read_text_c(path, *a, **kw)
+            if path.name == "f_report.json" \
+                    and sys._getframe(1).f_code.co_name == "run_f_verification":
+                f_holder["t"] = 1000.0
+            return value
+
+        mod.Path.read_text = _slow_f_report_read
+        try:
+            f_out = run_f_verification(
+                stage_specs=[{"stage_dir": sdir_f8, "plan": plan_f8,
+                              "registration": world_f8.registration_for("D1"),
+                              "decoder": world_f8.decoder,
+                              "loss_fn": world_f8.loss_fn}],
+                out_dir=tmp / "freread_f", budget=f_read_budget,
+                runtime_guard=SyntheticRuntimeGuard(),
+                build_modules=build_modules_factory(world_f8, plan_f8),
+                authorization=None)
+        finally:
+            mod.Path.read_text = real_read_text_c
+        caught = (f_out["return_coverage"]["covered"] is False
+                  and f_out["summary_doc"]["verdict"]
+                  == "budget_exceeded_after_seal"
+                  and f_out["summary_doc"]["complete_evidence"] is False)
+        record("f_report_reread_covered_by_f", caught,
+               "slow post-seal F report read flips F's own coverage to "
+               f"withdrawn (verdict={f_out['summary_doc']['verdict']})")
 
         # --- P1(r3): F refuses BEFORE construction past the deadline ----------
         world_f4, plan_f4, _, _, sdir_f4, _, _ = _mini_stage(

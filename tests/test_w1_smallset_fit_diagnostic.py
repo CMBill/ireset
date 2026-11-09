@@ -4,7 +4,7 @@ Pure-synthetic and offline: synthetic tokenizer/joint range/teacher windows
 and a synthetic 15-site FK stub.  No real data, checkpoint, asset compile or
 CUDA path is touched; nothing here claims production equivalence.
 
-The heavy test is the full §6.2/v0.3/v0.4 counterexample battery (35 cases)
+The heavy test is the full §6.2/v0.3/v0.4 counterexample battery (50 cases)
 shared with the synthetic acceptance CLI.
 """
 
@@ -426,52 +426,104 @@ def test_counterexample_battery_all_caught():
     assert failures == {}, json.dumps(failures, indent=1)[:2000]
 
 
-def test_cli_output_and_reread_inside_return_coverage(tmp_path, monkeypatch):
-    """P1 (round-2 review): the flushed stdout AND the necessary final
-    summary re-read must both happen BEFORE the final coverage sample — a
-    1000s stall in either must flip the run to a withdrawn exit 3."""
+def test_cli_output_and_reread_inside_return_coverage(tmp_path):
+    """P1 (round-2 + round-4 review): the flushed stdout AND the CLI's own
+    final summary re-read must both happen BEFORE the final coverage sample.
+
+    The hook is PRECISE (round-4 review): it delays only reads of the
+    acceptance summary issued by the CLI itself — identified by the caller
+    frame, so the internal reads inside ``verify_return_coverage`` /
+    ``_write_summary_sealed`` / ``write_acceptance_outputs`` are never
+    delayed.  Under this exact hook the current CLI must exit 3 while the
+    reverted ordering (coverage sample BEFORE the final read — the round-2
+    bug) still exits 0, which is what this test locks out.
+    """
     import importlib.util
-    import sys as _sys
     from unittest.mock import patch
 
     root = Path(__file__).resolve().parents[1]
-    spec = importlib.util.spec_from_file_location(
-        "review_cli_r2", root / "scripts" / "verify_w1_smallset_fit_diagnostic.py")
-    cli = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(cli)
-    cdir = tmp_path / "cli"
+    src = (root / "scripts" /
+           "verify_w1_smallset_fit_diagnostic.py").read_text()
+    # revert the round-3 ordering: final read AFTER the coverage sample
+    reverted_src = src.replace(
+        '    disk = json.loads(Path(paths["summary"]).read_text())\n'
+        '    cov = diag.verify_return_coverage(Path(paths["summary"]), budget,\n'
+        '                                      withdraw=dict(WITHDRAW_ON_EXCEED))\n',
+        '    cov = diag.verify_return_coverage(Path(paths["summary"]), budget,\n'
+        '                                      withdraw=dict(WITHDRAW_ON_EXCEED))\n')
+    assert reverted_src != src
+    reverted_src = reverted_src.replace(
+        '        return 3\n'
+        '    # P1 (round-2 review): the necessary final disk read happened BEFORE the\n'
+        '    # coverage sample above (flushed stdout → re-read → sample); after the\n'
+        '    # passing sample there is NO further I/O — the exit decision uses the\n'
+        '    # already-read disk state.\n',
+        '        return 3\n'
+        '    disk = json.loads(Path(paths["summary"]).read_text())\n')
+    assert reverted_src.index("cov = diag.verify_return_coverage") \
+        < reverted_src.index('disk = json.loads')
+    assert src.index('disk = json.loads') \
+        < src.index("cov = diag.verify_return_coverage")
+
     fake_facts = {"frozen_plan_defaults_problems": [],
                   "all_counterexamples_caught": True,
                   "d1": {"local_complete_evidence": True,
                          "call_matrix_problems": [], "report_problems": []},
                   "f": {"replay_passed": True}}
-    ct = cli._T0
-    ticks = {"t": ct + 1.0}
 
-    def fake_time():
-        return ticks["t"]
+    def run_cli(name: str, source: str) -> dict:
+        cli_path = tmp_path / f"{name}.py"
+        cli_path.write_text(source)
+        spec = importlib.util.spec_from_file_location(name, cli_path)
+        cli = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cli)
+        cdir = tmp_path / name
+        ct = cli._T0
+        ticks = {"t": ct + 1.0}
+        printed = {"done": False}
 
-    real_read_text = Path.read_text
+        def fake_time():
+            return ticks["t"]
 
-    def slow_summary_read(path, *a, **kw):
-        value = real_read_text(path, *a, **kw)
-        if path.name == "acceptance_summary.json":
-            ticks["t"] = ct + 1000.0  # the necessary re-read blocks for 1000s
-        return value
+        real_read_text = Path.read_text
+        internal_readers = ("verify_return_coverage", "_write_summary_sealed",
+                            "write_acceptance_outputs")
 
-    with patch.object(_sys, "argv", ["verify", "--output-root", str(cdir),
-                                     "--wall-cap-s", "100",
-                                     "--reserve-s", "10"]), \
-         patch.object(cli.diag, "run_synthetic_acceptance",
-                      lambda *a, **kw: json.loads(json.dumps(fake_facts))), \
-         patch.object(time, "perf_counter", fake_time), \
-         patch.object(Path, "read_text", slow_summary_read), \
-         patch("builtins.print", lambda *a, **kw: None):
-        rc = cli.main()
-    assert rc == 3
-    cs = json.loads((cdir / "attempt_001" / "acceptance_summary.json").read_text())
-    assert cs["seal"]["status"] == "budget_exceeded_after_seal"
-    co = json.loads((cdir / "attempt_001" / "return_observation.json").read_text())
-    assert co["covered"] is False
+        def precise_slow_read(path, *a, **kw):
+            value = real_read_text(path, *a, **kw)
+            if path.name == "acceptance_summary.json" and printed["done"]:
+                caller = sys._getframe(1).f_code.co_name
+                if caller not in internal_readers:
+                    ticks["t"] = ct + 1000.0  # the CLI's own re-read blocks
+            return value
+
+        def flag_print(*a, **kw):
+            printed["done"] = True
+
+        with patch.object(sys, "argv", ["verify", "--output-root", str(cdir),
+                                        "--wall-cap-s", "100",
+                                        "--reserve-s", "10"]), \
+             patch.object(cli.diag, "run_synthetic_acceptance",
+                          lambda *a, **kw: json.loads(json.dumps(fake_facts))), \
+             patch.object(time, "perf_counter", fake_time), \
+             patch.object(Path, "read_text", precise_slow_read), \
+             patch("builtins.print", flag_print):
+            rc = cli.main()
+        cs = json.loads((cdir / "attempt_001" /
+                         "acceptance_summary.json").read_text())
+        co = json.loads((cdir / "attempt_001" /
+                         "return_observation.json").read_text())
+        return {"rc": rc, "seal": cs["seal"]["status"], "covered": co["covered"],
+                "measured": cs["seal"]["measured_wall_s_at_summary"]}
+
+    current = run_cli("cli_current", src)
+    assert current["rc"] == 3
+    assert current["seal"] == "budget_exceeded_after_seal"
+    assert current["covered"] is False
     # the withdrawal's registered cost covers the 1000s tail (costs only rise)
-    assert cs["seal"]["measured_wall_s_at_summary"] >= 1000.0
+    assert current["measured"] >= 1000.0
+    # the reverted ordering exits 0 under the SAME precise hook: the delay
+    # lands on an unaccounted post-sample read.  If the CLI ever regressed to
+    # that ordering, the assertions above would flip and this test fails.
+    reverted = run_cli("cli_reverted", reverted_src)
+    assert reverted["rc"] == 0
