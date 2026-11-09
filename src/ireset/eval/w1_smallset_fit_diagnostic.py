@@ -1548,6 +1548,44 @@ def write_handoff_candidate(stage_dir: Path, summary: dict) -> dict | None:
     return candidate
 
 
+def _coverage_return_view(doc: dict, cov: dict,
+                          withdraw: dict) -> tuple[dict, dict]:
+    """Returned (doc, seal) view consistent with the coverage verdict.
+
+    On a passing sample the sealed doc is authoritative.  On a coverage
+    failure ``verify_return_coverage`` has already rewritten the on-disk
+    summary fail-closed (status ``budget_exceeded_after_seal``, withdrawal
+    fields applied, FINAL registered cost — costs only increase) and reports
+    that final cost; the returned view mirrors the rewrite EXACTLY in memory
+    — including the final cost, so the returned ``seal``/``budget`` can
+    never contradict the disk (P2 round-5) — without spending post-sample
+    I/O on a re-read."""
+    if cov.get("covered") is True:
+        return doc, dict(doc.get("seal") or {})
+    prior_registered = (doc.get("seal") or {}).get("measured_wall_s_at_summary")
+    final_cost = cov.get("registered_measured_s")
+    seal = {**(doc.get("seal") or {}),
+            "status": "budget_exceeded_after_seal",
+            "terminal": True,
+            "measured_wall_s_at_summary": final_cost,
+            "return_coverage_elapsed_s": cov.get("elapsed_s"),
+            # the N0 withdrawal keeps the PRE-withdrawal registered cost in
+            # this field (it is the coverage-check input, not the rewrite
+            # result) — mirror it exactly
+            "return_coverage_registered_s": prior_registered,
+            "note": "return_coverage_withdrawn"}
+    if cov.get("cost_coverage_proven") is True \
+            and isinstance(final_cost, (int, float)) \
+            and isinstance(cov.get("elapsed_s"), (int, float)):
+        # the withdrawal loop registers ``elapsed + reserve`` each round, so
+        # the final reserve is exactly derivable when coverage was proven
+        seal["seal_tail_reserve_s"] = float(final_cost) - float(cov["elapsed_s"])
+    out = {**doc, **withdraw, "seal": seal,
+           "budget": {**(doc.get("budget") or {}),
+                      "measured_wall_s_at_summary": final_cost}}
+    return out, seal
+
+
 def finish_stage(stage_dir: Path, summary: dict, budget: StageBudget) -> dict:
     """Seal the stage report (publish-verify seal), write the D1 handoff
     candidate, re-read the sealed report (the necessary post-seal read), and
@@ -1573,12 +1611,11 @@ def finish_stage(stage_dir: Path, summary: dict, budget: StageBudget) -> dict:
     cov = verify_return_coverage(path, budget,
                                  withdraw=dict(I_WITHDRAW_ON_EXCEED),
                                  clock=budget.clock)
-    if not cov["covered"]:
-        doc = {**doc, **I_WITHDRAW_ON_EXCEED,
-               "seal": {**(doc.get("seal") or {}),
-                        "status": "budget_exceeded_after_seal",
-                        "return_coverage_withdrawn": True}}
-    return {"stage_report": str(path), "seal": seal, "return_coverage": cov,
+    doc, seal_view = _coverage_return_view(doc, cov,
+                                           dict(I_WITHDRAW_ON_EXCEED))
+    return {"stage_report": str(path), "seal": seal_view,
+            "return_coverage": cov,
+            "seal_loop": seal,
             "handoff_candidate": candidate, "summary_doc": doc}
 
 
@@ -1656,13 +1693,22 @@ def verify_stage_local(stage_dir: Path, plan: FitPlan,
                        registration: FitRegistration,
                        decoder: MetricDecoder,
                        production_decoder=None,
-                       counters: dict | None = None) -> dict:
+                       counters: dict | None = None,
+                       budget: StageBudget | None = None) -> dict:
     """§7.4 items 1-3 for one stage: coverage multiset, full CPU recompute of
     every saved probe AND the frozen teacher references from disk raw x0
     (bitwise decode bindings on both sides), production-decode re-derivation
     bindings when the production chain is available, and checkpoint
-    role/step/dtype binding."""
+    role/step/dtype binding.
+
+    When ``budget`` is given, every numeric unit of the recompute (teacher
+    decode, teacher production decode, probe production decode, probe
+    decode, metric reduction) is guarded: a deadline crossed inside the
+    saved-quantity verification refuses the NEXT unit (P1 round-5 — the
+    caller decides how the stage closes; the checks never run silently
+    past the work deadline)."""
     stage_dir = Path(stage_dir)
+    check = budget.check if budget is not None else (lambda _point: None)
     problems: list[str] = []
     incomplete = {"problems": problems, "coverage": None,
                   "local_mean_fit_passed": None, "final_windows": [],
@@ -1743,6 +1789,7 @@ def verify_stage_local(stage_dir: Path, plan: FitPlan,
         problems += [f"teacher_raw_invalid:w{b}:{p}"
                      for p in decoder.verify_x0(raw_tgt)]
         problems += verify_rotation_matrix(recs["md_R"])
+        check(f"saved_teacher_decode_w{b}")
         try:
             re_tmd = decoder.decode(raw_tgt)
         except FitDiagnosticError:
@@ -1759,6 +1806,7 @@ def verify_stage_local(stage_dir: Path, plan: FitPlan,
         teacher_ok[b] = bound
         if not bound:
             problems.append(f"teacher_decode_binding_mismatch:w{b}")
+        check(f"saved_teacher_prod_decode_w{b}")
         problems += _production_decode_binding_problems(
             recs, raw_tgt, production_decoder, counters, f"teacher:w{b}")
     inputs_path = stage_dir / "probe_inputs.npz"
@@ -1807,6 +1855,7 @@ def verify_stage_local(stage_dir: Path, plan: FitPlan,
             raw_problems = decoder.verify_x0(raw)
             problems += [f"probe_raw_invalid:idx{idx}:{p}" for p in raw_problems]
             problems += verify_rotation_matrix(recs["md_R"])
+            check(f"saved_probe_prod_decode_{idx}_w{b}")
             problems += _production_decode_binding_problems(
                 recs, raw, production_decoder, counters, f"probe{idx}:w{b}")
             if not teacher_ok.get(b, False):
@@ -1820,6 +1869,7 @@ def verify_stage_local(stage_dir: Path, plan: FitPlan,
             if tgt_md is None:
                 continue
             # bitwise decode binding: re-decode from disk raw x0
+            check(f"saved_probe_decode_{idx}_w{b}")
             re_md = decoder.decode(raw)
             any_redecode = True
             if counters is not None:
@@ -1844,6 +1894,7 @@ def verify_stage_local(stage_dir: Path, plan: FitPlan,
                 if not np.array_equal(recs[key], arr):
                     problems.append(f"error_curve_mismatch:idx{idx}:w{b}:{key}")
             # metrics recompute (float64, from re-decoded + saved FK points)
+            check(f"saved_metrics_{idx}_w{b}")
             re_metrics = compute_window_metrics(
                 re_md, tgt_md, recs["fk_pred"], teacher_records[b]["fk_tgt"])
             problems += [f"probe_metrics_mismatch:idx{idx}:w{b}:{p}"
@@ -2209,7 +2260,18 @@ def run_f_verification(*, stage_specs: list[dict], out_dir: Path,
         decoder: MetricDecoder = spec["decoder"]
         loss_fn = spec["loss_fn"]
         res: dict = {"stage": plan.stage, "stage_dir": str(stage_dir)}
-        budget.check(f"f_stage_{plan.stage}_entry")
+        # P2 (round-5): a deadline crossed by an earlier stage must stop the
+        # SUBSEQUENT stages without crashing the F closure — the stage-entry
+        # check is non-raising here and the incomplete report still lands.
+        if budget.clock() >= budget.work_deadline:
+            budget.exceeded = True
+            budget.stopped_at = budget.stopped_at or f"f_stage_{plan.stage}_entry"
+            res.update({"replay_enabled": False, "replay_passed": None,
+                        "skip_reason": "stage_deadline_stop",
+                        "deadline_stop": f"f_stage_{plan.stage}_entry"})
+            stages_out.append(res)
+            evidence_all_ok = False
+            break
         report_path = stage_dir / "stage_report.json"
         doc, report_problems = _read_json_object(report_path)
         if doc is None:
@@ -2242,9 +2304,23 @@ def run_f_verification(*, stage_specs: list[dict], out_dir: Path,
             continue
         f_verify_counters: dict = {"production_decode_calls": 0,
                                    "metric_decode_calls": 0}
-        verification = verify_stage_local(
-            stage_dir, plan, registration, decoder,
-            production_decoder=loss_fn, counters=f_verify_counters)
+        try:
+            verification = verify_stage_local(
+                stage_dir, plan, registration, decoder,
+                production_decoder=loss_fn, counters=f_verify_counters,
+                budget=budget)
+        except BudgetExceeded as exc:
+            # P1 (round-5): the saved-quantity recompute is deadline-guarded
+            # too; a deadline crossed inside it refuses the next decode and
+            # stops this AND every later stage — the F report (with the
+            # executed counters) still closes honestly below.
+            res.update({"replay_enabled": False, "replay_passed": None,
+                        "skip_reason": "stage_deadline_stop",
+                        "deadline_stop": str(exc),
+                        "verification_counters": dict(f_verify_counters)})
+            stages_out.append(res)
+            evidence_all_ok = False
+            break
         res["local_reverify_problems"] = verification["problems"][:10]
         res["verification_counters"] = dict(f_verify_counters)
         res["intermediate_fk_state_binding_status"] = \
@@ -2451,13 +2527,10 @@ def run_f_verification(*, stage_specs: list[dict], out_dir: Path,
     cov = verify_return_coverage(path, budget,
                                  withdraw=dict(F_WITHDRAW_ON_EXCEED),
                                  clock=budget.clock)
-    if not cov["covered"]:
-        doc = {**doc, **F_WITHDRAW_ON_EXCEED,
-               "seal": {**(doc.get("seal") or {}),
-                        "status": "budget_exceeded_after_seal",
-                        "return_coverage_withdrawn": True}}
-    return {"f_report": str(path), "seal": seal, "return_coverage": cov,
-            "summary_doc": doc}
+    doc, seal_view = _coverage_return_view(doc, cov,
+                                           dict(F_WITHDRAW_ON_EXCEED))
+    return {"f_report": str(path), "seal": seal_view,
+            "return_coverage": cov, "seal_loop": seal, "summary_doc": doc}
 
 
 # --------------------------------------------------------------------------
@@ -2839,6 +2912,8 @@ COUNTEREXAMPLE_IDS = (
     "f_claim_deadline_refused",
     "stage_report_reread_inside_coverage_window",
     "f_report_reread_covered_by_f",
+    "f_saved_recompute_deadline_stop",
+    "f_second_stage_deadline_stop_reports",
     "f_construct_after_deadline_refused",
     "f_runtime_drift_before_fresh_refused",
     "proof_not_a_mapping_survives_f",
@@ -3748,9 +3823,10 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
             finish=True)
 
         class _JumpClock:
-            """Pass the first two budget checks (stage entry, probe start),
-            then jump past the work deadline — the load and input reads land
-            beyond it and no fresh forward may start."""
+            """Pass the first two budget checks (stage entry, first saved-
+            quantity check), then jump past the work deadline — the saved
+            recompute, the load and the input reads land beyond it and no
+            fresh forward may start."""
 
             def __init__(self, passes: int, t_jump: float) -> None:
                 self.n = 0
@@ -3775,14 +3851,15 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
             authorization=None)
         s0 = f_out["summary_doc"]["stages"][0]
         fc6 = s0.get("fresh_counters") or {}
-        caught = (fc6.get("conditioner_forward_calls") == 0
-                  and fc6.get("backbone_forward_calls") == 0
-                  and any("deadline" in p
-                          for p in s0.get("replay_problems", []))
+        stop6 = str(s0.get("deadline_stop") or "")
+        caught = (fc6.get("conditioner_forward_calls", 0) == 0
+                  and fc6.get("backbone_forward_calls", 0) == 0
+                  and s0.get("skip_reason") == "stage_deadline_stop"
+                  and "deadline" in stop6
                   and f_out["summary_doc"]["complete_evidence"] is False)
         record("f_forward_after_deadline_refused", caught,
-               f"load crossed the deadline; fresh forwards="
-               f"{fc6.get('conditioner_forward_calls')}")
+               f"saved recompute crossed the deadline at {stop6[:40]}; "
+               f"fresh forwards={fc6.get('conditioner_forward_calls', 0)}")
 
         # --- P1(r3): proof budget numbers must bind the SEALED report ---------
         world_p3, plan_p3, _, _, sdir_p3, _, _ = _mini_stage(
@@ -3880,11 +3957,18 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
                   and doc_c3["seal"]["status"] == "budget_exceeded_after_seal"
                   and on_disk["seal"]["status"] == "budget_exceeded_after_seal"
                   and fin["return_coverage"]["covered"] is False
+                  and fin["seal"]["status"] == "budget_exceeded_after_seal"
+                  and (doc_c3.get("budget") or {}).get(
+                      "measured_wall_s_at_summary")
+                  == (on_disk.get("budget") or {}).get(
+                      "measured_wall_s_at_summary")
+                  == fin["return_coverage"]["registered_measured_s"]
                   and handoff["handoff_ready"] is False)
         record("candidate_write_after_covered_refused", caught,
                "slow candidate write lands inside the checked window; "
                f"seal={doc_c3['seal']['status']} handoff="
-               f"{handoff['handoff_ready']}")
+               f"{handoff['handoff_ready']} cost="
+               f"{(doc_c3.get('budget') or {}).get('measured_wall_s_at_summary')}")
 
         # --- P1(r4): a deadline crossed at the teacher re-check return refuses
         # the fresh metric decode and the claim itself cannot pass -----------
@@ -3961,11 +4045,18 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
                   and fin_r["summary_doc"]["seal"]["status"]
                   == "budget_exceeded_after_seal"
                   and on_disk_r["seal"]["status"] == "budget_exceeded_after_seal"
-                  and fin_r["return_coverage"]["covered"] is False)
+                  and fin_r["return_coverage"]["covered"] is False
+                  and fin_r["seal"]["status"] == "budget_exceeded_after_seal"
+                  and (fin_r["summary_doc"].get("budget") or {}).get(
+                      "measured_wall_s_at_summary")
+                  == (on_disk_r.get("budget") or {}).get(
+                      "measured_wall_s_at_summary")
+                  == fin_r["return_coverage"]["registered_measured_s"])
         record("stage_report_reread_inside_coverage_window", caught,
                "slow post-seal report read lands inside the checked window; "
                f"seal={fin_r['summary_doc']['seal']['status']} "
-               f"covered={fin_r['return_coverage']['covered']}")
+               f"covered={fin_r['return_coverage']['covered']} cost="
+               f"{(fin_r['summary_doc'].get('budget') or {}).get('measured_wall_s_at_summary')}")
 
         # --- P1(r4): F's own final report re-read is covered by F's own
         # return-coverage verification (not just the outer budget) -----------
@@ -4005,6 +4096,111 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
                "slow post-seal F report read flips F's own coverage to "
                f"withdrawn (verdict={f_out['summary_doc']['verdict']})")
 
+        # --- P1(r5): the saved-quantity recompute is deadline-guarded ---------
+        # (the reviewer's round-5 attack: a clock jump at the FIRST decode
+        # return still let the remaining canonical decodes, production
+        # decodes and metric reductions run past the work deadline)
+        world_f9, plan_f9, _, _, sdir_f9, _, _ = _mini_stage(
+            tmp / "fsaveddl", "D1", n_windows=1, steps=1, seed=seed + 43,
+            finish=True)
+        saved_holder = {"t": 0.0}
+        saved_budget = StageBudget(stage="F", wall_cap_s=100.0, reserve_s=10.0,
+                                   t0=0.0, clock=lambda: saved_holder["t"])
+        dec_calls = {"n": 0}
+        real_decode = type(world_f9.decoder).decode
+
+        def _jumping_decode(self, *a, **kw):
+            out = real_decode(self, *a, **kw)
+            dec_calls["n"] += 1
+            if dec_calls["n"] == 1:
+                # first decode returns inside the cap but past the WORK
+                # deadline: every following numeric unit must be refused
+                saved_holder["t"] = saved_budget.work_deadline + 5.0
+            return out
+
+        mod.MetricDecoder.decode = _jumping_decode
+        try:
+            f_out = run_f_verification(
+                stage_specs=[{"stage_dir": sdir_f9, "plan": plan_f9,
+                              "registration": world_f9.registration_for("D1"),
+                              "decoder": world_f9.decoder,
+                              "loss_fn": world_f9.loss_fn}],
+                out_dir=tmp / "fsaveddl_f", budget=saved_budget,
+                runtime_guard=SyntheticRuntimeGuard(),
+                build_modules=build_modules_factory(world_f9, plan_f9),
+                authorization=None)
+        finally:
+            mod.MetricDecoder.decode = real_decode
+        s0 = f_out["summary_doc"]["stages"][0]
+        stop9 = str(s0.get("deadline_stop") or "")
+        caught = (dec_calls["n"] == 1
+                  and "saved_teacher_prod_decode" in stop9
+                  and s0.get("skip_reason") == "stage_deadline_stop"
+                  and f_out["summary_doc"]["verdict"] == "incomplete"
+                  and (Path(tmp) / "fsaveddl_f" / "f_report.json").is_file()
+                  and f_out["return_coverage"]["covered"] is True)
+        record("f_saved_recompute_deadline_stop", caught,
+               "one canonical decode ran; the production decode after the "
+               f"deadline jump was refused at {stop9[:48]} "
+               f"(decodes={dec_calls['n']})")
+
+        # --- P2(r5): a deadline crossed in D1 stops D6; the F report and the
+        # return proof still land (the uncaught second-stage entry check used
+        # to leave no f_report.json at all) ------------------------------------
+        world_g1, plan_g1, _, _, sdir_g1, _, _ = _mini_stage(
+            tmp / "fstopd1", "D1", n_windows=1, steps=1, seed=seed + 44,
+            finish=True)
+        d6_plan_mini = FitPlan("D6", steps=1, probe_every=1, synthetic=True,
+                               d_model=16, n_layers=1, n_heads=4, ffn_mult=2,
+                               lr=0.02)
+        stop_holder = {"t": 0.0}
+        stop_budget = StageBudget(stage="F", wall_cap_s=100.0, reserve_s=10.0,
+                                  t0=0.0, clock=lambda: stop_holder["t"])
+        stop_calls = {"n": 0}
+        real_tchk_g = mod._teacher_reference_checked
+
+        def _jump_at_first_teacher(*a, **kw):
+            out = real_tchk_g(*a, **kw)
+            stop_calls["n"] += 1
+            if stop_calls["n"] == 1:
+                stop_holder["t"] = stop_budget.work_deadline + 5.0
+            return out
+
+        mod._teacher_reference_checked = _jump_at_first_teacher
+        try:
+            f_out = run_f_verification(
+                stage_specs=[
+                    {"stage_dir": sdir_g1, "plan": plan_g1,
+                     "registration": world_g1.registration_for("D1"),
+                     "decoder": world_g1.decoder,
+                     "loss_fn": world_g1.loss_fn},
+                    {"stage_dir": sdir_g1, "plan": d6_plan_mini,
+                     "registration": world_g1.registration_for("D1"),
+                     "decoder": world_g1.decoder,
+                     "loss_fn": world_g1.loss_fn},
+                ],
+                out_dir=tmp / "fstopd1_f", budget=stop_budget,
+                runtime_guard=SyntheticRuntimeGuard(),
+                build_modules=build_modules_factory(world_g1, plan_g1),
+                authorization=None)
+        finally:
+            mod._teacher_reference_checked = real_tchk_g
+        doc_g = f_out["summary_doc"]
+        stages_g = doc_g.get("stages") or []
+        f_dir_g = Path(tmp) / "fstopd1_f"
+        caught = ((f_dir_g / "f_report.json").is_file()
+                  and (f_dir_g / "return_observation.json").is_file()
+                  and len(stages_g) == 2
+                  and stages_g[0].get("replay_passed") is False
+                  and stages_g[1].get("skip_reason") == "stage_deadline_stop"
+                  and doc_g.get("claim_deadline_exceeded") is True
+                  and doc_g.get("verdict") == "incomplete"
+                  and doc_g.get("complete_evidence") is False)
+        record("f_second_stage_deadline_stop_reports", caught,
+               "D1 crossed the deadline; D6 did not start and the F report + "
+               f"return proof still landed (stages={len(stages_g)}, "
+               f"verdict={doc_g.get('verdict')})")
+
         # --- P1(r3): F refuses BEFORE construction past the deadline ----------
         world_f4, plan_f4, _, _, sdir_f4, _, _ = _mini_stage(
             tmp / "fconstruct", "D1", n_windows=1, steps=1, seed=seed + 38,
@@ -4015,8 +4211,8 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
             built["count"] += 1
             return build_modules_factory(world_f4, plan_f4)()
 
-        # one passing budget check (stage entry), then everything refused:
-        # the pre-construct check fires before any module exists
+        # one passing stage-entry check, then the saved-quantity recompute is
+        # refused past the deadline: no construction, no forward
         budget_f4 = StageBudget(stage="F", wall_cap_s=300.0, reserve_s=10.0,
                                 t0=0.0, clock=_JumpClock(passes=1, t_jump=1e9))
         f_out = run_f_verification(
@@ -4029,16 +4225,16 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
             build_modules=counting_build_f4, authorization=None)
         s0 = f_out["summary_doc"]["stages"][0]
         fc4 = s0.get("fresh_counters") or {}
+        stop4 = str(s0.get("deadline_stop") or "")
         caught = (built["count"] == 0
                   and fc4.get("conditioner_forward_calls", 0) == 0
-                  and any("deadline" in p
-                          for p in s0.get("replay_problems", []))
+                  and s0.get("skip_reason") == "stage_deadline_stop"
+                  and "deadline" in stop4
                   and f_out["summary_doc"]["complete_evidence"] is False)
         record("f_construct_after_deadline_refused", caught,
-               f"deadline crossed by the pre-verification phase; builds="
-               f"{built['count']}, fresh forwards="
-               f"{fc4.get('conditioner_forward_calls')}, problems="
-               f"{s0.get('replay_problems', [])[:1]}")
+               f"deadline crossed by the pre-verification phase at {stop4[:40]}; "
+               f"builds={built['count']}, fresh forwards="
+               f"{fc4.get('conditioner_forward_calls', 0)}")
 
         # --- P1(r3): runtime drift during the input reads refuses the fresh call
         world_f5, plan_f5, _, _, sdir_f5, _, _ = _mini_stage(

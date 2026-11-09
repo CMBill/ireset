@@ -33,7 +33,7 @@
 - 构造/strict 加载后、下一构造或 forward 前执行 `parameter_contract_problems`：全部浮点参数**与缓冲**的 dtype/device 必须匹配冻结契约（真实路径 cuda/float32；合成路径 cpu/float32），错误即停、不静默 cast。
 - 合成路径使用 `SyntheticRuntimeGuard`：只记录单元数，明确 `production_equivalence_claimed=false`，不冒充生产运行时。
 
-## 5. 反例电池（§6.2/v0.3/v0.4 全清单；首轮 35 项 + 第二轮 6 项 + 第三轮 5 项 + 第四轮 4 项 = 50 项）
+## 5. 反例电池（§6.2/v0.3/v0.4 全清单；首轮 35 项 + 第二轮 6 项 + 第三轮 5 项 + 第四轮 4 项 + 第五轮 2 项 = 52 项）
 
 | 方案要求 | 反例 ID（捕获断言） |
 | --- | --- |
@@ -71,19 +71,19 @@
 
 ## 6. 测试结果
 
-- `tests/test_w1_smallset_fit_diagnostic.py`：**17 passed**（CPU，离线；含完整 50 项电池 `test_counterexample_battery_all_caught`）。
-- 反例电池独立运行：**50/50 caught**，ID 集合与冻结清单精确相等（§11 第四轮审阅修订后）。
+- `tests/test_w1_smallset_fit_diagnostic.py`：**17 passed**（CPU，离线；含完整 52 项电池 `test_counterexample_battery_all_caught`）。
+- 反例电池独立运行：**52/52 caught**，ID 集合与冻结清单精确相等（§12 第五轮审阅修订后）。
 
 ## 7. 权威合成验收运行
 
-**`derived/audit/w1_smallset_fit_diagnostic/attempt_004/`**（2026-11-08，§11 第四轮审阅修订后代码，独占创建，CLI exit 0）：单一单调时钟 t0 先于重导入，硬截止 3300s/预留 300s；summary 经发布-核验封口 `sealed_within_budget`（登记成本 **1431.43s** 覆盖封口、候选写盘、必要回读与返回）+ `return_observation.json` SHA 绑定 covered=true（elapsed 1427.43 ≤ 1431.43）。`attempt_001–003`（修复前/二轮/三轮代码）保留为被取代证据。
+**`derived/audit/w1_smallset_fit_diagnostic/attempt_006/`**（2026-11-08，§12 第五轮审阅修订后代码，独占创建，CLI exit 0）：单一单调时钟 t0 先于重导入，硬截止 3300s/预留 300s；summary 经发布-核验封口 `sealed_within_budget`（round 1，登记成本 **1433.63s** 覆盖封口、候选写盘、必要回读与返回）+ `return_observation.json` SHA 绑定 covered=true（elapsed 1429.63 ≤ 1433.63）。`attempt_001–004`（修复前/二轮/三轮/四轮代码）保留为被取代证据；`attempt_005` 为第五轮修复运行中途实现字节再次变更而终止的残缺目录（无 acceptance_summary/return_observation，不消费）。
 
-- **微型 D1**（300 步/probe_every 30/lr 0.03，d16 合成世界，登记成本 235.47s）：`local_complete_evidence=true`、调用矩阵实际=期望零偏差、本地核验零问题；教师与预测双侧 metric_decode **重解码逐位绑定**、生产 FP32 解码量**重推导逐位绑定**；`finish_stage` 时序为 **seal → 候选写盘 → 必要回读 → 最终返回覆盖采样**（§11 P1-1：采样后成功路径零 I/O）；step-300 四门全过（root RMSE **0.00115m**、root 旋转均值 **0.00288rad**、joint RMSE **0.00186rad**、teacher FK MPJPE **0.00121m**）→ `local_mean_fit_passed=true`、`complete_fit`；`handoff_candidate.json` 落盘且经 D6 入口消费 → `handoff_ready=true`（problems=[]）。
-- **微型 D6**（300 步/lr 0.02，六注册窗，登记成本 1396.05s）：覆盖行多重集精确、**六窗四门全过**（macro RMSE 0.00633m，`macro_is_not_a_gate` 显式登记）、`local_mean_fit_passed=true`。
-- **F**：返回证明前置核验通过；对两阶段各 fresh 构造+initial/last 各一次契约核验后 strict 加载 probe（每阶段恰 2 次 fresh 预测），原始 x0、生产 FP32 解码量与 FK 点对保存数组**逐位一致**，教师侧从原始 x0 重解码绑定后对账；**fresh 指标解码前新增工作截止检查（`f_fresh_metrics_*`）、完成声明前新增声明门（`claim_deadline_exceeded` 本轮未触发）**；F 自身对 f_report.json 的封口后回读执行**独立返回覆盖核验**（covered=true）→ `replay_passed=true`、`complete_evidence=true`、`mean_fit_passed=true`、`verdict=fit_pass`、`tolerance_policy=bitwise_no_tolerance`。
-- **反例电池**：50/50 caught（ID 集合与冻结清单精确相等，含 §11 新增 4 项）。
+- **微型 D1**（300 步/probe_every 30/lr 0.03，d16 合成世界，登记成本 236.74s，返回覆盖 covered）：`local_complete_evidence=true`、调用矩阵实际=期望零偏差、本地核验零问题（保存量重算在新截止守卫下逐单元通过）；教师与预测双侧 metric_decode **重解码逐位绑定**、生产 FP32 解码量**重推导逐位绑定**；step-300 四门全过（root RMSE **0.00115m**、root 旋转均值 **0.00288rad**、joint RMSE **0.00186rad**、teacher FK MPJPE **0.00121m**）→ `local_mean_fit_passed=true`、`complete_fit`；`handoff_candidate.json` 落盘且经 D6 入口消费 → `handoff_ready=true`（problems=[]）。
+- **微型 D6**（300 步/lr 0.02，六注册窗，登记成本 1396.38s，返回覆盖 covered）：覆盖行多重集精确、**六窗四门全过**（macro RMSE 0.00633m，`macro_is_not_a_gate` 显式登记）、`local_mean_fit_passed=true`。
+- **F**：返回证明前置核验通过；对两阶段各 fresh 构造+initial/last 各一次契约核验后 strict 加载 probe（每阶段恰 2 次 fresh 预测）；保存量重算在教师解码/生产解码/预测解码/指标归约边界均受同一预算守卫（本轮真实时钟下全部通过）；原始 x0、生产 FP32 解码量与 FK 点对保存数组**逐位一致**，教师侧从原始 x0 重解码绑定后对账；完成声明门 `claim_deadline_exceeded` 本轮未触发；F 自身对 f_report.json 的封口后回读执行**独立返回覆盖核验**（covered=true）→ `replay_passed=true`、`complete_evidence=true`、`mean_fit_passed=true`、`verdict=fit_pass`、`tolerance_policy=bitwise_no_tolerance`。
+- **反例电池**：52/52 caught（ID 集合与冻结清单精确相等，含 §12 新增 2 项）。
 
-历史运行 `attempt_001`（修复前代码）、`attempt_002`（§8 修订后）、`attempt_003`（§10 修订后）保留为被取代证据：其证据分别不含后续轮次的修复项（教师解码绑定/必需工件集合 → 证明预算绑定/候选时序 → 回读入窗/F 自身覆盖/声明门），不可消费为本轮结论。**合成四门通过只证明 I 阶段管线机制与门实现本身在合成世界上自洽；不外推到真实 W1 训练窗（真实可达性属 R/D1/D6 的授权后问题）。**
+历史运行 `attempt_001`（修复前代码）、`attempt_002`（§8 修订后）、`attempt_003`（§10 修订后）、`attempt_004`（§11 修订后）保留为被取代证据：其证据分别不含后续轮次的修复项（教师解码绑定/必需工件集合 → 证明预算绑定/候选时序 → 回读入窗/F 自身覆盖/声明门 → 保存量重算截止守卫/阶段停止收口/撤回成本同步），不可消费为本轮结论。**合成四门通过只证明 I 阶段管线机制与门实现本身在合成世界上自洽；不外推到真实 W1 训练窗（真实可达性属 R/D1/D6 的授权后问题）。**
 
 ## 8. 第二轮独立审阅修订（2026-11-08：7 P1 + 2 P2 全部修复）
 
@@ -144,4 +144,18 @@
 
 新增 4 项电池反例：`candidate_write_chain_control_passes`（无注入控制例：同一时钟下 seal/覆盖/候选链闭合干净）、`stage_report_reread_inside_coverage_window`（P1-1 攻击形态：慢报告回读→撤回+covered=false）、`f_claim_deadline_refused`（P1-3 攻击形态：教师核验返回后时钟越过工作截止（cap 内）→fresh 指标解码被 `f_fresh_metrics_last` 拒绝、`claim_deadline_exceeded=true`、verdict=incomplete、F 自身覆盖仍 covered=true）、`f_report_reread_covered_by_f`（P1-2 攻击形态：慢 F 报告回读→F 自身覆盖翻转为撤回）；重写 1 项 pytest 用例 `test_cli_output_and_reread_inside_return_coverage`（精确帧钩子+回退变体对照）。
 
-**权威合成验收 `derived/audit/w1_smallset_fit_diagnostic/attempt_004/`**（2026-11-08，第四轮修复后代码，独占创建，CLI exit 0）：封口 `sealed_within_budget`（round 1）、登记成本 **1431.43s** ≤ 3300s、返回覆盖 covered=true（elapsed 1427.43 ≤ 1431.43）；微型 D1（300 步，登记成本 235.47s）四门全过（RMSE 0.00115m / 0.00288rad / 0.00186rad / FK 0.00121m）→ `handoff_ready=true`（候选经 D6 入口消费）；微型 D6（登记成本 1396.05s）六窗四门全过（macro RMSE 0.00633m）；F 两阶段逐位重放通过（`fit_pass`、`claim_deadline_exceeded` 未触发、F 自身返回覆盖 covered=true）；50/50 反例捕获。`attempt_003` 保留为被取代证据（其证据不含第四轮的回读入窗/F 自身覆盖/声明门/统一时钟修复项）。
+**权威合成验收 `derived/audit/w1_smallset_fit_diagnostic/attempt_004/`**（2026-11-08，第四轮修复后代码，独占创建，CLI exit 0）：封口 `sealed_within_budget`（round 1）、登记成本 **1431.43s** ≤ 3300s、返回覆盖 covered=true（elapsed 1427.43 ≤ 1431.43）；微型 D1（300 步，登记成本 235.47s）四门全过（RMSE 0.00115m / 0.00288rad / 0.00186rad / FK 0.00121m）→ `handoff_ready=true`（候选经 D6 入口消费）；微型 D6（登记成本 1396.05s）六窗四门全过（macro RMSE 0.00633m）；F 两阶段逐位重放通过（`fit_pass`、`claim_deadline_exceeded` 未触发、F 自身返回覆盖 covered=true）；50/50 反例捕获。`attempt_003` 保留为被取代证据（其证据不含第四轮的回读入窗/F 自身覆盖/声明门/统一时钟修复项）。**attempt_004 自第五轮修订（§12）起保留为被取代证据。**
+
+## 12. 第五轮独立审阅修订（2026-11-08：1 P1 + 2 P2 全部修复）
+
+第四轮修订经独立复审确认有效（attempt_004 摘要/证明绑定、登记成本 1431.43s、D1/D6 保存量重算与交接成立，50 项均 caught），但新夹具复现 1 P1 + 2 P2（复现结果 `/tmp/opencode/review_i_round4_20261109_results.json`、`/tmp/opencode/review_i_round4_fresh_fixture_20261109_results.json`）。全部接受并修复，电池扩至 **52 项**（测试 17 passed），审阅者攻击形态在修复后代码上 fail-closed。attempt_004 自本轮起为被取代证据。
+
+| # | 复审发现 | 修复 |
+| --- | --- | --- |
+| P1 | F 调用保存量核验（`verify_stage_local`）未向内部循环传递截止守卫：首个解码返回时把时钟推进到工作截止后（cap 内），随后仍执行 3 次规范解码、4 次生产解码、3 次指标归约（声明门只降级结论，未阻断工作） | `verify_stage_local` 新增 `budget: StageBudget | None` 参数：**教师解码（`saved_teacher_decode_*`）、教师侧生产解码（`saved_teacher_prod_decode_*`）、预测侧生产解码（`saved_probe_prod_decode_*`）、预测解码（`saved_probe_decode_*`）、指标归约（`saved_metrics_*`）**逐单元 `budget.check`；F 调用传入同一预算并捕获 `BudgetExceeded` → 该阶段收口为 `stage_deadline_stop`（`deadline_stop` 记录具体检查点）→ **停止本阶段与全部后继阶段**；`resolve_handoff` 等未传预算的调用点行为不变（默认无检查） |
+| P2-2 | 双阶段 F 超时跳过最终报告：D1 fresh 返回越过工作截止后异常被捕获，继续进入 D6 时阶段入口检查在异常收口区之外抛出未捕获 `BudgetExceeded` → 没有 `f_report.json`、也没有返回证明 | 阶段入口检查改为**非抛出预检**（`clock >= work_deadline` 时记录 `stage_deadline_stop` 并 `break`，不启动后继阶段）；保存量重算的 `BudgetExceeded` 同样按阶段收口并 break；F 尾部封口、返回覆盖核验与 incomplete 报告（含已执行计数与 `budget` 成本）在所有路径上照常执行 |
+| P2-3 | 撤回后的返回视图成本仍旧：`finish_stage` 与 F 尾部只镜像撤回标志、未同步最终成本——慢回读反例中盘上登记 1007s、返回 `summary_doc` 仍 5s、返回顶层 `seal.status` 仍 `sealed_within_budget`（返回契约自相矛盾） | 新增 `_coverage_return_view`：撤回时从覆盖函数返回的 `registered_measured_s`（= 盘上最终登记成本）与 `elapsed_s` **在内存中重建最终文档快照**（seal.status=`budget_exceeded_after_seal`、terminal、`measured_wall_s_at_summary`/`budget.measured_wall_s_at_summary`=最终成本、撤回字段与 note），返回顶层 `seal` 与 `summary_doc` **均与盘上一致**，且不新增采样后 I/O；`finish_stage`/F 尾部共用该视图（成功路径返回封口文档的 seal 块） |
+
+新增 2 项电池反例：`f_saved_recompute_deadline_stop`（P1 攻击形态：首个解码返回后时钟越过工作截止（cap 内）→仅 1 次规范解码执行、生产解码在 `saved_teacher_prod_decode` 被拒、报告+覆盖仍成立）、`f_second_stage_deadline_stop_reports`（P2-2 攻击形态：D1 回放中越截止→D6 记 `stage_deadline_stop` 不启动、f_report 与 return_observation 均落盘、verdict=incomplete）；既有撤回用例补成本同步断言（返回 `summary_doc.budget`、盘上 `budget` 与 `return_coverage.registered_measured_s` 三方相等；返回顶层 `seal.status`=撤回终态）。审阅者另注：attempt_004 的 D1 initial 在新进程复放出现逐位差异且 F 正确拒收——未归因为代码缺陷，原同进程记录不改写；该现象与 F 逐位重放的设计语义（真实 CUDA 首现合法漂移按 `replay_mismatch` 收口）一致。
+
+**权威合成验收 `derived/audit/w1_smallset_fit_diagnostic/attempt_006/`**（2026-11-08，第五轮修复后代码，独占创建，CLI exit 0）：封口 `sealed_within_budget`（round 1）、登记成本 **1433.63s** ≤ 3300s、返回覆盖 covered=true（elapsed 1429.63 ≤ 1433.63）；微型 D1（300 步，登记成本 236.74s，返回覆盖 covered）四门全过（RMSE 0.00115m / 0.00288rad / 0.00186rad / FK 0.00121m）→ `handoff_ready=true`（候选经 D6 入口消费）；微型 D6（登记成本 1396.38s，返回覆盖 covered）六窗四门全过（macro RMSE 0.00633m）；F 两阶段逐位重放通过（`fit_pass`、`claim_deadline_exceeded` 未触发、F 自身返回覆盖 covered=true）；52/52 反例捕获。`attempt_005` 为第五轮修复运行中途再次变更实现字节（撤回返回视图细化）而终止的残缺目录（无 acceptance_summary/return_observation，不消费）；该细化只影响覆盖失败路径的**返回视图**，盘上撤回行为不变，但仍以最终字节重跑 attempt_006 为准。`attempt_004` 保留为被取代证据（其证据不含第五轮的保存量重算截止守卫/阶段停止收口/撤回成本同步修复项）。
