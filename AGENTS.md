@@ -96,6 +96,14 @@
 - 计时包含预处理、生成、拼接、检查、修复、重采样及终检;同时报告整段接受率,不能通过拒绝困难样本制造加速。
 - 教师轨迹和回放数据同样需要质量检查;不能把公开教师输出直接认定为可行真值。
 
+## Git 提交约定
+
+- **每次代码修复完成并通过相应验证(相关测试/对拍)后,必须立即自动创建本地 git commit,无需逐次再向用户确认;本条为预先授权,自 2026-11-08 起生效。**一次修复对应一个独立提交,不混合无关变更。
+- 提交前用 `git status`/`git diff` 核对变更,按文件名逐个暂存本次修复相关文件(实现/测试/配套文档);不得纳入数据入口、派生大工件、缓存或疑似密钥文件。
+- 提交信息沿用仓库现有风格(如 `fix(scope): 中文描述`),说明修复动机与验证结果;验证未通过或存在未解决阻塞时不得提交,先修复再提交。
+- 自动授权仅限本地 commit:push、amend、reset/force push、删除分支等改写历史或影响远端的操作仍须用户明确授权;不跳过 hooks、不绕过签名。
+- 此前进度记录中的"本轮未提交 git"为历史快照,不追溯补提交;自本约定生效后的新一轮修复按本节约束执行。
+
 ## 当前进度与后续顺序
 
 **2026-11-08 W1 I 阶段第八轮独立审阅修订完成——2 P1+1 P2 全部修复（conditioner→backbone 与 strict 加载内部边界守卫、输入重建逐读与端点工件逐窗读取守卫、坏容器结构化 incomplete 收口），电池扩至 68 项全捕获、17 项测试全过、N0/N1 回归 33 passed，权威验收重跑 attempt_009：**独立复审确认第七轮修复有效（attempt_008 四份证明、保存量、调用矩阵及 63/63 电池核验成立、登记成本 1476.95s≤3300s）但新隔离边界反例复现 2 P1+1 P2（复现脚本 /tmp/opencode/review_i_round7_new_boundaries_20261109.py 与结果 review_i_round7_new_boundaries_20261109_results.json），全部接受并修复（方案新增 §26，验证记录新增 §15）。**P1 ①F 的 forward/strict 加载内部缺守卫**（conditioner 返回越线后仍 1 次 backbone forward；checkpoint 读取返回越线后仍 2 次 strict 加载；model 加载返回越线后仍 conditioner 加载）——`_fresh_probe` 在 conditioner 后、backbone 前插 `f_fresh_backbone`；`_load_state_dicts_checked` 新增 `budget`（读取后 `f_strict_load_*_pre`、model 前 `_model`、conditioner 前 `_conditioner`）；**②F 数组读取链未守卫**（六窗输入重建首读越线后仍 5 原始量+30 条件读取；首窗归约越线后仍读下一窗端点工件）——输入重建逐次读取 `f_probe_{role}_input_w*_raw`/逐条件键、端点工件每窗 `f_saved_probe_read_{role}_w*`（`_saved_probe_records` 之前）；**P2 ③坏容器使 F 无报告**（`probe_index.json=[]`/`stage_report.seal=[1]` 各触发未捕获 AttributeError，无 f_report/返回证明）——`verify_stage_local` 的 artifacts_index/probe_index 改经 `_read_json_object` 并校验 probes/entry/window 映射与列表类型（失败→结构化问题+incomplete），F 流/`_return_proof_problems`/`resolve_handoff` 的 seal 非映射→结构化拒绝/跳过，`verify_artifacts_index` 校验 files/逐 meta 映射，`_saved_probe_entry` 结构异常→missing 跳过、`_saved_probe_records`→`FitDiagnosticError` 由既有收口捕获；两种坏容器现将 incomplete f_report+return_observation 照常落盘。新增 5 项电池反例（backbone 边界/strict 加载边界/输入重建逐读/端点逐读/坏容器收口），电池 **68/68 caught**、测试 **17 passed**、N0/N1 回归 **33 passed**；审阅者攻击形态 fail-closed（conditioner 越线 backbone 0；读取越线 0 次加载；输入重建越线 0 条件读取；端点越线仅 1 次读取；坏容器无崩溃且报告/证明落盘）。**attempt_008 保留为被取代证据；权威合成验收重跑为 `derived/audit/w1_smallset_fit_diagnostic/attempt_009/`（exit 0，封口 sealed_within_budget round 1、登记成本 1383.51s≤3300s、返回覆盖 covered（elapsed 1379.51≤1383.51））：微型 D1（225.96s、covered）四门全过（RMSE 0.00115m/0.00288rad/0.00186rad/FK 0.00121m）→ handoff_ready=true → 微型 D6（1313.61s、covered）六窗四门全过（macro RMSE 0.00633m）→ F 两阶段逐位重放通过（fit_pass、claim_deadline_exceeded 未触发、F 自身覆盖 covered）；68/68 反例捕获。**边界：R/真实 D1/D6/F 未实施、未授权、未运行；真实拟合仍须 §8.3 新冻结材料与新明确授权；T6 旧结论与 partial/null/false/not_ready/不接入全部保持；本轮未提交 git、未运行全项目套件（仅本交付 17 passed + N0/N1 回归 33 passed）。**
