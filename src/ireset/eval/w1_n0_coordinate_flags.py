@@ -1338,6 +1338,11 @@ def verify_return_coverage(summary_path: Path, budget: N0Budget,
     explicit ``cost_coverage_unproven`` flag and the state stays
     non-consumable (fail-closed).  Callers must fail closed on
     ``covered=False``.
+
+    Every return carries ``final_doc``: the FINAL document snapshot exactly
+    as left on disk (the entry doc when covered, the last written withdrawn
+    doc otherwise — including multi-round and exhausted withdrawals), so
+    callers never have to reconstruct the withdrawal semantics themselves.
     """
     now = clock if clock is not None else time.perf_counter
     summary_path = Path(summary_path)
@@ -1370,6 +1375,7 @@ def verify_return_coverage(summary_path: Path, budget: N0Budget,
                     "registered_measured_s": float(measured),
                     "wall_cap_s": cap, "withdrawn": False,
                     "cost_coverage_proven": True,
+                    "final_doc": doc,
                     "return_observation": str(obs_path)}
         elapsed = post  # the proof write itself was not covered
 
@@ -1411,6 +1417,7 @@ def verify_return_coverage(summary_path: Path, budget: N0Budget,
             return {"covered": False, "elapsed_s": elapsed,
                     "registered_measured_s": new_measured, "wall_cap_s": cap,
                     "withdrawn": True, "cost_coverage_proven": True,
+                    "final_doc": withdrawn_doc,
                     "return_observation": str(obs_path)}
         reserve = SEAL_PROCESS_RETURN_TAIL_S + max(
             SEAL_TAIL_MIN_RESERVE_S, 2.0 * (post - elapsed))
@@ -1429,4 +1436,5 @@ def verify_return_coverage(summary_path: Path, budget: N0Budget,
     return {"covered": False, "elapsed_s": elapsed,
             "registered_measured_s": elapsed, "wall_cap_s": cap,
             "withdrawn": True, "cost_coverage_proven": False,
+            "final_doc": withdrawn_doc,
             "return_observation": str(obs_path)}

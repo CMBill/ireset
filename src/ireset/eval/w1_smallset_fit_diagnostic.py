@@ -1240,10 +1240,15 @@ class FitDriver:
             matrix_snapshot = dict(self.counters)
             verification_counters: dict = {"production_decode_calls": 0,
                                            "metric_decode_calls": 0}
+            # P1 (round-6): the local recompute runs under the SAME stage
+            # budget — a deadline crossed inside it refuses the next decode
+            # instead of finishing the verification first (the driver's
+            # closure records the stage as incomplete).
+            self._phase = "local_verification"
             verification = verify_stage_local(
                 self.stage_dir, self.plan, self.registration, self.decoder,
                 production_decoder=self.loss_fn,
-                counters=verification_counters)
+                counters=verification_counters, budget=self.budget)
             self.budget.check("local_verification_complete")
             summary.update(verification)
             summary["verification_counters"] = verification_counters
@@ -1548,42 +1553,15 @@ def write_handoff_candidate(stage_dir: Path, summary: dict) -> dict | None:
     return candidate
 
 
-def _coverage_return_view(doc: dict, cov: dict,
-                          withdraw: dict) -> tuple[dict, dict]:
-    """Returned (doc, seal) view consistent with the coverage verdict.
-
-    On a passing sample the sealed doc is authoritative.  On a coverage
-    failure ``verify_return_coverage`` has already rewritten the on-disk
-    summary fail-closed (status ``budget_exceeded_after_seal``, withdrawal
-    fields applied, FINAL registered cost — costs only increase) and reports
-    that final cost; the returned view mirrors the rewrite EXACTLY in memory
-    — including the final cost, so the returned ``seal``/``budget`` can
-    never contradict the disk (P2 round-5) — without spending post-sample
-    I/O on a re-read."""
-    if cov.get("covered") is True:
-        return doc, dict(doc.get("seal") or {})
-    prior_registered = (doc.get("seal") or {}).get("measured_wall_s_at_summary")
-    final_cost = cov.get("registered_measured_s")
-    seal = {**(doc.get("seal") or {}),
-            "status": "budget_exceeded_after_seal",
-            "terminal": True,
-            "measured_wall_s_at_summary": final_cost,
-            "return_coverage_elapsed_s": cov.get("elapsed_s"),
-            # the N0 withdrawal keeps the PRE-withdrawal registered cost in
-            # this field (it is the coverage-check input, not the rewrite
-            # result) — mirror it exactly
-            "return_coverage_registered_s": prior_registered,
-            "note": "return_coverage_withdrawn"}
-    if cov.get("cost_coverage_proven") is True \
-            and isinstance(final_cost, (int, float)) \
-            and isinstance(cov.get("elapsed_s"), (int, float)):
-        # the withdrawal loop registers ``elapsed + reserve`` each round, so
-        # the final reserve is exactly derivable when coverage was proven
-        seal["seal_tail_reserve_s"] = float(final_cost) - float(cov["elapsed_s"])
-    out = {**doc, **withdraw, "seal": seal,
-           "budget": {**(doc.get("budget") or {}),
-                      "measured_wall_s_at_summary": final_cost}}
-    return out, seal
+def _coverage_return_view(cov: dict) -> tuple[dict, dict]:
+    """The coverage function returns ``final_doc`` — the FINAL document
+    snapshot exactly as left on disk (covered: the entry doc; withdrawn: the
+    last written withdrawn doc, including multi-round costs and the
+    ``cost_coverage_unproven`` flag).  The returned view therefore matches
+    the disk field-for-field without reconstructing the withdrawal
+    semantics and without post-sample I/O (P2 rounds 5-6)."""
+    final_doc = cov["final_doc"]
+    return final_doc, dict(final_doc.get("seal") or {})
 
 
 def finish_stage(stage_dir: Path, summary: dict, budget: StageBudget) -> dict:
@@ -1611,8 +1589,7 @@ def finish_stage(stage_dir: Path, summary: dict, budget: StageBudget) -> dict:
     cov = verify_return_coverage(path, budget,
                                  withdraw=dict(I_WITHDRAW_ON_EXCEED),
                                  clock=budget.clock)
-    doc, seal_view = _coverage_return_view(doc, cov,
-                                           dict(I_WITHDRAW_ON_EXCEED))
+    doc, seal_view = _coverage_return_view(cov)
     return {"stage_report": str(path), "seal": seal_view,
             "return_coverage": cov,
             "seal_loop": seal,
@@ -2064,8 +2041,18 @@ def resolve_handoff(stage_dir: Path, plan: FitPlan, decoder: MetricDecoder,
             problems.append("handoff_candidate_not_complete")
         if candidate.get("local_mean_fit_passed") is not True:
             problems.append("handoff_candidate_mean_fit_not_passed")
-    verification = verify_stage_local(stage_dir, plan, registration, decoder,
-                                      production_decoder=production_decoder)
+    # P1 (round-6): the handoff recompute runs under the SAME D6 budget — a
+    # deadline crossed inside it refuses the NEXT decode and the handoff
+    # (never a handoff_ready=true produced after the work deadline).
+    try:
+        verification = verify_stage_local(stage_dir, plan, registration,
+                                          decoder,
+                                          production_decoder=production_decoder,
+                                          budget=budget)
+    except BudgetExceeded as exc:
+        problems.append(f"handoff_deadline_exceeded:{exc}")
+        return {"handoff_ready": False, "problems": problems,
+                "local_mean_fit_passed": None, "coverage": None}
     problems += verification["problems"]
     mean_fit = verification["local_mean_fit_passed"]
     if mean_fit is not True:
@@ -2439,6 +2426,11 @@ def run_f_verification(*, stage_specs: list[dict], out_dir: Path,
                                 f"replay_mismatch:{key}:{role}:w{b}")
                     # fresh metric_decode + metrics from the fresh x0 against
                     # the RE-DERIVED teacher decode (never the saved md_*)
+                    # P1 (round-6): the saved-quantity read AND the bitwise
+                    # comparisons above are I/O work — a deadline crossed
+                    # during them must refuse the teacher decode that
+                    # follows (and be caught below as a replay failure).
+                    budget.check(f"f_teacher_recheck_{role}_w{b}")
                     teacher, teacher_problems = _teacher_reference_checked(
                         stage_dir, decoder, b, f_counters)
                     replay_problems += teacher_problems[:3]
@@ -2450,6 +2442,10 @@ def run_f_verification(*, stage_specs: list[dict], out_dir: Path,
                     budget.check(f"f_fresh_metrics_{role}_w{b}")
                     f_counters["metric_decode_calls"] += 1
                     fresh_md = decoder.decode(raw_f)
+                    # P1 (round-6): the fresh decode is a numeric unit too —
+                    # a deadline crossed during it refuses the metric
+                    # reduction that follows.
+                    budget.check(f"f_fresh_metrics_reduce_{role}_w{b}")
                     fresh_metrics = compute_window_metrics(
                         fresh_md, {"pos": teacher["md_pos"], "R": teacher["md_R"],
                                    "q": teacher["md_q"]},
@@ -2527,8 +2523,7 @@ def run_f_verification(*, stage_specs: list[dict], out_dir: Path,
     cov = verify_return_coverage(path, budget,
                                  withdraw=dict(F_WITHDRAW_ON_EXCEED),
                                  clock=budget.clock)
-    doc, seal_view = _coverage_return_view(doc, cov,
-                                           dict(F_WITHDRAW_ON_EXCEED))
+    doc, seal_view = _coverage_return_view(cov)
     return {"f_report": str(path), "seal": seal_view,
             "return_coverage": cov, "seal_loop": seal, "summary_doc": doc}
 
@@ -2914,6 +2909,12 @@ COUNTEREXAMPLE_IDS = (
     "f_report_reread_covered_by_f",
     "f_saved_recompute_deadline_stop",
     "f_second_stage_deadline_stop_reports",
+    "d_driver_recompute_deadline_stop",
+    "handoff_recompute_deadline_refused",
+    "f_teacher_recheck_deadline_stop",
+    "f_fresh_metrics_reduce_deadline_stop",
+    "withdrawal_view_matches_disk_multi_round",
+    "withdrawal_view_matches_disk_exhausted",
     "f_construct_after_deadline_refused",
     "f_runtime_drift_before_fresh_refused",
     "proof_not_a_mapping_survives_f",
@@ -4200,6 +4201,249 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
                "D1 crossed the deadline; D6 did not start and the F report + "
                f"return proof still landed (stages={len(stages_g)}, "
                f"verdict={doc_g.get('verdict')})")
+
+        # --- P1(r6): the D driver's local recompute runs under the stage
+        # budget — a deadline crossed inside it refuses the next decode -------
+        world_h1, plan_h1, _, _, _, _, _ = _mini_stage(
+            tmp / "ddlverify", "D1", n_windows=1, steps=1, seed=seed + 45)
+        ddir = tmp / "ddlverify2"
+        d_holder = {"t": 0.0}
+        d_budget = StageBudget(stage="D1", wall_cap_s=100.0, reserve_s=10.0,
+                               t0=0.0, clock=lambda: d_holder["t"])
+        d_view = world_h1.view_for("D1")
+        # the trainer's own save deadline compares against the real clock;
+        # with the controlled (fake-epoch) budget it is disabled — the
+        # driver's per-unit budget checks remain the guard under test
+        trainer_h1 = world_h1.build_trainer(
+            plan_h1, ddir, None, train_ds=d_view["ds"])
+        driver_h1 = FitDriver(
+            trainer=trainer_h1, plan=plan_h1,
+            registration=d_view["registration"], loss_fn=world_h1.loss_fn,
+            decoder=world_h1.decoder, probe_batch=d_view["probe_batch"],
+            budget=d_budget, runtime_guard=SyntheticRuntimeGuard(),
+            identity={"synthetic": True}, stage_dir=ddir,
+            training_gen=torch.Generator().manual_seed(plan_h1.seed),
+            dataset_window_keys=d_view["ds"].window_keys,
+            authorization_includes_d6=True)
+        real_decode_d = mod.MetricDecoder.decode
+        d_calls = {"n": 0}
+
+        def _jump_in_verify(self, *a, **kw):
+            out = real_decode_d(self, *a, **kw)
+            if sys._getframe(1).f_code.co_name == "verify_stage_local":
+                d_calls["n"] += 1
+                if d_calls["n"] == 1:
+                    d_holder["t"] = d_budget.work_deadline + 5.0
+            return out
+
+        mod.MetricDecoder.decode = _jump_in_verify
+        try:
+            summary_h1 = driver_h1.run()
+        finally:
+            mod.MetricDecoder.decode = real_decode_d
+        failure_h1 = summary_h1.get("failure") or {}
+        caught = (failure_h1.get("type") == "BudgetExceeded"
+                  and failure_h1.get("phase") == "local_verification"
+                  and d_calls["n"] == 1
+                  and summary_h1.get("local_complete_evidence") is False
+                  and summary_h1.get("local_conclusion") == "incomplete"
+                  and (summary_h1.get("budget") or {}).get("budget_exceeded")
+                  is True)
+        record("d_driver_recompute_deadline_stop", caught,
+               "driver recompute crossed the deadline after one decode; the "
+               f"stage closed incomplete (decodes={d_calls['n']}, "
+               f"failure={failure_h1.get('message', '')[:40]})")
+
+        # --- P1(r6): the handoff recompute runs under the D6 budget and a
+        # crossed deadline refuses the handoff --------------------------------
+        world_h2, plan_h2, _, _, sdir_h2, _, _ = _mini_stage(
+            tmp / "hdlverify", "D1", n_windows=1, steps=1, seed=seed + 46,
+            finish=True)
+        h_holder = {"t": 0.0}
+        h_budget = StageBudget(stage="D6", wall_cap_s=100.0, reserve_s=10.0,
+                               t0=0.0, clock=lambda: h_holder["t"])
+        real_decode_hd = mod.MetricDecoder.decode
+        h_calls = {"n": 0}
+
+        def _jump_in_handoff(self, *a, **kw):
+            out = real_decode_hd(self, *a, **kw)
+            if sys._getframe(1).f_code.co_name == "verify_stage_local":
+                h_calls["n"] += 1
+                if h_calls["n"] == 1:
+                    h_holder["t"] = h_budget.work_deadline + 5.0
+            return out
+
+        mod.MetricDecoder.decode = _jump_in_handoff
+        try:
+            handoff_h = resolve_handoff(
+                sdir_h2, plan_h2, world_h2.decoder,
+                world_h2.registration_for("D1"), {"includes": ["D6"]},
+                h_budget, production_decoder=world_h2.loss_fn)
+        finally:
+            mod.MetricDecoder.decode = real_decode_hd
+        caught = (handoff_h["handoff_ready"] is False
+                  and any("handoff_deadline_exceeded" in p
+                          for p in handoff_h["problems"])
+                  and h_budget.exceeded is True
+                  and h_calls["n"] == 1)
+        record("handoff_recompute_deadline_refused", caught,
+               "handoff recompute crossed the deadline after one decode; "
+               f"handoff refused (decodes={h_calls['n']}, "
+               f"problems={handoff_h['problems'][:1]})")
+
+        # --- P1(r6): a slow saved-quantity read refuses the teacher decode ----
+        world_h3, plan_h3, _, _, sdir_h3, _, _ = _mini_stage(
+            tmp / "fteachdl", "D1", n_windows=1, steps=1, seed=seed + 47,
+            finish=True)
+        t_holder = {"t": 0.0}
+        t_budget = StageBudget(stage="F", wall_cap_s=100.0, reserve_s=10.0,
+                               t0=0.0, clock=lambda: t_holder["t"])
+        tchk_seen = {"n": 0}
+        real_saved_h = mod._saved_probe_records
+        real_tchk_h = mod._teacher_reference_checked
+
+        def _slow_saved(*a, **kw):
+            out = real_saved_h(*a, **kw)
+            t_holder["t"] = t_budget.work_deadline + 5.0
+            return out
+
+        def _counting_tchk(*a, **kw):
+            tchk_seen["n"] += 1
+            return real_tchk_h(*a, **kw)
+
+        mod._saved_probe_records = _slow_saved
+        mod._teacher_reference_checked = _counting_tchk
+        try:
+            f_out = run_f_verification(
+                stage_specs=[{"stage_dir": sdir_h3, "plan": plan_h3,
+                              "registration": world_h3.registration_for("D1"),
+                              "decoder": world_h3.decoder,
+                              "loss_fn": world_h3.loss_fn}],
+                out_dir=tmp / "fteachdl_f", budget=t_budget,
+                runtime_guard=SyntheticRuntimeGuard(),
+                build_modules=build_modules_factory(world_h3, plan_h3),
+                authorization=None)
+        finally:
+            mod._saved_probe_records = real_saved_h
+            mod._teacher_reference_checked = real_tchk_h
+        s0 = f_out["summary_doc"]["stages"][0]
+        caught = (tchk_seen["n"] == 0
+                  and any("f_teacher_recheck" in p
+                          for p in s0.get("replay_problems", []))
+                  and f_out["summary_doc"]["verdict"] == "incomplete")
+        record("f_teacher_recheck_deadline_stop", caught,
+               "slow saved read crossed the deadline; the teacher decode "
+               f"never started (tchk={tchk_seen['n']}, "
+               f"problems={s0.get('replay_problems', [])[:1]})")
+
+        # --- P1(r6): a slow fresh decode refuses the metric reduction ---------
+        world_h4, plan_h4, _, _, sdir_h4, _, _ = _mini_stage(
+            tmp / "freducedl", "D1", n_windows=1, steps=1, seed=seed + 48,
+            finish=True)
+        r_holder = {"t": 0.0}
+        r_budget = StageBudget(stage="F", wall_cap_s=100.0, reserve_s=10.0,
+                               t0=0.0, clock=lambda: r_holder["t"])
+        real_decode_r = mod.MetricDecoder.decode
+
+        def _jump_after_fresh_decode(self, *a, **kw):
+            out = real_decode_r(self, *a, **kw)
+            if sys._getframe(1).f_code.co_name == "run_f_verification":
+                r_holder["t"] = r_budget.work_deadline + 5.0
+            return out
+
+        mod.MetricDecoder.decode = _jump_after_fresh_decode
+        try:
+            f_out = run_f_verification(
+                stage_specs=[{"stage_dir": sdir_h4, "plan": plan_h4,
+                              "registration": world_h4.registration_for("D1"),
+                              "decoder": world_h4.decoder,
+                              "loss_fn": world_h4.loss_fn}],
+                out_dir=tmp / "freducedl_f", budget=r_budget,
+                runtime_guard=SyntheticRuntimeGuard(),
+                build_modules=build_modules_factory(world_h4, plan_h4),
+                authorization=None)
+        finally:
+            mod.MetricDecoder.decode = real_decode_r
+        s0 = f_out["summary_doc"]["stages"][0]
+        caught = (any("f_fresh_metrics_reduce" in p
+                      for p in s0.get("replay_problems", []))
+                  and s0.get("mean_fit_passed") is None
+                  and f_out["summary_doc"]["verdict"] == "incomplete")
+        record("f_fresh_metrics_reduce_deadline_stop", caught,
+               "slow fresh decode crossed the deadline; the metric reduction "
+               f"was refused (problems={s0.get('replay_problems', [])[:1]})")
+
+        # --- P2(r6): multi-round and exhausted withdrawals return the FINAL
+        # on-disk document — no reconstructed withdrawal semantics -------------
+        import ireset.eval.w1_n0_coordinate_flags as _n0mod
+        real_fsync_n0 = _n0mod._write_json_fsync
+
+        def _run_withdrawal_case(name: str, mutator) -> tuple[dict, dict]:
+            world_v, plan_v, _, summary_v, sdir_v, _, _ = _mini_stage(
+                tmp / name, "D1", n_windows=1, steps=1, seed=seed + 49)
+            v_holder = {"t": 0.0}
+            v_budget = StageBudget(stage="D1", wall_cap_s=100.0,
+                                   reserve_s=10.0, t0=0.0,
+                                   clock=lambda: v_holder["t"])
+            real_read_v = Path.read_text
+            state = {"t_prev": 0.0, "t_cur": 0.0}
+
+            def _slow_read_v(path, *a, **kw):
+                value = real_read_v(path, *a, **kw)
+                if path.name == "stage_report.json" \
+                        and sys._getframe(1).f_code.co_name == "finish_stage":
+                    v_holder["t"] = 1000.0
+                    state["t_cur"] = 1000.0
+                return value
+
+            def _slow_fsync(path, doc):
+                if path.name == "return_observation.json" \
+                        and sys._getframe(1).f_code.co_name \
+                        == "verify_return_coverage":
+                    t_next = mutator(state)
+                    state["t_prev"], state["t_cur"] = state["t_cur"], t_next
+                    v_holder["t"] = t_next
+                return real_fsync_n0(path, doc)
+
+            mod.Path.read_text = _slow_read_v
+            _n0mod._write_json_fsync = _slow_fsync
+            try:
+                fin_v = finish_stage(sdir_v, summary_v, v_budget)
+            finally:
+                mod.Path.read_text = real_read_v
+                _n0mod._write_json_fsync = real_fsync_n0
+            on_disk_v = json.loads((sdir_v / "stage_report.json").read_text())
+            return fin_v, on_disk_v
+
+        fin_m, disk_m = _run_withdrawal_case(
+            "withmulti", lambda state: 1008.0)
+        # round 2 is forced by the slow proof write: the registered elapsed
+        # stays the ENTRY value on disk and the return must match it
+        caught = (fin_m["return_coverage"]["covered"] is False
+                  and json.loads(json.dumps(fin_m["summary_doc"])) == disk_m
+                  and disk_m["seal"]["return_coverage_elapsed_s"] == 1000.0
+                  and disk_m["seal"]["measured_wall_s_at_summary"]
+                  == fin_m["return_coverage"]["registered_measured_s"]
+                  and disk_m["seal"]["measured_wall_s_at_summary"] >= 1027.0)
+        record("withdrawal_view_matches_disk_multi_round", caught,
+               "multi-round withdrawal: returned doc == disk doc, entry "
+               f"elapsed={disk_m['seal']['return_coverage_elapsed_s']}, "
+               f"measured={disk_m['seal']['measured_wall_s_at_summary']}")
+
+        fin_x, disk_x = _run_withdrawal_case(
+            "withexhaust",
+            lambda state: state["t_cur"] + 2.0 * (state["t_cur"]
+                                                  - state["t_prev"]) + 10.0)
+        caught = (fin_x["return_coverage"]["covered"] is False
+                  and fin_x["return_coverage"]["cost_coverage_proven"] is False
+                  and json.loads(json.dumps(fin_x["summary_doc"])) == disk_x
+                  and disk_x["seal"].get("cost_coverage_unproven") is True
+                  and disk_x["seal"]["measured_wall_s_at_summary"]
+                  == fin_x["return_coverage"]["registered_measured_s"])
+        record("withdrawal_view_matches_disk_exhausted", caught,
+               "exhausted withdrawal: returned doc == disk doc incl. "
+               f"cost_coverage_unproven="
+               f"{disk_x['seal'].get('cost_coverage_unproven')}")
 
         # --- P1(r3): F refuses BEFORE construction past the deadline ----------
         world_f4, plan_f4, _, _, sdir_f4, _, _ = _mini_stage(
