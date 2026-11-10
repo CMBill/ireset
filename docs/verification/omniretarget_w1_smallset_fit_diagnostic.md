@@ -20,6 +20,7 @@
 
 - **FitPlan 冻结默认值**（非 synthetic 计划偏离即拒绝）：steps=1000、probe_every=10（101 次 probe，step 0 与 10..1000）、grad_accum=4、D1 micro_batch=1 / D6 micro_batch=6、seed/val_seed=20261008、lr=1e-4、weight_decay=1e-5、grad_clip=1、d240/4层/6头/time_window31；`frozen_plan_defaults_problems()` 由 CLI 与测试断言为空。
 - **FitRegistration**：D1 恰 1 窗、D6 恰 6 窗、规范字典序、start=0、跨度=T_WINDOW=60、split 全为 train；驱动另做**注册↔物化数据集窗键绑定**（`dataset_registration_window_mismatch`），并绑定 trainer 配置与计划（steps/micro/grad_accum/lr/wd/clip/seed/架构）与**七项冻结损失权重**（w_pos/w_rot6d/w_joint/w_geodesic/w_fk/w_contact=0/w_vel，容差目标与 checkpoint 内嵌配置同契约）；**阶段身份嵌入 plan/registration 的规范 SHA-256**，F 每个 stage spec 与交接另须携带调用方声明的**完整 expected identity**，报告与两 checkpoint 身份逐字段等于该外部声明（摘要仅是派生绑定）——协同改写 stage/module/implementation 等任一字段均被拒；实际 `loss_fn.w` 在 preflight/probe/micro/save/每次 loss 调用边界复核，`LossAssembler` 内部每次 decode/FK 前后均有工作截止检查；**实际 AdamW `param_groups` 的 lr/weight_decay/betas/eps/maximize/amsgrad 与 model+conditioner 参数名册在构造/preflight/micro/clip/step/save 逐组复核**（`optimizer_binding`），conditioner 入口、backbone/loss 入口与 clip 取证之后各有截止/精度守卫；checkpoint 实际张量有限性与 state key set 跨端点绑定（不信任自报 `parameters_finite`）；F 输入重建的 condition 数组按冻结键/形状/float32 契约读取，NPZ 坏存档（含 object 数组）不启用 pickle、结构化拒绝。
+- **第十四轮补强（实际算术/架构/精度边界）**：实际 AdamW `param_groups` 另冻结 `decoupled_weight_decay=true`、`foreach=None`、`fused=None`、`capturable=false`、`differentiable=false`（与 lr/wd/betas/eps/maximize/amsgrad 及参数 id 名册同一 `optimizer_binding` 契约）；checkpoint state 的**独立架构契约**由冻结 plan 构造参考模块派生（键集/shape/dtype，不依赖 checkpoint 自身；参考构建为预算守卫、RNG 隔离的元数据单元），本地/F 加载前/交接共用——两端同时删键、错 shape、int32 均拒；conditioner 入口、loss 内部 FK 调用前、F fresh 入口与逐窗 FK 前均做 runtime+截止复查（慢精度读取与解码后精度漂移都不再买到一次晚调用）；NPZ 读取把 `zipfile.BadZipFile`/`EOFError`/`zlib.error` 一并结构化包装（CRC 损坏不致 F 无报告退出）。
 - **metric_decode_v1**（域 `cpu_float64_from_saved_x0`）：对保存的 FP32 x0 先做合法性核验（dtype/形状 (60,38)/有限性/rot6d 非退化），再精确提升为 CPU float64；mean/std/lo/hi 取生产实际生效 FP32 常数的精确提升；6D 解码复用 dtype 泛型的 `rot6d_to_mat_torch`；关节走干净限位映射（clamp[-1,1]）。固定保存根位置 (60,3)、根旋转**矩阵** (60,3,3)、29 关节角 (60,29)，全部冻结 clip 系。
 - **保存记录表**（冻结形状/dtype）：每窗每 probe 12 个数组（raw_x0_pred/prod_*/fk_pred/md_*/err_*），教师参考每阶段一份（raw_x0_tgt/fk_tgt 等 8 类）；npz 键前缀 `w{b}__`；`artifacts_index.json` 登记全部文件 SHA-256+字节。
 - **§7.1 四门**：root_position_rmse_m≤0.01、root_rotation_mean_rad≤π/180、joint_rmse_rad≤0.05、teacher_fk_mpjpe_m≤0.01；度量归约 float64；根/旋转/关节只消费重解码量，FK MPJPE 只消费保存的生产 FP32 FK 点。**逐窗四门合取**才记 `window_mean_fit_passed`；宏平均仅展示且 `macro_is_not_a_gate=true`。
@@ -33,7 +34,7 @@
 - 构造/strict 加载后、下一构造或 forward 前执行 `parameter_contract_problems`：全部浮点参数**与缓冲**的 dtype/device 必须匹配冻结契约（真实路径 cuda/float32；合成路径 cpu/float32），错误即停、不静默 cast。
 - 合成路径使用 `SyntheticRuntimeGuard`：只记录单元数，明确 `production_equivalence_claimed=false`，不冒充生产运行时。
 
-## 5. 反例电池（§6.2/v0.3/v0.4 全清单；首轮 35 项 + 第二轮 6 项 + 第三轮 5 项 + 第四轮 4 项 + 第五轮 2 项 + 第六轮 6 项 + 第七轮 5 项 + 第八轮 5 项 + 第九轮 8 项 + 第十轮 5 项 + 第十一轮 6 项 + 第十二轮 5 项 + 第十三轮 6 项 = 98 项）
+## 5. 反例电池（§6.2/v0.3/v0.4 全清单；首轮 35 项 + 第二轮 6 项 + 第三轮 5 项 + 第四轮 4 项 + 第五轮 2 项 + 第六轮 6 项 + 第七轮 5 项 + 第八轮 5 项 + 第九轮 8 项 + 第十轮 5 项 + 第十一轮 6 项 + 第十二轮 5 项 + 第十三轮 6 项 + 第十四轮 7 项 = 105 项）
 
 | 方案要求 | 反例 ID（捕获断言） |
 | --- | --- |
@@ -95,23 +96,28 @@
 | 第十三轮：内部 forward 精度复查 | `runtime_drift_between_numeric_units_stop`（真实 ProductionRuntimeGuard + TF32 注入：conditioner 后 backbone 零启动，D/F 均 incomplete） |
 | 第十三轮：object NPZ | `object_npz_reports_incomplete`（object 数组存档不启用 pickle、落 incomplete 报告+证明） |
 | 第十三轮：条件数组契约 | `condition_contract_reports_incomplete`（contact 缺失/字符串 dtype 经冻结键/形状/dtype 契约结构化拒绝） |
+| 第十四轮：AdamW 有效算术标志 | `optimizer_arithmetic_flags_rejected`（`decoupled_weight_decay=false`、`foreach=true`、`fused=true` 均被实际参数组冻结契约拒绝：零 `opt.step`、D incomplete） |
+| 第十四轮：精度检查自身耗时 | `runtime_check_time_charged` / `f_runtime_check_time_charged`（D 在 `pre_backbone_post_runtime` 拒绝、晚 backbone=0；F 在 `f_fresh_entry` 拒绝、conditioner=0、报告+证明落盘） |
+| 第十四轮：checkpoint 独立架构契约 | `checkpoint_architecture_contract_bound`（两端同删键→`key_set_not_frozen`；last 错 shape→`shape_not_frozen`；last int32→`dtype_not_frozen`；三者本地 mean=null、交接拒绝、F incomplete） |
+| 第十四轮：conditioner/FK/F fresh 精度准入 | `conditioner_and_fk_precision_admission` / `f_fresh_fk_precision_admission`（输入检查后 TF32→conditioner 零执行；生产解码后 TF32→FK 零执行；F fresh FK 前检查后零 FK、报告+证明落盘） |
+| 第十四轮：CRC 损坏 NPZ | `crc_corrupt_npz_reports_incomplete`（probe raw / condition contact 成员 CRC 翻转：结构化 `record/condition_archive_unreadable`，F incomplete 报告+返回证明照常落盘） |
 
 ## 6. 测试结果
 
-- `tests/test_w1_smallset_fit_diagnostic.py`：**17 passed**（CPU，离线；含完整 98 项电池 `test_counterexample_battery_all_caught`）。
-- 反例电池独立运行：**98/98 caught**，ID 集合与冻结清单精确相等（§20 第十三轮审阅修订后）。
-- N0/N1 回归：**33 passed**（N0 `verify_return_coverage` 的加法性 `final_doc` 返回不改变 N0/N1 行为）。
+- `tests/test_w1_smallset_fit_diagnostic.py`：**17 passed**（CPU，离线；含完整 105 项电池 `test_counterexample_battery_all_caught`）。
+- 反例电池独立运行：**105/105 caught**，ID 集合与冻结清单精确相等（§21 第十四轮审阅修订后）。
+- N0/N1 回归：**33 passed**（N0 `verify_return_coverage` 的加法性 `final_doc` 返回不改变 N0/N1 行为）；本轮 I 测试 + N0/N1 合并运行 **50 passed（204.96s）**。
 
 ## 7. 权威合成验收运行
 
-**`derived/audit/w1_smallset_fit_diagnostic/attempt_014/`**（2026-11-10，§20 第十三轮审阅修订后代码，独占创建，CLI exit 0）：单一单调时钟 t0 先于重导入，硬截止 3300s/预留 300s；summary 经发布-核验封口 `sealed_within_budget`（round 1，登记成本 **1443.87s** 覆盖封口、候选写盘、必要回读与返回）+ `return_observation.json` SHA 绑定 covered=true（elapsed 1439.87 ≤ 1443.87）。`attempt_001–004`、`attempt_006–013`（修复前/二轮/三轮/四轮/五轮/六轮/七轮/八轮/九轮/十轮/十一轮/十二轮代码）保留为被取代证据；`attempt_005` 为第五轮修复运行中途实现字节再次变更而终止的残缺目录（无 acceptance_summary/return_observation，不消费）。
+**`derived/audit/w1_smallset_fit_diagnostic/attempt_015/`**（2026-11-10，§21 第十四轮审阅修订后代码，独占创建，CLI exit 0）：单一单调时钟 t0 先于重导入，硬截止 3300s/预留 300s；summary 经发布-核验封口 `sealed_within_budget`（round 1，登记成本 **1441.70s** 覆盖封口、候选写盘、必要回读与返回）+ `return_observation.json` SHA 绑定 covered=true（elapsed 1437.70 ≤ 1441.70，summary_sha256 `b9513c3c…`）。`attempt_001–004`、`attempt_006–014`（修复前/二轮…/十二轮/十三轮代码）保留为被取代证据；`attempt_005` 为第五轮修复运行中途实现字节再次变更而终止的残缺目录（无 acceptance_summary/return_observation，不消费）。
 
-- **微型 D1**（300 步/probe_every 30/lr 0.03，d16 合成世界，登记成本 231.40s，返回覆盖 covered=true（elapsed 227.39））：`local_complete_evidence=true`、调用矩阵实际=期望零偏差、本地核验零问题（完整外部 expected identity、checkpoint 逐项配置/身份（含七项损失权重）与实际张量/键集、实际 AdamW 参数组字段与参数名册、forward/backbone、strict 加载、逐次读取、解码/FK、checkpoint 读取均通过；运行期实际 `loss_fn.w`、loss 内部 decode/FK 截止守卫、conditioner/backbone/loss 入口精度守卫与 clip 取证后守卫均无触发）；教师与预测双侧 metric_decode **重解码逐位绑定**、生产 FP32 解码量**重推导逐位绑定**；step-300 四门全过（root RMSE **0.00115m**、root 旋转均值 **0.00288rad**、joint RMSE **0.00186rad**、teacher FK MPJPE **0.00121m**）→ `local_mean_fit_passed=true`、`complete_fit`；`handoff_candidate.json` 落盘且经 D6 入口消费（外部身份锚与张量事实一致）→ `handoff_ready=true`（problems=[]，交接声明前复查通过）。
-- **微型 D6**（300 步/lr 0.02，六注册窗，登记成本 1356.14s，返回覆盖 covered=true（elapsed 1352.12））：覆盖行多重集精确、**六窗四门全过**（逐窗 `window_mean_fit_passed` 全 true，macro RMSE 0.00633m，`macro_is_not_a_gate` 显式登记）、`local_mean_fit_passed=true`。
+- **微型 D1**（300 步/probe_every 30/lr 0.03，d16 合成世界，登记成本 231.12s，返回覆盖 covered=true（elapsed 227.12））：`local_complete_evidence=true`、调用矩阵实际=期望零偏差、本地核验零问题（完整外部 expected identity、checkpoint 逐项配置/身份（含七项损失权重）与实际张量/键集、实际 AdamW 参数组字段与参数名册、forward/backbone、strict 加载、逐次读取、解码/FK、checkpoint 读取均通过；运行期实际 `loss_fn.w`、loss 内部 decode/FK 截止守卫、conditioner/backbone/loss 入口精度守卫与 clip 取证后守卫均无触发）；教师与预测双侧 metric_decode **重解码逐位绑定**、生产 FP32 解码量**重推导逐位绑定**；step-300 四门全过（root RMSE **0.00115m**、root 旋转均值 **0.00288rad**、joint RMSE **0.00186rad**、teacher FK MPJPE **0.00121m**）→ `local_mean_fit_passed=true`、`complete_fit`；`handoff_candidate.json` 落盘且经 D6 入口消费（外部身份锚与张量事实一致）→ `handoff_ready=true`（problems=[]，交接声明前复查通过）。
+- **微型 D6**（300 步/lr 0.02，六注册窗，登记成本 1350.85s，返回覆盖 covered=true（elapsed 1346.85））：覆盖行多重集精确、**六窗四门全过**（逐窗 `window_mean_fit_passed` 全 true，macro RMSE 0.00633m，`macro_is_not_a_gate` 显式登记）、`local_mean_fit_passed=true`。
 - **F**：每阶段外部 expected identity 前置核验通过；返回证明前置核验通过；对两阶段各 fresh 构造+initial/last 各一次契约核验后 strict 加载 probe（每阶段恰 2 次 fresh 预测）；输入重建逐次读取与 condition 键/形状/float32 契约、conditioner→backbone、strict 加载、教师重读、fresh 解码/FK、指标归约与 checkpoint 读取均在逐单元截止/精度守卫下通过；原始 x0、生产 FP32 解码量与 FK 点对保存数组**逐位一致**，教师侧从原始 x0 重解码绑定后对账；完成声明门 `claim_deadline_exceeded` 本轮未触发；F 自身对 f_report.json 的封口后回读执行**独立返回覆盖核验**（covered=true）→ `replay_passed=true`、`complete_evidence=true`、`mean_fit_passed=true`、`verdict=fit_pass`、`tolerance_policy=bitwise_no_tolerance`。
-- **反例电池**：98/98 caught（ID 集合与冻结清单精确相等，含 §20 新增 6 项）。
+- **反例电池**：105/105 caught（ID 集合与冻结清单精确相等，含 §21 新增 7 项）。
 
-历史运行 `attempt_001`（修复前代码）、`attempt_002`（§8 修订后）、`attempt_003`（§10 修订后）、`attempt_004`（§11 修订后）、`attempt_006`（§12 修订后）、`attempt_007`（§13 修订后）、`attempt_008`（§14 修订后）、`attempt_009`（§15 修订后）、`attempt_010`（§16 修订后）、`attempt_011`（§17 修订后）、`attempt_012`（§18 修订后）、`attempt_013`（§19 修订后）保留为被取代证据：其证据分别不含后续轮次的修复项（教师解码绑定/必需工件集合 → 证明预算绑定/候选时序 → 回读入窗/F 自身覆盖/声明门 → 保存量重算截止守卫/阶段停止收口/撤回成本同步 → 驱动与交接预算守卫/F 端点边界/撤回最终文档快照 → helper 内部逐单元守卫/交接声明复查/驱动截断计数 → forward 与 strict 加载边界/输入重建与端点逐读/坏容器结构化收口 → checkpoint 配置/身份语义绑定/D 内部单元链/F 身份读取/计数边界/嵌套坏结构 → 七项 loss 权重绑定/身份摘要锚/predict 后守卫/被拒 backbone 计数/metrics 与 root_stats 坏容器 → 完整外部身份锚/运行期损失权重复核/loss 内部 decode-FK 守卫/进入即计数/严格整数与坏配置容器 → 实际 AdamW 参数组/conditioner 与 clip 前守卫/F 入口计数/溢出安全/坏 NPZ dtype → AdamW 扩展字段与参数名册/绑定读取守卫/checkpoint 实际张量与键集/内部 forward 精度复查/object NPZ 与条件契约），不可消费为本轮结论。**合成四门通过只证明 I 阶段管线机制与门实现本身在合成世界上自洽；不外推到真实 W1 训练窗（真实可达性属 R/D1/D6 的授权后问题）。**
+历史运行 `attempt_001`（修复前代码）、`attempt_002`（§8 修订后）、`attempt_003`（§10 修订后）、`attempt_004`（§11 修订后）、`attempt_006`（§12 修订后）、`attempt_007`（§13 修订后）、`attempt_008`（§14 修订后）、`attempt_009`（§15 修订后）、`attempt_010`（§16 修订后）、`attempt_011`（§17 修订后）、`attempt_012`（§18 修订后）、`attempt_013`（§19 修订后）、`attempt_014`（§20 修订后）保留为被取代证据：其证据分别不含后续轮次的修复项（教师解码绑定/必需工件集合 → 证明预算绑定/候选时序 → 回读入窗/F 自身覆盖/声明门 → 保存量重算截止守卫/阶段停止收口/撤回成本同步 → 驱动与交接预算守卫/F 端点边界/撤回最终文档快照 → helper 内部逐单元守卫/交接声明复查/驱动截断计数 → forward 与 strict 加载边界/输入重建与端点逐读/坏容器结构化收口 → checkpoint 配置/身份语义绑定/D 内部单元链/F 身份读取/计数边界/嵌套坏结构 → 七项 loss 权重绑定/身份摘要锚/predict 后守卫/被拒 backbone 计数/metrics 与 root_stats 坏容器 → 完整外部身份锚/运行期损失权重复核/loss 内部 decode-FK 守卫/进入即计数/严格整数与坏配置容器 → 实际 AdamW 参数组/conditioner 与 clip 前守卫/F 入口计数/溢出安全/坏 NPZ dtype → AdamW 扩展字段与参数名册/绑定读取守卫/checkpoint 实际张量与键集/内部 forward 精度复查/object NPZ 与条件契约 → AdamW 有效算术标志/精度读取耗时/runtime 检查自身耗时/checkpoint 独立架构契约/conditioner 与 FK 准入精度/CRC NPZ 收口），不可消费为本轮结论。**合成四门通过只证明 I 阶段管线机制与门实现本身在合成世界上自洽；不外推到真实 W1 训练窗（真实可达性属 R/D1/D6 的授权后问题）。**
 
 ## 8. 第二轮独立审阅修订（2026-11-08：7 P1 + 2 P2 全部修复）
 
@@ -329,3 +335,23 @@
 **权威合成验收 `derived/audit/w1_smallset_fit_diagnostic/attempt_014/`**（2026-11-10，第十三轮修复后代码，独占创建，CLI exit 0）：封口 `sealed_within_budget`（round 1）、登记成本 **1443.87s** ≤ 3300s、返回覆盖 covered=true（elapsed 1439.87 ≤ 1443.87）；微型 D1（300 步，登记成本 231.40s，返回覆盖 covered（227.39））四门全过（RMSE 0.00115m / 0.00288rad / 0.00186rad / FK 0.00121m）→ `handoff_ready=true`（候选经 D6 入口消费，交接声明前复查通过）；微型 D6（登记成本 1356.14s，返回覆盖 covered（1352.12））六窗四门全过（逐窗 true，macro RMSE 0.00633m）；F 两阶段逐位重放通过（`fit_pass`、`claim_deadline_exceeded` 未触发、F 自身返回覆盖 covered=true）；**98/98 反例捕获**。`attempt_013` 保留为被取代证据（其证据不含第十三轮的 AdamW 扩展字段与参数名册、绑定读取守卫、checkpoint 实际张量与键集、内部 forward 精度复查、object NPZ 与条件契约修复项）。
 
 **边界（与前轮一致）：R/真实 D1/D6/F 未实施、未授权、未运行；真实拟合仍须 §8.3 新冻结材料与新明确授权；T6 旧结论与 partial/null/false/not_ready/不接入全部保持；本轮未运行全项目套件（仅本交付 17 passed + N0/N1 回归 33 passed）。**
+
+## 21. 第十四轮独立审阅修订（2026-11-10：4 P1 + 1 P2 全部修复）
+
+第十三轮修订经独立复审确认有效（attempt_014 四份证明、保存量、调用矩阵、交接及 98/98 电池记录成立，登记成本 1443.87s≤3300s；第十三轮原攻击重放全部拦截），但新隔离反例复现 4 P1 + 1 P2（复现脚本 `/tmp/opencode/review_i_round13_new_boundaries_20261110.py`、结果 `/tmp/opencode/review_i_round13_new_boundaries_20261110_results.json`）。全部接受并修复，电池扩至 **105 项**；attempt_014 自本轮起为被取代证据。
+
+| # | 复审发现 | 修复 |
+| --- | --- | --- |
+| P1-1 | AdamW 有效算术字段仍未绑定：仅把实际参数组的 `decoupled_weight_decay` 置 false（实际更新改变 47 个参数张量）或把 `foreach`/`fused` 置 true，D/F 仍完整、端点重放仍通过 | `ADAMW_ARITHMETIC_FLAGS` 冻结 `decoupled_weight_decay=true`、`foreach=None`、`fused=None`、`capturable=false`、`differentiable=false`，与实际 `param_groups` 的 lr/wd/betas/eps/maximize/amsgrad 和参数 id 名册同契约逐组复核（`optimizer_group_mismatch`）；构造/preflight/每 micro/clip 取证后/step 前/save 前同契约复核，篡改后零 `opt.step` |
+| P1-2 | 精度检查自身耗时未覆盖准入：工作截止 90s 时 runtime 检查返回才把时钟推进至 91s，D 仍启动一次 backbone；F 在 `f_probe_initial_inputs_ready` 的 runtime 检查后仍启动一次 conditioner 才停止 | 每个 runtime 检查后紧接预算复查：`_pre_conditioner/_pre_backbone/_pre_loss` 分别新增 `*_post_runtime`，F `_fresh_probe` 入口新增 `f_fresh_entry`（预算+runtime）、backbone 完成后新增 `f_fresh_backbone_complete` 预算复查；慢精度读取不再买到一次晚调用 |
+| P1-3 | checkpoint 两端自洽不等于架构合法：两端同时删除同一参数键、或把 last 参数改为错误形状/int32，重签后均 `problems=[]`、`handoff_ready=true` | 新增 `_plan_state_contract`：由**冻结 plan**（model_type/d_model/n_layers/n_heads/ffn_mult/time_window）用生产构造器构建参考模块，派生每侧**完整键集+shape+dtype** 契约（预算守卫、`torch.random` 状态隔离、无 forward/优化器、按架构缓存）；`_checkpoint_architecture_problems` 对两端逐项比较（`*_key_set_not_frozen`/`*_shape_not_frozen`/`*_dtype_not_frozen`），本地核验与交接共用；F 的 strict 加载前契约（fresh 模块）继续拒绝同类篡改 |
+| P1-4 | conditioner/FK 准入仍缺精度复查：输入检查后开启 TF32 仍执行一次 conditioner；生产解码后开启 TF32，D/F 分别继续执行 2 次/1 次 FK 才拒绝 | `_pre_conditioner_gate` 增 runtime 复查；loss 内部每次 FK 的 pre-call 增 runtime 复查（`*_loss_fk_pre`），损失解码后也复查（`*_loss_decode_pre/_post`）；F `_fresh_probe` 入口与逐窗 FK 前各增 runtime 复查（`f_fresh_entry`/`f_fresh_fk_w*`）；真实 `ProductionRuntimeGuard` 下 TF32 注入后 conditioner=0、FK=0，D/F incomplete |
+| P2-5 | CRC 损坏的 NPZ 仍使 F 无报告退出：翻转 raw 或 contact 成员的一个字节（ZIP 目录完好）触发未捕获 `BadZipFile`，分别零构造/一次构造但均无 f_report 与返回证明 | `read_npz_records` 与 F condition 读取的异常集合加入 `zipfile.BadZipFile`/`EOFError`/`zlib.error`，CRC 损坏转为结构化 `record_archive_unreadable`/`condition_archive_unreadable`，经既有收口落 incomplete 报告+返回证明；不启用 pickle |
+
+新增 7 项电池反例：`optimizer_arithmetic_flags_rejected`、`runtime_check_time_charged`、`f_runtime_check_time_charged`、`checkpoint_architecture_contract_bound`、`conditioner_and_fk_precision_admission`、`f_fresh_fk_precision_admission`、`crc_corrupt_npz_reports_incomplete`。
+
+定点复现（隔离脚本 `/tmp/opencode/verify_round14_fixes.py`，结果 `verify_round14_fixes_results.json`）实测：三个算术标志篡改均为 `optimizer_binding` 拒绝、零 step、D incomplete；D 慢 runtime 读取得到 `pre_backbone_post_runtime`、晚 backbone=0；F 慢 runtime 读取得到 `f_fresh_entry`、conditioner=0、报告+证明落盘；checkpoint 同删键/错 shape/int32 分别得到 `key_set_not_frozen`/`shape_not_frozen`/`dtype_not_frozen`，本地 mean=null、交接拒绝、F incomplete；TF32 在输入检查后注入使 conditioner 零执行（`pre_conditioner`），在生产解码后注入使 FK 零执行（`loss_decode_post`），F fresh 解码后注入使 fresh FK 零执行；CRC 两形态均 `error=None`、报告+证明落盘、`verdict=incomplete`。电池内同一组反例作为 `test_counterexample_battery_all_caught` 的一部分运行；I 测试 + N0/N1 回归 **50 passed（204.96s）**。
+
+**权威合成验收 `derived/audit/w1_smallset_fit_diagnostic/attempt_015/`**（2026-11-10，第十四轮修复后代码，独占创建，CLI exit 0）：封口 `sealed_within_budget`（round 1）、登记成本 **1441.70s** ≤ 3300s、返回覆盖 covered=true（elapsed 1437.70 ≤ 1441.70，summary_sha256 `b9513c3c…`）；微型 D1（300 步，登记成本 231.12s，返回覆盖 covered（227.12））四门全过（RMSE 0.00115m / 0.00288rad / 0.00186rad / FK 0.00121m）→ `handoff_ready=true`（候选经 D6 入口消费，交接声明前复查通过）；微型 D6（登记成本 1350.85s，返回覆盖 covered（1346.85））六窗四门全过（逐窗 true，macro RMSE 0.00633m）；F 两阶段逐位重放通过（`fit_pass`、`claim_deadline_exceeded` 未触发、F 自身返回覆盖 covered=true）；**105/105 反例捕获**。`attempt_014` 保留为被取代证据（其证据不含第十四轮的 AdamW 有效算术标志、runtime 检查耗时复查、checkpoint 独立架构契约、conditioner/FK 准入精度、CRC NPZ 收口修复项）。
+
+**边界（与前轮一致）：R/真实 D1/D6/F 未实施、未授权、未运行；真实拟合仍须 §8.3 新冻结材料与新明确授权；T6 旧结论与 partial/null/false/not_ready/不接入全部保持；本轮未运行全项目套件（仅本交付 17 passed + N0/N1 回归 33 passed，合并 50 passed）。**
