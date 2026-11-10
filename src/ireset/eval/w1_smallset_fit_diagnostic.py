@@ -1156,6 +1156,58 @@ def _loss_weight_problems(weights, label: str) -> list[str]:
     return problems
 
 
+def _optimizer_state_problems(opt, expected_step: int) -> list[str]:
+    """P1 (round-15): the frozen claim is a FROM-SCRATCH, step-0 AdamW.  A
+    preloaded (step, exp_avg, exp_avg_sq) silently changes every update while
+    all frozen hyperparameters and the parameter roster still match.  At the
+    declared step 0 the actual state must be EMPTY; afterwards every populated
+    entry must carry exactly the driver's completed step count and shape-aligned
+    finite moments."""
+    state = getattr(opt, "state", None)
+    if not isinstance(state, dict):
+        return ["optimizer_state_missing"]
+    if not _is_json_int(expected_step) or expected_step < 0:
+        return [f"optimizer_expected_step_invalid:{expected_step!r}"]
+    if expected_step == 0:
+        return ([] if not state
+                else [f"optimizer_state_not_empty:{len(state)}"])
+    problems: list[str] = []
+    for idx, (param, entry) in enumerate(state.items()):
+        if not isinstance(entry, dict):
+            problems.append(f"optimizer_state_entry_not_a_mapping:{idx}")
+            continue
+        step = entry.get("step")
+        if torch.is_tensor(step):
+            if step.numel() != 1:
+                problems.append(f"optimizer_state_step_not_scalar:{idx}")
+                continue
+            try:
+                value = float(step.detach().cpu().item())
+            except (TypeError, ValueError):
+                problems.append(f"optimizer_state_step_unreadable:{idx}")
+                continue
+        elif isinstance(step, bool) or not isinstance(step, (int, float)):
+            problems.append(f"optimizer_state_step_unreadable:{idx}")
+            continue
+        else:
+            value = float(step)
+        if not math.isfinite(value) or value != float(expected_step):
+            problems.append(
+                f"optimizer_state_step:{idx}:{value!r}:want{expected_step}")
+        param_shape = getattr(param, "shape", None)
+        for key in ("exp_avg", "exp_avg_sq"):
+            moment = entry.get(key)
+            if (not torch.is_tensor(moment) or param_shape is None
+                    or moment.shape != param_shape):
+                problems.append(f"optimizer_state_{key}_shape:{idx}")
+                continue
+            if not bool(torch.isfinite(moment).all()):
+                problems.append(f"optimizer_state_{key}_nonfinite:{idx}")
+            elif key == "exp_avg_sq" and bool((moment < 0).any()):
+                problems.append(f"optimizer_state_{key}_negative:{idx}")
+    return problems
+
+
 def _optimizer_binding_problems(trainer, plan: FitPlan) -> list[str]:
     """P1 (round-12/13): the ACTUAL AdamW parameter groups are the update
     arithmetic — ``trainer.cfg`` being correct is not enough.  Every group's
@@ -1311,7 +1363,15 @@ class FitDriver:
         opt_problems = _optimizer_binding_problems(trainer, plan)
         if opt_problems:
             raise FitDiagnosticError(f"optimizer_binding:{opt_problems}")
+        # P1 (round-15): the step-0 empty state is part of the frozen claim.
+        state_problems = _optimizer_state_problems(trainer.opt, 0)
+        if state_problems:
+            raise FitDiagnosticError(
+                f"optimizer_state_binding:{state_problems}")
         self.trainer, self.plan, self.registration = trainer, plan, registration
+        # completed native optimizer steps; the ACTUAL state counters must
+        # follow it exactly (round-15).
+        self._completed_steps = 0
         self.decoder, self.budget = decoder, budget
         self.runtime_guard = runtime_guard
         # P1 (round-10): the stage identity is anchored to the plan and the
@@ -1511,13 +1571,21 @@ class FitDriver:
         if problems:
             raise FitDiagnosticError(f"optimizer_binding:{problems}")
 
+    def _check_optimizer_state(self) -> None:
+        problems = _optimizer_state_problems(self.trainer.opt,
+                                             self._completed_steps)
+        if problems:
+            raise FitDiagnosticError(f"optimizer_state_drift:{problems}")
+
     def _check_runtime_bindings(self) -> None:
-        """Config + actual loss object + ACTUAL AdamW parameter groups are
-        re-checked at every numeric boundary; any independent mutation is a
-        drift, not a silently consumed update."""
+        """Config + actual loss object + ACTUAL AdamW parameter groups and
+        their initial/advancing state are re-checked at every numeric
+        boundary; any independent mutation is a drift, not a silently
+        consumed update."""
         self._check_trainer_config(self.trainer, self.plan)
         self._check_loss_weights()
         self._check_optimizer_binding()
+        self._check_optimizer_state()
 
     def _guard_loss_fk_pre(self) -> None:
         if self._guard_point is not None:
@@ -1525,6 +1593,10 @@ class FitDriver:
             # P1 (round-14): the production decode may have returned under a
             # drifted precision/runtime; the FK call itself must refuse.
             self.runtime_guard.check_unit(self._guard_point + "_loss_fk_pre")
+            # P1 (round-15): the runtime read is itself work — charge it
+            # before the FK is admitted.
+            self.budget.check(
+                self._guard_point + "_loss_fk_pre_post_runtime")
 
     def _guard_loss_fk_post(self) -> None:
         if self._guard_point is not None:
@@ -1537,12 +1609,18 @@ class FitDriver:
         if self._guard_point is not None:
             self.budget.check(self._guard_point + "_loss_decode_pre")
             self.runtime_guard.check_unit(self._guard_point + "_loss_decode_pre")
+            # P1 (round-15): charge the runtime read before the decode starts.
+            self.budget.check(
+                self._guard_point + "_loss_decode_pre_post_runtime")
         out = self._real_decode_clip(*args, **kwargs)
         if self._guard_point is not None:
             # P1 (round-14): a drift enabled while the decode ran refuses the
             # following FK chain at this boundary too.
             self.budget.check(self._guard_point + "_loss_decode_post")
             self.runtime_guard.check_unit(self._guard_point + "_loss_decode_post")
+            # P1 (round-15): the post-decode runtime read is charged too.
+            self.budget.check(
+                self._guard_point + "_loss_decode_post_post_runtime")
         return out
 
     def _guarded_predict(self, *args, **kwargs):
@@ -1811,6 +1889,11 @@ class FitDriver:
             self._phase = f"step_{step}_optimizer_update"
             self.counters["adamw_step_calls"] += 1
             trainer.step_optimizer()
+            # P1 (round-15): one executed native step advances the frozen
+            # counter exactly once; the ACTUAL optimizer state must follow it
+            # (a stale/preloaded step is a refusal, never a silent update).
+            self._completed_steps += 1
+            self._check_optimizer_state()
             trainer._check_params()
             self.history.append({"step": step, "n_micro": n_micro,
                                  "n_samples": n_samples,
@@ -2217,10 +2300,12 @@ def verify_stage_local(stage_dir: Path, plan: FitPlan,
                 report_identity = declared
             else:
                 problems.append("stage_report_identity_invalid")
+    identity_failed = False
     if expected_identity is not None:
         if report_identity is not None and not _json_value_equal(
                 report_identity, expected_identity):
             problems.append("stage_report_identity_mismatch")
+            identity_failed = True
         identity_to_bind = expected_identity
     else:
         identity_to_bind = report_identity
@@ -2228,8 +2313,11 @@ def verify_stage_local(stage_dir: Path, plan: FitPlan,
         # P1 (round-10): the identity is anchored to the plan/registration
         # this verifier was given — a coordinated report+checkpoint rewrite
         # cannot make a foreign identity self-consistent.
-        problems += _identity_binding_problems(identity_to_bind, plan,
-                                               registration)
+        binding_problems = _identity_binding_problems(identity_to_bind, plan,
+                                                      registration)
+        if binding_problems:
+            identity_failed = True
+        problems += binding_problems
     probe_index_path = stage_dir / "probe_index.json"
     if not probe_index_path.is_file():
         problems.append("probe_index_missing")
@@ -2475,9 +2563,12 @@ def verify_stage_local(stage_dir: Path, plan: FitPlan,
                 "missing": missing, "extra": extra, "duplicated": duplicated}
 
     # 4. checkpoint role/step/config/identity binding ---------------------------
-    problems += _checkpoint_binding_problems(stage_dir, plan, decoder,
-                                             budget=budget,
-                                             expected_identity=identity_to_bind)
+    problems += _checkpoint_binding_problems(
+        stage_dir, plan, decoder, budget=budget,
+        expected_identity=identity_to_bind,
+        # P1 (round-15): an already-refused identity skips the reference
+        # construction (it is a real, budgeted numeric unit).
+        skip_state_contract=identity_failed)
 
     complete = problems == [] and len(final_windows) == len(window_ids)
     mean_fit = (bool(all(w["metrics"]["window_mean_fit_passed"]
@@ -2548,9 +2639,13 @@ def _checkpoint_identity_problems(ck: dict, name: str,
 _STATE_CONTRACT_CACHE: dict[tuple, dict[str, dict[str, tuple]]] = {}
 
 
-def _plan_fresh_modules(plan: FitPlan):
+def _plan_fresh_modules(plan: FitPlan, budget: StageBudget | None = None):
     """P1 (round-14): fresh modules for the FROZEN plan's architecture, from
-    the same constructors ``Trainer`` uses — never trained, never forwarded."""
+    the same constructors ``Trainer`` uses — never trained, never forwarded.
+
+    P1 (round-15): each construction is its own unit — a model returning past
+    the work deadline refuses the conditioner construction that follows."""
+    check = budget.check if budget is not None else (lambda _point: None)
     if plan.model_type == "diffusion":
         from ireset.diffusion.generator import DiffusionG1
         model = DiffusionG1(num_train_timesteps=PLAN_NUM_TRAIN_TIMESTEPS,
@@ -2558,8 +2653,11 @@ def _plan_fresh_modules(plan: FitPlan):
     else:
         from ireset.model.deterministic import DeterministicG1
         model = DeterministicG1(**_backbone_kwargs(plan))
+    check("saved_state_contract_model")
     from ireset.model.conditioner import ConditionEncoder
-    return model, ConditionEncoder(plan.d_model)
+    conditioner = ConditionEncoder(plan.d_model)
+    check("saved_state_contract_conditioner")
+    return model, conditioner
 
 
 def _plan_state_contract(plan: FitPlan,
@@ -2580,7 +2678,7 @@ def _plan_state_contract(plan: FitPlan,
         budget.check("saved_state_contract_build")
     rng_state = torch.random.get_rng_state()
     try:
-        model, conditioner = _plan_fresh_modules(plan)
+        model, conditioner = _plan_fresh_modules(plan, budget)
         contract = {
             "model": {name: (tuple(t.shape), str(t.dtype))
                       for name, t in model.state_dict().items()},
@@ -2603,6 +2701,15 @@ def _checkpoint_architecture_problems(
         got = ck.get(side)
         if not isinstance(got, dict):
             continue  # reported by _checkpoint_state_problems
+        # P2 (round-15): a readable checkpoint may carry mixed-primitive keys;
+        # sorting them raises TypeError and kills F without a report.  Key
+        # TYPE is validated before any ordering.
+        bad_keys = [key for key in got if not isinstance(key, str)]
+        if bad_keys:
+            problems.append(
+                f"checkpoint_{side}_key_type_not_string:{name}:"
+                f"{sorted(repr(k) for k in bad_keys)[:3]}")
+            continue
         want = contract[side]
         missing = sorted(set(want) - set(got))
         extra = sorted(set(got) - set(want))
@@ -2657,7 +2764,8 @@ def _checkpoint_state_problems(ck: dict, name: str
 def _checkpoint_binding_problems(stage_dir: Path, plan: FitPlan,
                                  decoder: MetricDecoder,
                                  budget: StageBudget | None = None,
-                                 expected_identity: dict | None = None) -> list[str]:
+                                 expected_identity: dict | None = None,
+                                 skip_state_contract: bool = False) -> list[str]:
     """Checkpoint role/step/root-stats/config/identity binding; when
     ``budget`` is given, every checkpoint read is guarded (P1 round-7: a
     reduction returning past the work deadline refuses the checkpoint
@@ -2665,16 +2773,12 @@ def _checkpoint_binding_problems(stage_dir: Path, plan: FitPlan,
     check = budget.check if budget is not None else (lambda _point: None)
     problems: list[str] = []
     state_key_sets: dict[str, dict[str, frozenset]] = {}
-    contract = None
+    loaded: list[tuple[str, dict]] = []
     for name, want_step in (("initial.pt", 0), ("last.pt", plan.steps)):
         path = Path(stage_dir) / name
         if not path.is_file():
             problems.append(f"checkpoint_missing:{name}")
             continue
-        if contract is None:
-            # P1 (round-14): the plan-derived roster, built only when a
-            # checkpoint actually exists to compare against.
-            contract = _plan_state_contract(plan, budget)
         check(f"saved_checkpoint_read_{name}")
         try:
             ck = torch.load(path, map_location="cpu", weights_only=False)
@@ -2700,7 +2804,7 @@ def _checkpoint_binding_problems(stage_dir: Path, plan: FitPlan,
         # structural mismatch even with a re-signed artifact chain).
         key_sets, state_problems = _checkpoint_state_problems(ck, name)
         problems += state_problems
-        problems += _checkpoint_architecture_problems(ck, name, contract)
+        loaded.append((name, ck))
         state_key_sets[name] = key_sets
     if len(state_key_sets) == 2:
         for side in ("model", "conditioner"):
@@ -2708,6 +2812,16 @@ def _checkpoint_binding_problems(stage_dir: Path, plan: FitPlan,
             last = state_key_sets["last.pt"].get(side)
             if initial is not None and last is not None and initial != last:
                 problems.append(f"checkpoint_state_key_set_mismatch:{side}")
+    # P1 (round-15): the reference construction is a real, budget-guarded
+    # numeric unit (model then conditioner).  It is only worth doing for a
+    # stage whose declared/per-checkpoint identity is already sound — an
+    # identity refusal must not silently construct reference modules.
+    identity_failed = skip_state_contract or any(
+        "identity" in p for p in problems)
+    if loaded and not identity_failed:
+        contract = _plan_state_contract(plan, budget)
+        for name, ck in loaded:
+            problems += _checkpoint_architecture_problems(ck, name, contract)
     return problems
 
 
@@ -2860,6 +2974,9 @@ def _fresh_probe(model, conditioner, batch: dict, plan: FitPlan,
         check("f_fresh_entry")
         if runtime_guard is not None:
             runtime_guard.check_unit("f_fresh_entry")
+            # P1 (round-15): the runtime read is itself work — charge it
+            # before the conditioner is admitted.
+            check("f_fresh_entry_post_runtime")
         # P2 (round-12): count at the ENTRY of the actual numeric call — an
         # executed conditioner/backbone that raises afterwards is still an
         # actual call; a budget refusal BEFORE the call is not.
@@ -2907,6 +3024,8 @@ def _fresh_probe(model, conditioner, batch: dict, plan: FitPlan,
         # drifted precision/runtime — the FK itself must refuse.
         if runtime_guard is not None:
             runtime_guard.check_unit(f"f_fresh_fk_w{b}")
+            # P1 (round-15): charge the runtime read before the FK starts.
+            check(f"f_fresh_fk_w{b}_post_runtime")
         counters["production_fk_batch_calls"] = \
             counters.get("production_fk_batch_calls", 0) + 1
         kp = loss_fn.fk.site_world_positions(
@@ -3906,6 +4025,11 @@ COUNTEREXAMPLE_IDS = (
     "conditioner_and_fk_precision_admission",
     "f_fresh_fk_precision_admission",
     "crc_corrupt_npz_reports_incomplete",
+    "optimizer_initial_state_bound",
+    "decode_fk_runtime_read_time_charged",
+    "f_fresh_runtime_read_time_charged",
+    "state_contract_construction_guarded",
+    "mixed_checkpoint_keys_report_incomplete",
 )
 
 
@@ -7957,6 +8081,333 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
                all(crc_r14.values()),
                "CRC-corrupted raw/condition NPZ members are structural "
                f"refusals that still publish the F report ({crc_r14})")
+
+        # ==================================================================
+        # Round-15 review counterexamples
+        # ==================================================================
+        # --- P1(r15): the from-scratch step-0 optimizer state is frozen -----
+        opt_state_r15: dict = {}
+        for injected in (False, True):
+            world_os = _r9_world(seed + 91)
+            holder_os = {"t": 0.0}
+            budget_os = StageBudget("D1", 100.0, 10.0, t0=0.0,
+                                    clock=lambda: holder_os["t"])
+            _, driver_os, _ = _r9_driver(tmp / f"r15optstate_{injected}", "D1",
+                                         budget_os, world_os)
+            target_os = driver_os.trainer._named_parameters()[0][1]
+            if injected:
+                driver_os.trainer.opt.state[target_os] = {
+                    "step": torch.tensor(17.0),
+                    "exp_avg": torch.full_like(target_os, 0.1),
+                    "exp_avg_sq": torch.full_like(target_os, 0.01)}
+            steps_os: list = []
+            real_step_os = driver_os.trainer.opt.step
+
+            def observe_step_os(*a, _real=real_step_os, _steps=steps_os, **kw):
+                _steps.append(1)
+                return _real(*a, **kw)
+
+            with patch.object(driver_os.trainer.opt, "step",
+                              observe_step_os), \
+                    patch.object(trainer_mod, "time",
+                                 types.SimpleNamespace(
+                                     perf_counter=budget_os.clock)):
+                summary_os = driver_os.run()
+            failure_os = summary_os.get("failure") or {}
+            opt_state_r15[str(injected)] = {
+                "steps": len(steps_os),
+                "failure": failure_os.get("type"),
+                "message": failure_os.get("message", ""),
+                "complete": summary_os.get("local_complete_evidence")}
+        caught = (opt_state_r15["False"]["steps"] == 1
+                  and opt_state_r15["False"]["complete"] is True
+                  and opt_state_r15["True"]["steps"] == 0
+                  and opt_state_r15["True"]["failure"] == "FitDiagnosticError"
+                  and "optimizer_state" in opt_state_r15["True"]["message"]
+                  and opt_state_r15["True"]["complete"] is False)
+        record("optimizer_initial_state_bound", caught,
+               "a preloaded momentum/step-17 state is refused at preflight "
+               f"before any update ({opt_state_r15})")
+
+        # --- P1(r15): the new decode/FK runtime reads are time too ----------
+        d_time_r15: dict = {}
+        for point in ("none", "step_1_micro_1_loss_decode_pre",
+                      "step_1_micro_1_loss_fk_pre"):
+            world_dt = _r9_world(seed + 92)
+            holder_dt = {"t": 0.0}
+            budget_dt = StageBudget("D1", 100.0, 10.0, t0=0.0,
+                                    clock=lambda: holder_dt["t"])
+            _, driver_dt, _ = _r9_driver(tmp / f"r15dtime_{point}", "D1",
+                                         budget_dt, world_dt)
+            calls_dt = {"injections": 0, "decode": 0, "late_decode": 0,
+                        "fk": 0, "late_fk": 0}
+            real_check_dt = driver_dt.runtime_guard.check_unit
+            real_decode_dt = driver_dt._real_decode_clip
+            real_fk_dt = driver_dt._real_fk.site_world_positions
+
+            def check_dt(where, _base=real_check_dt, _point=point,
+                         _ct=holder_dt, _c=calls_dt):
+                value = _base(where)
+                if where == _point and _c["injections"] == 0:
+                    _ct["t"] = 91.0
+                    _c["injections"] += 1
+                return value
+
+            def decode_dt(*a, _real=real_decode_dt, _c=calls_dt,
+                          _ct=holder_dt, _bg=budget_dt, **kw):
+                _c["decode"] += 1
+                _c["late_decode"] += int(
+                    _ct["t"] >= _bg.work_deadline)
+                return _real(*a, **kw)
+
+            def fk_dt(*a, _real=real_fk_dt, _c=calls_dt, _ct=holder_dt,
+                      _bg=budget_dt, **kw):
+                _c["fk"] += 1
+                _c["late_fk"] += int(_ct["t"] >= _bg.work_deadline)
+                return _real(*a, **kw)
+
+            driver_dt._real_decode_clip = decode_dt
+            with patch.object(driver_dt.runtime_guard, "check_unit",
+                              check_dt), \
+                    patch.object(driver_dt._real_fk, "site_world_positions",
+                                 fk_dt), \
+                    patch.object(trainer_mod, "time",
+                                 types.SimpleNamespace(
+                                     perf_counter=budget_dt.clock)):
+                summary_dt = driver_dt.run()
+            failure_dt = summary_dt.get("failure") or {}
+            d_time_r15[point] = {
+                **calls_dt, "failure": failure_dt.get("type"),
+                "message": failure_dt.get("message", ""),
+                "complete": summary_dt.get("local_complete_evidence")}
+        caught = (d_time_r15["none"]["late_decode"] == 0
+                  and d_time_r15["none"]["late_fk"] == 0
+                  and d_time_r15["none"]["complete"] is True
+                  and d_time_r15["step_1_micro_1_loss_decode_pre"][
+                      "injections"] == 1
+                  and d_time_r15["step_1_micro_1_loss_decode_pre"][
+                      "late_decode"] == 0
+                  and d_time_r15["step_1_micro_1_loss_decode_pre"][
+                      "failure"] == "BudgetExceeded"
+                  and "loss_decode_pre_post_runtime"
+                  in d_time_r15["step_1_micro_1_loss_decode_pre"]["message"]
+                  and d_time_r15["step_1_micro_1_loss_fk_pre"][
+                      "injections"] == 1
+                  and d_time_r15["step_1_micro_1_loss_fk_pre"][
+                      "late_fk"] == 0
+                  and d_time_r15["step_1_micro_1_loss_fk_pre"][
+                      "failure"] == "BudgetExceeded"
+                  and "loss_fk_pre_post_runtime"
+                  in d_time_r15["step_1_micro_1_loss_fk_pre"]["message"])
+        record("decode_fk_runtime_read_time_charged", caught,
+               "a slow precision read at the decode/FK admissions is charged "
+               f"before the numeric unit starts ({d_time_r15})")
+
+        f_time_r15: dict = {}
+        for point in ("none", "f_fresh_entry", "f_fresh_fk_w0"):
+            holder_ft2 = {"t": 0.0}
+            budget_ft2 = StageBudget("F", 100.0, 10.0, t0=0.0,
+                                     clock=lambda: holder_ft2["t"])
+            guard_ft2 = SyntheticRuntimeGuard()
+            calls_ft2 = {"injections": 0, "conditioner": 0,
+                         "late_conditioner": 0, "fresh_fk": 0,
+                         "late_fresh_fk": 0}
+            base_check_ft2 = guard_ft2.check_unit
+            base_factory_ft2 = build_modules_factory(world_r9,
+                                                     fixtures_r9["D1"][0])
+            base_fk_ft2 = world_r9.loss_fn.fk.site_world_positions
+
+            def check_ft2(where, _base=base_check_ft2, _point=point,
+                          _ct=holder_ft2, _c=calls_ft2):
+                value = _base(where)
+                if where == _point and _c["injections"] == 0:
+                    _ct["t"] = 91.0
+                    _c["injections"] += 1
+                return value
+
+            def factory_ft2(_base=base_factory_ft2, _c=calls_ft2,
+                            _ct=holder_ft2, _bg=budget_ft2):
+                model_ft2, cond_ft2 = _base()
+                real_c_ft2 = cond_ft2.forward
+
+                def cond_ft3(*a, **kw):
+                    _c["conditioner"] += 1
+                    _c["late_conditioner"] += int(
+                        _ct["t"] >= _bg.work_deadline)
+                    return real_c_ft2(*a, **kw)
+
+                cond_ft2.forward = cond_ft3
+                return model_ft2, cond_ft2
+
+            def fk_ft2(*a, _real=base_fk_ft2, _c=calls_ft2,
+                       _ct=holder_ft2, _bg=budget_ft2, **kw):
+                if _in_fresh_probe():
+                    _c["fresh_fk"] += 1
+                    _c["late_fresh_fk"] += int(
+                        _ct["t"] >= _bg.work_deadline)
+                return _real(*a, **kw)
+
+            with patch.object(guard_ft2, "check_unit", check_ft2), \
+                    patch.object(world_r9.loss_fn.fk, "site_world_positions",
+                                 fk_ft2):
+                out_ft2 = _run_f_r9(f"r15ftime_{point}_f", budget_ft2,
+                                    factory=factory_ft2, guard=guard_ft2)
+            fdir_ft2 = tmp / f"r15ftime_{point}_f"
+            f_time_r15[point] = {
+                **calls_ft2,
+                "verdict": out_ft2["summary_doc"]["verdict"],
+                "complete": out_ft2["summary_doc"]["complete_evidence"],
+                "report": (fdir_ft2 / "f_report.json").is_file(),
+                "proof": (fdir_ft2 / "return_observation.json").is_file()}
+        caught = (f_time_r15["none"]["late_conditioner"] == 0
+                  and f_time_r15["none"]["late_fresh_fk"] == 0
+                  and f_time_r15["none"]["complete"] is True
+                  and f_time_r15["f_fresh_entry"]["injections"] == 1
+                  and f_time_r15["f_fresh_entry"]["late_conditioner"] == 0
+                  and f_time_r15["f_fresh_entry"]["conditioner"] == 0
+                  and f_time_r15["f_fresh_entry"]["complete"] is False
+                  and f_time_r15["f_fresh_fk_w0"]["injections"] == 1
+                  and f_time_r15["f_fresh_fk_w0"]["late_fresh_fk"] == 0
+                  and f_time_r15["f_fresh_fk_w0"]["fresh_fk"] == 0
+                  and f_time_r15["f_fresh_fk_w0"]["complete"] is False
+                  and all(r["report"] and r["proof"]
+                          and r["verdict"] == "incomplete"
+                          for r in (f_time_r15["f_fresh_entry"],
+                                    f_time_r15["f_fresh_fk_w0"])))
+        record("f_fresh_runtime_read_time_charged", caught,
+               "slow precision reads at F's fresh entry/FK admission are "
+               f"charged before the conditioner/FK starts ({f_time_r15})")
+
+        # --- P1(r15): the reference construction is budgeted and skipped on
+        # an already-refused identity ---------------------------------------
+        def _inside_code(code) -> bool:
+            frame = sys._getframe(1)
+            try:
+                while frame:
+                    if frame.f_code is code:
+                        return True
+                    frame = frame.f_back
+                return False
+            finally:
+                del frame
+
+        from ireset.model.conditioner import ConditionEncoder
+        from ireset.model.deterministic import DeterministicG1
+        real_model_init = DeterministicG1.__init__
+        real_cond_init = ConditionEncoder.__init__
+        contract_r15: dict = {}
+        for variant in ("none", "model_returns_late", "identity_bad"):
+            holder_sc = {"t": 0.0}
+            budget_sc = StageBudget("F", 100.0, 10.0, t0=0.0,
+                                    clock=lambda: holder_sc["t"])
+            events_sc: list = []
+            _STATE_CONTRACT_CACHE.clear()
+            before_rng_sc = torch.get_rng_state().clone()
+
+            def model_init_sc(obj, *a, _base=real_model_init,
+                              _variant=variant, _ct=holder_sc,
+                              _events=events_sc, **kw):
+                metadata = _inside_code(_plan_fresh_modules.__code__)
+                _events.append({"unit": "model", "metadata": metadata,
+                                "start": _ct["t"]})
+                _base(obj, *a, **kw)
+                if metadata and _variant == "model_returns_late":
+                    _ct["t"] = 91.0
+
+            def cond_init_sc(obj, *a, _base=real_cond_init,
+                             _ct=holder_sc, _events=events_sc, **kw):
+                _events.append({"unit": "conditioner",
+                                "metadata": _inside_code(
+                                    _plan_fresh_modules.__code__),
+                                "start": _ct["t"]})
+                return _base(obj, *a, **kw)
+
+            ident_sc = dict(_synthetic_stage_identity(
+                plan_ar, world_r9.registration_for("D1")))
+            if variant == "identity_bad":
+                ident_sc["implementation_sha256"] = "b" * 64
+            with patch.object(DeterministicG1, "__init__", model_init_sc), \
+                    patch.object(ConditionEncoder, "__init__", cond_init_sc):
+                out_sc = run_f_verification(
+                    stage_specs=[{
+                        "stage_dir": sdir_ar, "plan": plan_ar,
+                        "registration": world_r9.registration_for("D1"),
+                        "decoder": world_r9.decoder,
+                        "loss_fn": world_r9.loss_fn,
+                        "identity": ident_sc}],
+                    out_dir=tmp / f"r15sc_{variant}",
+                    budget=budget_sc,
+                    runtime_guard=SyntheticRuntimeGuard(),
+                    build_modules=build_modules_factory(world_r9, plan_ar),
+                    authorization={"includes": ["D6"]})
+            s0_sc = out_sc["summary_doc"]["stages"][0]
+            contract_r15[variant] = {
+                "events": events_sc,
+                "rng_unchanged": torch.equal(before_rng_sc,
+                                             torch.get_rng_state()),
+                "module_builds": 1 if any(not e["metadata"]
+                                          for e in events_sc) else 0,
+                "complete": out_sc["summary_doc"]["complete_evidence"],
+                "skip": s0_sc.get("skip_reason"),
+                "local": s0_sc.get("local_reverify_problems") or []}
+        caught = (
+            [e["unit"] for e in contract_r15["none"]["events"]]
+            == ["model", "conditioner"] * 2
+            and contract_r15["none"]["complete"] is True
+            and [e["unit"] for e in contract_r15["model_returns_late"]["events"]]
+            == ["model"]
+            and contract_r15["model_returns_late"]["complete"] is False
+            and contract_r15["model_returns_late"]["rng_unchanged"] is True
+            and contract_r15["model_returns_late"]["module_builds"] == 0
+            and contract_r15["identity_bad"]["events"] == []
+            and contract_r15["identity_bad"]["complete"] is False
+            and contract_r15["identity_bad"]["rng_unchanged"] is True
+            and contract_r15["identity_bad"]["module_builds"] == 0
+            and any("stage_report_identity_mismatch" in p
+                    for p in contract_r15["identity_bad"]["local"]))
+        record("state_contract_construction_guarded", caught,
+               "a model construction returning past the deadline refuses the "
+               "conditioner; a refused identity constructs nothing "
+               f"({ {k: [e['unit'] for e in v['events']] for k, v in contract_r15.items()} })")
+
+        # --- P2(r15): mixed-primitive checkpoint keys are a structured fault -
+        mixed_r15: dict = {}
+        for injected in (False, True):
+            copydir = tmp / f"r15mixed_{injected}"
+            shutil.copytree(sdir_ar, copydir)
+            if injected:
+                path = copydir / "last.pt"
+                ck = torch.load(path, map_location="cpu", weights_only=False)
+                ck["model"][17] = torch.zeros(1, dtype=torch.float32)
+                ck["model"]["unexpected"] = torch.zeros(1,
+                                                        dtype=torch.float32)
+                torch.save(ck, path)
+                _full_resign(copydir)
+            error, out_m = None, None
+            try:
+                out_m = _run_f_r9(f"r15mixed_{injected}_f",
+                                  StageBudget("F", 300.0, 10.0),
+                                  directory=copydir)
+            except Exception as exc:  # noqa: BLE001
+                error = f"{type(exc).__name__}:{exc}"
+            fdir_m = tmp / f"r15mixed_{injected}_f"
+            local_m = ((out_m["summary_doc"]["stages"][0].get(
+                "local_reverify_problems") or []) if out_m is not None else [])
+            mixed_r15[str(injected)] = (
+                error is None
+                and (fdir_m / "f_report.json").is_file()
+                and (fdir_m / "return_observation.json").is_file()
+                and out_m is not None
+                and ((not injected
+                      and out_m["summary_doc"]["complete_evidence"] is True)
+                     or (injected
+                         and out_m["summary_doc"]["verdict"] == "incomplete"
+                         and any("key_type_not_string" in p
+                                 for p in local_m))))
+        record("mixed_checkpoint_keys_report_incomplete",
+               all(mixed_r15.values()),
+               "mixed int/str checkpoint keys are refused before any ordering "
+               f"and still publish the F report ({mixed_r15})")
 
     return results
 
