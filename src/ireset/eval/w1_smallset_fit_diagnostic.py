@@ -466,6 +466,8 @@ class MetricDecoder:
             return ["x0_not_array"]
         if x0.dtype != np.float32:
             problems.append(f"x0_dtype:{x0.dtype}")
+            # P2 (round-12): isfinite/decode are invalid on a non-float dtype
+            return problems
         if x0.ndim != 2 or x0.shape != (T_WINDOW, 38):
             problems.append(f"x0_shape:{tuple(x0.shape)}")
             return problems
@@ -741,8 +743,10 @@ def _check_record(record_name: str, key: str, arr, table: dict) -> list[str]:
         problems.append(f"record_dtype:{key}:{arr.dtype}")
     if arr.shape != want_shape:
         problems.append(f"record_shape:{key}:{tuple(arr.shape)}:want{want_shape}")
-    if arr.dtype != np.bool_ and not np.issubdtype(arr.dtype, np.integer) \
-            and not np.isfinite(arr).all():
+    # P2 (round-12): only numeric arrays can reach isfinite — a string dtype
+    # is already a recorded dtype failure and must not raise TypeError before
+    # the incomplete report can be published.
+    if np.issubdtype(arr.dtype, np.floating) and not np.isfinite(arr).all():
         problems.append(f"record_nonfinite:{key}")
     return problems
 
@@ -1103,6 +1107,31 @@ def _loss_weight_problems(weights, label: str) -> list[str]:
     return problems
 
 
+def _optimizer_binding_problems(trainer, plan: FitPlan) -> list[str]:
+    """P1 (round-12): the ACTUAL AdamW parameter groups are the update
+    arithmetic — ``trainer.cfg`` being correct is not enough.  Every group's
+    lr/weight_decay must equal the frozen plan at run time."""
+    opt = getattr(trainer, "opt", None)
+    if opt is None:
+        return ["optimizer_missing"]
+    groups = getattr(opt, "param_groups", None)
+    if not isinstance(groups, list) or not groups:
+        return ["optimizer_param_groups_missing"]
+    problems: list[str] = []
+    for idx, group in enumerate(groups):
+        if not isinstance(group, dict):
+            problems.append(f"optimizer_group_not_a_mapping:{idx}")
+            continue
+        for key, want in (("lr", plan.lr),
+                          ("weight_decay", plan.weight_decay)):
+            got = group.get(key)
+            if not _json_value_equal(got, want):
+                problems.append(
+                    f"optimizer_group_mismatch:{idx}:{key}:"
+                    f"{got!r}:want{want!r}")
+    return problems
+
+
 # P1 (round-10): the stage identity must be anchored OUTSIDE the stage report.
 # The driver embeds the canonical plan/registration digests into the identity
 # it writes; F, the handoff and the local verification recompute those
@@ -1205,6 +1234,9 @@ class FitDriver:
         if loss_fn_weight_problems:
             raise FitDiagnosticError(
                 f"loss_weight_binding:{loss_fn_weight_problems}")
+        opt_problems = _optimizer_binding_problems(trainer, plan)
+        if opt_problems:
+            raise FitDiagnosticError(f"optimizer_binding:{opt_problems}")
         self.trainer, self.plan, self.registration = trainer, plan, registration
         self.decoder, self.budget = decoder, budget
         self.runtime_guard = runtime_guard
@@ -1254,6 +1286,11 @@ class FitDriver:
         if self._real_decode_clip is not None:
             loss_fn.decode_clip = self._guarded_loss_decode
         patch_conditioner_leak_guard(trainer.conditioner)
+        # P1 (round-12): the conditioner is a numeric unit of its own — an
+        # expiry during predict's input checks refuses the conditioner (the
+        # gate precedes the counting hook, so a refused call is not counted).
+        self.cond_gate_handle = trainer.conditioner.register_forward_pre_hook(
+            self._pre_conditioner_gate)
         self.cond_handle = _forward_hook_counter(
             trainer.conditioner, self.counters, "conditioner_forward_calls")
         # P1 (round-9): the conditioner→backbone and backbone→loss boundaries
@@ -1355,6 +1392,10 @@ class FitDriver:
         return {k: (v.to(self.trainer.cfg.device) if torch.is_tensor(v) else v)
                 for k, v in batch.items()}
 
+    def _pre_conditioner_gate(self, _module, _inputs) -> None:
+        if self._guard_point is not None:
+            self.budget.check(self._guard_point + "_pre_conditioner")
+
     def _pre_backbone_gate(self, _module, _inputs) -> None:
         if self._guard_point is not None:
             self.budget.check(self._guard_point + "_pre_backbone")
@@ -1371,6 +1412,19 @@ class FitDriver:
             getattr(self.loss_inner, "w", None), "loss_fn_weights")
         if problems:
             raise FitDiagnosticError(f"loss_weight_drift:{problems}")
+
+    def _check_optimizer_binding(self) -> None:
+        problems = _optimizer_binding_problems(self.trainer, self.plan)
+        if problems:
+            raise FitDiagnosticError(f"optimizer_binding:{problems}")
+
+    def _check_runtime_bindings(self) -> None:
+        """Config + actual loss object + ACTUAL AdamW parameter groups are
+        re-checked at every numeric boundary; any independent mutation is a
+        drift, not a silently consumed update."""
+        self._check_trainer_config(self.trainer, self.plan)
+        self._check_loss_weights()
+        self._check_optimizer_binding()
 
     def _guard_loss_fk_pre(self) -> None:
         if self._guard_point is not None:
@@ -1442,8 +1496,8 @@ class FitDriver:
     def _run_probe(self, step: int, idx: int) -> None:
         self.budget.check(f"probe_{idx}_step_{step}_start")
         self.runtime_guard.check_unit(f"probe_{idx}_step_{step}_start")
-        # P1 (round-11): the live objective object is re-validated per unit
-        self._check_loss_weights()
+        # P1 (round-11/12): live objective, config and ACTUAL AdamW groups
+        self._check_runtime_bindings()
         self._ensure_teacher()
         self.counters["probe_calls"] = self.counters.get("probe_calls", 0) + 1
         gen = torch.Generator()
@@ -1464,7 +1518,7 @@ class FitDriver:
     def _save_checkpoint(self, name: str, step: int) -> None:
         self.budget.check(f"checkpoint_{name}_start")
         self.runtime_guard.check_unit(f"checkpoint_{name}_start")
-        self._check_loss_weights()
+        self._check_runtime_bindings()
         self.counters["checkpoint_saves"] = \
             self.counters.get("checkpoint_saves", 0) + 1
         self.trainer.save(name, step, {"step": step}, identity=self.identity)
@@ -1536,6 +1590,7 @@ class FitDriver:
                                       "problems": ["stage_failed"]}
         finally:
             self.cond_handle.remove()
+            self.cond_gate_handle.remove()
             self.back_handle.remove()
             self.guard_pre_handle.remove()
             self.guard_post_handle.remove()
@@ -1556,9 +1611,9 @@ class FitDriver:
         self._phase = "preflight"
         self.budget.check("preflight")
         self.runtime_guard.check_unit("preflight")
-        # P1 (round-11): freeze-check the LIVE objective before any numeric
-        # unit; a post-construction mutation must not consume a tampered loss.
-        self._check_loss_weights()
+        # P1 (round-11/12): freeze-check the LIVE objective, config and
+        # actual AdamW groups before any numeric unit.
+        self._check_runtime_bindings()
         apply_problems = getattr(self.runtime_guard, "apply_problems", None)
         if apply_problems:
             raise FitDiagnosticError(f"runtime_apply_failed:{apply_problems}")
@@ -1593,7 +1648,7 @@ class FitDriver:
                 self.budget.check(f"step_{step}_micro_{micro + 1}_start")
                 self.runtime_guard.check_unit(
                     f"step_{step}_micro_{micro + 1}_start")
-                self._check_loss_weights()
+                self._check_runtime_bindings()
                 try:
                     batch = next(data_iter)
                 except StopIteration:
@@ -1637,11 +1692,16 @@ class FitDriver:
             self.budget.check(f"step_{step}_clip")
             self.runtime_guard.check_unit(f"step_{step}_clip")
             self._check_clip_coverage_pre()
+            # P1 (round-12): the forensics read is time too — an expiry
+            # during it refuses the clip that follows.
+            self.budget.check(f"step_{step}_clip_coverage_pre")
+            self._check_runtime_bindings()
             self.counters["clip_calls"] += 1
             gnorm = trainer.clip_gradients()
             self._check_clip_coverage_post()
             self.budget.check(f"step_{step}_pre_optimizer_step")
             self.runtime_guard.check_unit(f"step_{step}_pre_optimizer_step")
+            self._check_runtime_bindings()
             self._phase = f"step_{step}_optimizer_update"
             self.counters["adamw_step_calls"] += 1
             trainer.step_optimizer()
@@ -1973,8 +2033,14 @@ def _json_value_equal(got, want) -> bool:
     if isinstance(want, int):
         return _is_json_int(got) and got == want
     if isinstance(want, float):
-        return (isinstance(got, (int, float)) and not isinstance(got, bool)
-                and float(got) == want)
+        if isinstance(got, bool) or not isinstance(got, (int, float)):
+            return False
+        # P2 (round-12): a huge Python int (e.g. 10**400) makes float()
+        # raise OverflowError — a mismatch, never an F crash.
+        try:
+            return float(got) == want
+        except (OverflowError, ValueError):
+            return False
     if isinstance(want, str):
         return isinstance(got, str) and got == want
     if isinstance(want, dict):
@@ -2567,12 +2633,12 @@ def _fresh_probe(model, conditioner, batch: dict, plan: FitPlan,
     with torch.no_grad():
         conditioner.eval()
         model.eval()
-        memory = conditioner(batch)
-        # P2 (round-9): counters land at the ACTUAL call boundary — a
-        # completed conditioner call stays recorded even when the following
-        # backbone gate refuses the rest of the fresh probe
+        # P2 (round-12): count at the ENTRY of the actual numeric call — an
+        # executed conditioner/backbone that raises afterwards is still an
+        # actual call; a budget refusal BEFORE the call is not.
         counters["conditioner_forward_calls"] = \
             counters.get("conditioner_forward_calls", 0) + 1
+        memory = conditioner(batch)
         # P1 (round-8): the conditioner and backbone are independent numeric
         # units — a conditioner returning past the work deadline refuses the
         # backbone forward that follows.
@@ -2584,11 +2650,13 @@ def _fresh_probe(model, conditioner, batch: dict, plan: FitPlan,
                               (batch["x0"].shape[0],), generator=gen).to(device)
             noise = torch.randn(batch["x0"].shape, generator=gen).to(device)
             x_t = model.add_noise(batch["x0"], noise, t)
+            counters["backbone_forward_calls"] = \
+                counters.get("backbone_forward_calls", 0) + 1
             x0_pred = model(x_t, t, memory)
         else:
+            counters["backbone_forward_calls"] = \
+                counters.get("backbone_forward_calls", 0) + 1
             x0_pred = model(memory, batch["x0"].shape[1])
-        counters["backbone_forward_calls"] = \
-            counters.get("backbone_forward_calls", 0) + 1
     x0_np = x0_pred.detach().to("cpu").numpy()
     per_window = []
     flat = lambda a: a.reshape(-1, a.shape[-1])
@@ -3542,6 +3610,11 @@ COUNTEREXAMPLE_IDS = (
     "bad_checkpoint_config_containers_report_incomplete",
     "executed_failing_backbone_counted",
     "typed_counts_and_coordinates_rejected",
+    "effective_optimizer_binding_rejected",
+    "conditioner_and_clip_pre_boundaries_stop",
+    "f_entered_failed_forwards_counted",
+    "huge_config_scalars_report_incomplete",
+    "bad_npz_dtype_reports_incomplete",
 )
 
 
@@ -6592,6 +6665,249 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
                all(typed_r11.values()),
                "bool/float checkpoint step, true forward counts and float "
                f"worst coordinates are type violations ({typed_r11})")
+
+        # ==================================================================
+        # Round-12 review counterexamples
+        # ==================================================================
+        # --- P1(r12): the ACTUAL AdamW parameter groups are bound ----------
+        opt_results: dict = {}
+        for field, changed in (("lr", 0.125), ("weight_decay", 0.25)):
+            world_o = _r9_world(seed + 70)
+            holder_o = {"t": 0.0}
+            budget_o = StageBudget("D1", 100.0, 10.0, t0=0.0,
+                                   clock=lambda: holder_o["t"])
+            _, driver_o, sdir_o = _r9_driver(tmp / f"r12opt_{field}", "D1",
+                                             budget_o, world_o)
+            for group in driver_o.trainer.opt.param_groups:
+                group[field] = changed
+            steps_o: list = []
+            real_step_o = driver_o.trainer.opt.step
+
+            def observe_step_o(*a, _steps=steps_o, _real=real_step_o, **kw):
+                _steps.append(True)
+                return _real(*a, **kw)
+
+            with patch.object(trainer_mod, "time",
+                              types.SimpleNamespace(
+                                  perf_counter=budget_o.clock)), \
+                    patch.object(driver_o.trainer.opt, "step",
+                                 observe_step_o):
+                summary_o = driver_o.run()
+            failure_o = summary_o.get("failure") or {}
+            out_o = _run_f_r9(f"r12opt_{field}_f",
+                              StageBudget("F", 300.0, 10.0),
+                              directory=sdir_o)
+            opt_results[field] = (
+                steps_o == []
+                and failure_o.get("type") == "FitDiagnosticError"
+                and "optimizer_binding" in failure_o.get("message", "")
+                and summary_o.get("local_complete_evidence") is False
+                and out_o["summary_doc"]["complete_evidence"] is False)
+        record("effective_optimizer_binding_rejected",
+               all(opt_results.values()),
+               "actual AdamW param-group lr/weight_decay mutations are "
+               f"refused before any step ({opt_results})")
+
+        # --- P1(r12): conditioner entry and clip-forensics boundaries -------
+        boundary_r12: dict = {}
+        for variant in ("none", "predict_input_check", "clip_coverage_pre"):
+            world_b = _r9_world(seed + 71)
+            holder_b = {"t": 0.0}
+            budget_b = StageBudget("D1", 100.0, 10.0, t0=0.0,
+                                   clock=lambda: holder_b["t"])
+            _, driver_b, _ = _r9_driver(tmp / f"r12bound_{variant}", "D1",
+                                        budget_b, world_b)
+            counts_b = dict(training_conditioner_calls=0,
+                            late_conditioner_calls=0, clip_calls=0,
+                            late_clip_calls=0, injections=0)
+            real_check_b = driver_b.trainer._check_batch
+            real_cond_b = driver_b.trainer.conditioner.forward
+            real_cov_b = driver_b._check_clip_coverage_pre
+            real_clip_b = driver_b.trainer.clip_gradients
+
+            def check_batch_b(batch, _d=driver_b, _c=counts_b,
+                              _holder=holder_b, _real=real_check_b,
+                              _inj=variant):
+                value = _real(batch)
+                if (_inj == "predict_input_check"
+                        and sys._getframe(1).f_code is Trainer.predict.__code__
+                        and _d.trainer.model.training
+                        and _c["injections"] == 0):
+                    _holder["t"] = 91.0
+                    _c["injections"] += 1
+                return value
+
+            def conditioner_b(*a, _d=driver_b, _c=counts_b,
+                              _holder=holder_b, _real=real_cond_b, **kw):
+                if _d.trainer.conditioner.training:
+                    _c["training_conditioner_calls"] += 1
+                    _c["late_conditioner_calls"] += int(
+                        _holder["t"] >= budget_b.work_deadline)
+                return _real(*a, **kw)
+
+            def coverage_b(*a, _c=counts_b, _holder=holder_b,
+                           _real=real_cov_b, _inj=variant):
+                value = _real(*a)
+                if _inj == "clip_coverage_pre":
+                    _holder["t"] = 91.0
+                    _c["injections"] += 1
+                return value
+
+            def clip_b(*a, _c=counts_b, _holder=holder_b,
+                       _real=real_clip_b, **kw):
+                _c["clip_calls"] += 1
+                _c["late_clip_calls"] += int(
+                    _holder["t"] >= budget_b.work_deadline)
+                return _real(*a, **kw)
+
+            with patch.object(trainer_mod, "time",
+                              types.SimpleNamespace(
+                                  perf_counter=budget_b.clock)), \
+                    patch.object(driver_b.trainer, "_check_batch",
+                                 check_batch_b), \
+                    patch.object(driver_b.trainer.conditioner, "forward",
+                                 conditioner_b), \
+                    patch.object(driver_b, "_check_clip_coverage_pre",
+                                 coverage_b), \
+                    patch.object(driver_b.trainer, "clip_gradients", clip_b):
+                summary_b = driver_b.run()
+            failure_b = summary_b.get("failure") or {}
+            boundary_r12[variant] = {
+                **counts_b,
+                "failure": failure_b.get("type"),
+                "steps": summary_b["counters"]["adamw_step_calls"],
+                "complete": summary_b.get("local_complete_evidence")}
+        caught = (boundary_r12["none"]["training_conditioner_calls"] == 4
+                  and boundary_r12["none"]["clip_calls"] == 1
+                  and boundary_r12["none"]["complete"] is True
+                  and boundary_r12["predict_input_check"][
+                      "late_conditioner_calls"] == 0
+                  and boundary_r12["predict_input_check"][
+                      "training_conditioner_calls"] == 0
+                  and boundary_r12["predict_input_check"]["failure"]
+                  == "BudgetExceeded"
+                  and boundary_r12["predict_input_check"]["steps"] == 0
+                  and boundary_r12["clip_coverage_pre"]["late_clip_calls"] == 0
+                  and boundary_r12["clip_coverage_pre"]["clip_calls"] == 0
+                  and boundary_r12["clip_coverage_pre"]["failure"]
+                  == "BudgetExceeded"
+                  and boundary_r12["clip_coverage_pre"]["steps"] == 0)
+        record("conditioner_and_clip_pre_boundaries_stop", caught,
+               "expiry in predict's input check refuses the conditioner; "
+               "expiry in the clip forensics refuses the clip "
+               f"({boundary_r12})")
+
+        # --- P2(r12): F fresh probes count entered-then-failing forwards ----
+        f_failed_r12: dict = {}
+        for variant in ("conditioner", "backbone"):
+            actual_f = {"conditioner": 0, "backbone": 0}
+            base_factory_f = build_modules_factory(world_r9,
+                                                   fixtures_r9["D1"][0])
+
+            def failing_factory_f(_base=base_factory_f, _counts=actual_f,
+                                  _variant=variant):
+                model_f, cond_f = _base()
+                real_cond_f, real_back_f = cond_f.forward, model_f.forward
+
+                def cond_w(*a, **kw):
+                    value = real_cond_f(*a, **kw)
+                    _counts["conditioner"] += 1
+                    if _variant == "conditioner":
+                        raise TrainingNumericalError(
+                            "synthetic_f_failure_after_conditioner")
+                    return value
+
+                def back_w(*a, **kw):
+                    value = real_back_f(*a, **kw)
+                    _counts["backbone"] += 1
+                    if _variant == "backbone":
+                        raise TrainingNumericalError(
+                            "synthetic_f_failure_after_backbone")
+                    return value
+
+                cond_f.forward, model_f.forward = cond_w, back_w
+                return model_f, cond_f
+
+            out_f = _run_f_r9(f"r12ff_{variant}_f",
+                              StageBudget("F", 300.0, 10.0),
+                              factory=failing_factory_f)
+            s0_f = out_f["summary_doc"]["stages"][0]
+            fc_f = s0_f.get("fresh_counters") or {}
+            disk_f = json.loads(
+                (tmp / f"r12ff_{variant}_f" / "f_report.json").read_text())
+            dfc_f = disk_f["stages"][0].get("fresh_counters") or {}
+            key_f = variant + "_forward_calls"
+            f_failed_r12[variant] = (
+                actual_f[variant] == 1
+                and fc_f.get(key_f) == 1
+                and dfc_f.get(key_f) == 1
+                and out_f["summary_doc"]["complete_evidence"] is False)
+        record("f_entered_failed_forwards_counted",
+               all(f_failed_r12.values()),
+               "F fresh conditioner/backbone entry counters keep executed "
+               f"then failing forwards ({f_failed_r12})")
+
+        # --- P2(r12): huge config scalars and bad NPZ dtypes ----------------
+        huge_r12: dict = {}
+        for variant in ("lr", "w_fk"):
+            copydir = tmp / f"r12huge_{variant}"
+            shutil.copytree(fixtures_r9["D1"][1], copydir)
+            path = copydir / "initial.pt"
+            ck = torch.load(path, map_location="cpu", weights_only=False)
+            if variant == "lr":
+                ck["config"]["lr"] = 10 ** 400
+            else:
+                ck["config"]["loss"]["w_fk"] = 10 ** 400
+            torch.save(ck, path)
+            _full_resign(copydir)
+            error, out_h = None, None
+            try:
+                out_h = _run_f_r9(f"r12huge_{variant}_f",
+                                  StageBudget("F", 300.0, 10.0),
+                                  directory=copydir)
+            except Exception as exc:  # noqa: BLE001
+                error = f"{type(exc).__name__}:{exc}"
+            fdir = tmp / f"r12huge_{variant}_f"
+            huge_r12[variant] = (
+                error is None
+                and (fdir / "f_report.json").is_file()
+                and (fdir / "return_observation.json").is_file()
+                and out_h is not None
+                and out_h["summary_doc"]["verdict"] == "incomplete")
+        record("huge_config_scalars_report_incomplete",
+               all(huge_r12.values()),
+               "10**400 config lr / loss weight are type-strict mismatches, "
+               f"never an OverflowError ({huge_r12})")
+
+        bad_npz_r12: dict = {}
+        for variant in ("raw", "fk"):
+            copydir = tmp / f"r12npz_{variant}"
+            shutil.copytree(fixtures_r9["D1"][1], copydir)
+            path = copydir / "probes" / "probe_0000_step_000000.npz"
+            with np.load(path) as archive:
+                arrays = {key: archive[key] for key in archive.files}
+            key = "w0__raw_x0_pred" if variant == "raw" else "w0__fk_pred"
+            arrays[key] = arrays[key].astype("U32")
+            np.savez(path, **arrays)
+            _full_resign(copydir)
+            error, out_n = None, None
+            try:
+                out_n = _run_f_r9(f"r12npz_{variant}_f",
+                                  StageBudget("F", 300.0, 10.0),
+                                  directory=copydir)
+            except Exception as exc:  # noqa: BLE001
+                error = f"{type(exc).__name__}:{exc}"
+            fdir = tmp / f"r12npz_{variant}_f"
+            bad_npz_r12[variant] = (
+                error is None
+                and (fdir / "f_report.json").is_file()
+                and (fdir / "return_observation.json").is_file()
+                and out_n is not None
+                and out_n["summary_doc"]["verdict"] == "incomplete")
+        record("bad_npz_dtype_reports_incomplete",
+               all(bad_npz_r12.values()),
+               "string-dtype raw/FK NPZ records are dtype failures, never "
+               f"isfinite TypeErrors ({bad_npz_r12})")
 
     return results
 
