@@ -1,6 +1,6 @@
 # 文档索引
 
-最后更新：2026-11-10。**当前工作是数值缺口有限收口与受控拟合诊断：N0/N1 已完成（attempt_006 权威），I 阶段（小集拟合诊断器+合成反例）已经十二轮独立审阅修订并以合成验收收口（attempt_013 权威）；R/真实 D1/D6/F 未实施、未授权、未运行。** 已结束阶段集中转入历史导航，冻结原文及实验产物保持原路径、原字节。
+最后更新：2026-11-10。**当前工作是数值缺口有限收口与受控拟合诊断：N0/N1 已完成（attempt_006 权威），I 阶段（小集拟合诊断器+合成反例）已经十三轮独立审阅修订并以合成验收收口（attempt_014 权威）；R/真实 D1/D6/F 未实施、未授权、未运行。** 已结束阶段集中转入历史导航，冻结原文及实验产物保持原路径、原字节。
 
 ## 当前状态
 
@@ -9,17 +9,17 @@
 - 最新T6（2026-11-06）为 **0 direct failures、539 mandatory gaps**（350 precision/189 sensitivity/0 bound）；证据完整，但 `covered_contract_passed=false`、`audit_incomplete`。没有新生产checkpoint或质量评估。
 - T6一次性授权已消费；cohort累计34次诊断更新、1347.195507/3240秒。剩余墙钟不构成新运行权限，不自动重试。
 - N0/N1（2026-11-07，attempt_006 权威）：350 precision_limited + 189 cross_path_sensitive + 0 implementation_issue_candidate；同输入公式逐位验证、六类47合成用例全过。
-- **I 阶段（2026-11-10，十二轮审阅修订后）已交付**：独立小集拟合诊断器复用已审计 Trainer 更新单元；metric_decode_v1/四门/尖峰可见性/本地核验/交接/F 逐位重放/台账与运行时硬门实现；92 项 §6.2/v0.3/v0.4 合成反例全捕获，17 项测试全过，合成验收（微型 D1→D6→F）attempt_013 收口。真实拟合仍须 §8.3 新冻结与授权。
+- **I 阶段（2026-11-10，十三轮审阅修订后）已交付**：独立小集拟合诊断器复用已审计 Trainer 更新单元；metric_decode_v1/四门/尖峰可见性/本地核验/交接/F 逐位重放/台账与运行时硬门实现；98 项 §6.2/v0.3/v0.4 合成反例全捕获，17 项测试全过，合成验收（微型 D1→D6→F）attempt_014 收口。真实拟合仍须 §8.3 新冻结与授权。
 - `objective_coverage=partial`、`full_objective_contract_passed=null`、`factor_selected=false`、`auto_execute=false`、`production_integration=false`保持。
 
 ## 当前入口
 
 | 文档 | 用途与状态 |
 | --- | --- |
-| [I 阶段小集拟合诊断器验证记录](verification/omniretarget_w1_smallset_fit_diagnostic.md) | **I已实施；十二轮独立审阅（最新 2026-11-10）2 P1+3 P2 全部修复、92 项反例全捕获、attempt_013 权威**：复用Trainer更新单元的D1/D6驱动、metric_decode_v1（教师/预测双侧原始x0重解码绑定+生产解码重推导绑定）、四平均门+尖峰可见性、§7.4本地核验（必需工件集合+报告索引SHA闭链+checkpoint 14字段配置/七项损失权重/完整外部 expected identity 逐字段语义绑定+实际AdamW参数组与运行期config/loss权重复核+驱动/交接/helper内部逐次读取·解码·FK·前向·strict加载·checkpoint读取逐单元截止守卫+conditioner入口与clip取证后守卫+predict输出检查后loss前守卫+loss内部decode/FK前后守卫+准入后forward入口计数+坏容器/嵌套坏结构/NPZ dtype结构化收口）、封口/返回证明完整消费（证明registered/cap逐项绑定报告+候选写盘与必要回读先于最终覆盖采样、F自身返回覆盖核验、后继阶段截止停止仍照常落盘报告与证明、撤回返回快照为覆盖函数给出的盘上最终文档）、F逐位重放（加载前dtype契约+构造/加载/输入/教师重读/fresh解码/归约前预算与运行时双检+完成声明门+实际调用边界计数）、逐micro运行时守卫、CLI输出与回读先于最终采样；真实R/D1/D6/F未授权 |
+| [I 阶段小集拟合诊断器验证记录](verification/omniretarget_w1_smallset_fit_diagnostic.md) | **I已实施；十三轮独立审阅（最新 2026-11-10）4 P1+2 P2 全部修复、98 项反例全捕获、attempt_014 权威**：复用Trainer更新单元的D1/D6驱动、metric_decode_v1（教师/预测双侧原始x0重解码绑定+生产解码重推导绑定）、四平均门+尖峰可见性、§7.4本地核验（必需工件集合+报告索引SHA闭链+checkpoint 14字段配置/七项损失权重/完整外部 expected identity/实际张量与state key set逐项语义绑定+实际AdamW参数组字段与model+conditioner参数名册及运行期config/loss权重复核+驱动/交接/helper内部逐次读取·解码·FK·前向·strict加载·checkpoint读取逐单元截止/精度守卫+conditioner/backbone/loss入口与clip取证后守卫+predict输出检查后loss前守卫+loss内部decode/FK前后守卫+准入后forward入口计数+坏容器/嵌套坏结构/object NPZ/条件契约结构化收口）、封口/返回证明完整消费（证明registered/cap逐项绑定报告+候选写盘与必要回读先于最终覆盖采样、F自身返回覆盖核验、后继阶段截止停止仍照常落盘报告与证明、撤回返回快照为覆盖函数给出的盘上最终文档）、F逐位重放（加载前dtype契约+构造/加载/输入/教师重读/fresh解码/归约前预算与运行时双检+完成声明门+实际调用边界计数）、逐micro运行时守卫、CLI输出与回读先于最终采样；真实R/D1/D6/F未授权 |
 | [N1 最小合成验证与有限数值收口说明](verification/omniretarget_w1_n1_synthetic_closure.md) | **N1已收口（2026-11-07，五轮复阅修订后 attempt_006）**：C1 audited vs 独立节点图逐位对照、C5 三例门失败全区间内、C6 八偏差全经N0检测器检出；六类47用例全过，go=no_go→go_for_conditional_fit_diagnostics_review。封口=登记成本同盘覆盖+写后核验；返回核验先读盘后采样、return_observation.json SHA绑定证明且所有退出路径核验；撤回走覆盖成本循环 |
 | [N0 坐标级数值缺口分析记录](verification/omniretarget_w1_n0_coordinate_analysis.md) | **N0已收口（2026-11-07，五轮复阅修订后 attempt_006）**：uint32存在性/单侧可辨识位（4行）；same_input公式门+delta_measured一致性；分侧写界；roster精确集合；来源闭链（journal逐级SHA+registration三阶段严格校验+F重放双锚）；旧629全三类交付（381/223/25）；封口=登记成本覆盖封口与返回+终态时序；返回核验先读盘后采样+SHA绑定观察文件+撤回覆盖成本循环。结论=350 precision_limited+189 cross_path_sensitive+0 implementation_issue_candidate |
-| [数值缺口有限收口与受控拟合诊断方案](plans/omniretarget_w1_numerics_closure_fit_diagnostic_plan.md) | **v0.4+§14–§30修订对照，N0/N1/I已完成（I最新 2026-11-10 attempt_013）**：N0保存证据坐标级分析✓→N1最小合成验证/有限收口✓→I共享Trainer诊断实现+合成反例（十二轮审阅修订）✓→R新冻结/授权→D1单窗/D6六窗确定性拟合→F收口。平均门、预算和8206次/路径forward上限不放宽；真实拟合须新明确授权 |
+| [数值缺口有限收口与受控拟合诊断方案](plans/omniretarget_w1_numerics_closure_fit_diagnostic_plan.md) | **v0.4+§14–§31修订对照，N0/N1/I已完成（I最新 2026-11-10 attempt_014）**：N0保存证据坐标级分析✓→N1最小合成验证/有限收口✓→I共享Trainer诊断实现+合成反例（十三轮审阅修订）✓→R新冻结/授权→D1单窗/D6六窗确定性拟合→F收口。平均门、预算和8206次/路径forward上限不放宽；真实拟合须新明确授权 |
 | [最新T6执行报告](verification/omniretarget_w1_gradient_numerics_retest_report.md) | **已执行的基线，不是待执行任务**：329 failures清零，539 gaps保留；一次性授权已消费，完整目标与交互质量不通过 |
 | [项目整体实现方案](plans/interaction_retarget_impl_plan.md) | 总体目标、坐标/资产约定和最终质量/端到端加速标准；其历史完成快照不能覆盖最新裁决 |
 | [已完成阶段归档](archive/omniretarget_completed_20261106/README.md) | A2、W1训练/归因/融合、合成/真实目标与FK审计、更新审计/迁移、数值修复/T6的分组导航、实际结论和边界 |
