@@ -35,6 +35,7 @@ authorized deliverables (plan §8.3).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import random
@@ -349,6 +350,8 @@ def frozen_plan_defaults_problems() -> list[str]:
     if (d1.lr, d1.weight_decay, d1.grad_clip, d1.seed) != (
             PLAN_LR, PLAN_WEIGHT_DECAY, PLAN_GRAD_CLIP, PLAN_SEED):
         problems.append("optimizer_defaults")
+    if _loss_weight_values(LossWeights(w_contact=0.0)) != LOSS_WEIGHT_EXPECTED:
+        problems.append("loss_weight_defaults")
     if d6.steps != d1.steps or d6.micro_batch != D6_MICRO_BATCH:
         problems.append("d6_defaults")
     return problems
@@ -671,10 +674,13 @@ class CountingLoss:
 
 
 def _forward_hook_counter(module: torch.nn.Module, counter: dict, key: str):
-    def hook(_module, _inputs):
+    # P2 (round-10): count AFTER the module forward actually ran.  A pre-hook
+    # counter records a refused backbone (the admission hook raises before
+    # ``forward`` is entered), i.e. a call that never happened.
+    def hook(_module, _inputs, _output):
         counter[key] = counter.get(key, 0) + 1
 
-    return module.register_forward_pre_hook(hook)
+    return module.register_forward_hook(hook)
 
 
 def _rng_atom_equal(a, b) -> bool:
@@ -1042,6 +1048,101 @@ def run_probe(*, trainer: Trainer, probe_batch: dict, plan: FitPlan, step: int,
 # driver
 # --------------------------------------------------------------------------
 
+# P1 (round-10): the frozen effective objective is NOT just the 14 optimizer/
+# architecture fields — the loss weights are part of the training target and
+# the mandatory zero contact weight.  Plan §7 line 144: "损失权重不变且
+# w_contact=0".  A file-hash-consistent checkpoint can still claim a different
+# objective; every consumer reconciles these seven fields semantically.
+LOSS_WEIGHT_FIELDS = ("w_pos", "w_rot6d", "w_joint", "w_geodesic",
+                      "w_fk", "w_contact", "w_vel")
+LOSS_WEIGHT_EXPECTED = {"w_pos": 1.0, "w_rot6d": 1.0, "w_joint": 1.0,
+                        "w_geodesic": 0.5, "w_fk": 2.0, "w_contact": 0.0,
+                        "w_vel": 0.5}
+
+
+def _loss_weight_values(weights) -> dict | None:
+    if isinstance(weights, dict):
+        return weights
+    if weights is not None and all(hasattr(weights, key)
+                                   for key in LOSS_WEIGHT_FIELDS):
+        return {key: getattr(weights, key) for key in LOSS_WEIGHT_FIELDS}
+    return None
+
+
+def _loss_weight_problems(weights, label: str) -> list[str]:
+    """Seven frozen loss weights, item by item (bool forgery refused)."""
+    values = _loss_weight_values(weights)
+    if values is None:
+        return [f"{label}_not_a_mapping"]
+    problems: list[str] = []
+    for key in LOSS_WEIGHT_FIELDS:
+        want = LOSS_WEIGHT_EXPECTED[key]
+        got = values.get(key)
+        if isinstance(got, bool) != isinstance(want, bool) or got != want:
+            problems.append(f"{label}:{key}:{got!r}:want{want!r}")
+    extra = sorted(set(values) - set(LOSS_WEIGHT_FIELDS))
+    if extra:
+        problems.append(f"{label}_extra_fields:{extra[:3]}")
+    return problems
+
+
+# P1 (round-10): the stage identity must be anchored OUTSIDE the stage report.
+# The driver embeds the canonical plan/registration digests into the identity
+# it writes; F, the handoff and the local verification recompute those
+# digests from the plan/registration THEY were given (the external anchor)
+# and refuse a coordinated report+checkpoint identity rewrite.  A caller
+# cannot override a binding field with a different value.
+IDENTITY_PLAN_SHA_KEY = "plan_sha256"
+IDENTITY_REGISTRATION_SHA_KEY = "registration_sha256"
+
+
+def _canonical_sha256(obj) -> str:
+    data = json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                      allow_nan=False)
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
+def _stage_identity_binding(plan: FitPlan,
+                            registration: FitRegistration) -> dict:
+    return {IDENTITY_PLAN_SHA_KEY: _canonical_sha256(plan.as_dict()),
+            IDENTITY_REGISTRATION_SHA_KEY:
+                _canonical_sha256(registration.as_dict())}
+
+
+def _identity_binding_problems(identity, plan: FitPlan,
+                               registration: FitRegistration) -> list[str]:
+    if not isinstance(identity, dict):
+        return ["stage_identity_not_a_mapping"]
+    want = _stage_identity_binding(plan, registration)
+    problems = [f"stage_identity_binding_mismatch:{key}"
+                for key, value in want.items() if identity.get(key) != value]
+    return problems
+
+
+def _checkpoint_root_stats_problems(rs, name: str,
+                                    decoder: MetricDecoder) -> list[str]:
+    """Container/type check BEFORE the float32 conversion (P2 round-10: a
+    wrong-shaped mapping used to raise TypeError and kill F without a
+    report)."""
+    if not isinstance(rs, dict) or "mean" not in rs or "std" not in rs:
+        return [f"checkpoint_root_stats_missing:{name}"]
+    src = decoder.source_constants_f32
+    problems: list[str] = []
+    for key in ("mean", "std"):
+        try:
+            arr = np.asarray(rs[key])
+            if arr.dtype == object or not np.issubdtype(arr.dtype, np.number):
+                raise TypeError
+            arr = np.ascontiguousarray(arr, dtype=np.float32)
+        except (TypeError, ValueError):
+            problems.append(f"checkpoint_root_stats_unreadable:{name}:{key}")
+            continue
+        if arr.shape != src[key].shape or not np.array_equal(
+                arr.view(np.uint32), src[key].view(np.uint32)):
+            problems.append(f"checkpoint_root_stats_mismatch:{name}:{key}")
+    return problems
+
+
 class FitDriver:
     """D1/D6 fitting over the audited Trainer update units (plan §7).
 
@@ -1072,12 +1173,25 @@ class FitDriver:
                 raise FitDiagnosticError(
                     f"dataset_registration_window_mismatch:got{got[:4]}:want{want[:4]}")
         self._check_trainer_config(trainer, plan)
-        if float(trainer.cfg.loss.w_contact) != 0.0:
-            raise FitDiagnosticError("contact_loss_must_be_disabled")
+        # P1 (round-10): the ACTUAL loss assembler is the training target too;
+        # matching ``cfg.loss`` alone lets a changed objective through.
+        loss_fn_weight_problems = _loss_weight_problems(
+            getattr(loss_fn, "w", None), "loss_fn_weights")
+        if loss_fn_weight_problems:
+            raise FitDiagnosticError(
+                f"loss_weight_binding:{loss_fn_weight_problems}")
         self.trainer, self.plan, self.registration = trainer, plan, registration
         self.decoder, self.budget = decoder, budget
         self.runtime_guard = runtime_guard
-        self.identity = dict(identity)
+        # P1 (round-10): the stage identity is anchored to the plan and the
+        # registration (external inputs of every consumer); a conflicting
+        # caller-supplied binding field is refused, never silently overridden.
+        binding = _stage_identity_binding(plan, registration)
+        declared = dict(identity)
+        for key, value in binding.items():
+            if key in declared and declared[key] != value:
+                raise FitDiagnosticError(f"identity_binding_conflict:{key}")
+        self.identity = {**declared, **binding}
         self.stage_dir = Path(stage_dir)
         self.authorization_includes_d6 = bool(authorization_includes_d6)
         self.counters: dict = {"conditioner_forward_calls": 0,
@@ -1118,6 +1232,13 @@ class FitDriver:
             self._pre_backbone_gate)
         self.guard_post_handle = trainer.model.register_forward_hook(
             self._pre_loss_gate)
+        # P1 (round-10): ``Trainer.predict`` performs its own output-validity
+        # checks AFTER the model's forward hook.  Those checks are time too:
+        # the loss/FK chain must not start when they cross the work deadline.
+        # The shared Trainer source stays untouched — the instance-bound
+        # predictor is wrapped at the exact predict→loss boundary.
+        self._real_predict = trainer.predict
+        trainer.predict = self._guarded_predict
         self.training_gen = training_gen
         self.probe_batch = probe_batch
         self.probes: list[dict] = []
@@ -1147,6 +1268,9 @@ class FitDriver:
                     for k, v in pairs if getattr(cfg, k) != v]
         if cfg.val_seed != plan.val_seed:
             problems.append(f"config_val_seed:{cfg.val_seed}:want{plan.val_seed}")
+        # P1 (round-10): the seven loss weights are part of the frozen target
+        problems += _loss_weight_problems(getattr(cfg, "loss", None),
+                                          "config_loss")
         if problems:
             raise FitDiagnosticError(f"trainer_plan_binding:{problems}")
         want_windows = 1 if plan.stage == "D1" else 6
@@ -1197,6 +1321,15 @@ class FitDriver:
     def _pre_loss_gate(self, _module, _inputs, _output) -> None:
         if self._guard_point is not None:
             self.budget.check(self._guard_point + "_pre_loss")
+
+    def _guarded_predict(self, *args, **kwargs):
+        """Predict→loss admission: the post-backbone validity checks inside
+        ``Trainer.predict`` are part of the preceding numeric unit, so their
+        elapsed time is charged before the loss (and its FK calls) start."""
+        out = self._real_predict(*args, **kwargs)
+        if self._guard_point is not None:
+            self.budget.check(self._guard_point + "_post_predict")
+        return out
 
     def _ensure_teacher(self) -> None:
         if self.teacher is not None:
@@ -1334,6 +1467,7 @@ class FitDriver:
             self.back_handle.remove()
             self.guard_pre_handle.remove()
             self.guard_post_handle.remove()
+            self.trainer.predict = self._real_predict
             summary["counters"] = dict(self.counters)
             summary["budget"] = self.budget.facts()
         return summary
@@ -1799,6 +1933,12 @@ def verify_stage_local(stage_dir: Path, plan: FitPlan,
         identity_to_bind = expected_identity
     else:
         identity_to_bind = report_identity
+    if identity_to_bind is not None:
+        # P1 (round-10): the identity is anchored to the plan/registration
+        # this verifier was given — a coordinated report+checkpoint rewrite
+        # cannot make a foreign identity self-consistent.
+        problems += _identity_binding_problems(identity_to_bind, plan,
+                                               registration)
     probe_index_path = stage_dir / "probe_index.json"
     if not probe_index_path.is_file():
         problems.append("probe_index_missing")
@@ -2020,9 +2160,16 @@ def verify_stage_local(stage_dir: Path, plan: FitPlan,
             check(f"saved_metrics_{idx}_w{b}")
             re_metrics = compute_window_metrics(
                 re_md, tgt_md, recs["fk_pred"], teacher_records[b]["fk_tgt"])
-            problems += [f"probe_metrics_mismatch:idx{idx}:w{b}:{p}"
-                         for p in _metrics_equal(wout.get("metrics") or {},
-                                                 re_metrics)]
+            saved_metrics = wout.get("metrics")
+            # P2 (round-10): a list-shaped metrics container used to reach
+            # ``saved[key]`` and raise TypeError; it is a structural problem
+            # that must still close as an incomplete report.
+            if not isinstance(saved_metrics, dict):
+                problems.append(
+                    f"probe_metrics_not_a_mapping:idx{idx}:w{b}")
+            else:
+                problems += [f"probe_metrics_mismatch:idx{idx}:w{b}:{p}"
+                             for p in _metrics_equal(saved_metrics, re_metrics)]
             if wout.get("spike_gate_status") != SPIKE_GATE_STATUS:
                 problems.append(f"spike_gate_status_invalid:idx{idx}:w{b}")
             if step == final_step:
@@ -2069,7 +2216,8 @@ CHECKPOINT_CONFIG_FIELDS = ("steps", "micro_batch", "grad_accum", "seed",
 
 
 def _checkpoint_config_problems(cfg, plan: FitPlan, name: str) -> list[str]:
-    """Full frozen-config contract of one saved checkpoint."""
+    """Full frozen-config contract of one saved checkpoint (14 plan fields +
+    the seven frozen loss weights, P1 round-10)."""
     if not isinstance(cfg, dict):
         return [f"checkpoint_config_missing:{name}"]
     problems: list[str] = []
@@ -2079,6 +2227,12 @@ def _checkpoint_config_problems(cfg, plan: FitPlan, name: str) -> list[str]:
         if isinstance(got, bool) != isinstance(want, bool) or got != want:
             problems.append(
                 f"checkpoint_config_mismatch:{name}:{key}:{got!r}:want{want!r}")
+    loss_cfg = cfg.get("loss")
+    if not isinstance(loss_cfg, dict):
+        problems.append(f"checkpoint_config_loss_missing:{name}")
+    else:
+        problems += [f"checkpoint_config_mismatch:{name}:{p}"
+                     for p in _loss_weight_problems(loss_cfg, "loss")]
     return problems
 
 
@@ -2121,15 +2275,7 @@ def _checkpoint_binding_problems(stage_dir: Path, plan: FitPlan,
         if ck.get("step") != want_step:
             problems.append(f"checkpoint_step_mismatch:{name}:{ck.get('step')!r}")
         rs = ck.get("root_stats")
-        if not isinstance(rs, dict) or "mean" not in rs or "std" not in rs:
-            problems.append(f"checkpoint_root_stats_missing:{name}")
-        else:
-            src = decoder.source_constants_f32
-            for key in ("mean", "std"):
-                if not np.array_equal(
-                        np.ascontiguousarray(rs[key], dtype=np.float32).view(np.uint32),
-                        src[key].view(np.uint32)):
-                    problems.append(f"checkpoint_root_stats_mismatch:{name}:{key}")
+        problems += _checkpoint_root_stats_problems(rs, name, decoder)
         problems += _checkpoint_config_problems(ck.get("config"), plan, name)
         problems += _checkpoint_identity_problems(ck, name, expected_identity)
         if ck.get("parameters_finite") is not True:
@@ -2408,15 +2554,7 @@ def _f_identity_problems(stage_dir: Path, plan: FitPlan,
         problems += _checkpoint_config_problems(ck.get("config"), plan, name)
         problems += _checkpoint_identity_problems(ck, name, report_identity)
         rs = ck.get("root_stats")
-        if not isinstance(rs, dict) or "mean" not in rs or "std" not in rs:
-            problems.append(f"checkpoint_root_stats_missing:{name}")
-        else:
-            src = decoder.source_constants_f32
-            for key in ("mean", "std"):
-                if not np.array_equal(
-                        np.ascontiguousarray(rs[key], dtype=np.float32).view(np.uint32),
-                        src[key].view(np.uint32)):
-                    problems.append(f"checkpoint_root_stats_mismatch:{name}:{key}")
+        problems += _checkpoint_root_stats_problems(rs, name, decoder)
     return problems
 
 
@@ -3245,6 +3383,11 @@ COUNTEREXAMPLE_IDS = (
     "f_identity_checkpoint_read_deadline_stop",
     "f_completed_conditioner_counter_kept",
     "nested_probe_schema_containers_report_incomplete",
+    "loss_weight_binding_rejected",
+    "stage_identity_external_anchor",
+    "post_backbone_validation_tail_stop",
+    "refused_backbone_not_counted",
+    "bad_metrics_and_root_stats_report_incomplete",
 )
 
 
@@ -5740,6 +5883,247 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
         record("nested_probe_schema_containers_report_incomplete", caught,
                "step/window_id/forward_counts/extra-window shape faults all "
                f"close as incomplete F reports ({schema_results})")
+
+        # ==================================================================
+        # Round-10 review counterexamples
+        # ==================================================================
+        # --- P1(r10): the seven loss weights are part of the frozen target --
+        frozen_plan_r10 = FitPlan("D1")
+        frozen_cfg_r10 = TrainConfig(
+            model_type=frozen_plan_r10.model_type,
+            steps=frozen_plan_r10.steps,
+            micro_batch=frozen_plan_r10.micro_batch,
+            grad_accum=frozen_plan_r10.grad_accum,
+            seed=frozen_plan_r10.seed, val_seed=frozen_plan_r10.val_seed,
+            loss=LossWeights(w_fk=999.0, w_contact=0.0))
+        frozen_rejected = False
+        try:
+            FitDriver._check_trainer_config(
+                types.SimpleNamespace(cfg=frozen_cfg_r10, train_ds=[None]),
+                frozen_plan_r10)
+        except FitDiagnosticError as exc:
+            frozen_rejected = "config_loss" in str(exc)
+        frozen_problems = _checkpoint_config_problems(
+            asdict(frozen_cfg_r10), frozen_plan_r10, "metadata_only.pt")
+        world_l = _r9_world(seed + 64)
+        plan_l = FitPlan("D1", steps=1, probe_every=1, synthetic=True,
+                         d_model=16, n_layers=1, n_heads=4, ffn_mult=2,
+                         lr=0.02)
+        view_l = world_l.view_for("D1")
+        trainer_l = world_l.build_trainer(plan_l, tmp / "r10loss", None,
+                                          train_ds=view_l["ds"])
+        trainer_l.cfg.loss.w_fk = 999.0
+        world_l.loss_fn.w.w_fk = 999.0
+        objective_rejected = False
+        try:
+            FitDriver(trainer=trainer_l, plan=plan_l,
+                      registration=view_l["registration"],
+                      loss_fn=world_l.loss_fn, decoder=world_l.decoder,
+                      probe_batch=view_l["probe_batch"],
+                      budget=StageBudget("D1", 60.0, 5.0),
+                      runtime_guard=SyntheticRuntimeGuard(), identity={},
+                      stage_dir=tmp / "r10loss",
+                      training_gen=torch.Generator().manual_seed(plan_l.seed),
+                      dataset_window_keys=view_l["ds"].window_keys)
+        except FitDiagnosticError as exc:
+            objective_rejected = ("config_loss" in str(exc)
+                                  or "loss_weight_binding" in str(exc))
+        loss_bind: dict = {}
+        for variant in ("w_fk", "w_contact", "loss_missing"):
+            copydir = tmp / f"r10loss_{variant}"
+            shutil.copytree(fixtures_r9["D1"][1], copydir)
+            for ck_name in ("initial.pt", "last.pt"):
+                path = copydir / ck_name
+                ck = torch.load(path, map_location="cpu", weights_only=False)
+                if variant == "loss_missing":
+                    del ck["config"]["loss"]
+                else:
+                    ck["config"]["loss"][variant] = (
+                        999.0 if variant == "w_fk" else 1.0)
+                torch.save(ck, path)
+            _full_resign(copydir)
+            local = verify_stage_local(
+                copydir, fixtures_r9["D1"][0],
+                world_r9.registration_for("D1"), world_r9.decoder,
+                production_decoder=world_r9.loss_fn)
+            out = _run_f_r9(f"r10loss_{variant}_f",
+                            StageBudget("F", 300.0, 10.0), directory=copydir)
+            loss_bind[variant] = (
+                any("loss" in p for p in local["problems"])
+                and out["summary_doc"]["complete_evidence"] is False
+                and out["summary_doc"]["verdict"] == "incomplete"
+                and (tmp / f"r10loss_{variant}_f" / "f_report.json").is_file())
+        record("loss_weight_binding_rejected",
+               frozen_rejected and bool(frozen_problems)
+               and objective_rejected and all(loss_bind.values()),
+               "w_fk=999 (config+actual target), w_contact=1 and a missing "
+               "loss block are all refused; the metadata-only frozen-plan "
+               f"omission is rejected too ({loss_bind})")
+
+        # --- P1(r10): the stage identity is anchored to plan+registration ---
+        copydir = tmp / "r10identity"
+        shutil.copytree(fixtures_r9["D1"][1], copydir)
+        foreign = {"foreign_stage": True}
+        report_path = copydir / "stage_report.json"
+        report = json.loads(report_path.read_text())
+        report["identity"] = foreign
+        report_path.write_text(json.dumps(report))
+        for ck_name in ("initial.pt", "last.pt"):
+            path = copydir / ck_name
+            ck = torch.load(path, map_location="cpu", weights_only=False)
+            ck["identity"] = foreign
+            torch.save(ck, path)
+        _full_resign(copydir)
+        local = verify_stage_local(
+            copydir, fixtures_r9["D1"][0],
+            world_r9.registration_for("D1"), world_r9.decoder,
+            production_decoder=world_r9.loss_fn)
+        out_i = _run_f_r9("r10identity_f", StageBudget("F", 300.0, 10.0),
+                          directory=copydir)
+        caught = (any("stage_identity_binding_mismatch" in p
+                      for p in local["problems"])
+                  and out_i["summary_doc"]["complete_evidence"] is False
+                  and out_i["summary_doc"]["verdict"] == "incomplete"
+                  and (tmp / "r10identity_f" / "f_report.json").is_file())
+        record("stage_identity_external_anchor", caught,
+               "a coordinated report+checkpoint identity rewrite is refused "
+               "against the plan/registration digests the verifier was given")
+
+        # --- P1(r10): predict's post-backbone validity tail -----------------
+        world_t2 = _r9_world(seed + 65)
+        holder_t2 = {"t": 0.0}
+        budget_t2 = StageBudget("D1", 100.0, 10.0, t0=0.0,
+                                clock=lambda: holder_t2["t"])
+        _, driver_t2, _ = _r9_driver(tmp / "r10tail", "D1", budget_t2,
+                                     world_t2)
+        counts_t2 = dict(validity_in_predict=0, loss_calls=0,
+                         late_loss_calls=0, fk_calls=0, late_fk_calls=0)
+        real_valid_t2 = getattr(trainer_mod, "_rotation6d_valid")
+        real_loss_t2 = CountingLoss.__call__
+        real_fk_t2 = world_t2.fk_inner.site_world_positions
+
+        def valid_tail(*a, _driver=driver_t2, _holder=holder_t2,
+                       _counts=counts_t2, **kw):
+            value = real_valid_t2(*a, **kw)
+            if (sys._getframe(1).f_code is Trainer.predict.__code__
+                    and _driver.trainer.model.training):
+                _counts["validity_in_predict"] += 1
+                _holder["t"] = 91
+            return value
+
+        def loss_tail_u(self, *a, _counts=counts_t2, _holder=holder_t2,
+                        _budget=budget_t2, **kw):
+            _counts["loss_calls"] += 1
+            _counts["late_loss_calls"] += int(
+                _holder["t"] >= _budget.work_deadline)
+            return real_loss_t2(self, *a, **kw)
+
+        def fk_tail_u(*a, _counts=counts_t2, _holder=holder_t2,
+                      _budget=budget_t2, **kw):
+            _counts["fk_calls"] += 1
+            _counts["late_fk_calls"] += int(
+                _holder["t"] >= _budget.work_deadline)
+            return real_fk_t2(*a, **kw)
+
+        with patch.object(trainer_mod, "time",
+                          types.SimpleNamespace(
+                              perf_counter=budget_t2.clock)), \
+                patch.object(trainer_mod, "_rotation6d_valid", valid_tail), \
+                patch.object(CountingLoss, "__call__", loss_tail_u), \
+                patch.object(world_t2.fk_inner, "site_world_positions",
+                             fk_tail_u):
+            summary_t2 = driver_t2.run()
+        failure_t2 = summary_t2.get("failure") or {}
+        caught = (counts_t2["validity_in_predict"] == 1
+                  and counts_t2["late_loss_calls"] == 0
+                  and counts_t2["late_fk_calls"] == 0
+                  and failure_t2.get("type") == "BudgetExceeded"
+                  and "post_predict" in failure_t2.get("message", "")
+                  and summary_t2["counters"]["backward_calls"] == 0
+                  and summary_t2["counters"]["adamw_step_calls"] == 0)
+        record("post_backbone_validation_tail_stop", caught,
+               "a deadline crossed inside predict's output-validity checks "
+               f"refuses the loss/FK chain ({counts_t2}, "
+               f"failure={failure_t2.get('message', '')[:48]})")
+
+        # --- P2(r10): a refused backbone is not counted ---------------------
+        world_c2 = _r9_world(seed + 66)
+        holder_c2 = {"t": 0.0}
+        budget_c2 = StageBudget("D1", 100.0, 10.0, t0=0.0,
+                                clock=lambda: holder_c2["t"])
+        _, driver_c2, _ = _r9_driver(tmp / "r10count", "D1", budget_c2,
+                                     world_c2)
+        actual_c2 = dict(conditioner=0, backbone=0)
+        real_forward_c2 = driver_c2.trainer.model.forward
+
+        def observe_backbone_c2(*a, _counts=actual_c2,
+                                _real=real_forward_c2, **kw):
+            _counts["backbone"] += 1
+            return _real(*a, **kw)
+
+        def conditioner_end_c2(module, _inputs, _output):
+            actual_c2["conditioner"] += 1
+            if module.training:
+                holder_c2["t"] = 91
+
+        handle_c2 = driver_c2.trainer.conditioner.register_forward_hook(
+            conditioner_end_c2)
+        with patch.object(trainer_mod, "time",
+                          types.SimpleNamespace(
+                              perf_counter=budget_c2.clock)), \
+                patch.object(driver_c2.trainer.model, "forward",
+                             observe_backbone_c2):
+            summary_c2 = driver_c2.run()
+        handle_c2.remove()
+        failure_c2 = summary_c2.get("failure") or {}
+        caught = (actual_c2["conditioner"] == 2
+                  and actual_c2["backbone"] == 1
+                  and summary_c2["counters"]["conditioner_forward_calls"] == 2
+                  and summary_c2["counters"]["backbone_forward_calls"] == 1
+                  and (failure_c2.get("counters") or {}).get(
+                      "backbone_forward_calls") == 1)
+        record("refused_backbone_not_counted", caught,
+               "the backbone admission hook refuses before forward runs; "
+               f"actual={actual_c2}, reported="
+               f"{summary_c2['counters']['backbone_forward_calls']}")
+
+        # --- P2(r10): bad metrics/root_stats containers report incomplete ---
+        schema_r10: dict = {}
+        for variant in ("metric_list", "metric_nested_list", "root_stats"):
+            copydir = tmp / f"r10schema_{variant}"
+            shutil.copytree(fixtures_r9["D1"][1], copydir)
+            if variant.startswith("metric"):
+                path = copydir / "probe_index.json"
+                pidx = json.loads(path.read_text())
+                pidx["probes"][0]["windows"][0]["metrics"] = (
+                    ["root_position_rmse_m"] if variant == "metric_list"
+                    else [[]])
+                path.write_text(json.dumps(pidx))
+            else:
+                path = copydir / "initial.pt"
+                ck = torch.load(path, map_location="cpu", weights_only=False)
+                ck["root_stats"]["mean"] = {"bad": 1}
+                torch.save(ck, path)
+            _full_resign(copydir)
+            error = None
+            out_s = None
+            try:
+                out_s = _run_f_r9(f"r10schema_{variant}_f",
+                                  StageBudget("F", 300.0, 10.0),
+                                  directory=copydir)
+            except Exception as exc:  # noqa: BLE001
+                error = f"{type(exc).__name__}:{exc}"
+            fdir = tmp / f"r10schema_{variant}_f"
+            schema_r10[variant] = (
+                error is None
+                and (fdir / "f_report.json").is_file()
+                and (fdir / "return_observation.json").is_file()
+                and out_s is not None
+                and out_s["summary_doc"]["verdict"] == "incomplete")
+        record("bad_metrics_and_root_stats_report_incomplete",
+               all(schema_r10.values()),
+               "list/nested-list metrics and a wrong-shaped root_stats "
+               f"mapping all close as incomplete F reports ({schema_r10})")
 
     return results
 
