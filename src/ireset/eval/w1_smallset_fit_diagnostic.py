@@ -643,16 +643,24 @@ def patch_conditioner_leak_guard(conditioner: torch.nn.Module) -> None:
 
 
 class CountingFK:
-    """Duck-type wrapper counting production FK batch calls."""
+    """Duck-type wrapper counting production FK batch calls; optional
+    pre/post unit guards bracket EACH internal loss FK call (P1 round-11)."""
 
-    def __init__(self, inner, counter: dict) -> None:
+    def __init__(self, inner, counter: dict, pre_call=None, post_call=None) -> None:
         self._inner = inner
         self._counter = counter
+        self._pre_call = pre_call
+        self._post_call = post_call
 
     def site_world_positions(self, *args, **kwargs):
+        if self._pre_call is not None:
+            self._pre_call()
         self._counter["production_fk_batch_calls"] = \
             self._counter.get("production_fk_batch_calls", 0) + 1
-        return self._inner.site_world_positions(*args, **kwargs)
+        out = self._inner.site_world_positions(*args, **kwargs)
+        if self._post_call is not None:
+            self._post_call()
+        return out
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
@@ -661,11 +669,17 @@ class CountingFK:
 class CountingLoss:
     """Duck-type wrapper counting loss evaluations; delegates attributes."""
 
-    def __init__(self, inner, counter: dict) -> None:
+    def __init__(self, inner, counter: dict, pre_call=None) -> None:
         self._inner = inner
         self._counter = counter
+        self._pre_call = pre_call
 
     def __call__(self, *args, **kwargs):
+        # P1 (round-11): the ACTUAL weights are re-checked at the real loss
+        # boundary — a post-construction mutation cannot consume the tampered
+        # objective while the checkpoint still records the frozen one.
+        if self._pre_call is not None:
+            self._pre_call()
         self._counter["loss_calls"] = self._counter.get("loss_calls", 0) + 1
         return self._inner(*args, **kwargs)
 
@@ -674,13 +688,14 @@ class CountingLoss:
 
 
 def _forward_hook_counter(module: torch.nn.Module, counter: dict, key: str):
-    # P2 (round-10): count AFTER the module forward actually ran.  A pre-hook
-    # counter records a refused backbone (the admission hook raises before
-    # ``forward`` is entered), i.e. a call that never happened.
-    def hook(_module, _inputs, _output):
+    # P2 (round-11): count at the forward ENTRY boundary.  For the backbone
+    # the counter is registered AFTER the admission gate, so a refused
+    # backbone is never counted while an entered forward that later raises
+    # still is (a post-forward hook would miss that executed call).
+    def hook(_module, _inputs):
         counter[key] = counter.get(key, 0) + 1
 
-    return module.register_forward_hook(hook)
+    return module.register_forward_pre_hook(hook)
 
 
 def _rng_atom_equal(a, b) -> bool:
@@ -1078,7 +1093,9 @@ def _loss_weight_problems(weights, label: str) -> list[str]:
     for key in LOSS_WEIGHT_FIELDS:
         want = LOSS_WEIGHT_EXPECTED[key]
         got = values.get(key)
-        if isinstance(got, bool) != isinstance(want, bool) or got != want:
+        # P2 (round-11): a Tensor/ndarray value must be a mismatch, never an
+        # ambiguous Boolean conversion that escapes the incomplete closure.
+        if not _json_value_equal(got, want):
             problems.append(f"{label}:{key}:{got!r}:want{want!r}")
     extra = sorted(set(values) - set(LOSS_WEIGHT_FIELDS))
     if extra:
@@ -1109,13 +1126,21 @@ def _stage_identity_binding(plan: FitPlan,
                 _canonical_sha256(registration.as_dict())}
 
 
+def _synthetic_stage_identity(plan: FitPlan,
+                              registration: FitRegistration) -> dict:
+    """The full identity a ``_mini_stage``/battery driver is constructed
+    with; every F/handoff consumer must be given this external value."""
+    return {"synthetic": True, **_stage_identity_binding(plan, registration)}
+
+
 def _identity_binding_problems(identity, plan: FitPlan,
                                registration: FitRegistration) -> list[str]:
     if not isinstance(identity, dict):
         return ["stage_identity_not_a_mapping"]
     want = _stage_identity_binding(plan, registration)
     problems = [f"stage_identity_binding_mismatch:{key}"
-                for key, value in want.items() if identity.get(key) != value]
+                for key, value in want.items()
+                if not _json_value_equal(identity.get(key), value)]
     return problems
 
 
@@ -1189,7 +1214,7 @@ class FitDriver:
         binding = _stage_identity_binding(plan, registration)
         declared = dict(identity)
         for key, value in binding.items():
-            if key in declared and declared[key] != value:
+            if key in declared and not _json_value_equal(declared[key], value):
                 raise FitDiagnosticError(f"identity_binding_conflict:{key}")
         self.identity = {**declared, **binding}
         self.stage_dir = Path(stage_dir)
@@ -1210,18 +1235,27 @@ class FitDriver:
         # executes its own ``self.fk`` calls; rebinding is idempotent for
         # worlds whose loss assembler is shared across drivers.
         self.loss_inner = loss_fn
-        self.loss_fn = CountingLoss(loss_fn, self.counters)
+        self.loss_fn = CountingLoss(loss_fn, self.counters,
+                                    pre_call=self._check_loss_weights)
         trainer.loss_fn = self.loss_fn
         inner_fk = getattr(loss_fn, "fk", None)
         if isinstance(inner_fk, CountingFK):
             inner_fk = inner_fk._inner
+        # P1 (round-11): the LossAssembler's OWN decode→FK chains are numeric
+        # units too.  Each FK call is bracketed by pre/post deadline checks
+        # (an FK returning past the deadline refuses the following teacher
+        # decode/FK), and each decode_clip call is bracketed the same way.
+        self._real_fk = inner_fk
         if inner_fk is not None:
-            loss_fn.fk = CountingFK(inner_fk, self.counters)
+            loss_fn.fk = CountingFK(inner_fk, self.counters,
+                                    pre_call=self._guard_loss_fk_pre,
+                                    post_call=self._guard_loss_fk_post)
+        self._real_decode_clip = getattr(loss_fn, "decode_clip", None)
+        if self._real_decode_clip is not None:
+            loss_fn.decode_clip = self._guarded_loss_decode
         patch_conditioner_leak_guard(trainer.conditioner)
         self.cond_handle = _forward_hook_counter(
             trainer.conditioner, self.counters, "conditioner_forward_calls")
-        self.back_handle = _forward_hook_counter(
-            trainer.model, self.counters, "backbone_forward_calls")
         # P1 (round-9): the conditioner→backbone and backbone→loss boundaries
         # INSIDE the shared micro/predict unit are guarded with module-level
         # hooks (the shared Trainer itself is untouched): a completed unit
@@ -1230,6 +1264,13 @@ class FitDriver:
         self._guard_point: str | None = None
         self.guard_pre_handle = trainer.model.register_forward_pre_hook(
             self._pre_backbone_gate)
+        # P2 (round-10/11): count at the admission boundary — a refused
+        # backbone never enters forward (not counted), while a forward that
+        # has actually been entered (even if it later raises) is counted.
+        # Registering the counter AFTER the admission gate gives exactly that
+        # order; a post-forward hook would miss the entered-but-failed case.
+        self.back_handle = _forward_hook_counter(
+            trainer.model, self.counters, "backbone_forward_calls")
         self.guard_post_handle = trainer.model.register_forward_hook(
             self._pre_loss_gate)
         # P1 (round-10): ``Trainer.predict`` performs its own output-validity
@@ -1322,6 +1363,34 @@ class FitDriver:
         if self._guard_point is not None:
             self.budget.check(self._guard_point + "_pre_loss")
 
+    def _check_loss_weights(self) -> None:
+        """The live objective is re-validated at run time (preflight, probe,
+        micro, save and the actual loss call) — construction-time equality
+        does not freeze an independently mutable ``loss_fn.w`` object."""
+        problems = _loss_weight_problems(
+            getattr(self.loss_inner, "w", None), "loss_fn_weights")
+        if problems:
+            raise FitDiagnosticError(f"loss_weight_drift:{problems}")
+
+    def _guard_loss_fk_pre(self) -> None:
+        if self._guard_point is not None:
+            self.budget.check(self._guard_point + "_loss_fk_pre")
+
+    def _guard_loss_fk_post(self) -> None:
+        if self._guard_point is not None:
+            self.budget.check(self._guard_point + "_loss_fk_post")
+
+    def _guarded_loss_decode(self, *args, **kwargs):
+        """Bracket each LossAssembler decode under the work deadline: a
+        decode returning past it refuses the FK call that follows, and a
+        decode not yet started past it never starts (P1 round-11)."""
+        if self._guard_point is not None:
+            self.budget.check(self._guard_point + "_loss_decode_pre")
+        out = self._real_decode_clip(*args, **kwargs)
+        if self._guard_point is not None:
+            self.budget.check(self._guard_point + "_loss_decode_post")
+        return out
+
     def _guarded_predict(self, *args, **kwargs):
         """Predict→loss admission: the post-backbone validity checks inside
         ``Trainer.predict`` are part of the preceding numeric unit, so their
@@ -1373,6 +1442,8 @@ class FitDriver:
     def _run_probe(self, step: int, idx: int) -> None:
         self.budget.check(f"probe_{idx}_step_{step}_start")
         self.runtime_guard.check_unit(f"probe_{idx}_step_{step}_start")
+        # P1 (round-11): the live objective object is re-validated per unit
+        self._check_loss_weights()
         self._ensure_teacher()
         self.counters["probe_calls"] = self.counters.get("probe_calls", 0) + 1
         gen = torch.Generator()
@@ -1393,6 +1464,7 @@ class FitDriver:
     def _save_checkpoint(self, name: str, step: int) -> None:
         self.budget.check(f"checkpoint_{name}_start")
         self.runtime_guard.check_unit(f"checkpoint_{name}_start")
+        self._check_loss_weights()
         self.counters["checkpoint_saves"] = \
             self.counters.get("checkpoint_saves", 0) + 1
         self.trainer.save(name, step, {"step": step}, identity=self.identity)
@@ -1468,6 +1540,14 @@ class FitDriver:
             self.guard_pre_handle.remove()
             self.guard_post_handle.remove()
             self.trainer.predict = self._real_predict
+            # P1/P2 (round-11): restore the shared loss assembler's injected
+            # wrappers so a later driver (D6) or F sees the raw methods.  The
+            # decode wrapper was an INSTANCE attribute shadowing the class
+            # method, so deleting it restores normal class-level dispatch
+            # (and class-level observation patches in the battery).
+            if "decode_clip" in self.loss_inner.__dict__:
+                del self.loss_inner.__dict__["decode_clip"]
+            self.loss_inner.fk = self._real_fk
             summary["counters"] = dict(self.counters)
             summary["budget"] = self.budget.facts()
         return summary
@@ -1476,6 +1556,9 @@ class FitDriver:
         self._phase = "preflight"
         self.budget.check("preflight")
         self.runtime_guard.check_unit("preflight")
+        # P1 (round-11): freeze-check the LIVE objective before any numeric
+        # unit; a post-construction mutation must not consume a tampered loss.
+        self._check_loss_weights()
         apply_problems = getattr(self.runtime_guard, "apply_problems", None)
         if apply_problems:
             raise FitDiagnosticError(f"runtime_apply_failed:{apply_problems}")
@@ -1510,6 +1593,7 @@ class FitDriver:
                 self.budget.check(f"step_{step}_micro_{micro + 1}_start")
                 self.runtime_guard.check_unit(
                     f"step_{step}_micro_{micro + 1}_start")
+                self._check_loss_weights()
                 try:
                     batch = next(data_iter)
                 except StopIteration:
@@ -1805,17 +1889,26 @@ def _metrics_equal(saved: dict, recomputed: dict, path: str = "") -> list[str]:
             continue
         sv = saved[key]
         if isinstance(value, dict):
-            problems += _metrics_equal(sv if isinstance(sv, dict) else {},
-                                       value, f"{path}{key}.")
+            if not isinstance(sv, dict):
+                problems.append(f"metric_container_mismatch:{path}{key}")
+            else:
+                problems += _metrics_equal(sv, value, f"{path}{key}.")
         elif isinstance(value, bool):
-            if not isinstance(sv, bool) or sv != value:
+            if not _json_value_equal(sv, value):
                 problems.append(f"metric_bool_mismatch:{path}{key}")
+        elif isinstance(value, int):
+            # P2 (round-11): an index/coordinate is an exact JSON integer —
+            # 3.0 or true in an int field is a type violation, not equality.
+            if not _json_value_equal(sv, value):
+                problems.append(f"metric_int_type_or_value:{path}{key}")
         elif isinstance(value, float):
-            if isinstance(sv, bool) or not isinstance(sv, (int, float)) \
-                    or float(sv) != value:
+            if not _json_value_equal(sv, value):
                 problems.append(f"metric_value_mismatch:{path}{key}")
+        elif isinstance(value, (list, tuple)):
+            if not _json_value_equal(sv, value):
+                problems.append(f"metric_list_type_or_value:{path}{key}")
         else:
-            if sv != value:
+            if not _json_value_equal(sv, value):
                 problems.append(f"metric_field_mismatch:{path}{key}")
     extra = sorted(set(saved) - set(recomputed))
     if extra:
@@ -1866,6 +1959,31 @@ def _production_decode_binding_problems(saved: dict, raw: np.ndarray,
 def _is_json_int(value) -> bool:
     """A JSON integer (bools are ints in Python but never valid indices)."""
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _json_value_equal(got, want) -> bool:
+    """Type-strict JSON value comparison that never lets Tensor/ndarray
+    equality reach an ``if`` (P2 round-11: a multi-element container used to
+    raise RuntimeError/ValueError instead of closing as a structured
+    refusal)."""
+    if want is None:
+        return got is None
+    if isinstance(want, bool):
+        return isinstance(got, bool) and got == want
+    if isinstance(want, int):
+        return _is_json_int(got) and got == want
+    if isinstance(want, float):
+        return (isinstance(got, (int, float)) and not isinstance(got, bool)
+                and float(got) == want)
+    if isinstance(want, str):
+        return isinstance(got, str) and got == want
+    if isinstance(want, dict):
+        return (isinstance(got, dict) and set(got) == set(want)
+                and all(_json_value_equal(got[key], want[key]) for key in want))
+    if isinstance(want, (list, tuple)):
+        return (isinstance(got, (list, tuple)) and len(got) == len(want)
+                and all(_json_value_equal(g, w) for g, w in zip(got, want)))
+    return False
 
 
 def verify_stage_local(stage_dir: Path, plan: FitPlan,
@@ -1928,7 +2046,8 @@ def verify_stage_local(stage_dir: Path, plan: FitPlan,
             else:
                 problems.append("stage_report_identity_invalid")
     if expected_identity is not None:
-        if report_identity is not None and report_identity != expected_identity:
+        if report_identity is not None and not _json_value_equal(
+                report_identity, expected_identity):
             problems.append("stage_report_identity_mismatch")
         identity_to_bind = expected_identity
     else:
@@ -2097,8 +2216,12 @@ def verify_stage_local(stage_dir: Path, plan: FitPlan,
             problems.append(f"probe_npz_missing:idx{idx}")
             continue
         fc = entry.get("forward_counts")
-        if not isinstance(fc, dict) or fc.get("conditioner") != 1 \
-                or fc.get("backbone") != 1:
+        # P2 (round-11): exact JSON integers — true == 1 in Python but is not
+        # an executed forward count.
+        if (not isinstance(fc, dict)
+                or not _is_json_int(fc.get("conditioner"))
+                or not _is_json_int(fc.get("backbone"))
+                or fc.get("conditioner") != 1 or fc.get("backbone") != 1):
             problems.append(f"probe_forward_counts:idx{idx}:{fc!r}")
         for b, wout in enumerate(windows_raw):
             if not isinstance(wout, dict):
@@ -2224,7 +2347,9 @@ def _checkpoint_config_problems(cfg, plan: FitPlan, name: str) -> list[str]:
     for key in CHECKPOINT_CONFIG_FIELDS:
         want = getattr(plan, key)
         got = cfg.get(key)
-        if isinstance(got, bool) != isinstance(want, bool) or got != want:
+        # P2 (round-11): safe type-strict equality — a Tensor/ndarray value
+        # cannot reach an ``if`` and crash F before its incomplete report.
+        if not _json_value_equal(got, want):
             problems.append(
                 f"checkpoint_config_mismatch:{name}:{key}:{got!r}:want{want!r}")
     loss_cfg = cfg.get("loss")
@@ -2238,12 +2363,12 @@ def _checkpoint_config_problems(cfg, plan: FitPlan, name: str) -> list[str]:
 
 def _checkpoint_identity_problems(ck: dict, name: str,
                                   expected_identity: dict | None) -> list[str]:
-    """A saved stage identity is only meaningful when it EQUALS the stage's
-    declared identity; a foreign (re-signed) identity is a semantic refusal."""
+    """A saved stage identity is only meaningful when it EQUALS the external
+    declared identity; a coordinated (re-signed) rewrite is a refusal."""
     if expected_identity is None:
         return []
     got = ck.get("identity")
-    if not isinstance(got, dict) or got != expected_identity:
+    if not isinstance(got, dict) or not _json_value_equal(got, expected_identity):
         return [f"checkpoint_identity_mismatch:{name}"]
     return []
 
@@ -2272,8 +2397,10 @@ def _checkpoint_binding_problems(stage_dir: Path, plan: FitPlan,
         if not isinstance(ck, dict):
             problems.append(f"checkpoint_not_a_mapping:{name}")
             continue
-        if ck.get("step") != want_step:
-            problems.append(f"checkpoint_step_mismatch:{name}:{ck.get('step')!r}")
+        step = ck.get("step")
+        # P2 (round-11): bool/float step used to pass Python's == rule
+        if not _is_json_int(step) or step != want_step:
+            problems.append(f"checkpoint_step_mismatch:{name}:{step!r}")
         rs = ck.get("root_stats")
         problems += _checkpoint_root_stats_problems(rs, name, decoder)
         problems += _checkpoint_config_problems(ck.get("config"), plan, name)
@@ -2342,7 +2469,8 @@ def build_handoff_candidate(stage_dir: Path, plan: FitPlan,
 
 def resolve_handoff(stage_dir: Path, plan: FitPlan, decoder: MetricDecoder,
                     registration: FitRegistration, authorization: dict | None,
-                    budget: StageBudget,
+                    budget: StageBudget, *,
+                    expected_identity: dict,
                     production_decoder=None) -> dict:
     """D6-entry re-verification of the D1 receipt INSIDE D6's billed window.
 
@@ -2355,6 +2483,11 @@ def resolve_handoff(stage_dir: Path, plan: FitPlan, decoder: MetricDecoder,
     authorization explicitly includes D6."""
     stage_dir = Path(stage_dir)
     problems: list[str] = []
+    if not isinstance(expected_identity, dict):
+        # P1 (round-11): the handoff identity anchor is the caller's external
+        # declaration — a coordinated report+checkpoint rewrite is caught here.
+        return {"handoff_ready": False, "problems": ["handoff_identity_not_declared"],
+                "local_mean_fit_passed": None, "coverage": None}
     budget.check("handoff_reverify")
     report_path = stage_dir / "stage_report.json"
     if not report_path.is_file():
@@ -2390,7 +2523,8 @@ def resolve_handoff(stage_dir: Path, plan: FitPlan, decoder: MetricDecoder,
         verification = verify_stage_local(stage_dir, plan, registration,
                                           decoder,
                                           production_decoder=production_decoder,
-                                          budget=budget)
+                                          budget=budget,
+                                          expected_identity=expected_identity)
     except BudgetExceeded as exc:
         problems.append(f"handoff_deadline_exceeded:{exc}")
         return {"handoff_ready": False, "problems": problems,
@@ -2527,11 +2661,11 @@ def _load_state_dicts_checked(path: Path, model, conditioner,
 def _f_identity_problems(stage_dir: Path, plan: FitPlan,
                          decoder: MetricDecoder, index: dict,
                          budget: StageBudget | None = None,
-                         report_identity: dict | None = None) -> list[str]:
-    """P1 (round-9): the identity helper's checkpoint reads are units too —
+                         expected_identity: dict | None = None) -> list[str]:
+    """P1 (round-9/11): the identity helper's checkpoint reads are units too —
     each read is guarded, the embedded configuration is reconciled against
     the frozen plan FIELD BY FIELD and the embedded stage identity against
-    the report's declared identity."""
+    the CALLER'S external identity declaration (never the report's copy)."""
     check = budget.check if budget is not None else (lambda _point: None)
     problems = verify_artifacts_index(
         Path(stage_dir), index, required=_required_stage_artifacts(plan))
@@ -2549,10 +2683,11 @@ def _f_identity_problems(stage_dir: Path, plan: FitPlan,
         if not isinstance(ck, dict):
             problems.append(f"checkpoint_not_a_mapping:{name}")
             continue
-        if ck.get("step") != want_step:
+        step = ck.get("step")
+        if not _is_json_int(step) or step != want_step:
             problems.append(f"checkpoint_step_mismatch:{name}")
         problems += _checkpoint_config_problems(ck.get("config"), plan, name)
-        problems += _checkpoint_identity_problems(ck, name, report_identity)
+        problems += _checkpoint_identity_problems(ck, name, expected_identity)
         rs = ck.get("root_stats")
         problems += _checkpoint_root_stats_problems(rs, name, decoder)
     return problems
@@ -2648,7 +2783,19 @@ def run_f_verification(*, stage_specs: list[dict], out_dir: Path,
         registration: FitRegistration = spec["registration"]
         decoder: MetricDecoder = spec["decoder"]
         loss_fn = spec["loss_fn"]
+        # P1 (round-11): the stage identity anchor is the caller's FULL
+        # external declaration.  Only the plan/registration digests are
+        # derived; every other field (stage/module/implementation/...) is
+        # compared against this external value, so a coordinated rewrite of
+        # the report and both checkpoint identities cannot self-authenticate.
+        expected_identity = spec.get("identity")
         res: dict = {"stage": plan.stage, "stage_dir": str(stage_dir)}
+        if not isinstance(expected_identity, dict):
+            res.update({"replay_enabled": False, "replay_passed": None,
+                        "skip_reason": "stage_identity_not_declared"})
+            stages_out.append(res)
+            evidence_all_ok = False
+            continue
         # P2 (round-5): a deadline crossed by an earlier stage must stop the
         # SUBSEQUENT stages without crashing the F closure — the stage-entry
         # check is non-raising here and the incomplete report still lands.
@@ -2700,7 +2847,7 @@ def run_f_verification(*, stage_specs: list[dict], out_dir: Path,
             verification = verify_stage_local(
                 stage_dir, plan, registration, decoder,
                 production_decoder=loss_fn, counters=f_verify_counters,
-                budget=budget)
+                budget=budget, expected_identity=expected_identity)
         except BudgetExceeded as exc:
             # P1 (round-5): the saved-quantity recompute is deadline-guarded
             # too; a deadline crossed inside it refuses the next decode and
@@ -2738,9 +2885,7 @@ def run_f_verification(*, stage_specs: list[dict], out_dir: Path,
             try:
                 identity_problems = _f_identity_problems(
                     stage_dir, plan, decoder, index_doc, budget=budget,
-                    report_identity=(doc.get("identity")
-                                     if isinstance(doc.get("identity"), dict)
-                                     else None))
+                    expected_identity=expected_identity)
             except BudgetExceeded as exc:
                 res.update({"replay_enabled": False, "replay_passed": None,
                             "skip_reason": "stage_deadline_stop",
@@ -3249,8 +3394,8 @@ def run_synthetic_acceptance(budget: StageBudget, out_dir: Path,
                       synthetic=True, d_model=16, n_layers=1, n_heads=4,
                       ffn_mult=2, lr=d1_lr)
     budget.check("acceptance_d1_entry")
-    _, d1_summary, d1_fin = _run_fit_stage(world, d1_plan, out_dir / "d1",
-                                           budget, auth)
+    d1_driver, d1_summary, d1_fin = _run_fit_stage(
+        world, d1_plan, out_dir / "d1", budget, auth)
     facts["d1"] = {
         "local_complete_evidence": d1_summary.get("local_complete_evidence"),
         "local_mean_fit_passed": d1_summary.get("local_mean_fit_passed"),
@@ -3265,6 +3410,7 @@ def run_synthetic_acceptance(budget: StageBudget, out_dir: Path,
     if facts["d1"]["local_mean_fit_passed"] is True:
         handoff = resolve_handoff(out_dir / "d1", d1_plan, world.decoder,
                                   world.registration_for("D1"), auth, budget,
+                                  expected_identity=d1_driver.identity,
                                   production_decoder=world.loss_fn)
         facts["d1_handoff"] = {"handoff_ready": handoff["handoff_ready"],
                                "problems": handoff["problems"][:5]}
@@ -3273,8 +3419,8 @@ def run_synthetic_acceptance(budget: StageBudget, out_dir: Path,
                               synthetic=True, d_model=16, n_layers=1, n_heads=4,
                               ffn_mult=2, lr=d6_lr)
             budget.check("acceptance_d6_entry")
-            _, d6_summary, d6_fin = _run_fit_stage(world, d6_plan,
-                                                   out_dir / "d6", budget, auth)
+            d6_driver, d6_summary, d6_fin = _run_fit_stage(
+                world, d6_plan, out_dir / "d6", budget, auth)
             facts["d6"] = {
                 "local_complete_evidence": d6_summary.get("local_complete_evidence"),
                 "local_mean_fit_passed": d6_summary.get("local_mean_fit_passed"),
@@ -3292,11 +3438,13 @@ def run_synthetic_acceptance(budget: StageBudget, out_dir: Path,
     if facts["d1"]["local_complete_evidence"]:
         f_specs.append({"stage_dir": out_dir / "d1", "plan": d1_plan,
                         "registration": world.registration_for("D1"),
-                        "decoder": world.decoder, "loss_fn": world.loss_fn})
+                        "decoder": world.decoder, "loss_fn": world.loss_fn,
+                        "identity": d1_driver.identity})
     if d6_summary is not None and d6_summary.get("local_complete_evidence"):
         f_specs.append({"stage_dir": out_dir / "d6", "plan": d6_plan,
                         "registration": world.registration_for("D6"),
-                        "decoder": world.decoder, "loss_fn": world.loss_fn})
+                        "decoder": world.decoder, "loss_fn": world.loss_fn,
+                        "identity": d6_driver.identity})
     if f_specs:
         budget.check("acceptance_f_entry")
         f_out = run_f_verification(
@@ -3388,6 +3536,12 @@ COUNTEREXAMPLE_IDS = (
     "post_backbone_validation_tail_stop",
     "refused_backbone_not_counted",
     "bad_metrics_and_root_stats_report_incomplete",
+    "loss_internal_fk_units_deadline_stop",
+    "live_loss_weight_drift_refused",
+    "stage_identity_full_external_anchor",
+    "bad_checkpoint_config_containers_report_incomplete",
+    "executed_failing_backbone_counted",
+    "typed_counts_and_coordinates_rejected",
 )
 
 
@@ -3752,7 +3906,8 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
             stage_specs=[{"stage_dir": sdir_f, "plan": plan_f,
                           "registration": world_f.registration_for("D1"),
                           "decoder": world_f.decoder,
-                          "loss_fn": world_f.loss_fn}],
+                          "loss_fn": world_f.loss_fn,
+                          "identity": _synthetic_stage_identity(plan_f, world_f.registration_for("D1"))}],
             out_dir=tmp / "fident_f", budget=StageBudget("F", 300.0, 10.0),
             runtime_guard=SyntheticRuntimeGuard(),
             build_modules=counting_build, authorization=None)
@@ -3879,7 +4034,8 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
             stage_specs=[{"stage_dir": sdir_b, "plan": plan_b,
                           "registration": world_b.registration_for("D1"),
                           "decoder": world_b.decoder,
-                          "loss_fn": world_b.loss_fn}],
+                          "loss_fn": world_b.loss_fn,
+                          "identity": _synthetic_stage_identity(plan_b, world_b.registration_for("D1"))}],
             out_dir=tmp / "bitwise_f", budget=StageBudget("F", 300.0, 10.0),
             runtime_guard=SyntheticRuntimeGuard(),
             build_modules=build_modules_factory(world_b, plan_b),
@@ -4041,6 +4197,8 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
         handoff = resolve_handoff(sdir_h, plan_h, world_h.decoder,
                                   world_h.registration_for("D1"),
                                   {"includes": []}, StageBudget("D6", 60.0, 5.0),
+                                  expected_identity=_synthetic_stage_identity(
+                                      plan_h, world_h.registration_for("D1")),
                                   production_decoder=world_h.loss_fn)
         record("d1_handoff_cannot_publish_final",
                report_ok and final_blocked and handoff["handoff_ready"] is False
@@ -4063,7 +4221,8 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
             stage_specs=[{"stage_dir": sdir_p2, "plan": plan_p2,
                           "registration": world_p2.registration_for("D1"),
                           "decoder": world_p2.decoder,
-                          "loss_fn": world_p2.loss_fn}],
+                          "loss_fn": world_p2.loss_fn,
+                          "identity": _synthetic_stage_identity(plan_p2, world_p2.registration_for("D1"))}],
             out_dir=tmp / "preserve_f", budget=StageBudget("F", 300.0, 10.0),
             runtime_guard=SyntheticRuntimeGuard(),
             build_modules=build_modules_factory(world_p2, plan_p2),
@@ -4137,7 +4296,8 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
             stage_specs=[{"stage_dir": sdir_t, "plan": plan_t,
                           "registration": world_t.registration_for("D1"),
                           "decoder": world_t.decoder,
-                          "loss_fn": world_t.loss_fn}],
+                          "loss_fn": world_t.loss_fn,
+                          "identity": _synthetic_stage_identity(plan_t, world_t.registration_for("D1"))}],
             out_dir=tmp / "teacher_swap_f", budget=StageBudget("F", 300.0, 10.0),
             runtime_guard=SyntheticRuntimeGuard(),
             build_modules=build_modules_factory(world_t, plan_t),
@@ -4163,6 +4323,8 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
                                   world_r2.registration_for("D1"),
                                   {"includes": ["D6"]},
                                   StageBudget("D6", 60.0, 5.0),
+                                  expected_identity=_synthetic_stage_identity(
+                                      plan_r2, world_r2.registration_for("D1")),
                                   production_decoder=world_r2.loss_fn)
         proof_bound = (handoff["handoff_ready"] is False
                        and any("return_observation_summary_sha_mismatch" in p
@@ -4172,7 +4334,8 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
             stage_specs=[{"stage_dir": sdir_r2, "plan": plan_r2,
                           "registration": world_r2.registration_for("D1"),
                           "decoder": world_r2.decoder,
-                          "loss_fn": world_r2.loss_fn}],
+                          "loss_fn": world_r2.loss_fn,
+                          "identity": _synthetic_stage_identity(plan_r2, world_r2.registration_for("D1"))}],
             out_dir=tmp / "proof_f", budget=StageBudget("F", 300.0, 10.0),
             runtime_guard=SyntheticRuntimeGuard(),
             build_modules=build_modules_factory(world_r2, plan_r2),
@@ -4230,7 +4393,8 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
             stage_specs=[{"stage_dir": sdir_c4, "plan": plan_c4,
                           "registration": world_c4.registration_for("D1"),
                           "decoder": world_c4.decoder,
-                          "loss_fn": world_c4.loss_fn}],
+                          "loss_fn": world_c4.loss_fn,
+                          "identity": _synthetic_stage_identity(plan_c4, world_c4.registration_for("D1"))}],
             out_dir=tmp / "ckptdtype_f", budget=StageBudget("F", 300.0, 10.0),
             runtime_guard=SyntheticRuntimeGuard(),
             build_modules=counting_build_c4, authorization=None)
@@ -4315,7 +4479,8 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
             stage_specs=[{"stage_dir": sdir_f6, "plan": plan_f6,
                           "registration": world_f6.registration_for("D1"),
                           "decoder": world_f6.decoder,
-                          "loss_fn": world_f6.loss_fn}],
+                          "loss_fn": world_f6.loss_fn,
+                          "identity": _synthetic_stage_identity(plan_f6, world_f6.registration_for("D1"))}],
             out_dir=tmp / "fdeadline_f", budget=budget_f6,
             runtime_guard=SyntheticRuntimeGuard(),
             build_modules=build_modules_factory(world_f6, plan_f6),
@@ -4348,12 +4513,15 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
                                   world_p3.registration_for("D1"),
                                   {"includes": ["D6"]},
                                   StageBudget("D6", 60.0, 5.0),
+                                  expected_identity=_synthetic_stage_identity(
+                                      plan_p3, world_p3.registration_for("D1")),
                                   production_decoder=world_p3.loss_fn)
         f_out = run_f_verification(
             stage_specs=[{"stage_dir": sdir_p3, "plan": plan_p3,
                           "registration": world_p3.registration_for("D1"),
                           "decoder": world_p3.decoder,
-                          "loss_fn": world_p3.loss_fn}],
+                          "loss_fn": world_p3.loss_fn,
+                          "identity": _synthetic_stage_identity(plan_p3, world_p3.registration_for("D1"))}],
             out_dir=tmp / "proofbudget_f", budget=StageBudget("F", 300.0, 10.0),
             runtime_guard=SyntheticRuntimeGuard(),
             build_modules=build_modules_factory(world_p3, plan_p3),
@@ -4423,6 +4591,8 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
                                   world_c4.registration_for("D1"),
                                   {"includes": ["D6"]},
                                   StageBudget("D6", 60.0, 5.0),
+                                  expected_identity=_synthetic_stage_identity(
+                                      plan_c4, world_c4.registration_for("D1")),
                                   production_decoder=world_c4.loss_fn)
         caught = (control_ok
                   and doc_c3["seal"]["status"] == "budget_exceeded_after_seal"
@@ -4467,7 +4637,8 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
                 stage_specs=[{"stage_dir": sdir_f7, "plan": plan_f7,
                               "registration": world_f7.registration_for("D1"),
                               "decoder": world_f7.decoder,
-                              "loss_fn": world_f7.loss_fn}],
+                              "loss_fn": world_f7.loss_fn,
+                              "identity": _synthetic_stage_identity(plan_f7, world_f7.registration_for("D1"))}],
                 out_dir=tmp / "fclaimdl_f", budget=claim_budget,
                 runtime_guard=SyntheticRuntimeGuard(),
                 build_modules=build_modules_factory(world_f7, plan_f7),
@@ -4552,7 +4723,8 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
                 stage_specs=[{"stage_dir": sdir_f8, "plan": plan_f8,
                               "registration": world_f8.registration_for("D1"),
                               "decoder": world_f8.decoder,
-                              "loss_fn": world_f8.loss_fn}],
+                              "loss_fn": world_f8.loss_fn,
+                              "identity": _synthetic_stage_identity(plan_f8, world_f8.registration_for("D1"))}],
                 out_dir=tmp / "freread_f", budget=f_read_budget,
                 runtime_guard=SyntheticRuntimeGuard(),
                 build_modules=build_modules_factory(world_f8, plan_f8),
@@ -4595,7 +4767,8 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
                 stage_specs=[{"stage_dir": sdir_f9, "plan": plan_f9,
                               "registration": world_f9.registration_for("D1"),
                               "decoder": world_f9.decoder,
-                              "loss_fn": world_f9.loss_fn}],
+                              "loss_fn": world_f9.loss_fn,
+                              "identity": _synthetic_stage_identity(plan_f9, world_f9.registration_for("D1"))}],
                 out_dir=tmp / "fsaveddl_f", budget=saved_budget,
                 runtime_guard=SyntheticRuntimeGuard(),
                 build_modules=build_modules_factory(world_f9, plan_f9),
@@ -4644,11 +4817,13 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
                     {"stage_dir": sdir_g1, "plan": plan_g1,
                      "registration": world_g1.registration_for("D1"),
                      "decoder": world_g1.decoder,
-                     "loss_fn": world_g1.loss_fn},
+                     "loss_fn": world_g1.loss_fn,
+                     "identity": _synthetic_stage_identity(plan_g1, world_g1.registration_for("D1"))},
                     {"stage_dir": sdir_g1, "plan": d6_plan_mini,
                      "registration": world_g1.registration_for("D1"),
                      "decoder": world_g1.decoder,
-                     "loss_fn": world_g1.loss_fn},
+                     "loss_fn": world_g1.loss_fn,
+                     "identity": _synthetic_stage_identity(d6_plan_mini, world_g1.registration_for("D1"))},
                 ],
                 out_dir=tmp / "fstopd1_f", budget=stop_budget,
                 runtime_guard=SyntheticRuntimeGuard(),
@@ -4750,7 +4925,10 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
             handoff_h = resolve_handoff(
                 sdir_h2, plan_h2, world_h2.decoder,
                 world_h2.registration_for("D1"), {"includes": ["D6"]},
-                h_budget, production_decoder=world_h2.loss_fn)
+                h_budget,
+                expected_identity=_synthetic_stage_identity(
+                    plan_h2, world_h2.registration_for("D1")),
+                production_decoder=world_h2.loss_fn)
         finally:
             mod.MetricDecoder.decode = real_decode_hd
         caught = (handoff_h["handoff_ready"] is False
@@ -4790,7 +4968,8 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
                 stage_specs=[{"stage_dir": sdir_h3, "plan": plan_h3,
                               "registration": world_h3.registration_for("D1"),
                               "decoder": world_h3.decoder,
-                              "loss_fn": world_h3.loss_fn}],
+                              "loss_fn": world_h3.loss_fn,
+                              "identity": _synthetic_stage_identity(plan_h3, world_h3.registration_for("D1"))}],
                 out_dir=tmp / "fteachdl_f", budget=t_budget,
                 runtime_guard=SyntheticRuntimeGuard(),
                 build_modules=build_modules_factory(world_h3, plan_h3),
@@ -4829,7 +5008,8 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
                 stage_specs=[{"stage_dir": sdir_h4, "plan": plan_h4,
                               "registration": world_h4.registration_for("D1"),
                               "decoder": world_h4.decoder,
-                              "loss_fn": world_h4.loss_fn}],
+                              "loss_fn": world_h4.loss_fn,
+                              "identity": _synthetic_stage_identity(plan_h4, world_h4.registration_for("D1"))}],
                 out_dir=tmp / "freducedl_f", budget=r_budget,
                 runtime_guard=SyntheticRuntimeGuard(),
                 build_modules=build_modules_factory(world_h4, plan_h4),
@@ -4949,7 +5129,8 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
                 stage_specs=[{"stage_dir": sdir_i1, "plan": plan_i1,
                               "registration": world_i1.registration_for("D6"),
                               "decoder": world_i1.decoder,
-                              "loss_fn": world_i1.loss_fn}],
+                              "loss_fn": world_i1.loss_fn,
+                              "identity": _synthetic_stage_identity(plan_i1, world_i1.registration_for("D6"))}],
                 out_dir=tmp / "ffreshdl_f", budget=i_budget,
                 runtime_guard=SyntheticRuntimeGuard(),
                 build_modules=build_modules_factory(world_i1, plan_i1),
@@ -5000,7 +5181,8 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
                 stage_specs=[{"stage_dir": sdir_i2, "plan": plan_i2,
                               "registration": world_i2.registration_for("D1"),
                               "decoder": world_i2.decoder,
-                              "loss_fn": world_i2.loss_fn}],
+                              "loss_fn": world_i2.loss_fn,
+                              "identity": _synthetic_stage_identity(plan_i2, world_i2.registration_for("D1"))}],
                 out_dir=tmp / "fteachdec_f", budget=j_budget,
                 runtime_guard=SyntheticRuntimeGuard(),
                 build_modules=build_modules_factory(world_i2, plan_i2),
@@ -5041,7 +5223,8 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
                 stage_specs=[{"stage_dir": sdir_i3, "plan": plan_i3,
                               "registration": world_i3.registration_for("D6"),
                               "decoder": world_i3.decoder,
-                              "loss_fn": world_i3.loss_fn}],
+                              "loss_fn": world_i3.loss_fn,
+                              "identity": _synthetic_stage_identity(plan_i3, world_i3.registration_for("D6"))}],
                 out_dir=tmp / "savedreads_f", budget=k_budget,
                 runtime_guard=SyntheticRuntimeGuard(),
                 build_modules=build_modules_factory(world_i3, plan_i3),
@@ -5089,7 +5272,10 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
             handoff_l = resolve_handoff(
                 sdir_i4, plan_i4, world_i4.decoder,
                 world_i4.registration_for("D1"), {"includes": ["D6"]},
-                l_budget, production_decoder=world_i4.loss_fn)
+                l_budget,
+                expected_identity=_synthetic_stage_identity(
+                    plan_i4, world_i4.registration_for("D1")),
+                production_decoder=world_i4.loss_fn)
         finally:
             mod.compute_window_metrics = real_metrics_i
             mod.torch.load = real_load_i
@@ -5125,7 +5311,10 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
             handoff_m = resolve_handoff(
                 sdir_i5, plan_i5, world_i5.decoder,
                 world_i5.registration_for("D1"), {"includes": ["D6"]},
-                m_budget, production_decoder=world_i5.loss_fn)
+                m_budget,
+                expected_identity=_synthetic_stage_identity(
+                    plan_i5, world_i5.registration_for("D1")),
+                production_decoder=world_i5.loss_fn)
         finally:
             mod.torch.load = real_load_m
         caught = (handoff_m["handoff_ready"] is False
@@ -5173,7 +5362,8 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
             stage_specs=[{"stage_dir": sdir_n1, "plan": plan_n1,
                           "registration": world_n1.registration_for("D1"),
                           "decoder": world_n1.decoder,
-                          "loss_fn": world_n1.loss_fn}],
+                          "loss_fn": world_n1.loss_fn,
+                          "identity": _synthetic_stage_identity(plan_n1, world_n1.registration_for("D1"))}],
             out_dir=tmp / "fbackbone_f", budget=n_budget,
             runtime_guard=SyntheticRuntimeGuard(),
             build_modules=_wrapped_factory, authorization=None)
@@ -5225,7 +5415,8 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
                     stage_specs=[{"stage_dir": sdir_n2, "plan": plan_n2,
                                   "registration": world_n2.registration_for("D1"),
                                   "decoder": world_n2.decoder,
-                                  "loss_fn": world_n2.loss_fn}],
+                                  "loss_fn": world_n2.loss_fn,
+                                  "identity": _synthetic_stage_identity(plan_n2, world_n2.registration_for("D1"))}],
                     out_dir=tmp / out_name, budget=budget_,
                     runtime_guard=SyntheticRuntimeGuard(),
                     build_modules=build_modules_factory(world_n2, plan_n2),
@@ -5285,7 +5476,8 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
                 stage_specs=[{"stage_dir": sdir_n3, "plan": plan_n3,
                               "registration": world_n3.registration_for("D6"),
                               "decoder": world_n3.decoder,
-                              "loss_fn": world_n3.loss_fn}],
+                              "loss_fn": world_n3.loss_fn,
+                              "identity": _synthetic_stage_identity(plan_n3, world_n3.registration_for("D6"))}],
                 out_dir=tmp / "finputs_f", budget=o_budget,
                 runtime_guard=SyntheticRuntimeGuard(),
                 build_modules=build_modules_factory(world_n3, plan_n3),
@@ -5334,7 +5526,8 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
                 stage_specs=[{"stage_dir": sdir_n4, "plan": plan_n4,
                               "registration": world_n4.registration_for("D6"),
                               "decoder": world_n4.decoder,
-                              "loss_fn": world_n4.loss_fn}],
+                              "loss_fn": world_n4.loss_fn,
+                              "identity": _synthetic_stage_identity(plan_n4, world_n4.registration_for("D6"))}],
                 out_dir=tmp / "fendpoint_f", budget=p_budget,
                 runtime_guard=SyntheticRuntimeGuard(),
                 build_modules=build_modules_factory(world_n4, plan_n4),
@@ -5361,7 +5554,8 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
             stage_specs=[{"stage_dir": sdir_n5, "plan": plan_n5,
                           "registration": world_n5.registration_for("D1"),
                           "decoder": world_n5.decoder,
-                          "loss_fn": world_n5.loss_fn}],
+                          "loss_fn": world_n5.loss_fn,
+                          "identity": _synthetic_stage_identity(plan_n5, world_n5.registration_for("D1"))}],
             out_dir=tmp / "badidx_f", budget=StageBudget("F", 300.0, 10.0),
             runtime_guard=SyntheticRuntimeGuard(),
             build_modules=build_modules_factory(world_n5, plan_n5),
@@ -5384,7 +5578,8 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
             stage_specs=[{"stage_dir": sdir_n6, "plan": plan_n6,
                           "registration": world_n6.registration_for("D1"),
                           "decoder": world_n6.decoder,
-                          "loss_fn": world_n6.loss_fn}],
+                          "loss_fn": world_n6.loss_fn,
+                          "identity": _synthetic_stage_identity(plan_n6, world_n6.registration_for("D1"))}],
             out_dir=tmp / "badseal_f", budget=StageBudget("F", 300.0, 10.0),
             runtime_guard=SyntheticRuntimeGuard(),
             build_modules=build_modules_factory(world_n6, plan_n6),
@@ -5418,7 +5613,8 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
             stage_specs=[{"stage_dir": sdir_f4, "plan": plan_f4,
                           "registration": world_f4.registration_for("D1"),
                           "decoder": world_f4.decoder,
-                          "loss_fn": world_f4.loss_fn}],
+                          "loss_fn": world_f4.loss_fn,
+                          "identity": _synthetic_stage_identity(plan_f4, world_f4.registration_for("D1"))}],
             out_dir=tmp / "fconstruct_f", budget=budget_f4,
             runtime_guard=SyntheticRuntimeGuard(),
             build_modules=counting_build_f4, authorization=None)
@@ -5455,7 +5651,8 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
             stage_specs=[{"stage_dir": sdir_f5, "plan": plan_f5,
                           "registration": world_f5.registration_for("D1"),
                           "decoder": world_f5.decoder,
-                          "loss_fn": world_f5.loss_fn}],
+                          "loss_fn": world_f5.loss_fn,
+                          "identity": _synthetic_stage_identity(plan_f5, world_f5.registration_for("D1"))}],
             out_dir=tmp / "fdriftfresh_f",
             budget=StageBudget("F", 300.0, 10.0),
             runtime_guard=_DriftAtInputsReady(),
@@ -5481,7 +5678,8 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
             stage_specs=[{"stage_dir": sdir_p6, "plan": plan_p6,
                           "registration": world_p6.registration_for("D1"),
                           "decoder": world_p6.decoder,
-                          "loss_fn": world_p6.loss_fn}],
+                          "loss_fn": world_p6.loss_fn,
+                          "identity": _synthetic_stage_identity(plan_p6, world_p6.registration_for("D1"))}],
             out_dir=tmp / "prooflist_f", budget=StageBudget("F", 300.0, 10.0),
             runtime_guard=SyntheticRuntimeGuard(),
             build_modules=build_modules_factory(world_p6, plan_p6),
@@ -5492,6 +5690,8 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
                                   world_p6.registration_for("D1"),
                                   {"includes": ["D6"]},
                                   StageBudget("D6", 60.0, 5.0),
+                                  expected_identity=_synthetic_stage_identity(
+                                      plan_p6, world_p6.registration_for("D1")),
                                   production_decoder=world_p6.loss_fn)
         caught = (report_written
                   and s0.get("replay_enabled") is False
@@ -5550,7 +5750,8 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
                               "plan": plan_r9,
                               "registration": world_r9.registration_for("D1"),
                               "decoder": world_r9.decoder,
-                              "loss_fn": world_r9.loss_fn}],
+                              "loss_fn": world_r9.loss_fn,
+                              "identity": _synthetic_stage_identity(plan_r9, world_r9.registration_for("D1"))}],
                 out_dir=tmp / name, budget=budget_,
                 runtime_guard=SyntheticRuntimeGuard(),
                 build_modules=(factory
@@ -6124,6 +6325,273 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
                all(schema_r10.values()),
                "list/nested-list metrics and a wrong-shaped root_stats "
                f"mapping all close as incomplete F reports ({schema_r10})")
+
+        # ==================================================================
+        # Round-11 review counterexamples
+        # ==================================================================
+        # --- P1(r11): LossAssembler's own decode->FK chain is guarded -------
+        loss_units_r11: dict = {}
+        for inject_after in ("none", "pred_decode", "pred_fk"):
+            world_u2 = _r9_world(seed + 67)
+            holder_u2 = {"t": 0.0}
+            budget_u2 = StageBudget("D1", 100.0, 10.0, t0=0.0,
+                                    clock=lambda: holder_u2["t"])
+            _, driver_u2, _ = _r9_driver(tmp / f"r11units_{inject_after}",
+                                         "D1", budget_u2, world_u2)
+            counts_u2 = dict(training_decodes=0, late_training_decodes=0,
+                             training_fks=0, late_training_fks=0)
+            real_decode_u2 = world_u2.loss_fn.decode_clip
+            real_fk_u2 = world_u2.fk_inner.site_world_positions
+
+            def decode_u2(*a, _c=counts_u2, _real=real_decode_u2,
+                          _holder=holder_u2, _budget=budget_u2,
+                          _inj=inject_after, **kw):
+                active = _stack_has(Trainer.accumulate_micro.__code__)
+                if active:
+                    _c["training_decodes"] += 1
+                    _c["late_training_decodes"] += int(
+                        _holder["t"] >= _budget.work_deadline)
+                value = _real(*a, **kw)
+                if (active and _inj == "pred_decode"
+                        and _c["training_decodes"] == 1):
+                    _holder["t"] = 91.0
+                return value
+
+            def fk_u2(*a, _c=counts_u2, _real=real_fk_u2,
+                      _holder=holder_u2, _budget=budget_u2,
+                      _inj=inject_after, **kw):
+                active = _stack_has(Trainer.accumulate_micro.__code__)
+                if active:
+                    _c["training_fks"] += 1
+                    _c["late_training_fks"] += int(
+                        _holder["t"] >= _budget.work_deadline)
+                value = _real(*a, **kw)
+                if (active and _inj == "pred_fk"
+                        and _c["training_fks"] == 1):
+                    _holder["t"] = 91.0
+                return value
+
+            with patch.object(trainer_mod, "time",
+                              types.SimpleNamespace(
+                                  perf_counter=budget_u2.clock)), \
+                    patch.object(world_u2.loss_fn, "decode_clip", decode_u2), \
+                    patch.object(world_u2.fk_inner, "site_world_positions",
+                                 fk_u2):
+                summary_u2 = driver_u2.run()
+            loss_units_r11[inject_after] = {
+                **counts_u2,
+                "failure": (summary_u2.get("failure") or {}).get("type"),
+                "complete": summary_u2.get("local_complete_evidence"),
+                "backward": summary_u2["counters"]["backward_calls"],
+                "step": summary_u2["counters"]["adamw_step_calls"]}
+        caught = (loss_units_r11["none"]["training_decodes"] == 8
+                  and loss_units_r11["none"]["training_fks"] == 8
+                  and loss_units_r11["none"]["complete"] is True
+                  and all(loss_units_r11[inj]["late_training_decodes"] == 0
+                          and loss_units_r11[inj]["late_training_fks"] == 0
+                          and loss_units_r11[inj]["failure"] == "BudgetExceeded"
+                          and loss_units_r11[inj]["backward"] == 0
+                          and loss_units_r11[inj]["step"] == 0
+                          for inj in ("pred_decode", "pred_fk")))
+        record("loss_internal_fk_units_deadline_stop", caught,
+               "decode/FK inside the production loss are bracketed: a "
+               f"completed unit crossing the deadline starts no later unit "
+               f"({loss_units_r11})")
+
+        # --- P1(r11): live loss weights are re-checked at run time ----------
+        world_l2 = _r9_world(seed + 68)
+        holder_l2 = {"t": 0.0}
+        budget_l2 = StageBudget("D1", 100.0, 10.0, t0=0.0,
+                                clock=lambda: holder_l2["t"])
+        _, driver_l2, sdir_l2 = _r9_driver(tmp / "r11livedrift", "D1",
+                                           budget_l2, world_l2)
+        world_l2.loss_fn.w.w_fk = 999.0
+        used_l2: list = []
+        real_loss_l2 = LossAssembler.__call__
+
+        def observe_loss_l2(self, *a, _used=used_l2, _real=real_loss_l2, **kw):
+            if _stack_has(Trainer.accumulate_micro.__code__):
+                _used.append(float(self.w.w_fk))
+            return _real(self, *a, **kw)
+
+        with patch.object(trainer_mod, "time",
+                          types.SimpleNamespace(
+                              perf_counter=budget_l2.clock)), \
+                patch.object(LossAssembler, "__call__", observe_loss_l2):
+            summary_l2 = driver_l2.run()
+        failure_l2 = summary_l2.get("failure") or {}
+        out_l2 = _run_f_r9("r11livedrift_f", StageBudget("F", 300.0, 10.0),
+                           directory=sdir_l2)
+        caught = (used_l2 == []
+                  and failure_l2.get("type") == "FitDiagnosticError"
+                  and "loss_weight_drift" in failure_l2.get("message", "")
+                  and summary_l2.get("local_complete_evidence") is False
+                  and out_l2["summary_doc"]["complete_evidence"] is False)
+        record("live_loss_weight_drift_refused", caught,
+               "post-construction loss_fn.w drift is refused before any "
+               f"micro consumes it (uses={used_l2}, "
+               f"failure={failure_l2.get('type')})")
+
+        # --- P1(r11): the FULL external identity is the anchor --------------
+        copydir = tmp / "r11identity_full"
+        shutil.copytree(fixtures_r9["D1"][1], copydir)
+        report_path = copydir / "stage_report.json"
+        report = json.loads(report_path.read_text())
+        original_identity = dict(report["identity"])
+        foreign = {**original_identity, "synthetic": False, "stage": "D6",
+                   "module": "foreign.module",
+                   "implementation_sha256": "b" * 64}
+        report["identity"] = foreign
+        report_path.write_text(json.dumps(report))
+        for ck_name in ("initial.pt", "last.pt"):
+            path = copydir / ck_name
+            ck = torch.load(path, map_location="cpu", weights_only=False)
+            ck["identity"] = foreign
+            torch.save(ck, path)
+        _full_resign(copydir)
+        local_no_anchor = verify_stage_local(
+            copydir, fixtures_r9["D1"][0],
+            world_r9.registration_for("D1"), world_r9.decoder,
+            production_decoder=world_r9.loss_fn)
+        local_external = verify_stage_local(
+            copydir, fixtures_r9["D1"][0],
+            world_r9.registration_for("D1"), world_r9.decoder,
+            production_decoder=world_r9.loss_fn,
+            expected_identity=original_identity)
+        out_i2 = _run_f_r9("r11identity_full_f",
+                           StageBudget("F", 300.0, 10.0), directory=copydir)
+        caught = (any("stage_report_identity_mismatch" in p
+                      or "checkpoint_identity_mismatch" in p
+                      for p in local_external["problems"])
+                  and out_i2["summary_doc"]["complete_evidence"] is False
+                  and out_i2["summary_doc"]["verdict"] == "incomplete"
+                  and (tmp / "r11identity_full_f" / "f_report.json").is_file())
+        record("stage_identity_full_external_anchor", caught,
+               "coordinated report+checkpoint identity rewrite (digests kept) "
+               "is refused against the caller's full external identity "
+               f"(no_anchor={local_no_anchor['problems'][:2]})")
+
+        # --- P2(r11): bad config value containers close as incomplete -------
+        bad_cfg_r11: dict = {}
+        for variant in ("loss_tensor", "lr_array"):
+            copydir = tmp / f"r11cfg_{variant}"
+            shutil.copytree(fixtures_r9["D1"][1], copydir)
+            path = copydir / "initial.pt"
+            ck = torch.load(path, map_location="cpu", weights_only=False)
+            if variant == "loss_tensor":
+                ck["config"]["loss"]["w_fk"] = torch.tensor([2.0, 2.0])
+            else:
+                ck["config"]["lr"] = np.array([fixtures_r9["D1"][0].lr,
+                                               fixtures_r9["D1"][0].lr])
+            torch.save(ck, path)
+            _full_resign(copydir)
+            error, out_c = None, None
+            try:
+                out_c = _run_f_r9(f"r11cfg_{variant}_f",
+                                  StageBudget("F", 300.0, 10.0),
+                                  directory=copydir)
+            except Exception as exc:  # noqa: BLE001
+                error = f"{type(exc).__name__}:{exc}"
+            fdir = tmp / f"r11cfg_{variant}_f"
+            bad_cfg_r11[variant] = (
+                error is None
+                and (fdir / "f_report.json").is_file()
+                and (fdir / "return_observation.json").is_file()
+                and out_c is not None
+                and out_c["summary_doc"]["verdict"] == "incomplete")
+        record("bad_checkpoint_config_containers_report_incomplete",
+               all(bad_cfg_r11.values()),
+               "Tensor/ndarray config values are type-strict mismatches, "
+               f"never an F crash ({bad_cfg_r11})")
+
+        # --- P2(r11): an entered-but-failing forward is still counted -------
+        world_c3 = _r9_world(seed + 69)
+        holder_c3 = {"t": 0.0}
+        budget_c3 = StageBudget("D1", 100.0, 10.0, t0=0.0,
+                                clock=lambda: holder_c3["t"])
+        _, driver_c3, _ = _r9_driver(tmp / "r11failedfw", "D1",
+                                     budget_c3, world_c3)
+        actual_c3 = dict(numeric=0, training=0)
+        real_forward_c3 = driver_c3.trainer.model.forward
+
+        def fail_after_forward_c3(*a, _counts=actual_c3,
+                                  _real=real_forward_c3, **kw):
+            value = _real(*a, **kw)
+            _counts["numeric"] += 1
+            if driver_c3.trainer.model.training:
+                _counts["training"] += 1
+                raise TrainingNumericalError("synthetic_failure_after_forward")
+            return value
+
+        with patch.object(trainer_mod, "time",
+                          types.SimpleNamespace(
+                              perf_counter=budget_c3.clock)), \
+                patch.object(driver_c3.trainer.model, "forward",
+                             fail_after_forward_c3):
+            summary_c3 = driver_c3.run()
+        failure_c3 = summary_c3.get("failure") or {}
+        caught = (actual_c3["numeric"] == 2
+                  and actual_c3["training"] == 1
+                  and summary_c3["counters"]["backbone_forward_calls"] == 2
+                  and (failure_c3.get("counters") or {}).get(
+                      "backbone_forward_calls") == 2)
+        record("executed_failing_backbone_counted", caught,
+               "forward-entry counting after the admission gate: a refused "
+               "backbone is not counted, an entered-then-failing one is "
+               f"({actual_c3}, reported="
+               f"{summary_c3['counters']['backbone_forward_calls']})")
+
+        # --- P2(r11): integer/boolean strictness ----------------------------
+        typed_r11: dict = {}
+        for variant in ("checkpoint_step", "forward_counts",
+                        "worst_coordinate"):
+            copydir = tmp / f"r11typed_{variant}"
+            shutil.copytree(fixtures_r9["D1"][1], copydir)
+            if variant == "checkpoint_step":
+                for filename, step in (("initial.pt", False),
+                                       ("last.pt",
+                                        float(fixtures_r9["D1"][0].steps))):
+                    path = copydir / filename
+                    ck = torch.load(path, map_location="cpu",
+                                    weights_only=False)
+                    ck["step"] = step
+                    torch.save(ck, path)
+            else:
+                path = copydir / "probe_index.json"
+                pidx = json.loads(path.read_text())
+                for entry in pidx["probes"]:
+                    if variant == "forward_counts":
+                        entry["forward_counts"] = {"conditioner": True,
+                                                   "backbone": True}
+                    else:
+                        for wout in entry["windows"]:
+                            for stats in wout["metrics"]["spike"].values():
+                                stats["worst_coordinate"] = [
+                                    float(v)
+                                    for v in stats["worst_coordinate"]]
+                path.write_text(json.dumps(pidx))
+            _full_resign(copydir)
+            local_t = verify_stage_local(
+                copydir, fixtures_r9["D1"][0],
+                world_r9.registration_for("D1"), world_r9.decoder,
+                production_decoder=world_r9.loss_fn)
+            error, out_t = None, None
+            try:
+                out_t = _run_f_r9(f"r11typed_{variant}_f",
+                                  StageBudget("F", 300.0, 10.0),
+                                  directory=copydir)
+            except Exception as exc:  # noqa: BLE001
+                error = f"{type(exc).__name__}:{exc}"
+            typed_r11[variant] = (
+                bool(local_t["problems"])
+                and error is None
+                and out_t is not None
+                and out_t["summary_doc"]["complete_evidence"] is False
+                and out_t["summary_doc"]["verdict"] == "incomplete")
+        record("typed_counts_and_coordinates_rejected",
+               all(typed_r11.values()),
+               "bool/float checkpoint step, true forward counts and float "
+               f"worst coordinates are type violations ({typed_r11})")
 
     return results
 

@@ -4,7 +4,7 @@ Pure-synthetic and offline: synthetic tokenizer/joint range/teacher windows
 and a synthetic 15-site FK stub.  No real data, checkpoint, asset compile or
 CUDA path is touched; nothing here claims production equivalence.
 
-The heavy test is the full §6.2/v0.3/v0.4 counterexample battery (81 cases)
+The heavy test is the full §6.2/v0.3/v0.4 counterexample battery (87 cases)
 shared with the synthetic acceptance CLI.
 """
 
@@ -327,7 +327,9 @@ def test_mini_stage_local_verification_and_f_bitwise_replay():
         f_out = diag.run_f_verification(
             stage_specs=[{"stage_dir": sdir, "plan": plan,
                           "registration": world.registration_for("D1"),
-                          "decoder": world.decoder, "loss_fn": world.loss_fn}],
+                          "decoder": world.decoder, "loss_fn": world.loss_fn,
+                          "identity": diag._synthetic_stage_identity(
+                              plan, world.registration_for("D1"))}],
             out_dir=Path(td) / "f", budget=diag.budget_for_stage("F"),
             runtime_guard=diag.SyntheticRuntimeGuard(),
             build_modules=diag.build_modules_factory(world, plan),
@@ -355,7 +357,9 @@ def test_handoff_requires_gate_authorization_and_seal():
         handoff = diag.resolve_handoff(sdir, plan, world.decoder,
                                        world.registration_for("D1"),
                                        {"includes": ["D6"]},
-                                       diag.StageBudget("D6", 60.0, 5.0))
+                                       diag.StageBudget("D6", 60.0, 5.0),
+                                       expected_identity=diag._synthetic_stage_identity(
+                                           plan, world.registration_for("D1")))
         assert handoff["handoff_ready"] is False
         assert any("d1_mean_fit_gate_not_passed" in p
                    for p in handoff["problems"])
@@ -365,7 +369,9 @@ def test_handoff_requires_gate_authorization_and_seal():
         auth_missing = diag.resolve_handoff(sdir, plan, world.decoder,
                                             world.registration_for("D1"),
                                             {"includes": []},
-                                            diag.StageBudget("D6", 60.0, 5.0))
+                                            diag.StageBudget("D6", 60.0, 5.0),
+                                            expected_identity=diag._synthetic_stage_identity(
+                                                plan, world.registration_for("D1")))
         assert any("authorization_does_not_include_d6" in p
                    for p in auth_missing["problems"])
         # the D1 report itself never publishes final-namespace fields
