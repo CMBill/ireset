@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import shutil
 import sys
@@ -272,6 +273,79 @@ def test_teacher_reference_precision_and_deadline_admission(tmp_path, variant):
     finished = diag.finish_stage(stage_dir, summary, budget)
     assert finished["summary_doc"]["local_complete_evidence"] is False
     assert (stage_dir / "return_observation.json").is_file()
+
+
+@pytest.mark.parametrize("variant", ["control", "slow_metric", "slow_target_to"])
+def test_teacher_target_conversion_is_bounded_by_deadline(tmp_path, variant):
+    _, _, driver, _, clock, budget = _driver(tmp_path)
+    actual_metric = driver.decoder.decode
+    actual_to = torch.Tensor.to
+    actual_check = driver.runtime_guard.check_unit
+    actual_decode = driver._real_decode_clip
+    actual_fk = driver._real_fk.site_world_positions
+    calls = {"injections": 0, "target_to": 0, "late_target_to": 0,
+             "prod_runtime": 0, "decode": 0, "fk": 0}
+
+    def metric(*args, **kwargs):
+        result = actual_metric(*args, **kwargs)
+        if variant == "slow_metric" and not calls["injections"]:
+            calls["injections"] += 1
+            clock.t = 91.0
+        return result
+
+    def to(tensor, *args, **kwargs):
+        frame = inspect.currentframe()
+        try:
+            is_target = frame.f_back.f_code is diag.FitDriver._ensure_teacher.__code__
+        finally:
+            del frame
+        if is_target:
+            calls["target_to"] += 1
+            calls["late_target_to"] += int(clock.t >= budget.work_deadline)
+        result = actual_to(tensor, *args, **kwargs)
+        if is_target and variant == "slow_target_to" and not calls["injections"]:
+            calls["injections"] += 1
+            clock.t = 91.0
+        return result
+
+    def check(point):
+        if point == "teacher_window_w0_prod_decode":
+            calls["prod_runtime"] += 1
+        return actual_check(point)
+
+    def decode(*args, **kwargs):
+        calls["decode"] += 1
+        return actual_decode(*args, **kwargs)
+
+    def fk(*args, **kwargs):
+        calls["fk"] += 1
+        return actual_fk(*args, **kwargs)
+
+    driver._real_decode_clip = decode
+    with patch.object(driver.decoder, "decode", metric), \
+            patch.object(torch.Tensor, "to", to), \
+            patch.object(driver.runtime_guard, "check_unit", check), \
+            patch.object(driver._real_fk, "site_world_positions", fk):
+        summary = _run(driver, clock)
+
+    assert calls["late_target_to"] == 0
+    if variant == "control":
+        assert summary["local_complete_evidence"] is True, summary.get("failure")
+        assert calls["target_to"] == calls["prod_runtime"] == 1
+        assert calls["decode"] > 0 and calls["fk"] > 0
+        return
+    assert calls["injections"] == 1
+    assert calls["target_to"] == (0 if variant == "slow_metric" else 1)
+    assert calls["prod_runtime"] == calls["decode"] == calls["fk"] == 0
+    assert summary["local_complete_evidence"] is False
+    assert summary["failure"]["type"] == "BudgetExceeded"
+    assert ("teacher_window_w0_target_to" if variant == "slow_metric"
+            else "teacher_window_w0_prod_decode") in summary["failure"]["message"]
+    assert summary["counters"]["metric_decode_calls"] == 1
+    assert summary["counters"]["production_decode_calls"] == 0
+    assert summary["counters"]["production_fk_batch_calls"] == 0
+    assert summary["counters"]["conditioner_forward_calls"] == 0
+    assert summary["counters"]["adamw_step_calls"] == 0
 
 
 @pytest.mark.parametrize("variant", ["control", "missing", "list", "null"])

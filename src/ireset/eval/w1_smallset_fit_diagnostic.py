@@ -1664,6 +1664,10 @@ class FitDriver:
                 self.counters["metric_decode_calls"] = \
                     self.counters.get("metric_decode_calls", 0) + 1
                 md.append(self.decoder.decode(np.ascontiguousarray(x0_tgt[b])))
+                # Conversion may launch device work; the metric decode must
+                # not admit it after the deadline. The prod-decode check below
+                # also charges the conversion before runtime/FK admission.
+                self.budget.check(f"teacher_window_w{b}_target_to")
                 target = (self.probe_batch["x0"].detach()[b:b + 1]
                           .to(self.trainer.cfg.device))
                 point = f"teacher_window_w{b}_prod_decode"
