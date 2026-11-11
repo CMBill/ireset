@@ -148,3 +148,40 @@ def test_parameter_frozen_mid_step_is_refused_before_update(tmp_path):
     assert summary["local_complete_evidence"] is False
     assert "optimizer_parameter_frozen" in summary["failure"]["message"]
     assert calls == {"micro": 1, "step": 0}
+
+
+@pytest.mark.parametrize("injected", [False, True])
+def test_pre_backward_runtime_read_is_charged(tmp_path, injected):
+    _, _, driver, stage_dir, clock, budget = _driver(tmp_path)
+    actual_check = driver.runtime_guard.check_unit
+    actual_backward = torch.Tensor.backward
+    calls = {"injections": 0, "backward": 0, "late": 0}
+
+    def check(point):
+        actual_check(point)
+        if injected and point == "step_1_micro_1_pre_backward":
+            calls["injections"] += 1
+            clock.t = 91.0
+
+    def backward(tensor, *args, **kwargs):
+        calls["backward"] += 1
+        calls["late"] += int(clock.t >= budget.work_deadline)
+        return actual_backward(tensor, *args, **kwargs)
+
+    with patch.object(driver.runtime_guard, "check_unit", check), \
+            patch.object(torch.Tensor, "backward", backward):
+        summary = _run(driver, clock)
+    if not injected:
+        assert summary["local_complete_evidence"] is True
+        assert calls == {"injections": 0, "backward": 4, "late": 0}
+        return
+    assert summary["local_complete_evidence"] is False
+    assert summary["failure"]["type"] == "BudgetExceeded"
+    assert "pre_backward_post_runtime" in summary["failure"]["message"]
+    assert calls == {"injections": 1, "backward": 0, "late": 0}
+    assert summary["counters"]["backward_calls"] == 0
+    assert summary["counters"]["adamw_step_calls"] == 0
+    finished = diag.finish_stage(stage_dir, summary, budget)
+    assert finished["summary_doc"]["local_complete_evidence"] is False
+    assert finished["return_coverage"]["covered"] is True
+    assert (stage_dir / "return_observation.json").is_file()

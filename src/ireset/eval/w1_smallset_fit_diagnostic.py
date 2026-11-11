@@ -1864,6 +1864,10 @@ class FitDriver:
                     self.budget.check(f"step_{_s}_micro_{_m + 1}_pre_backward")
                     self.runtime_guard.check_unit(
                         f"step_{_s}_micro_{_m + 1}_pre_backward")
+                    # The runtime read is work too; it must not admit a
+                    # backward that starts after the work deadline.
+                    self.budget.check(
+                        f"step_{_s}_micro_{_m + 1}_pre_backward_post_runtime")
 
                 def post_backward():
                     self.counters["backward_calls"] += 1
@@ -4053,6 +4057,7 @@ COUNTEREXAMPLE_IDS = (
     "state_contract_construction_guarded",
     "mixed_checkpoint_keys_report_incomplete",
     "trainable_parameter_roster_bound",
+    "pre_backward_runtime_read_time_charged",
 )
 
 
@@ -8462,6 +8467,56 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
                           for v in ("model", "conditioner")))
         record("trainable_parameter_roster_bound", caught,
                f"frozen model/conditioner parameter refuses before forward ({trainable_r16})")
+
+        # The runtime check immediately before backward can itself cross the
+        # work deadline. Count the actual backward entry, not a later summary.
+        backward_r16: dict = {}
+        for injected in (False, True):
+            world_bw = _r9_world(seed + 102)
+            clock_bw = _FakeClock(1.0)
+            budget_bw = StageBudget("D1", 100.0, 10.0, t0=0.0, clock=clock_bw)
+            _, driver_bw, _ = _r9_driver(tmp / f"r16backward_{injected}",
+                                         "D1", budget_bw, world_bw)
+            calls_bw = {"injections": 0, "backward": 0, "late": 0}
+            base_check_bw = driver_bw.runtime_guard.check_unit
+            base_backward_bw = torch.Tensor.backward
+
+            def check_bw(point, _base=base_check_bw, _calls=calls_bw,
+                         _clock=clock_bw, _injected=injected):
+                value = _base(point)
+                if _injected and point == "step_1_micro_1_pre_backward":
+                    _calls["injections"] += 1
+                    _clock.t = 91.0
+                return value
+
+            def backward_bw(tensor, *a, _base=base_backward_bw,
+                            _calls=calls_bw, _clock=clock_bw,
+                            _budget=budget_bw, **kw):
+                _calls["backward"] += 1
+                _calls["late"] += int(_clock.t >= _budget.work_deadline)
+                return _base(tensor, *a, **kw)
+
+            with patch.object(driver_bw.runtime_guard, "check_unit", check_bw), \
+                    patch.object(torch.Tensor, "backward", backward_bw), \
+                    patch.object(trainer_mod, "time",
+                                 types.SimpleNamespace(perf_counter=clock_bw)):
+                summary_bw = driver_bw.run()
+            backward_r16[str(injected)] = {
+                **calls_bw, "complete": summary_bw["local_complete_evidence"],
+                "recorded": summary_bw["counters"]["backward_calls"],
+                "steps": summary_bw["counters"]["adamw_step_calls"],
+                "message": (summary_bw.get("failure") or {}).get("message", "")}
+        caught = (backward_r16["False"]["complete"] is True
+                  and backward_r16["False"]["backward"] == 4
+                  and backward_r16["True"]["complete"] is False
+                  and backward_r16["True"]["injections"] == 1
+                  and backward_r16["True"]["backward"] == 0
+                  and backward_r16["True"]["late"] == 0
+                  and backward_r16["True"]["recorded"] == 0
+                  and backward_r16["True"]["steps"] == 0
+                  and "pre_backward_post_runtime" in backward_r16["True"]["message"])
+        record("pre_backward_runtime_read_time_charged", caught,
+               f"runtime read crossing the deadline refuses backward ({backward_r16})")
 
     return results
 
