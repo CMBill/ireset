@@ -185,3 +185,87 @@ def test_pre_backward_runtime_read_is_charged(tmp_path, injected):
     assert finished["summary_doc"]["local_complete_evidence"] is False
     assert finished["return_coverage"]["covered"] is True
     assert (stage_dir / "return_observation.json").is_file()
+
+
+@pytest.mark.parametrize("variant", ["control", "drift_after_metric",
+                                     "drift_after_decode", "slow_decode_gate",
+                                     "slow_fk_gate"])
+def test_teacher_reference_precision_and_deadline_admission(tmp_path, variant):
+    _, _, driver, stage_dir, clock, budget = _driver(tmp_path)
+    runtime_before = (torch.backends.cuda.matmul.allow_tf32,
+                      torch.backends.cudnn.allow_tf32,
+                      torch.get_float32_matmul_precision())
+    calls = {"injections": 0, "decode": 0, "fk": 0,
+             "late_decode": 0, "late_fk": 0, "bad_fk": 0}
+    try:
+        driver.runtime_guard = diag.ProductionRuntimeGuard(expected_device="cpu")
+        assert not driver.runtime_guard.apply_problems
+        actual_check = driver.runtime_guard.check_unit
+        actual_metric = driver.decoder.decode
+        actual_decode = driver._real_decode_clip
+        actual_fk = driver._real_fk.site_world_positions
+
+        def check(point):
+            actual_check(point)
+            target = {"slow_decode_gate": "teacher_window_w0_prod_decode",
+                      "slow_fk_gate": "teacher_window_w0_fk"}.get(variant)
+            if point == target and calls["injections"] == 0:
+                calls["injections"] += 1
+                clock.t = 91.0
+
+        def metric(*args, **kwargs):
+            value = actual_metric(*args, **kwargs)
+            if variant == "drift_after_metric" and calls["injections"] == 0:
+                calls["injections"] += 1
+                torch.backends.cuda.matmul.allow_tf32 = True
+            return value
+
+        def decode(*args, **kwargs):
+            calls["decode"] += 1
+            calls["late_decode"] += int(clock.t >= budget.work_deadline)
+            value = actual_decode(*args, **kwargs)
+            if variant == "drift_after_decode" and calls["injections"] == 0:
+                calls["injections"] += 1
+                torch.backends.cuda.matmul.allow_tf32 = True
+            return value
+
+        def fk(*args, **kwargs):
+            calls["fk"] += 1
+            calls["late_fk"] += int(clock.t >= budget.work_deadline)
+            calls["bad_fk"] += int(torch.backends.cuda.matmul.allow_tf32)
+            return actual_fk(*args, **kwargs)
+
+        driver._real_decode_clip = decode
+        with patch.object(driver.runtime_guard, "check_unit", check), \
+                patch.object(driver.decoder, "decode", metric), \
+                patch.object(driver._real_fk, "site_world_positions", fk):
+            summary = _run(driver, clock)
+    finally:
+        torch.set_float32_matmul_precision(runtime_before[2])
+        torch.backends.cuda.matmul.allow_tf32 = runtime_before[0]
+        torch.backends.cudnn.allow_tf32 = runtime_before[1]
+
+    assert calls["late_decode"] == calls["late_fk"] == calls["bad_fk"] == 0
+    if variant == "control":
+        assert summary["local_complete_evidence"] is True, summary.get("failure")
+        assert calls["decode"] > 0 and calls["fk"] > 0
+        return
+    assert calls["injections"] == 1
+    assert summary["local_complete_evidence"] is False
+    assert summary["counters"]["conditioner_forward_calls"] == 0
+    assert summary["counters"]["adamw_step_calls"] == 0
+    if variant in ("drift_after_metric", "slow_decode_gate"):
+        assert calls["decode"] == 0
+        assert summary["counters"]["production_decode_calls"] == 0
+    else:
+        assert calls["decode"] == 1
+        assert summary["counters"]["production_decode_calls"] == 1
+    assert calls["fk"] == summary["counters"]["production_fk_batch_calls"] == 0
+    if variant.startswith("drift"):
+        assert "runtime_drift" in summary["failure"]["message"]
+    else:
+        assert summary["failure"]["type"] == "BudgetExceeded"
+        assert "post_runtime" in summary["failure"]["message"]
+    finished = diag.finish_stage(stage_dir, summary, budget)
+    assert finished["summary_doc"]["local_complete_evidence"] is False
+    assert (stage_dir / "return_observation.json").is_file()

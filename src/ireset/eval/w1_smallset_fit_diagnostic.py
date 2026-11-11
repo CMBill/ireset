@@ -1664,14 +1664,20 @@ class FitDriver:
                 self.counters["metric_decode_calls"] = \
                     self.counters.get("metric_decode_calls", 0) + 1
                 md.append(self.decoder.decode(np.ascontiguousarray(x0_tgt[b])))
-                self.budget.check(f"teacher_window_w{b}_prod_decode")
+                target = (self.probe_batch["x0"].detach()[b:b + 1]
+                          .to(self.trainer.cfg.device))
+                point = f"teacher_window_w{b}_prod_decode"
+                self.budget.check(point)
+                self.runtime_guard.check_unit(point)
+                self.budget.check(point + "_post_runtime")
                 self.counters["production_decode_calls"] = \
                     self.counters.get("production_decode_calls", 0) + 1
-                pos, quat, q = self.loss_fn.decode_clip(
-                    self.probe_batch["x0"].detach()[b:b + 1]
-                    .to(self.trainer.cfg.device))
+                pos, quat, q = self.loss_fn.decode_clip(target)
                 flat = lambda a: a.reshape(-1, a.shape[-1])
-                self.budget.check(f"teacher_window_w{b}_fk")
+                point = f"teacher_window_w{b}_fk"
+                self.budget.check(point)
+                self.runtime_guard.check_unit(point)
+                self.budget.check(point + "_post_runtime")
                 kp = self.loss_fn.fk.site_world_positions(
                     flat(pos), flat(quat), flat(q), list(KPT_TO_SMPLH)
                 ).view(T_WINDOW, S_SITES, 3)
@@ -4058,6 +4064,7 @@ COUNTEREXAMPLE_IDS = (
     "mixed_checkpoint_keys_report_incomplete",
     "trainable_parameter_roster_bound",
     "pre_backward_runtime_read_time_charged",
+    "teacher_reference_precision_admission",
 )
 
 
@@ -8517,6 +8524,84 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
                   and "pre_backward_post_runtime" in backward_r16["True"]["message"])
         record("pre_backward_runtime_read_time_charged", caught,
                f"runtime read crossing the deadline refuses backward ({backward_r16})")
+
+        # Teacher references precede the guarded probe/forward chain. Check
+        # real runtime drift and slow runtime reads at both numeric units.
+        teacher_r16: dict = {}
+        for variant in ("control", "drift_after_decode", "slow_decode_gate",
+                        "slow_fk_gate"):
+            runtime_before = _runtime_snapshot_r13()
+            try:
+                world_te = _r9_world(seed + 103)
+                clock_te = _FakeClock(1.0)
+                budget_te = StageBudget("D1", 100.0, 10.0, t0=0.0, clock=clock_te)
+                _, driver_te, _ = _r9_driver(tmp / f"r16teacher_{variant}",
+                                             "D1", budget_te, world_te)
+                driver_te.runtime_guard = ProductionRuntimeGuard(expected_device="cpu")
+                calls_te = {"injections": 0, "decode": 0, "fk": 0,
+                            "late_decode": 0, "late_fk": 0, "bad_fk": 0}
+                base_check_te = driver_te.runtime_guard.check_unit
+                base_decode_te = driver_te._real_decode_clip
+                base_fk_te = driver_te._real_fk.site_world_positions
+
+                def check_te(point, _base=base_check_te, _v=variant,
+                             _clock=clock_te, _calls=calls_te):
+                    value = _base(point)
+                    target = {"slow_decode_gate": "teacher_window_w0_prod_decode",
+                              "slow_fk_gate": "teacher_window_w0_fk"}.get(_v)
+                    if point == target and _calls["injections"] == 0:
+                        _calls["injections"] += 1
+                        _clock.t = 91.0
+                    return value
+
+                def decode_te(*a, _base=base_decode_te, _v=variant,
+                              _clock=clock_te, _budget=budget_te,
+                              _calls=calls_te, **kw):
+                    _calls["decode"] += 1
+                    _calls["late_decode"] += int(_clock.t >= _budget.work_deadline)
+                    out = _base(*a, **kw)
+                    if _v == "drift_after_decode" and _calls["injections"] == 0:
+                        _calls["injections"] += 1
+                        torch.backends.cuda.matmul.allow_tf32 = True
+                    return out
+
+                def fk_te(*a, _base=base_fk_te, _clock=clock_te,
+                          _budget=budget_te, _calls=calls_te, **kw):
+                    _calls["fk"] += 1
+                    _calls["late_fk"] += int(_clock.t >= _budget.work_deadline)
+                    _calls["bad_fk"] += int(torch.backends.cuda.matmul.allow_tf32)
+                    return _base(*a, **kw)
+
+                driver_te._real_decode_clip = decode_te
+                with patch.object(driver_te.runtime_guard, "check_unit", check_te), \
+                        patch.object(driver_te._real_fk, "site_world_positions", fk_te), \
+                        patch.object(trainer_mod, "time",
+                                     types.SimpleNamespace(perf_counter=clock_te)):
+                    summary_te = driver_te.run()
+                teacher_r16[variant] = {
+                    **calls_te, "complete": summary_te["local_complete_evidence"],
+                    "recorded_decode": summary_te["counters"]["production_decode_calls"],
+                    "recorded_fk": summary_te["counters"]["production_fk_batch_calls"],
+                    "message": (summary_te.get("failure") or {}).get("message", "")}
+            finally:
+                _runtime_restore_r13(runtime_before)
+        caught = (teacher_r16["control"]["complete"] is True
+                  and teacher_r16["drift_after_decode"]["injections"] == 1
+                  and teacher_r16["drift_after_decode"]["fk"] == 0
+                  and teacher_r16["drift_after_decode"]["bad_fk"] == 0
+                  and "runtime_drift" in teacher_r16["drift_after_decode"]["message"]
+                  and teacher_r16["slow_decode_gate"]["decode"] == 0
+                  and teacher_r16["slow_decode_gate"]["recorded_decode"] == 0
+                  and teacher_r16["slow_fk_gate"]["fk"] == 0
+                  and teacher_r16["slow_fk_gate"]["recorded_fk"] == 0
+                  and all(not teacher_r16[v]["complete"]
+                          and teacher_r16[v]["injections"] == 1
+                          and teacher_r16[v]["late_decode"] == 0
+                          and teacher_r16[v]["late_fk"] == 0
+                          for v in ("drift_after_decode", "slow_decode_gate",
+                                    "slow_fk_gate")))
+        record("teacher_reference_precision_admission", caught,
+               f"teacher decode/FK have runtime and charged deadline gates ({teacher_r16})")
 
     return results
 
