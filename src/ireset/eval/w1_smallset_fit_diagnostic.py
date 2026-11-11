@@ -1160,9 +1160,9 @@ def _optimizer_state_problems(opt, expected_step: int) -> list[str]:
     """P1 (round-15): the frozen claim is a FROM-SCRATCH, step-0 AdamW.  A
     preloaded (step, exp_avg, exp_avg_sq) silently changes every update while
     all frozen hyperparameters and the parameter roster still match.  At the
-    declared step 0 the actual state must be EMPTY; afterwards every populated
-    entry must carry exactly the driver's completed step count and shape-aligned
-    finite moments."""
+    declared step 0 the actual state must be EMPTY; afterwards every optimizer
+    parameter must have an entry with the driver's completed step count and
+    shape-aligned finite moments."""
     state = getattr(opt, "state", None)
     if not isinstance(state, dict):
         return ["optimizer_state_missing"]
@@ -1172,6 +1172,17 @@ def _optimizer_state_problems(opt, expected_step: int) -> list[str]:
         return ([] if not state
                 else [f"optimizer_state_not_empty:{len(state)}"])
     problems: list[str] = []
+    groups = getattr(opt, "param_groups", None)
+    if not isinstance(groups, list) or not groups or any(
+            not isinstance(group, dict) or not isinstance(group.get("params"), list)
+            for group in groups):
+        return ["optimizer_state_parameter_roster_invalid"]
+    expected_ids = {id(param) for group in groups for param in group["params"]}
+    state_ids = {id(param) for param in state}
+    missing = len(expected_ids - state_ids)
+    extra = len(state_ids - expected_ids)
+    if missing or extra:
+        problems.append(f"optimizer_state_roster_mismatch:missing{missing}:extra{extra}")
     for idx, (param, entry) in enumerate(state.items()):
         if not isinstance(entry, dict):
             problems.append(f"optimizer_state_entry_not_a_mapping:{idx}")
@@ -1246,6 +1257,12 @@ def _optimizer_binding_problems(trainer, plan: FitPlan) -> list[str]:
     model = getattr(trainer, "model", None)
     conditioner = getattr(trainer, "conditioner", None)
     if model is not None and conditioner is not None:
+        frozen = [f"{side}.{name}" for side, module in
+                  (("model", model), ("conditioner", conditioner))
+                  for name, param in module.named_parameters()
+                  if not param.requires_grad]
+        if frozen:
+            problems.append(f"optimizer_parameter_frozen:{frozen[:3]}")
         expected_ids = [id(p) for p in (*model.parameters(),
                                         *conditioner.parameters())]
         missing = len(set(expected_ids) - set(actual_ids))
@@ -1907,7 +1924,11 @@ class FitDriver:
         self._save_checkpoint("last.pt", plan.steps)
 
     def _check_clip_coverage_pre(self) -> None:
-        """Every parameter must enter the joint clip (§6.2)."""
+        """Every trainable parameter must have a gradient for the joint clip."""
+        missing = [name for name, p in self.trainer._named_parameters()
+                   if p.grad is None]
+        if missing:
+            raise FitDiagnosticError(f"clip_coverage_grad_missing:{missing[:3]}")
         self._clip_pre = {
             name: (p.grad.detach().abs().clone() if p.grad is not None else None)
             for name, p in self.trainer._named_parameters()}
@@ -1923,6 +1944,9 @@ class FitDriver:
             raise FitDiagnosticError(f"clip_coverage_param_missing:{missing[:3]}")
         posts = {name: (p.grad.detach().abs() if p.grad is not None else None)
                  for name, p in named.items()}
+        for name, pre_g in pre.items():
+            if (pre_g is None) != (posts.get(name) is None):
+                raise FitDiagnosticError(f"clip_coverage_grad_side:{name}")
         coef = None
         for name, pre_g in pre.items():
             post_g = posts.get(name)
@@ -1935,8 +1959,6 @@ class FitDriver:
         if coef is not None and coef < 1.0 - 1e-12:
             for name, pre_g in pre.items():
                 post_g = posts.get(name)
-                if (pre_g is None) != (post_g is None):
-                    raise FitDiagnosticError(f"clip_coverage_grad_side:{name}")
                 if pre_g is None or pre_g.numel() == 0:
                     continue
                 expect = pre_g * coef
@@ -4030,6 +4052,7 @@ COUNTEREXAMPLE_IDS = (
     "f_fresh_runtime_read_time_charged",
     "state_contract_construction_guarded",
     "mixed_checkpoint_keys_report_incomplete",
+    "trainable_parameter_roster_bound",
 )
 
 
@@ -8408,6 +8431,37 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
                all(mixed_r15.values()),
                "mixed int/str checkpoint keys are refused before any ordering "
                f"and still publish the F report ({mixed_r15})")
+
+        # A frozen parameter remains in AdamW's roster but has no gradient,
+        # state or update; membership alone must not make D complete.
+        trainable_r16: dict = {}
+        for variant, name in (("control", None),
+                              ("model", "model.net.root_out.weight"),
+                              ("conditioner", "conditioner.kpt_proj.weight")):
+            world_tr = _r9_world(seed + 101)
+            clock_tr = _FakeClock(1.0)
+            budget_tr = StageBudget("D1", 100.0, 10.0, t0=0.0, clock=clock_tr)
+            _, driver_tr, _ = _r9_driver(tmp / f"r16trainable_{variant}",
+                                         "D1", budget_tr, world_tr)
+            if name is not None:
+                dict(driver_tr.trainer._named_parameters())[name].requires_grad_(False)
+            with patch.object(trainer_mod, "time",
+                              types.SimpleNamespace(perf_counter=clock_tr)):
+                summary_tr = driver_tr.run()
+            trainable_r16[variant] = {
+                "complete": summary_tr["local_complete_evidence"],
+                "steps": summary_tr["counters"]["adamw_step_calls"],
+                "forwards": summary_tr["counters"]["conditioner_forward_calls"],
+                "message": (summary_tr.get("failure") or {}).get("message", "")}
+        caught = (trainable_r16["control"]["complete"] is True
+                  and trainable_r16["control"]["steps"] == 1
+                  and all(not trainable_r16[v]["complete"]
+                          and trainable_r16[v]["steps"] == 0
+                          and trainable_r16[v]["forwards"] == 0
+                          and "optimizer_parameter_frozen" in trainable_r16[v]["message"]
+                          for v in ("model", "conditioner")))
+        record("trainable_parameter_roster_bound", caught,
+               f"frozen model/conditioner parameter refuses before forward ({trainable_r16})")
 
     return results
 
