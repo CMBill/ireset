@@ -2785,6 +2785,12 @@ def _checkpoint_state_problems(ck: dict, name: str
             if not torch.is_tensor(tensor):
                 problems.append(f"checkpoint_{side}.{key}_not_tensor:{name}")
                 continue
+            # Shape and dtype alone do not imply a dense tensor: sparse COO/
+            # CSR tensors may not support isfinite/all or strict copying.
+            if tensor.layout != torch.strided:
+                problems.append(
+                    f"checkpoint_tensor_layout:{name}:{side}.{key}:{tensor.layout}")
+                continue
             if not tensor.is_floating_point():
                 continue
             if tensor.dtype != torch.float32:
@@ -3091,6 +3097,9 @@ def _checkpoint_tensor_problems(ck: dict, model, conditioner) -> list[str]:
             got_t = got[key]
             if not torch.is_tensor(got_t):
                 problems.append(f"checkpoint_{side}.{key}_not_tensor")
+                continue
+            if got_t.layout != torch.strided:
+                problems.append(f"checkpoint_tensor_layout:{side}.{key}:{got_t.layout}")
                 continue
             if got_t.shape != want_t.shape:
                 problems.append(f"checkpoint_{side}.{key}_shape")
@@ -4068,6 +4077,7 @@ COUNTEREXAMPLE_IDS = (
     "pre_backward_runtime_read_time_charged",
     "teacher_reference_precision_admission",
     "bad_report_identity_no_reference_construction",
+    "sparse_checkpoint_layout_report_incomplete",
 )
 
 
@@ -8660,6 +8670,48 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
                           for v in ("missing", "list", "null")))
         record("bad_report_identity_no_reference_construction", caught,
                f"bad report identities refuse cold reference construction ({identity_r16})")
+
+        sparse_r16: dict = {}
+        for variant in ("control", "model_last", "conditioner_initial"):
+            copydir = tmp / f"r16sparse_{variant}"
+            shutil.copytree(sdir_ar, copydir)
+            if variant != "control":
+                side = "model" if variant == "model_last" else "conditioner"
+                key = "net.root_out.weight" if side == "model" else "kpt_proj.weight"
+                path = copydir / ("last.pt" if side == "model" else "initial.pt")
+                ck = torch.load(path, map_location="cpu", weights_only=False)
+                ck[side][key] = ck[side][key].to_sparse()
+                torch.save(ck, path)
+                _full_resign(copydir)
+            builds: list = []
+            base_factory = build_modules_factory(world_r9, plan_ar)
+
+            def factory_sparse(_base=base_factory, _builds=builds):
+                _builds.append(1)
+                return _base()
+
+            out_sp = _run_f_r9(f"r16sparse_{variant}_f",
+                               StageBudget("F", 300.0, 10.0),
+                               directory=copydir, factory=factory_sparse)
+            doc_sp = out_sp["summary_doc"]
+            fdir_sp = tmp / f"r16sparse_{variant}_f"
+            sparse_r16[variant] = {
+                "builds": len(builds), "complete": doc_sp["complete_evidence"],
+                "verdict": doc_sp["verdict"],
+                "local": doc_sp["stages"][0].get("local_reverify_problems", []),
+                "report": (fdir_sp / "f_report.json").is_file(),
+                "proof": (fdir_sp / "return_observation.json").is_file()}
+        caught = (sparse_r16["control"]["complete"] is True
+                  and sparse_r16["control"]["builds"] == 1
+                  and all(sparse_r16[v]["complete"] is False
+                          and sparse_r16[v]["builds"] == 0
+                          and sparse_r16[v]["verdict"] == "incomplete"
+                          and sparse_r16[v]["report"] and sparse_r16[v]["proof"]
+                          and any("checkpoint_tensor_layout" in p
+                                  for p in sparse_r16[v]["local"])
+                          for v in ("model_last", "conditioner_initial")))
+        record("sparse_checkpoint_layout_report_incomplete", caught,
+               f"non-strided tensors refuse before isfinite/load ({sparse_r16})")
 
     return results
 

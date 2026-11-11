@@ -6,6 +6,7 @@ import json
 import shutil
 import sys
 import types
+import warnings
 from pathlib import Path
 from unittest.mock import patch
 
@@ -335,3 +336,77 @@ def test_bad_report_identity_refuses_cold_reference_construction(tmp_path, varia
         assert torch.equal(before_rng, torch.get_rng_state())
         assert doc["verdict"] == "incomplete" and doc["complete_evidence"] is False
         assert "stage_report_identity_invalid" in doc["stages"][0]["local_reverify_problems"]
+
+
+@pytest.mark.parametrize("side,role,layout", [
+    (None, None, None),
+    ("model", "last", "coo"),
+    ("model", "initial", "csr"),
+    ("conditioner", "last", "coo"),
+    ("conditioner", "initial", "csr"),
+])
+def test_sparse_checkpoint_is_rejected_before_finite_check_or_load(
+        tmp_path, side, role, layout):
+    world, plan, driver, stage_dir, clock, budget = _driver(tmp_path / "source")
+    summary = _run(driver, clock)
+    assert summary["local_complete_evidence"] is True, summary.get("failure")
+    diag.finish_stage(stage_dir, summary, budget)
+    copydir = tmp_path / "copy"
+    shutil.copytree(stage_dir, copydir)
+    path = copydir / f"{role or 'last'}.pt"
+    if side is not None:
+        ck = torch.load(path, map_location="cpu", weights_only=False)
+        key = "net.root_out.weight" if side == "model" else "kpt_proj.weight"
+        dense = ck[side][key]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            sparse = dense.to_sparse() if layout == "coo" else dense.to_sparse_csr()
+        assert sparse.shape == dense.shape and sparse.dtype == dense.dtype
+        assert torch.equal(sparse.to_dense(), dense)
+        ck[side][key] = sparse
+        torch.save(ck, path)
+        diag._full_resign(copydir)
+
+    local = diag.verify_stage_local(
+        copydir, plan, world.registration_for("D1"), world.decoder,
+        production_decoder=world.loss_fn, expected_identity=driver.identity)
+    model, conditioner = diag.build_modules_factory(world, plan)()
+    with patch.object(model, "load_state_dict", wraps=model.load_state_dict) as model_load, \
+            patch.object(conditioner, "load_state_dict", wraps=conditioner.load_state_dict) as cond_load:
+        load_problems = diag._load_state_dicts_checked(path, model, conditioner)
+    if side is None:
+        assert local["problems"] == [] and load_problems == []
+        assert model_load.call_count == cond_load.call_count == 1
+    else:
+        assert any("checkpoint_tensor_layout" in p for p in local["problems"])
+        assert any("checkpoint_tensor_layout" in p for p in load_problems)
+        assert model_load.call_count == cond_load.call_count == 0
+
+    builds = []
+    factory = diag.build_modules_factory(world, plan)
+
+    def build():
+        builds.append(1)
+        return factory()
+
+    out_dir = tmp_path / "f"
+    out = diag.run_f_verification(
+        stage_specs=[{"stage_dir": copydir, "plan": plan,
+                      "registration": world.registration_for("D1"),
+                      "decoder": world.decoder, "loss_fn": world.loss_fn,
+                      "identity": driver.identity}],
+        out_dir=out_dir, budget=diag.StageBudget("F", 300.0, 10.0),
+        runtime_guard=diag.SyntheticRuntimeGuard(), build_modules=build,
+        authorization={"includes": ["D6"]})
+    doc = out["summary_doc"]
+    proof = json.loads((out_dir / "return_observation.json").read_text())
+    assert json.loads((out_dir / "f_report.json").read_text()) == doc
+    assert proof["summary_sha256"] == diag.sha256_file(out_dir / "f_report.json")
+    assert proof["covered"] is True
+    if side is None:
+        assert doc["complete_evidence"] is True and builds == [1]
+    else:
+        assert doc["verdict"] == "incomplete" and doc["complete_evidence"] is False
+        assert builds == []
+        assert any("checkpoint_tensor_layout" in p
+                   for p in doc["stages"][0]["local_reverify_problems"])
