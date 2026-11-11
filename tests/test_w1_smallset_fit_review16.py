@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import shutil
 import sys
 import types
 from pathlib import Path
@@ -269,3 +271,67 @@ def test_teacher_reference_precision_and_deadline_admission(tmp_path, variant):
     finished = diag.finish_stage(stage_dir, summary, budget)
     assert finished["summary_doc"]["local_complete_evidence"] is False
     assert (stage_dir / "return_observation.json").is_file()
+
+
+@pytest.mark.parametrize("variant", ["control", "missing", "list", "null"])
+def test_bad_report_identity_refuses_cold_reference_construction(tmp_path, variant):
+    from ireset.model.conditioner import ConditionEncoder
+    from ireset.model.deterministic import DeterministicG1
+
+    world, plan, driver, stage_dir, clock, budget = _driver(tmp_path / "source")
+    summary = _run(driver, clock)
+    assert summary["local_complete_evidence"] is True, summary.get("failure")
+    diag.finish_stage(stage_dir, summary, budget)
+    copydir = tmp_path / "copy"
+    shutil.copytree(stage_dir, copydir)
+    if variant != "control":
+        report_path = copydir / "stage_report.json"
+        report = json.loads(report_path.read_text())
+        if variant == "missing":
+            del report["identity"]
+        else:
+            report["identity"] = [] if variant == "list" else None
+        report_path.write_text(json.dumps(report))
+        diag._full_resign(copydir)
+    diag._STATE_CONTRACT_CACHE.clear()
+    before_rng = torch.get_rng_state().clone()
+    real_model, real_cond = DeterministicG1.__init__, ConditionEncoder.__init__
+    events = []
+    factory = diag.build_modules_factory(world, plan)
+    builds = []
+
+    def model_init(obj, *args, **kwargs):
+        events.append("model")
+        return real_model(obj, *args, **kwargs)
+
+    def cond_init(obj, *args, **kwargs):
+        events.append("conditioner")
+        return real_cond(obj, *args, **kwargs)
+
+    def build():
+        builds.append(1)
+        return factory()
+
+    out_dir = tmp_path / "f"
+    with patch.object(DeterministicG1, "__init__", model_init), \
+            patch.object(ConditionEncoder, "__init__", cond_init):
+        out = diag.run_f_verification(
+            stage_specs=[{"stage_dir": copydir, "plan": plan,
+                          "registration": world.registration_for("D1"),
+                          "decoder": world.decoder, "loss_fn": world.loss_fn,
+                          "identity": driver.identity}],
+            out_dir=out_dir, budget=diag.StageBudget("F", 300.0, 10.0),
+            runtime_guard=diag.SyntheticRuntimeGuard(), build_modules=build,
+            authorization={"includes": ["D6"]})
+    doc = out["summary_doc"]
+    assert json.loads((out_dir / "f_report.json").read_text()) == doc
+    assert (out_dir / "return_observation.json").is_file()
+    if variant == "control":
+        assert doc["complete_evidence"] is True
+        assert events == ["model", "conditioner", "model", "conditioner"]
+        assert builds == [1]
+    else:
+        assert events == builds == []
+        assert torch.equal(before_rng, torch.get_rng_state())
+        assert doc["verdict"] == "incomplete" and doc["complete_evidence"] is False
+        assert "stage_report_identity_invalid" in doc["stages"][0]["local_reverify_problems"]

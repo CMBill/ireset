@@ -2318,10 +2318,12 @@ def verify_stage_local(stage_dir: Path, plan: FitPlan,
     # report already exists (F / handoff contexts)
     report_path = stage_dir / "stage_report.json"
     report_identity: dict | None = None
+    identity_failed = False
     if report_path.is_file():
         report, report_problems = _read_json_object(report_path)
         if report is None:
             problems.append(f"stage_report_invalid:{report_problems[:2]}")
+            identity_failed = True
         else:
             if report.get("artifacts_index_sha256") != sha256_file(index_path):
                 problems.append("artifacts_index_sha_mismatch")
@@ -2332,7 +2334,7 @@ def verify_stage_local(stage_dir: Path, plan: FitPlan,
                 report_identity = declared
             else:
                 problems.append("stage_report_identity_invalid")
-    identity_failed = False
+                identity_failed = True
     if expected_identity is not None:
         if report_identity is not None and not _json_value_equal(
                 report_identity, expected_identity):
@@ -4065,6 +4067,7 @@ COUNTEREXAMPLE_IDS = (
     "trainable_parameter_roster_bound",
     "pre_backward_runtime_read_time_charged",
     "teacher_reference_precision_admission",
+    "bad_report_identity_no_reference_construction",
 )
 
 
@@ -8602,6 +8605,61 @@ def run_counterexample_battery(budget: StageBudget, seed: int = 20261107) -> dic
                                     "slow_fk_gate")))
         record("teacher_reference_precision_admission", caught,
                f"teacher decode/FK have runtime and charged deadline gates ({teacher_r16})")
+
+        # A missing/non-object identity has already failed the identity
+        # gate, just like a mismatched identity. A cold contract cache must
+        # not build reference modules on any of those paths.
+        identity_r16: dict = {}
+        for variant in ("control", "missing", "list", "null"):
+            copydir = tmp / f"r16identity_{variant}"
+            shutil.copytree(sdir_ar, copydir)
+            if variant != "control":
+                report_path = copydir / "stage_report.json"
+                report = json.loads(report_path.read_text())
+                if variant == "missing":
+                    del report["identity"]
+                else:
+                    report["identity"] = [] if variant == "list" else None
+                report_path.write_text(json.dumps(report))
+                _full_resign(copydir)
+            _STATE_CONTRACT_CACHE.clear()
+            before_rng = torch.get_rng_state().clone()
+            events: list = []
+
+            def model_init_id(obj, *a, _base=real_model_init,
+                              _events=events, **kw):
+                _events.append(("model", _inside_code(_plan_fresh_modules.__code__)))
+                return _base(obj, *a, **kw)
+
+            def cond_init_id(obj, *a, _base=real_cond_init,
+                             _events=events, **kw):
+                _events.append(("conditioner", _inside_code(_plan_fresh_modules.__code__)))
+                return _base(obj, *a, **kw)
+
+            with patch.object(DeterministicG1, "__init__", model_init_id), \
+                    patch.object(ConditionEncoder, "__init__", cond_init_id):
+                out_id = _run_f_r9(f"r16identity_{variant}_f",
+                                   StageBudget("F", 300.0, 10.0),
+                                   directory=copydir)
+            doc_id = out_id["summary_doc"]
+            fdir_id = tmp / f"r16identity_{variant}_f"
+            identity_r16[variant] = {
+                "events": events, "rng_unchanged": torch.equal(before_rng, torch.get_rng_state()),
+                "complete": doc_id["complete_evidence"], "verdict": doc_id["verdict"],
+                "local": doc_id["stages"][0].get("local_reverify_problems", []),
+                "report": (fdir_id / "f_report.json").is_file(),
+                "proof": (fdir_id / "return_observation.json").is_file()}
+        caught = (identity_r16["control"]["complete"] is True
+                  and len(identity_r16["control"]["events"]) == 4
+                  and all(identity_r16[v]["events"] == []
+                          and identity_r16[v]["rng_unchanged"]
+                          and identity_r16[v]["complete"] is False
+                          and identity_r16[v]["verdict"] == "incomplete"
+                          and identity_r16[v]["report"] and identity_r16[v]["proof"]
+                          and "stage_report_identity_invalid" in identity_r16[v]["local"]
+                          for v in ("missing", "list", "null")))
+        record("bad_report_identity_no_reference_construction", caught,
+               f"bad report identities refuse cold reference construction ({identity_r16})")
 
     return results
 
