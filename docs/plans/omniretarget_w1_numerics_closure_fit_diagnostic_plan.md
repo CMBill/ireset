@@ -2,6 +2,8 @@
 
 日期：2026-11-06。版本：v0.4（本地/最终状态分层与原始预测解码关联修订）。**状态：仅方案，待复阅；未实施、未预注册、未授权、未运行。** 本文不授予任何新真实数值计算、训练或重放权限，不恢复T6的一次性授权。v0.1由git提交 `9fb90e3` 保留；§11/§12保留v0.2/v0.3修订说明，§13记录本次修订。本方案尚未作为实验契约冻结，本次只修订文档，不重冻结旧证据。
 
+**当前状态注记（2026-11-11）：**上段为起草时快照。N0/N1 和 I 的合成实现已交付；I 第十六轮修复及有限合成回归见 §34。`attempt_016` 仅证明第十五轮代码，当前代码尚未重跑完整合成验收。R/真实 D1/D6/F 仍未实施、未授权、未运行；本注记不授予新权限。
+
 ## 1. 目标与当前基线
 
 下一阶段从“重复全链审计”转向两个可区分的问题：
@@ -454,3 +456,9 @@ N0 attempt_006：coverage_complete=true、0 异常、写盘前采样 53.91s、�
 ## 33. I 阶段第十五轮独立审阅修订（3 P1 + 1 P2）
 
 2026-11-10 独立复审确认第十四轮修复有效（attempt_015 四份证明、保存量、调用矩阵、交接及 105/105 电池核验成立，登记成本 1441.70s≤3300s），但新隔离反例复现 3 P1 + 1 P2（复现脚本 /tmp/opencode/review_i_round14_new_boundaries_20261110.py 与结果 review_i_round14_new_boundaries_20261110_results.json），全部接受并修复；attempt_015 保留为被取代证据。修复明细见 [I 阶段验证记录 §22](../verification/omniretarget_w1_smallset_fit_diagnostic.md)：①**AdamW 初始历史状态**——`_optimizer_state_problems` 把"从头、step-0 空状态"作为冻结契约：构造与每次运行期复核要求 `opt.state` 为空（`optimizer_state_not_empty`），之后每个条目的 `step` 精确等于 `self._completed_steps`（每执行一步恰加一）且 `exp_avg/exp_avg_sq` 形状对齐、有限、非负；`_check_runtime_bindings` 与 step 返回后同契约复核，预置 step-17/动量在 preflight 即零 step 拒绝；②**新 runtime 门自身耗时**——`loss_decode_pre/_post`、`loss_fk_pre`、F `f_fresh_entry` 与 `f_fresh_fk_w*` 的 runtime 读取后各加预算复查（`*_post_runtime`/`f_fresh_entry_post_runtime`），晚 decode/FK/conditioner 均为 0；③**参考构造准入**——`_plan_fresh_modules` 的 model/conditioner 构造各自成预算单元（`saved_state_contract_model/_conditioner`），model 越线拒绝 conditioner；`verify_stage_local` 记录 `identity_failed` 并在身份已拒时跳过参考构造（checkpoint 级 identity 失败同样跳过），参考构建保持 `torch.random` 隔离；④**混合键类型**——`_checkpoint_architecture_problems` 先验证 checkpoint state key 均为字符串（`checkpoint_*_key_type_not_string`）再做集合差/排序，混合 int/str 键经 incomplete 收口落 F 报告+返回证明。电池扩至 **110 项全捕获**（新增 5 项），测试 **17 passed**、N0/N1 回归 **33 passed**（合并 50 passed/219.63s）；审阅者攻击形态 fail-closed（定点脚本 /tmp/opencode/verify_round15_fixes.py）。权威合成验收重跑为 `derived/audit/w1_smallset_fit_diagnostic/attempt_016/`（exit 0，封口 sealed_within_budget round 1、登记成本 1495.72s≤3300s、返回覆盖 covered（elapsed 1491.73）；微型 D1 240.07s 四门全过（RMSE 0.00115m/0.00288rad/0.00186rad/FK 0.00121m）→ handoff_ready=true → 微型 D6 1400.49s 六窗四门全过（macro RMSE 0.00633m）→ F fit_pass；110/110 反例捕获）。**边界：R/真实 D1/D6/F 未实施、未授权、未运行；真实拟合仍须 §8.3 新冻结材料与新明确授权；T6 旧结论与 partial/null/false/not_ready/不接入全部保持；本轮未运行全项目套件。**
+
+## 34. I 阶段第十六轮独立审阅修订（4 P1 + 1 P2）
+
+2026-11-11 对第十五轮 `199f3fd` 的隔离复验发现：①模型/conditioner 参数可被冻结、无梯度及 AdamW 状态而 D/F 仍声称完整；②pre-backward runtime 读取越过截止后仍启动 backward；③教师生产解码后 TF32 漂移仍启动 FK；④报告身份格式已拒时冷缓存仍构造参考模块；⑤稀疏 checkpoint 在有限性检查中崩溃而 F 不落报告。分别修复参数可训练性/梯度及状态名册、pre-backward 检查后的截止、教师 decode/FK 精度与截止准入、身份失败后的构造短路、非 strided 张量在有限性/加载前拒绝。随后发现教师精度修复引入目标 `.to(device)` 越截止仍启动的回归，又单独补转换前预算门；转换返回后的截止及 runtime 守卫保留。
+
+最终实现 `aa30368` 的四文件合并回归 **75 passed（262.33s）**，含 **115/115** 合成反例；五项原攻击及教师转换截止反例在独立 CPU 合成夹具中拒绝，正常微型 D/F 控制为 `fit_insufficient` 而非拟合通过。修复详情、提交、命令、临时结果恢复记录及证据边界见 [I 阶段验证记录 §23](../verification/omniretarget_w1_smallset_fit_diagnostic.md)。**本轮未运行完整微型 D1→D6→F 验收或权威 fresh 预测；`attempt_016` 是第十五轮旧代码的历史结果，不能作为当前实现的完整验收。** R/真实 D1/D6/F 仍未实施、未授权、未运行；§8.3 新冻结与新明确授权、T6 `audit_incomplete`/539 gaps 和 `partial/null/false/not_ready/不接入` 均保持，本轮未运行全项目套件。

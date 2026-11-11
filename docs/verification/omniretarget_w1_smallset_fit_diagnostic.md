@@ -4,6 +4,8 @@
 
 **性质：纯合成实现与验证交付。本记录不含任何真实数据读取、真实 checkpoint、真实模型/优化器构造、真实 forward/backward/FK/AdamW 或真实训练更新；全部模块与测试在合成世界（合成 tokenizer/关节限位/教师窗/15-site FK 替身）上离线运行，不声称与生产 CUDA/foreach 等价。** 真实 R 冻结与真实 D1/D6/F 执行仍须方案 §8.3 的新冻结材料与新明确授权，本交付不创建 cohort/attempt/授权，不恢复旧 T6 一次性授权。
 
+**2026-11-11 当前状态：**第十六轮 4 P1 + 1 P2 与本轮引入的一处教师转换截止回归已修复，最终实现 `aa30368` 的合并回归 **75 passed**，其中 115 项反例电池全捕获；详见 [§23](#23-第十六轮独立审阅修订2026-11-114-p1--1-p2及教师转换截止回归)。**本轮未重跑完整合成验收**，`attempt_016` 仅是第十五轮旧代码 `199f3fd` 的历史验收，不能作为当前代码的完整验收或真实拟合证据；后文各轮“权威”按当时代码与日期理解。
+
 ## 1. 交付物
 
 | 文件 | 内容 |
@@ -35,7 +37,7 @@
 - 构造/strict 加载后、下一构造或 forward 前执行 `parameter_contract_problems`：全部浮点参数**与缓冲**的 dtype/device 必须匹配冻结契约（真实路径 cuda/float32；合成路径 cpu/float32），错误即停、不静默 cast。
 - 合成路径使用 `SyntheticRuntimeGuard`：只记录单元数，明确 `production_equivalence_claimed=false`，不冒充生产运行时。
 
-## 5. 反例电池（§6.2/v0.3/v0.4 全清单；首轮 35 项 + 第二轮 6 项 + 第三轮 5 项 + 第四轮 4 项 + 第五轮 2 项 + 第六轮 6 项 + 第七轮 5 项 + 第八轮 5 项 + 第九轮 8 项 + 第十轮 5 项 + 第十一轮 6 项 + 第十二轮 5 项 + 第十三轮 6 项 + 第十四轮 7 项 + 第十五轮 5 项 = 110 项）
+## 5. 反例电池（§6.2/v0.3/v0.4 全清单；第十五轮 110 项 + 第十六轮 5 项 = 115 项）
 
 | 方案要求 | 反例 ID（捕获断言） |
 | --- | --- |
@@ -107,14 +109,19 @@
 | 第十五轮：F fresh 精度门自身耗时 | `f_fresh_runtime_read_time_charged`（`f_fresh_entry` 越线→conditioner=0；`f_fresh_fk_w0` 越线→fresh FK=0；F incomplete 报告+证明） |
 | 第十五轮：参考构造的截止与身份门 | `state_contract_construction_guarded`（冷缓存 model 返回越线→conditioner 不再构造、RNG 不变；身份已拒→零构造；控制例 metadata+replay 两对构造） |
 | 第十五轮：混合类型 checkpoint 键 | `mixed_checkpoint_keys_report_incomplete`（int+str 键：`checkpoint_*_key_type_not_string`，F incomplete 报告+证明，无 TypeError） |
+| 第十六轮：参数冻结与状态名册 | `trainable_parameter_roster_bound`（模型/conditioner 冻结时零 forward、零 step；控制例正常更新） |
+| 第十六轮：pre-backward 检查耗时 | `pre_backward_runtime_read_time_charged`（runtime 读取越线后零 backward、零 step；控制例完成四次 backward） |
+| 第十六轮：教师参考精度准入 | `teacher_reference_precision_admission`（教师 decode/FK 前精度与截止守卫，TF32 漂移和检查耗时越线均阻止后继单元） |
+| 第十六轮：报告身份格式 | `bad_report_identity_no_reference_construction`（身份缺失/list/null 时冷缓存零参考构造、F 报告与证明落盘） |
+| 第十六轮：稀疏 checkpoint | `sparse_checkpoint_layout_report_incomplete`（非 strided 张量在 isfinite/加载前拒绝，F incomplete 报告与证明落盘） |
 
-## 6. 测试结果
+## 6. 第十五轮测试结果（历史快照；当前见 §23）
 
 - `tests/test_w1_smallset_fit_diagnostic.py`：**17 passed**（CPU，离线；含完整 110 项电池 `test_counterexample_battery_all_caught`）。
 - 反例电池独立运行：**110/110 caught**，ID 集合与冻结清单精确相等（§22 第十五轮审阅修订后）。
 - N0/N1 回归：**33 passed**（N0 `verify_return_coverage` 的加法性 `final_doc` 返回不改变 N0/N1 行为）；本轮 I 测试 + N0/N1 合并运行 **50 passed（219.63s）**。
 
-## 7. 权威合成验收运行
+## 7. 第十五轮历史合成验收运行（非当前代码验收）
 
 **`derived/audit/w1_smallset_fit_diagnostic/attempt_016/`**（2026-11-10，§22 第十五轮审阅修订后代码，独占创建，CLI exit 0）：单一单调时钟 t0 先于重导入，硬截止 3300s/预留 300s；summary 经发布-核验封口 `sealed_within_budget`（round 1，登记成本 **1495.72s** 覆盖封口、候选写盘、必要回读与返回）+ `return_observation.json` SHA 绑定 covered=true（elapsed 1491.73 ≤ 1495.72，summary_sha256 `7f1ed608…`）。`attempt_001–004`、`attempt_006–015`（修复前/二轮…/十三轮/十四轮代码）保留为被取代证据；`attempt_005` 为第五轮修复运行中途实现字节再次变更而终止的残缺目录（无 acceptance_summary/return_observation，不消费）。
 
@@ -380,3 +387,25 @@
 **权威合成验收 `derived/audit/w1_smallset_fit_diagnostic/attempt_016/`**（2026-11-10，第十五轮修复后代码，独占创建，CLI exit 0）：封口 `sealed_within_budget`（round 1）、登记成本 **1495.72s** ≤ 3300s、返回覆盖 covered=true（elapsed 1491.73 ≤ 1495.72，summary_sha256 `7f1ed608…`）；微型 D1（300 步，登记成本 240.07s，返回覆盖 covered（236.07））四门全过（RMSE 0.00115m / 0.00288rad / 0.00186rad / FK 0.00121m）→ `handoff_ready=true`（候选经 D6 入口消费，交接声明前复查通过）；微型 D6（登记成本 1400.49s，返回覆盖 covered（1396.49））六窗四门全过（逐窗 true，macro RMSE 0.00633m）；F 两阶段逐位重放通过（`fit_pass`、`claim_deadline_exceeded` 未触发、F 自身返回覆盖 covered=true）；**110/110 反例捕获**。`attempt_015` 保留为被取代证据（其证据不含第十五轮的 AdamW 初始历史状态、新精度门耗时复查、参考构造截止与身份门、混合键类型修复项）。
 
 **边界（与前轮一致）：R/真实 D1/D6/F 未实施、未授权、未运行；真实拟合仍须 §8.3 新冻结材料与新明确授权；T6 旧结论与 partial/null/false/not_ready/不接入全部保持；本轮未运行全项目套件（仅本交付 17 passed + N0/N1 回归 33 passed，合并 50 passed）。**
+
+## 23. 第十六轮独立审阅修订（2026-11-11：4 P1 + 1 P2）及教师转换截止回归
+
+在第十五轮代码 `199f3fd` 上，隔离反例实证了下列 4 P1 + 1 P2；原脚本 `/tmp/opencode/review_i_round15_new_boundaries_20261111.py` 及其结果 `review_i_round15_new_boundaries_20261111_results.json` 保留。五项修复分别提交，不改 Trainer 的原生更新算术：
+
+| 项 | 已复现问题与修复 | 本地提交 |
+| --- | --- | --- |
+| P1 参数冻结/缺梯度 | 冻结 model 或 conditioner 参数后，参数仍在优化器名册但无梯度、无 AdamW 状态且不更新，D/F 仍声称完整。现运行时检查 `requires_grad`，联合 clip 前拒绝缺梯度并校验裁剪前后梯度存在性，step 后要求优化器状态名册覆盖全部参数；合法的**存在但为零**的梯度仍允许 | `8c0919c` |
+| P1 pre-backward 截止 | pre-backward 的 runtime 检查返回时越过工作截止，仍实际执行一次 backward。现检查返回后再次检查预算；反例零晚 backward、零 step，控制例四次 backward、一次 step | `8c18210` |
+| P1 教师参考精度 | 教师生产 decode 后注入 TF32，旧路径在下一个守卫前仍执行一次 FK。现逐窗在教师生产 decode 与 FK 前复核运行时精度，并在检查返回后复核截止；注入后 FK=0 | `c6e9a68` |
+| P1 身份格式准入 | 报告身份缺失、list 或 null 已导致 incomplete，但冷缓存参考模型和 conditioner 仍被构造。现身份坏形态也设置失败标志，跳过参考构造；不把 `build_modules=0` 误当作所有构造均为零 | `acfdc5a` |
+| P2 checkpoint 布局 | 等 shape/dtype 的稀疏 checkpoint 进入 `isfinite` 抛 `NotImplementedError`，F 无报告与返回证明。现本地核验及 strict 加载前拒绝非 `torch.strided`；COO/CSR 各侧反例均结构化 incomplete | `77dc221` |
+
+**本轮引入并修复的额外回归：**`c6e9a68` 把教师目标 `.to(device)` 移到了先前的预算检查之前；受控时钟中 metric decode 返回至 91s（工作截止 90s）后仍启动一次目标转换。新增 `teacher_window_w*_target_to` 转换前检查，原 `teacher_window_w*_prod_decode` 检查继续位于转换返回之后、runtime 与生产 decode 之前；runtime 检查后的预算复查和 FK 精度门保留。修复单独提交 `aa30368`。回归测试先在修复前实测 **1 failed / 2 passed**（慢 metric 的晚转换=1），修复后慢 metric 晚转换=0；慢 `.to` 返回越线后 runtime/decode/FK=0；metric decode 已执行计数=1，正常控制完整。三个转换场景以及教师精度、D6/F 微型对照合计 **10 passed（23.73s）**。
+
+**最终实现验证：**在 `aa30368` 上运行 `TMPDIR=/tmp/opencode uv run --locked pytest -q tests/test_w1_smallset_fit_review16.py tests/test_w1_smallset_fit_diagnostic.py tests/test_w1_n0_coordinate_flags.py tests/test_w1_n1_synthetic_numerics.py`，**75 passed（262.33s）**：第十六轮 25 个参数化测试、原 I 阶段 17 项（含 **115/115** 电池，ID 集与 `COUNTEREXAMPLE_IDS` 精确相等）、N0/N1 33 项。随后只把原测试文件文档字符串的电池数量从 110 更正为 115，未改测试逻辑或实现；额外轻量复查曾因测试名误写而 exit 4、未运行测试，更正名称后 **4 passed（6.38s）**。未运行全项目套件。
+
+**隔离复验与证据保护：**`/tmp/opencode/verify_i_round16_final_20261111.py` 的结果 `verify_i_round16_final_20261111_results.json` 绑定 `aa30368`：五类原攻击均 fail-closed；正常微型 D/F 控制证据完整、F 重放通过但裁决为 **`fit_insufficient`**，并非拟合通过。独立转换边界脚本 `verify_i_round16_teacher_conversion_20261111.py` 及结果 `verify_i_round16_teacher_conversion_20261111_results.json` 绑定同一实现，验证两个越线场景、控制例、盘上报告及返回覆盖；原攻击与转换两组隔离运行均记录历史权威目录和受检源码哈希未变。转换脚本首次运行因测试脚本把 `budget()` helper 名覆盖为实例而报 `TypeError`，仅控制例在临时目录执行、未写结果；更名后重跑成功，非产品路径错误。旧四类攻击的独立重放 `verify_i_round16_previous_attacks_20261111_results.json` 绑定较早修复提交 `77dc221`，不是最终实现 `aa30368` 的重跑。
+
+**历史临时结果更正：**复跑旧四类攻击时，旧脚本曾覆盖 `/tmp/opencode/review_i_round15_previous_attacks_20261111_results.json`；已从原完整日志 `review_i_round15_previous_attacks_20261111.log` 恢复原内容（SHA-256 `e5541f2880c89144806f556b49bc0610a80d31fb62dd98ca6f61ea430db55b51`，文件时间戳改变），新结果另存于上述 `verify_i_round16_previous_attacks_20261111_results.json`。仓库历史产物和 `attempt_016` 未改写。
+
+**验收与授权边界：**本轮没有运行完整微型 D1→D6→F 合成验收或权威工件的 fresh 预测；`attempt_016` 的 `fit_pass`、110/110 和 1495.72s 仅对应第十五轮 `199f3fd`，不作为新实现的验收结果。R/真实 D1/D6/F 未实施、未授权、未运行；真实拟合仍须 §8.3 新冻结材料与新明确授权。T6 `audit_incomplete`/539 gaps、cohort 34 次更新/1347.195507s、一次性授权已消费，以及 `partial/null/false/not_ready/不接入` 保持；合成检查不证明真实拟合、泛化、碰撞、抓握或生产接入。

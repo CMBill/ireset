@@ -4,7 +4,7 @@ Pure-synthetic and offline: synthetic tokenizer/joint range/teacher windows
 and a synthetic 15-site FK stub.  No real data, checkpoint, asset compile or
 CUDA path is touched; nothing here claims production equivalence.
 
-The heavy test is the full §6.2/v0.3/v0.4 counterexample battery (110 cases)
+The heavy test is the full §6.2/v0.3/v0.4 counterexample battery (115 cases)
 shared with the synthetic acceptance CLI.
 """
 
