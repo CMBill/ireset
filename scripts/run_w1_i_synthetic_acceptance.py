@@ -1,0 +1,325 @@
+"""Supervise the synthetic-only W1 I acceptance from before uv until wait().
+
+Run this standard-library-only launcher with the system Python; the actual
+project process is always ``uv run --locked``.  The child report is only a
+candidate.  A consumer must also require the launch-specific outer return
+observation and the final verdict, both bound to the exact candidate bytes.
+Nothing here starts a real-data stage or retries a failed attempt.
+"""
+
+import time
+
+_OUTER_T0 = time.perf_counter()  # before uv, project imports, and entry checks
+
+import argparse
+import ast
+import hashlib
+import json
+import math
+import os
+import signal
+import subprocess
+import sys
+import uuid
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+WORKER = ROOT / "scripts/verify_w1_smallset_fit_diagnostic.py"
+DEFAULT_OUTPUT_ROOT = ROOT / "derived/audit/w1_smallset_fit_diagnostic"
+
+
+def _sha(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _source_hashes() -> dict[str, str]:
+    files = sorted((ROOT / "src/ireset").rglob("*.py"))
+    files += [WORKER, Path(__file__).resolve(), ROOT / "pyproject.toml", ROOT / "uv.lock"]
+    return {str(path.relative_to(ROOT)): _sha(path) for path in files}
+
+
+def _expected_counterexamples() -> set[str]:
+    source = (ROOT / "src/ireset/eval/w1_smallset_fit_diagnostic.py").read_text()
+    tree = ast.parse(source)
+    entries = [node.value for node in tree.body
+               if isinstance(node, ast.Assign)
+               and any(isinstance(t, ast.Name) and t.id == "COUNTEREXAMPLE_IDS"
+                       for t in node.targets)]
+    if len(entries) != 1:
+        raise ValueError("counterexample roster is ambiguous")
+    values = ast.literal_eval(entries[0])
+    if (not isinstance(values, tuple) or not values
+            or any(not isinstance(v, str) for v in values)
+            or len(values) != len(set(values))):
+        raise ValueError("counterexample roster is invalid")
+    return set(values)
+
+
+def _write_json(path: Path, obj: dict) -> None:
+    with path.open("w", encoding="utf-8") as out:
+        json.dump(obj, out, indent=1, allow_nan=False)
+        out.write("\n")
+        out.flush()
+        os.fsync(out.fileno())
+    fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _attempt_dir(root: Path) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    existing = [int(p.name.removeprefix("attempt_")) for p in root.glob("attempt_*")
+                if p.is_dir() and p.name.removeprefix("attempt_").isdigit()]
+    start = max(existing, default=0) + 1
+    for number in range(start, start + 1000):
+        path = root / f"attempt_{number:03d}"
+        try:
+            path.mkdir()
+            return path
+        except FileExistsError:
+            continue
+    raise RuntimeError("no free synthetic attempt directory")
+
+
+def _object(path: Path) -> dict:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"expected JSON object: {path.name}")
+    return data
+
+
+def _number(value) -> bool:
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and value >= 0)
+
+
+def _proof_problems(summary_path: Path, proof_path: Path,
+                    expected_t0: float, expected_cap: float) -> tuple[list[str], dict, dict]:
+    problems: list[str] = []
+    try:
+        summary, proof = _object(summary_path), _object(proof_path)
+        seal, budget = summary.get("seal"), summary.get("budget")
+        if not isinstance(seal, dict) or not isinstance(budget, dict):
+            raise ValueError("invalid seal or budget")
+        reg, cap, elapsed = (seal.get("measured_wall_s_at_summary"),
+                             seal.get("wall_cap_s"), proof.get("elapsed_s"))
+        if (seal.get("status") != "sealed_within_budget"
+                or seal.get("terminal") is not True
+                or proof.get("schema") != "n0_return_observation_v1"
+                or proof.get("covered") is not True):
+            problems.append("non_consumable_seal_or_proof")
+        if (seal.get("t0_perf_counter") != expected_t0 or cap != expected_cap
+                or budget.get("t0_perf_counter") != expected_t0
+                or budget.get("wall_cap_s") != expected_cap
+                or budget.get("measured_wall_s_at_summary") != reg
+                or proof.get("registered_measured_s") != reg
+                or proof.get("wall_cap_s") != cap):
+            problems.append("budget_binding_mismatch")
+        if not all(_number(v) for v in (reg, cap, elapsed)) or not elapsed <= reg <= cap:
+            problems.append("in_process_coverage_invalid")
+        if proof.get("summary_sha256") != _sha(summary_path):
+            problems.append("summary_hash_mismatch")
+        return problems, summary, proof
+    except (OSError, ValueError, TypeError, OverflowError, json.JSONDecodeError):
+        return ["report_or_proof_unreadable"], {}, {}
+
+
+def _candidate_problems(doc: dict, launch_id: str, t0: float,
+                        expected_ids: set[str]) -> list[str]:
+    problems = []
+    launch = doc.get("outer_launch")
+    if (not isinstance(launch, dict) or launch.get("launch_id") != launch_id
+            or launch.get("t0_perf_counter") != t0
+            or launch.get("supervisor_declared") is not True
+            or not _number(launch.get("cli_entry_perf_counter"))
+            or launch["cli_entry_perf_counter"] < t0):
+        problems.append("launch_identity_mismatch")
+    if doc.get("label_verdict") != "pending_outer_return":
+        problems.append("candidate_state_invalid")
+    battery, ids = doc.get("counterexample_battery"), doc.get("counterexample_ids")
+    if (not isinstance(battery, dict) or not battery or not isinstance(ids, list)
+            or any(not isinstance(i, str) for i in ids)
+            or len(ids) != len(set(ids)) or set(ids) != set(battery)
+            or set(ids) != expected_ids
+            or doc.get("all_counterexamples_caught") is not True
+            or any(not isinstance(v, dict) or v.get("caught") is not True
+                   for v in battery.values())):
+        problems.append("counterexample_battery_incomplete")
+    d1, d6, handoff, f = (doc.get(k) for k in ("d1", "d6", "d1_handoff", "f"))
+    if not all(isinstance(v, dict) for v in (d1, d6, handoff, f)):
+        return problems + ["stage_facts_invalid"]
+    if (doc.get("frozen_plan_defaults_problems") != []
+            or d1.get("local_complete_evidence") is not True
+            or d1.get("return_coverage") is not True
+            or d1.get("call_matrix_problems") != [] or d1.get("report_problems") != []
+            or handoff.get("handoff_ready") is not True or handoff.get("problems") != []
+            or d6.get("local_complete_evidence") is not True
+            or d6.get("return_coverage") is not True or d6.get("call_matrix_problems") != []
+            or f.get("complete_evidence") is not True or f.get("replay_passed") is not True
+            or f.get("return_coverage") is not True):
+        problems.append("stage_facts_incomplete")
+    stages = f.get("stages")
+    if (not isinstance(stages, list) or len(stages) != 2
+            or any(not isinstance(s, dict) for s in stages)
+            or {s.get("stage") for s in stages} != {"D1", "D6"}
+            or any(s.get("replay_passed") is not True for s in stages)):
+        problems.append("fresh_replay_incomplete")
+    return problems
+
+
+def run(args, *, t0: float = _OUTER_T0) -> int:
+    if (not all(_number(v) for v in (args.wall_cap_s, args.reserve_s))
+            or args.wall_cap_s <= args.reserve_s or args.reserve_s <= 0):
+        raise ValueError("wall cap and reserve must be finite and 0 < reserve < cap")
+    out_dir = _attempt_dir(Path(args.output_root).resolve())
+    launch_id = uuid.uuid4().hex
+    before = _source_hashes()
+    expected_ids = _expected_counterexamples()
+    command = ["uv", "run", "--locked", "python", str(WORKER),
+               "--output-dir", str(out_dir), "--outer-t0-hex", t0.hex(),
+               "--launch-id", launch_id, "--wall-cap-s", str(args.wall_cap_s),
+               "--reserve-s", str(args.reserve_s)]
+    launch = {"schema": "w1_i_outer_launch_v1", "state": "running",
+              "launch_id": launch_id, "t0_perf_counter": t0,
+              "wall_cap_s": args.wall_cap_s, "reserve_s": args.reserve_s,
+              "command": command, "source_sha256": before}
+    launch_path = out_dir / "outer_launch.json"
+    _write_json(launch_path, launch)
+    print(f"Synthetic attempt: {out_dir}", flush=True)
+    if time.perf_counter() >= t0 + args.wall_cap_s - args.reserve_s:
+        _write_json(out_dir / "acceptance_verdict.json",
+                    {"verdict": "incomplete", "problems": ["deadline_before_uv"]})
+        return 3
+
+    stdout_path, stderr_path = out_dir / "worker_stdout.log", out_dir / "worker_stderr.log"
+    with stdout_path.open("xb") as stdout, stderr_path.open("xb") as stderr:
+        process = subprocess.Popen(command, cwd=ROOT, stdout=stdout, stderr=stderr,
+                                   start_new_session=True)
+        timed_out = False
+        try:
+            rc = process.wait(timeout=max(0.0, t0 + args.wall_cap_s - time.perf_counter()))
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                rc = process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                rc = process.wait()
+        wait_time = time.perf_counter()  # immediately after the actual wait returns
+        os.fsync(stdout.fileno())
+        os.fsync(stderr.fileno())
+
+    problems, summary, proof = _proof_problems(
+        out_dir / "acceptance_summary.json", out_dir / "return_observation.json",
+        t0, args.wall_cap_s)
+    problems += _candidate_problems(summary, launch_id, t0, expected_ids)
+    if rc != 0:
+        problems.append(f"worker_exit:{rc}")
+    if timed_out:
+        problems.append("worker_hard_deadline_timeout")
+    after = _source_hashes()
+    if before != after:
+        problems.append("implementation_changed_during_run")
+    seal = summary.get("seal") if isinstance(summary.get("seal"), dict) else {}
+    registered = seal.get("measured_wall_s_at_summary")
+    wait_elapsed = wait_time - t0
+    in_process = proof.get("elapsed_s")
+    if (not _number(registered) or not _number(in_process)
+            or not in_process <= wait_elapsed <= registered <= args.wall_cap_s):
+        problems.append("actual_wait_not_covered")
+    for subdir, filename in (("d1", "stage_report.json"),
+                             ("d6", "stage_report.json"), ("f", "f_report.json")):
+        try:
+            stage_doc = _object(out_dir / subdir / filename)
+            stage_seal = stage_doc["seal"]
+            stage_t0 = t0 if subdir in ("d1", "d6") else stage_seal["t0_perf_counter"]
+            stage_cap = args.wall_cap_s if subdir in ("d1", "d6") else 600.0
+            stage_problems, _, stage_proof = _proof_problems(
+                out_dir / subdir / filename, out_dir / subdir / "return_observation.json",
+                stage_t0, stage_cap)
+            problems += [f"{subdir}:{p}" for p in stage_problems]
+            facts = summary.get(subdir)
+            returned = facts.get("stage_returned_elapsed_s") if isinstance(facts, dict) else None
+            observed = stage_proof.get("elapsed_s")
+            if (not _number(returned) or not _number(observed) or returned > observed
+                    or not _number(stage_t0) or not t0 <= stage_t0 <= wait_time
+                    or stage_t0 + observed > wait_time):
+                problems.append(f"{subdir}:actual_stage_return_not_covered")
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            problems.append(f"{subdir}:report_or_proof_unreadable")
+
+    receipt = {"schema": "w1_i_outer_return_observation_v1", "launch_id": launch_id,
+               "t0_perf_counter": t0, "uv_pid": process.pid, "wait_return_code": rc,
+               "worker_hard_deadline_timeout": timed_out,
+               "wait_return_perf_counter": wait_time, "wait_elapsed_s": wait_elapsed,
+               "registered_measured_s": registered, "wall_cap_s": args.wall_cap_s,
+               "in_process_elapsed_s": in_process,
+               "summary_sha256": (_sha(out_dir / "acceptance_summary.json")
+                                  if (out_dir / "acceptance_summary.json").is_file() else None),
+               "in_process_proof_sha256": (_sha(out_dir / "return_observation.json")
+                                           if (out_dir / "return_observation.json").is_file() else None),
+               "launch_sha256": _sha(launch_path), "stdout_sha256": _sha(stdout_path),
+               "stderr_sha256": _sha(stderr_path), "source_sha256_after": after,
+               "problems": problems}
+    receipt_path = out_dir / "outer_return_observation.json"
+    _write_json(receipt_path, receipt)
+    after_receipt = time.perf_counter() - t0
+    if not _number(registered) or after_receipt > registered or after_receipt > args.wall_cap_s:
+        problems.append("receipt_write_not_covered")
+    verdict = {"schema": "w1_i_synthetic_outer_verdict_v1", "launch_id": launch_id,
+               "verdict": "candidate_complete" if not problems else "incomplete",
+               "summary_sha256": receipt["summary_sha256"],
+               "outer_return_observation_sha256": _sha(receipt_path),
+               "receipt_write_completed_elapsed_s": after_receipt,
+               "registered_measured_s": registered, "wall_cap_s": args.wall_cap_s,
+               "problems": problems}
+    verdict_path = out_dir / "acceptance_verdict.json"
+    _write_json(verdict_path, verdict)
+    verdict_sha = _sha(verdict_path)
+    after_verdict = time.perf_counter() - t0
+    if not _number(registered) or after_verdict > registered or after_verdict > args.wall_cap_s:
+        verdict.update(verdict="incomplete", problems=problems + ["verdict_write_not_covered"],
+                       observed_elapsed_s=after_verdict)
+        _write_json(verdict_path, verdict)
+        return 3
+    if problems:
+        return 3
+    # The durable file is deliberately only a candidate: killing this
+    # observer before the post-write sample must never publish success.  The
+    # emitted observation is the final claim and binds the exact file bytes.
+    # No acceptance artifact is read or written after this passing sample.
+    print(json.dumps({"event": "w1_i_outer_verdict_write_observed",
+                      "verdict": "complete", "output_dir": str(out_dir),
+                      "launch_id": launch_id, "verdict_sha256": verdict_sha,
+                      "elapsed_s": after_verdict, "registered_measured_s": registered,
+                      "wall_cap_s": args.wall_cap_s}), flush=True)
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT))
+    parser.add_argument("--wall-cap-s", type=float, default=3300.0)
+    parser.add_argument("--reserve-s", type=float, default=300.0)
+    try:
+        return run(parser.parse_args())
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f"I synthetic supervisor failed: {exc}", file=sys.stderr, flush=True)
+        return 3
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

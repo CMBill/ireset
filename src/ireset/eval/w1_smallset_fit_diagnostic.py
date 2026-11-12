@@ -3859,6 +3859,18 @@ def _run_fit_stage(world: SyntheticWorld, plan: FitPlan, stage_dir: Path,
     return driver, summary, finished
 
 
+def _observe_returned_report(path: Path, budget: StageBudget, withdraw: dict) -> dict:
+    """Recheck coverage *after* the stage function actually returned.
+
+    Its in-function observation cannot cover execution between that sample
+    and the caller regaining control.  The replacement observation remains
+    bound to the same sealed bytes; on failure the existing withdrawal path
+    makes the report non-consumable.
+    """
+    return verify_return_coverage(path, budget, withdraw=dict(withdraw),
+                                  clock=budget.clock)
+
+
 def _mini_stage(tmp: Path, stage: str, *, n_windows: int = 6, steps: int = 2,
                 probe_every: int = 1, seed: int = 20261107, d_model: int = 16,
                 lr: float = 0.02, world: SyntheticWorld | None = None,
@@ -3899,7 +3911,9 @@ def run_synthetic_acceptance(budget: StageBudget, out_dir: Path,
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     facts: dict = {"schema": SCHEMA, "kind": "synthetic_acceptance", "seed": seed}
+    budget.check("acceptance_world_entry")
     world = make_synthetic_world(seed=seed, n_windows=6, d_model=16)
+    budget.check("acceptance_world_constructed")
     facts["frozen_plan_defaults_problems"] = frozen_plan_defaults_problems()
     auth = {"includes": ["D6"]}
     d1_plan = FitPlan("D1", steps=d1_steps, probe_every=d1_probe_every,
@@ -3908,18 +3922,27 @@ def run_synthetic_acceptance(budget: StageBudget, out_dir: Path,
     budget.check("acceptance_d1_entry")
     d1_driver, d1_summary, d1_fin = _run_fit_stage(
         world, d1_plan, out_dir / "d1", budget, auth)
+    d1_returned = budget.clock() - budget.t0
+    d1_cov = _observe_returned_report(out_dir / "d1" / "stage_report.json",
+                                      budget, I_WITHDRAW_ON_EXCEED)
+    d1_fin["return_coverage"] = d1_cov
+    d1_fin["summary_doc"] = d1_cov["final_doc"]
+    d1_doc = d1_fin["summary_doc"]
     facts["d1"] = {
-        "local_complete_evidence": d1_summary.get("local_complete_evidence"),
-        "local_mean_fit_passed": d1_summary.get("local_mean_fit_passed"),
-        "local_conclusion": d1_summary.get("local_conclusion"),
-        "seal": (d1_fin["summary_doc"].get("seal") or {}).get("status"),
+        "local_complete_evidence": d1_doc.get("local_complete_evidence"),
+        "local_mean_fit_passed": d1_doc.get("local_mean_fit_passed"),
+        "local_conclusion": d1_doc.get("local_conclusion"),
+        "seal": (d1_doc.get("seal") or {}).get("status"),
         "return_coverage": d1_fin["return_coverage"].get("covered"),
+        "stage_returned_elapsed_s": d1_returned,
         "call_matrix_problems": d1_summary["call_matrix"]["problems"],
         "report_problems": local_report_problems(
             {k: v for k, v in d1_fin["summary_doc"].items() if k != "seal"})}
     d6_summary = None
     d6_plan = None
-    if facts["d1"]["local_mean_fit_passed"] is True:
+    if (facts["d1"]["local_complete_evidence"] is True
+            and facts["d1"]["local_mean_fit_passed"] is True
+            and facts["d1"]["return_coverage"] is True):
         handoff = resolve_handoff(out_dir / "d1", d1_plan, world.decoder,
                                   world.registration_for("D1"), auth, budget,
                                   expected_identity=d1_driver.identity,
@@ -3933,16 +3956,24 @@ def run_synthetic_acceptance(budget: StageBudget, out_dir: Path,
             budget.check("acceptance_d6_entry")
             d6_driver, d6_summary, d6_fin = _run_fit_stage(
                 world, d6_plan, out_dir / "d6", budget, auth)
+            d6_returned = budget.clock() - budget.t0
+            d6_cov = _observe_returned_report(out_dir / "d6" / "stage_report.json",
+                                              budget, I_WITHDRAW_ON_EXCEED)
+            d6_fin["return_coverage"] = d6_cov
+            d6_fin["summary_doc"] = d6_cov["final_doc"]
+            d6_doc = d6_fin["summary_doc"]
             facts["d6"] = {
-                "local_complete_evidence": d6_summary.get("local_complete_evidence"),
-                "local_mean_fit_passed": d6_summary.get("local_mean_fit_passed"),
-                "local_conclusion": d6_summary.get("local_conclusion"),
-                "seal": (d6_fin["summary_doc"].get("seal") or {}).get("status"),
+                "local_complete_evidence": d6_doc.get("local_complete_evidence"),
+                "local_mean_fit_passed": d6_doc.get("local_mean_fit_passed"),
+                "local_conclusion": d6_doc.get("local_conclusion"),
+                "seal": (d6_doc.get("seal") or {}).get("status"),
+                "return_coverage": d6_cov.get("covered"),
+                "stage_returned_elapsed_s": d6_returned,
                 "call_matrix_problems": d6_summary["call_matrix"]["problems"]}
     else:
         facts["d1_handoff"] = {
             "handoff_ready": False,
-            "skipped_reason": "d1_mean_fit_gate_not_passed",
+            "skipped_reason": "d1_incomplete_or_mean_fit_gate_not_passed",
             "note": "D6 is never appended as a retry (plan §7.2)"}
     # F verifies whatever stages completed locally; a complete negative
     # result is verifiable too (plan §7.3).
@@ -3952,23 +3983,32 @@ def run_synthetic_acceptance(budget: StageBudget, out_dir: Path,
                         "registration": world.registration_for("D1"),
                         "decoder": world.decoder, "loss_fn": world.loss_fn,
                         "identity": d1_driver.identity})
-    if d6_summary is not None and d6_summary.get("local_complete_evidence"):
+    if (d6_summary is not None
+            and facts["d6"]["local_complete_evidence"] is True
+            and facts["d6"]["return_coverage"] is True):
         f_specs.append({"stage_dir": out_dir / "d6", "plan": d6_plan,
                         "registration": world.registration_for("D6"),
                         "decoder": world.decoder, "loss_fn": world.loss_fn,
                         "identity": d6_driver.identity})
     if f_specs:
         budget.check("acceptance_f_entry")
+        f_budget = budget_for_stage("F", t0=budget.clock())
         f_out = run_f_verification(
             stage_specs=f_specs, out_dir=out_dir / "f",
-            budget=budget_for_stage("F", t0=budget.clock()),
+            budget=f_budget,
             runtime_guard=SyntheticRuntimeGuard(),
             build_modules=build_modules_factory(world, d1_plan),
             authorization=auth)
+        f_returned = f_budget.clock() - f_budget.t0
+        f_cov = _observe_returned_report(out_dir / "f" / "f_report.json",
+                                         f_budget, F_WITHDRAW_ON_EXCEED)
+        f_out["return_coverage"] = f_cov
+        f_out["summary_doc"] = f_cov["final_doc"]
         facts["f"] = {k: f_out["summary_doc"].get(k)
                       for k in ("complete_evidence", "replay_passed",
                                 "mean_fit_passed", "verdict")}
         facts["f"]["return_coverage"] = f_out["return_coverage"]["covered"]
+        facts["f"]["stage_returned_elapsed_s"] = f_returned
         facts["f"]["stages"] = [
             {k: s.get(k) for k in ("stage", "replay_enabled", "replay_passed",
                                    "skip_reason", "replay_problems")}

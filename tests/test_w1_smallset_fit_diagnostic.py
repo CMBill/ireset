@@ -473,9 +473,17 @@ def test_cli_output_and_reread_inside_return_coverage(tmp_path):
 
     fake_facts = {"frozen_plan_defaults_problems": [],
                   "all_counterexamples_caught": True,
+                  "counterexample_ids": list(diag.COUNTEREXAMPLE_IDS),
                   "d1": {"local_complete_evidence": True,
+                         "return_coverage": True,
                          "call_matrix_problems": [], "report_problems": []},
-                  "f": {"replay_passed": True}}
+                  "d1_handoff": {"handoff_ready": True},
+                  "d6": {"local_complete_evidence": True,
+                         "return_coverage": True, "call_matrix_problems": []},
+                  "f": {"complete_evidence": True, "return_coverage": True,
+                        "replay_passed": True,
+                        "stages": [{"stage": "D1", "replay_passed": True},
+                                   {"stage": "D6", "replay_passed": True}]}}
 
     def run_cli(name: str, source: str) -> dict:
         cli_path = tmp_path / f"{name}.py"
