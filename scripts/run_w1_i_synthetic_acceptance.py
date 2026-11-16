@@ -87,11 +87,12 @@ def _attempt_dir(root: Path) -> Path:
     raise RuntimeError("no free synthetic attempt directory")
 
 
-def _object(path: Path) -> dict:
-    data = json.loads(path.read_text(encoding="utf-8"))
+def _object_and_sha(path: Path) -> tuple[dict, str]:
+    raw = path.read_bytes()
+    data = json.loads(raw)
     if not isinstance(data, dict):
         raise ValueError(f"expected JSON object: {path.name}")
-    return data
+    return data, hashlib.sha256(raw).hexdigest()
 
 
 def _number(value) -> bool:
@@ -100,10 +101,12 @@ def _number(value) -> bool:
 
 
 def _proof_problems(summary_path: Path, proof_path: Path,
-                    expected_t0: float, expected_cap: float) -> tuple[list[str], dict, dict]:
+                    expected_t0: float | None, expected_cap: float
+                    ) -> tuple[list[str], dict, dict, dict]:
     problems: list[str] = []
     try:
-        summary, proof = _object(summary_path), _object(proof_path)
+        summary, report_sha = _object_and_sha(summary_path)
+        proof, proof_sha = _object_and_sha(proof_path)
         seal, budget = summary.get("seal"), summary.get("budget")
         if not isinstance(seal, dict) or not isinstance(budget, dict):
             raise ValueError("invalid seal or budget")
@@ -114,8 +117,10 @@ def _proof_problems(summary_path: Path, proof_path: Path,
                 or proof.get("schema") != "n0_return_observation_v1"
                 or proof.get("covered") is not True):
             problems.append("non_consumable_seal_or_proof")
-        if (seal.get("t0_perf_counter") != expected_t0 or cap != expected_cap
-                or budget.get("t0_perf_counter") != expected_t0
+        t0 = seal.get("t0_perf_counter")
+        if (not _number(t0) or (expected_t0 is not None and t0 != expected_t0)
+                or cap != expected_cap
+                or budget.get("t0_perf_counter") != t0
                 or budget.get("wall_cap_s") != expected_cap
                 or budget.get("measured_wall_s_at_summary") != reg
                 or proof.get("registered_measured_s") != reg
@@ -123,11 +128,72 @@ def _proof_problems(summary_path: Path, proof_path: Path,
             problems.append("budget_binding_mismatch")
         if not all(_number(v) for v in (reg, cap, elapsed)) or not elapsed <= reg <= cap:
             problems.append("in_process_coverage_invalid")
-        if proof.get("summary_sha256") != _sha(summary_path):
+        if proof.get("summary_sha256") != report_sha:
             problems.append("summary_hash_mismatch")
-        return problems, summary, proof
+        return problems, summary, proof, {"report_sha256": report_sha,
+                                          "return_observation_sha256": proof_sha}
     except (OSError, ValueError, TypeError, OverflowError, json.JSONDecodeError):
-        return ["report_or_proof_unreadable"], {}, {}
+        return ["report_or_proof_unreadable"], {}, {}, {}
+
+
+def _matching_fields(left: dict, right: dict, fields: tuple[str, ...]) -> bool:
+    return all(key in left and key in right and type(left[key]) is type(right[key])
+               and left[key] == right[key] for key in fields)
+
+
+def _stage_report_matches(stage: str, report: dict, summary: dict) -> bool:
+    """Require the proof-bound report and the acceptance summary to agree."""
+    facts = summary.get(stage)
+    if not isinstance(facts, dict):
+        return False
+    if stage != "f":
+        matrix, seal = report.get("call_matrix"), report.get("seal")
+        mean = report.get("local_mean_fit_passed")
+        return (report.get("schema") == "w1_smallset_fit_diagnostic_v1"
+                and report.get("stage") == stage.upper()
+                and report.get("local_complete_evidence") is True
+                and isinstance(mean, bool)
+                and report.get("local_conclusion") == ("complete_fit" if mean else "fit_insufficient")
+                and (stage != "d1" or mean is True)
+                and report.get("final_verification_status") == "pending_F"
+                and report.get("problems") == [] and report.get("failure", "missing") is None
+                and isinstance(matrix, dict) and matrix.get("problems") == []
+                and facts.get("call_matrix_problems") == matrix["problems"]
+                and isinstance(seal, dict) and facts.get("seal") == seal.get("status")
+                and _matching_fields(facts, report, ("local_complete_evidence",
+                                      "local_mean_fit_passed", "local_conclusion")))
+
+    mean = report.get("mean_fit_passed")
+    stages, copies = report.get("stages"), facts.get("stages")
+    if (report.get("schema") != "w1_smallset_fit_f_report_v1"
+            or report.get("complete_evidence") is not True
+            or report.get("replay_passed") is not True or not isinstance(mean, bool)
+            or report.get("verdict") != ("fit_pass" if mean else "fit_insufficient")
+            or report.get("final_verification_status") != "final_F"
+            or report.get("tolerance_policy") != "bitwise_no_tolerance"
+            or not _matching_fields(facts, report, ("complete_evidence", "replay_passed",
+                                                     "mean_fit_passed", "verdict"))
+            or not isinstance(stages, list) or not isinstance(copies, list)
+            or len(stages) != 2 or len(copies) != 2):
+        return False
+    for expected, entry, copy in zip(("D1", "D6"), stages, copies):
+        if (not isinstance(entry, dict) or not isinstance(copy, dict)
+                or entry.get("stage") != expected or copy.get("stage") != expected
+                or entry.get("replay_enabled") is not True
+                or entry.get("replay_passed") is not True
+                or entry.get("complete_evidence") is not True
+                or entry.get("local_reverify_problems") != []
+                or entry.get("replay_problems") != []
+                or entry.get("skip_reason") is not None
+                or not _matching_fields(copy, entry, ("stage", "replay_enabled",
+                                                       "replay_passed", "replay_problems"))
+                or copy.get("skip_reason") is not None):
+            return False
+        source = summary.get(expected.lower())
+        if (not isinstance(source, dict) or not isinstance(entry.get("mean_fit_passed"), bool)
+                or entry["mean_fit_passed"] is not source.get("local_mean_fit_passed")):
+            return False
+    return mean is all(entry["mean_fit_passed"] for entry in stages)
 
 
 def _candidate_problems(doc: dict, launch_id: str, t0: float,
@@ -223,7 +289,7 @@ def run(args, *, t0: float = _OUTER_T0) -> int:
         os.fsync(stdout.fileno())
         os.fsync(stderr.fileno())
 
-    problems, summary, proof = _proof_problems(
+    problems, summary, proof, summary_binding = _proof_problems(
         out_dir / "acceptance_summary.json", out_dir / "return_observation.json",
         t0, args.wall_cap_s)
     problems += _candidate_problems(summary, launch_id, t0, expected_ids)
@@ -241,17 +307,21 @@ def run(args, *, t0: float = _OUTER_T0) -> int:
     if (not _number(registered) or not _number(in_process)
             or not in_process <= wait_elapsed <= registered <= args.wall_cap_s):
         problems.append("actual_wait_not_covered")
+    stage_artifacts = {}
     for subdir, filename in (("d1", "stage_report.json"),
                              ("d6", "stage_report.json"), ("f", "f_report.json")):
         try:
-            stage_doc = _object(out_dir / subdir / filename)
-            stage_seal = stage_doc["seal"]
-            stage_t0 = t0 if subdir in ("d1", "d6") else stage_seal["t0_perf_counter"]
+            expected_t0 = t0 if subdir in ("d1", "d6") else None
             stage_cap = args.wall_cap_s if subdir in ("d1", "d6") else 600.0
-            stage_problems, _, stage_proof = _proof_problems(
+            stage_problems, stage_doc, stage_proof, stage_binding = _proof_problems(
                 out_dir / subdir / filename, out_dir / subdir / "return_observation.json",
-                stage_t0, stage_cap)
+                expected_t0, stage_cap)
             problems += [f"{subdir}:{p}" for p in stage_problems]
+            stage_artifacts[subdir] = stage_binding
+            if not _stage_report_matches(subdir, stage_doc, summary):
+                problems.append(f"{subdir}:report_facts_mismatch")
+            stage_seal = stage_doc["seal"]
+            stage_t0 = stage_seal["t0_perf_counter"]
             facts = summary.get(subdir)
             returned = facts.get("stage_returned_elapsed_s") if isinstance(facts, dict) else None
             observed = stage_proof.get("elapsed_s")
@@ -268,10 +338,9 @@ def run(args, *, t0: float = _OUTER_T0) -> int:
                "wait_return_perf_counter": wait_time, "wait_elapsed_s": wait_elapsed,
                "registered_measured_s": registered, "wall_cap_s": args.wall_cap_s,
                "in_process_elapsed_s": in_process,
-               "summary_sha256": (_sha(out_dir / "acceptance_summary.json")
-                                  if (out_dir / "acceptance_summary.json").is_file() else None),
-               "in_process_proof_sha256": (_sha(out_dir / "return_observation.json")
-                                           if (out_dir / "return_observation.json").is_file() else None),
+               "summary_sha256": summary_binding.get("report_sha256"),
+               "in_process_proof_sha256": summary_binding.get("return_observation_sha256"),
+               "stage_artifacts": stage_artifacts,
                "launch_sha256": _sha(launch_path), "stdout_sha256": _sha(stdout_path),
                "stderr_sha256": _sha(stderr_path), "source_sha256_after": after,
                "problems": problems}

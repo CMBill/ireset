@@ -34,6 +34,33 @@ def _report(path, t0, cap, registered, elapsed):
     return doc, proof
 
 
+def _update_report(path, changes):
+    doc = json.loads(path.read_text())
+    doc.update(changes)
+    path.write_text(json.dumps(doc))
+    proof_path = path.parent / "return_observation.json"
+    proof = json.loads(proof_path.read_text())
+    proof["summary_sha256"] = supervisor._sha(path)
+    proof_path.write_text(json.dumps(proof))
+
+
+def _stage_facts(stage):
+    return {"schema": "w1_smallset_fit_diagnostic_v1", "stage": stage,
+            "local_complete_evidence": True, "local_mean_fit_passed": True,
+            "local_conclusion": "complete_fit", "final_verification_status": "pending_F",
+            "call_matrix": {"problems": []}, "problems": [], "failure": None}
+
+
+def _f_facts():
+    return {"schema": "w1_smallset_fit_f_report_v1", "complete_evidence": True,
+            "replay_passed": True, "mean_fit_passed": True, "verdict": "fit_pass",
+            "final_verification_status": "final_F", "tolerance_policy": "bitwise_no_tolerance",
+            "stages": [{"stage": s, "replay_enabled": True, "replay_passed": True,
+                        "complete_evidence": True, "mean_fit_passed": True,
+                        "local_reverify_problems": [], "replay_problems": []}
+                       for s in ("D1", "D6")]}
+
+
 def _populate(command, mutation):
     out = Path(command[command.index("--output-dir") + 1])
     launch_id = command[command.index("--launch-id") + 1]
@@ -41,7 +68,9 @@ def _populate(command, mutation):
     assert t0 == 100.0
     for name in ("d1", "d6"):
         _report(out / name / "stage_report.json", t0, 100.0, 20.0, 4.0)
+        _update_report(out / name / "stage_report.json", _stage_facts(name.upper()))
     _report(out / "f/f_report.json", 103.0, 600.0, 5.0, 4.0)
+    _update_report(out / "f/f_report.json", _f_facts())
     doc, proof = _report(out / "acceptance_summary.json", t0, 100.0, 20.0, 9.0)
     doc.update({
         "outer_launch": {"launch_id": launch_id, "t0_perf_counter": t0,
@@ -51,15 +80,21 @@ def _populate(command, mutation):
         "counterexample_battery": {"a": {"caught": True}, "b": {"caught": True}},
         "all_counterexamples_caught": True,
         "d1": {"local_complete_evidence": True, "return_coverage": True,
+               "local_mean_fit_passed": True, "local_conclusion": "complete_fit",
+               "seal": "sealed_within_budget",
                "stage_returned_elapsed_s": 3.0, "call_matrix_problems": [],
                "report_problems": []},
         "d1_handoff": {"handoff_ready": True, "problems": []},
         "d6": {"local_complete_evidence": True, "return_coverage": True,
+               "local_mean_fit_passed": True, "local_conclusion": "complete_fit",
+               "seal": "sealed_within_budget",
                "stage_returned_elapsed_s": 3.0, "call_matrix_problems": []},
         "f": {"complete_evidence": True, "replay_passed": True,
+              "mean_fit_passed": True, "verdict": "fit_pass",
               "return_coverage": True, "stage_returned_elapsed_s": 3.0,
-              "stages": [{"stage": "D1", "replay_passed": True},
-                         {"stage": "D6", "replay_passed": True}]},
+              "stages": [{"stage": s, "replay_enabled": True, "replay_passed": True,
+                          "skip_reason": None, "replay_problems": []}
+                         for s in ("D1", "D6")]},
     })
     if mutation == "roster":
         doc["counterexample_ids"].pop()
@@ -74,6 +109,27 @@ def _populate(command, mutation):
         doc["f"]["stages"][0]["stage"] = []
     if mutation == "stage_name_dict":
         doc["f"]["stages"][0]["stage"] = {}
+    if mutation == "f_disk_incomplete":
+        _update_report(out / "f/f_report.json", {"complete_evidence": False,
+                       "replay_passed": False, "mean_fit_passed": None,
+                       "verdict": "incomplete", "stages": []})
+    if mutation == "d1_disk_incomplete":
+        _update_report(out / "d1/stage_report.json", {"local_complete_evidence": False})
+    if mutation == "d6_disk_mismatch":
+        _update_report(out / "d6/stage_report.json", {"local_mean_fit_passed": False})
+    if mutation == "f_disk_stage_invalid":
+        changed = _f_facts()["stages"]
+        changed[0]["stage"] = []
+        _update_report(out / "f/f_report.json", {"stages": changed})
+    if mutation == "fit_insufficient":
+        _update_report(out / "d6/stage_report.json", {"local_mean_fit_passed": False,
+                       "local_conclusion": "fit_insufficient"})
+        f = _f_facts()
+        f["stages"][1]["mean_fit_passed"] = False
+        f.update(mean_fit_passed=False, verdict="fit_insufficient")
+        _update_report(out / "f/f_report.json", f)
+        doc["d6"].update(local_mean_fit_passed=False, local_conclusion="fit_insufficient")
+        doc["f"].update(mean_fit_passed=False, verdict="fit_insufficient")
     path = out / "acceptance_summary.json"
     path.write_text(json.dumps(doc))
     proof["summary_sha256"] = supervisor._sha(path)
@@ -84,6 +140,7 @@ def _populate(command, mutation):
 
 @pytest.mark.parametrize("mutation,expected", [
     (None, None),
+    ("fit_insufficient", None),
     ("late_wait", "actual_wait_not_covered"),
     ("nonzero", "worker_exit:1"),
     ("roster", "counterexample_battery_incomplete"),
@@ -92,6 +149,10 @@ def _populate(command, mutation):
     ("missing_d6", "fresh_replay_incomplete"),
     ("stage_name_list", "fresh_replay_incomplete"),
     ("stage_name_dict", "fresh_replay_incomplete"),
+    ("f_disk_incomplete", "f:report_facts_mismatch"),
+    ("d1_disk_incomplete", "d1:report_facts_mismatch"),
+    ("d6_disk_mismatch", "d6:report_facts_mismatch"),
+    ("f_disk_stage_invalid", "f:report_facts_mismatch"),
     ("bad_proof", "report_or_proof_unreadable"),
     ("slow_receipt", "receipt_write_not_covered"),
     ("slow_verdict", "verdict_write_not_covered"),
@@ -139,6 +200,11 @@ def test_actual_wait_and_all_evidence_are_required(tmp_path, monkeypatch, capsys
         assert rc == 0 and verdict["verdict"] == "candidate_complete" and verdict["problems"] == []
         assert receipt["wait_elapsed_s"] == 10.0
         assert receipt["in_process_elapsed_s"] <= receipt["wait_elapsed_s"] <= 20.0
+        for stage, name in (("d1", "stage_report.json"), ("d6", "stage_report.json"),
+                            ("f", "f_report.json")):
+            assert receipt["stage_artifacts"][stage] == {
+                "report_sha256": supervisor._sha(out / stage / name),
+                "return_observation_sha256": supervisor._sha(out / stage / "return_observation.json")}
         assert verdict["outer_return_observation_sha256"] == supervisor._sha(
             out / "outer_return_observation.json")
         event = json.loads(printed[-1])
@@ -185,8 +251,18 @@ def report(path, cap, extra):
     (path.parent / "return_observation.json").write_text(json.dumps(proof))
 
 for name in ("d1", "d6"):
-    report(out / name / "stage_report.json", 100.0, {})
-report(out / "f/f_report.json", 600.0, {})
+    report(out / name / "stage_report.json", 100.0, {
+        "schema": "w1_smallset_fit_diagnostic_v1", "stage": name.upper(),
+        "local_complete_evidence": True, "local_mean_fit_passed": True,
+        "local_conclusion": "complete_fit", "final_verification_status": "pending_F",
+        "call_matrix": {"problems": []}, "problems": [], "failure": None})
+report(out / "f/f_report.json", 600.0, {
+    "schema": "w1_smallset_fit_f_report_v1", "complete_evidence": True,
+    "replay_passed": True, "mean_fit_passed": True, "verdict": "fit_pass",
+    "final_verification_status": "final_F", "tolerance_policy": "bitwise_no_tolerance",
+    "stages": [{"stage": s, "replay_enabled": True, "replay_passed": True,
+                "complete_evidence": True, "mean_fit_passed": True,
+                "local_reverify_problems": [], "replay_problems": []} for s in ("D1", "D6")]})
 report(out / "acceptance_summary.json", 100.0, {
     "outer_launch": {"launch_id": launch_id, "t0_perf_counter": t0,
                      "cli_entry_perf_counter": time.perf_counter(), "supervisor_declared": True},
@@ -194,14 +270,19 @@ report(out / "acceptance_summary.json", 100.0, {
     "counterexample_ids": ["a"], "counterexample_battery": {"a": {"caught": True}},
     "all_counterexamples_caught": True,
     "d1": {"local_complete_evidence": True, "return_coverage": True,
+           "local_mean_fit_passed": True, "local_conclusion": "complete_fit",
+           "seal": "sealed_within_budget",
            "stage_returned_elapsed_s": 0.0, "call_matrix_problems": [], "report_problems": []},
     "d1_handoff": {"handoff_ready": True, "problems": []},
     "d6": {"local_complete_evidence": True, "return_coverage": True,
+           "local_mean_fit_passed": True, "local_conclusion": "complete_fit",
+           "seal": "sealed_within_budget",
            "stage_returned_elapsed_s": 0.0, "call_matrix_problems": []},
     "f": {"complete_evidence": True, "replay_passed": True,
+          "mean_fit_passed": True, "verdict": "fit_pass",
           "return_coverage": True, "stage_returned_elapsed_s": 0.0,
-          "stages": [{"stage": "D1", "replay_passed": True},
-                     {"stage": "D6", "replay_passed": True}]}})
+          "stages": [{"stage": s, "replay_enabled": True, "replay_passed": True,
+                      "skip_reason": None, "replay_problems": []} for s in ("D1", "D6")]}})
 time.sleep(0.1)
 ''')
     fake_uv.chmod(0o755)
