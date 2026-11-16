@@ -156,6 +156,10 @@ def _populate(command, mutation):
     ("bad_proof", "report_or_proof_unreadable"),
     ("slow_receipt", "receipt_write_not_covered"),
     ("slow_verdict", "verdict_write_not_covered"),
+    ("slow_final_stdout", "stdout_not_covered"),
+    ("slow_final_stdout_hard", "stdout_not_covered"),
+    ("slow_stdout_observation", "stdout_observation_write_not_covered"),
+    ("stdout_failure", "stdout_write_failed"),
     ("source_drift", "implementation_changed_during_run"),
 ])
 def test_actual_wait_and_all_evidence_are_required(tmp_path, monkeypatch, capsys, mutation, expected):
@@ -166,15 +170,29 @@ def test_actual_wait_and_all_evidence_are_required(tmp_path, monkeypatch, capsys
     monkeypatch.setattr(supervisor, "_source_hashes", lambda: next(hashes))
     monkeypatch.setattr(supervisor, "_expected_counterexamples", lambda: {"a", "b"})
     real_write = supervisor._write_json
+    real_print = print
 
     def controlled_write(path, obj):
         real_write(path, obj)
         if ((mutation == "slow_receipt" and path.name == "outer_return_observation.json")
                 or (mutation == "slow_verdict" and path.name == "acceptance_verdict.json"
-                    and obj["verdict"] == "candidate_complete")):
+                    and obj["verdict"] == "candidate_complete")
+                or (mutation == "slow_stdout_observation"
+                    and path.name == "outer_stdout_observation.json")):
             ticks["now"] = 121.0
 
     monkeypatch.setattr(supervisor, "_write_json", controlled_write)
+
+    def controlled_print(value, **kwargs):
+        if (mutation == "stdout_failure" and isinstance(value, str)
+                and "w1_i_outer_verdict_" in value):
+            raise BrokenPipeError("closed stdout")
+        real_print(value, **kwargs)
+        if (isinstance(value, str) and "w1_i_outer_verdict_" in value
+                and mutation in ("slow_final_stdout", "slow_final_stdout_hard")):
+            ticks["now"] = 201.0 if mutation == "slow_final_stdout_hard" else 121.0
+
+    monkeypatch.setattr(supervisor, "print", controlled_print, raising=False)
 
     class Child:
         pid = 1234
@@ -208,14 +226,20 @@ def test_actual_wait_and_all_evidence_are_required(tmp_path, monkeypatch, capsys
         assert verdict["outer_return_observation_sha256"] == supervisor._sha(
             out / "outer_return_observation.json")
         event = json.loads(printed[-1])
-        assert event["event"] == "w1_i_outer_verdict_write_observed"
-        assert event["verdict"] == "complete"
+        assert event["event"] == "w1_i_outer_verdict_output_pending"
+        assert event["verdict"] == "pending_output_coverage"
         assert event["verdict_sha256"] == supervisor._sha(out / "acceptance_verdict.json")
         assert receipt["wait_elapsed_s"] <= event["elapsed_s"] <= 20.0
+        output_proof = json.loads((out / "outer_stdout_observation.json").read_text())
+        assert output_proof["stdout_flushed_elapsed_s"] >= event["elapsed_s"]
+        assert output_proof["stdout_flushed_elapsed_s"] <= 20.0
+        assert output_proof["verdict_sha256"] == event["verdict_sha256"]
+        assert output_proof["event_sha256"] == supervisor.hashlib.sha256(
+            (printed[-1] + "\n").encode()).hexdigest()
     else:
         assert rc == 3 and verdict["verdict"] == "incomplete"
         assert expected in verdict["problems"]
-        assert not any("w1_i_outer_verdict_write_observed" in line for line in printed)
+        assert not any('"verdict": "complete"' in line for line in printed)
 
 
 def test_counterexample_roster_is_read_from_the_frozen_source():
@@ -299,6 +323,9 @@ time.sleep(0.1)
     assert receipt["wait_elapsed_s"] >= receipt["in_process_elapsed_s"] + 0.09
     assert receipt["wait_elapsed_s"] <= event["elapsed_s"] <= 30.0
     assert event["verdict_sha256"] == supervisor._sha(out / "acceptance_verdict.json")
+    assert event["verdict"] == "pending_output_coverage"
+    output_proof = json.loads((out / "outer_stdout_observation.json").read_text())
+    assert event["elapsed_s"] <= output_proof["stdout_flushed_elapsed_s"] <= 30.0
 
 
 @pytest.mark.parametrize("stage", ["D1", "F"])

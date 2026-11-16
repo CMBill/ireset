@@ -1,10 +1,10 @@
 """Supervise the synthetic-only W1 I acceptance from before uv until wait().
 
 Run this standard-library-only launcher with the system Python; the actual
-project process is always ``uv run --locked``.  The child report is only a
-candidate.  A consumer must also require the launch-specific outer return
-observation and the final verdict, both bound to the exact candidate bytes.
-Nothing here starts a real-data stage or retries a failed attempt.
+project process is always ``uv run --locked``.  Every emitted verdict is
+provisional.  A consumer must require this supervisor's successful exit,
+the candidate verdict, the stdout observation, and the bound outer return
+observation.  Nothing here starts a real-data stage or retries a failure.
 """
 
 import time
@@ -367,15 +367,41 @@ def run(args, *, t0: float = _OUTER_T0) -> int:
         return 3
     if problems:
         return 3
-    # The durable file is deliberately only a candidate: killing this
-    # observer before the post-write sample must never publish success.  The
-    # emitted observation is the final claim and binds the exact file bytes.
-    # No acceptance artifact is read or written after this passing sample.
-    print(json.dumps({"event": "w1_i_outer_verdict_write_observed",
-                      "verdict": "complete", "output_dir": str(out_dir),
-                      "launch_id": launch_id, "verdict_sha256": verdict_sha,
-                      "elapsed_s": after_verdict, "registered_measured_s": registered,
-                      "wall_cap_s": args.wall_cap_s}), flush=True)
+    # Output can itself block.  It is deliberately *not* a complete claim:
+    # a reader must also have the post-flush observation and successful
+    # process exit.  No other stdout is emitted on the success path.
+    event = json.dumps({"event": "w1_i_outer_verdict_output_pending",
+                        "verdict": "pending_output_coverage", "output_dir": str(out_dir),
+                        "launch_id": launch_id, "verdict_sha256": verdict_sha,
+                        "elapsed_s": after_verdict, "registered_measured_s": registered,
+                        "wall_cap_s": args.wall_cap_s})
+    try:
+        print(event, flush=True)
+    except OSError:
+        verdict.update(verdict="incomplete", problems=["stdout_write_failed"],
+                       observed_elapsed_s=time.perf_counter() - t0)
+        _write_json(verdict_path, verdict)
+        return 3
+    after_stdout = time.perf_counter() - t0
+    if after_stdout > registered or after_stdout > args.wall_cap_s:
+        verdict.update(verdict="incomplete", problems=["stdout_not_covered"],
+                       observed_elapsed_s=after_stdout)
+        _write_json(verdict_path, verdict)
+        return 3
+    output_observation = {
+        "schema": "w1_i_outer_stdout_observation_v1", "state": "pending_supervisor_return",
+        "launch_id": launch_id, "verdict_sha256": verdict_sha,
+        "event_sha256": hashlib.sha256((event + "\n").encode("utf-8")).hexdigest(),
+        "stdout_flushed_elapsed_s": after_stdout,
+        "registered_measured_s": registered, "wall_cap_s": args.wall_cap_s,
+    }
+    _write_json(out_dir / "outer_stdout_observation.json", output_observation)
+    after_observation = time.perf_counter() - t0
+    if after_observation > registered or after_observation > args.wall_cap_s:
+        verdict.update(verdict="incomplete", problems=["stdout_observation_write_not_covered"],
+                       observed_elapsed_s=after_observation)
+        _write_json(verdict_path, verdict)
+        return 3
     return 0
 
 
