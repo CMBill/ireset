@@ -167,6 +167,7 @@ def _candidate_problems(doc: dict, launch_id: str, t0: float,
     stages = f.get("stages")
     if (not isinstance(stages, list) or len(stages) != 2
             or any(not isinstance(s, dict) for s in stages)
+            or any(not isinstance(s.get("stage"), str) for s in stages)
             or {s.get("stage") for s in stages} != {"D1", "D6"}
             or any(s.get("replay_passed") is not True for s in stages)):
         problems.append("fresh_replay_incomplete")

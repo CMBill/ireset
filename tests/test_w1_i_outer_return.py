@@ -70,6 +70,10 @@ def _populate(command, mutation):
         doc["d1"]["stage_returned_elapsed_s"] = 5.0
     if mutation == "missing_d6":
         doc["f"]["stages"].pop()
+    if mutation == "stage_name_list":
+        doc["f"]["stages"][0]["stage"] = []
+    if mutation == "stage_name_dict":
+        doc["f"]["stages"][0]["stage"] = {}
     path = out / "acceptance_summary.json"
     path.write_text(json.dumps(doc))
     proof["summary_sha256"] = supervisor._sha(path)
@@ -86,6 +90,8 @@ def _populate(command, mutation):
     ("identity", "launch_identity_mismatch"),
     ("stage_return", "d1:actual_stage_return_not_covered"),
     ("missing_d6", "fresh_replay_incomplete"),
+    ("stage_name_list", "fresh_replay_incomplete"),
+    ("stage_name_dict", "fresh_replay_incomplete"),
     ("bad_proof", "report_or_proof_unreadable"),
     ("slow_receipt", "receipt_write_not_covered"),
     ("slow_verdict", "verdict_write_not_covered"),
