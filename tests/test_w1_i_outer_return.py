@@ -248,6 +248,159 @@ def test_counterexample_roster_is_read_from_the_frozen_source():
     assert "registration_tamper" in ids
 
 
+@pytest.mark.parametrize("trigger,reason", [
+    ("stdout", "stdout_not_covered"),
+    ("stdout_failure", "stdout_write_failed"),
+    ("launcher_stdout_failure", "launcher_stdout_write_failed"),
+    ("observation", "stdout_observation_write_not_covered"),
+    ("observation_failure", "stdout_observation_write_failed"),
+    ("verdict", "verdict_write_not_covered"),
+    ("receipt", "receipt_write_not_covered"),
+    ("timeout", "worker_hard_deadline_timeout"),
+    ("before_uv", "deadline_before_uv"),
+])
+def test_failure_rechecks_and_registers_slow_withdrawal(
+        tmp_path, monkeypatch, trigger, reason):
+    ticks = {"now": 191.0 if trigger == "before_uv" else 105.0}
+    monkeypatch.setattr(supervisor.time, "perf_counter", lambda: ticks["now"])
+    monkeypatch.setattr(supervisor, "_source_hashes", lambda: {"source": "same"})
+    monkeypatch.setattr(supervisor, "_expected_counterexamples", lambda: {"a", "b"})
+    real_write = supervisor._write_json
+    withdrawals = []
+
+    def slow_write(path, doc):
+        if trigger == "observation_failure" and path.name == "outer_stdout_observation.json":
+            ticks["now"] = 121.0
+            raise OSError("injected observation write failure")
+        real_write(path, doc)
+        if path.name == "acceptance_verdict.json" and doc.get("verdict") == "incomplete":
+            withdrawals.append(doc.get("registered_measured_s"))
+            if len(withdrawals) == 1:
+                ticks["now"] = max(201.0, ticks["now"] + 80.0)
+        elif ((trigger == "observation" and path.name == "outer_stdout_observation.json")
+              or (trigger == "receipt" and path.name == "outer_return_observation.json")
+              or (trigger == "verdict" and path.name == "acceptance_verdict.json"
+                  and doc.get("verdict") == "candidate_complete")):
+            ticks["now"] = 121.0
+
+    def slow_print(value, **kwargs):
+        if trigger == "launcher_stdout_failure" and value.startswith("Synthetic attempt:"):
+            ticks["now"] = 121.0
+            raise BrokenPipeError("injected launcher stdout failure")
+        if isinstance(value, str) and "w1_i_outer_verdict_output_pending" in value:
+            if trigger == "stdout_failure":
+                ticks["now"] = 121.0
+                raise BrokenPipeError("injected stdout failure")
+            if trigger == "stdout":
+                ticks["now"] = 121.0
+
+    class Child:
+        pid = 1234
+
+        def __init__(self, command, **kwargs):
+            assert trigger not in ("before_uv", "launcher_stdout_failure")
+            self.calls = 0
+            _populate(command, None)
+
+        def wait(self, timeout=None):
+            self.calls += 1
+            if trigger == "timeout" and self.calls == 1:
+                ticks["now"] = 201.0
+                raise supervisor.subprocess.TimeoutExpired("fake uv", timeout)
+            if trigger != "timeout":
+                ticks["now"] = 110.0
+            return -15 if trigger == "timeout" else 0
+
+    monkeypatch.setattr(supervisor, "_write_json", slow_write)
+    monkeypatch.setattr(supervisor, "print", slow_print, raising=False)
+    monkeypatch.setattr(supervisor.subprocess, "Popen", Child)
+    monkeypatch.setattr(supervisor.os, "killpg", lambda *args: None)
+    args = SimpleNamespace(output_root=tmp_path, wall_cap_s=100.0, reserve_s=10.0)
+    assert supervisor.run(args, t0=100.0) == 3
+    out = tmp_path / "attempt_001"
+    verdict = json.loads((out / "acceptance_verdict.json").read_text())
+    assert verdict["verdict"] == "incomplete" and reason in verdict["problems"]
+    assert verdict["observed_elapsed_s"] >= 101.0
+    assert verdict["registered_measured_s"] >= 101.0
+    assert verdict["hard_deadline_exceeded"] is True
+    assert verdict["cost_coverage_proven"] is False
+    assert verdict["cost_coverage_status"] == "pending_external_return"
+    assert verdict["sealed_registered_measured_s"] == (
+        None if trigger in ("before_uv", "launcher_stdout_failure") else 20.0)
+    observation = json.loads((out / "failure_cost_observation.json").read_text())
+    assert observation["verdict_sha256"] == supervisor._sha(out / "acceptance_verdict.json")
+    assert observation["elapsed_after_verdict_write_s"] >= 101.0
+    assert observation["elapsed_after_verdict_write_s"] <= verdict["registered_measured_s"]
+    assert len(withdrawals) >= 2
+
+
+@pytest.mark.parametrize("delay_point", ["observation_write", "verdict_hash"])
+def test_failure_rechecks_delayed_cost_proof(tmp_path, monkeypatch, delay_point):
+    ticks = {"now": 121.0}
+    monkeypatch.setattr(supervisor.time, "perf_counter", lambda: ticks["now"])
+    real_write, real_sha = supervisor._write_json, supervisor._sha
+    injected = {"done": False}
+
+    def slow_write(path, doc):
+        real_write(path, doc)
+        if (delay_point == "observation_write" and path.name == "failure_cost_observation.json"
+                and not injected["done"]):
+            injected["done"] = True
+            ticks["now"] = 201.0
+
+    def slow_sha(path):
+        value = real_sha(path)
+        if delay_point == "verdict_hash" and not injected["done"]:
+            injected["done"] = True
+            ticks["now"] = 201.0
+        return value
+
+    monkeypatch.setattr(supervisor, "_write_json", slow_write)
+    monkeypatch.setattr(supervisor, "_sha", slow_sha)
+    path = tmp_path / "acceptance_verdict.json"
+    supervisor._write_incomplete_costed(path, {"registered_measured_s": 20.0,
+                                        "problems": ["injected"]}, t0=100.0,
+                                        wall_cap_s=100.0)
+    verdict = json.loads(path.read_text())
+    observation = json.loads((tmp_path / "failure_cost_observation.json").read_text())
+    assert injected["done"]
+    assert verdict["withdrawal_round"] >= 2
+    assert verdict["registered_measured_s"] >= verdict["observed_elapsed_s"] >= 101.0
+    assert verdict["hard_deadline_exceeded"] is True
+    assert verdict["cost_coverage_proven"] is False
+    assert observation["verdict_sha256"] == real_sha(path)
+    assert observation["elapsed_after_verdict_write_s"] >= 101.0
+
+
+def test_failure_cost_exhaustion_remains_explicitly_unproven(tmp_path, monkeypatch):
+    ticks = {"now": 121.0}
+    monkeypatch.setattr(supervisor.time, "perf_counter", lambda: ticks["now"])
+    real_write = supervisor._write_json
+    costs = []
+
+    def always_slow(path, doc):
+        real_write(path, doc)
+        if path.name == "acceptance_verdict.json":
+            costs.append(doc["registered_measured_s"])
+            ticks["now"] = 100.0 + doc["registered_measured_s"] + 100.0
+
+    monkeypatch.setattr(supervisor, "_write_json", always_slow)
+    path = tmp_path / "acceptance_verdict.json"
+    supervisor._write_incomplete_costed(path, {"registered_measured_s": 20.0,
+                                        "problems": ["injected"]}, t0=100.0,
+                                        wall_cap_s=100.0)
+    verdict = json.loads(path.read_text())
+    assert len(costs) == supervisor.FAILURE_COST_ROUNDS + 1
+    assert costs == sorted(costs)
+    assert verdict["verdict"] == "incomplete"
+    assert verdict["cost_coverage_proven"] is False
+    assert verdict["cost_coverage_unproven"] is True
+    assert verdict["cost_coverage_status"] == "unproven_rounds_exhausted"
+    assert verdict["withdrawal_rounds_exhausted"] is True
+    assert verdict["observed_elapsed_s"] <= verdict["registered_measured_s"] < ticks["now"] - 100.0
+    assert not (tmp_path / "failure_cost_observation.json").exists()
+
+
 def test_real_subprocess_wait_is_sampled_after_its_last_output(tmp_path, monkeypatch, capsys):
     fake_uv = tmp_path / "uv"
     fake_uv.write_text(f"#!{sys.executable}\n" + r'''

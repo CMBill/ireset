@@ -26,6 +26,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = ROOT / "scripts/verify_w1_smallset_fit_diagnostic.py"
 DEFAULT_OUTPUT_ROOT = ROOT / "derived/audit/w1_smallset_fit_diagnostic"
+FAILURE_COST_ROUNDS = 4
+FAILURE_COST_MIN_TAIL_S = 4.0
 
 
 def _sha(path: Path) -> str:
@@ -70,6 +72,73 @@ def _write_json(path: Path, obj: dict) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def _write_incomplete_costed(path: Path, verdict: dict, *, t0: float,
+                             wall_cap_s: float) -> None:
+    """Withdraw with monotone cost accounting, including the withdrawal writes.
+
+    The worker's sealed cost remains immutable and separately named.  A
+    failure cost is a conservative reservation, not evidence of a successful
+    or in-budget run.  An observation binds the exact verdict bytes and the
+    post-verdict-write sample; even then the supervisor's own return remains
+    externally unobserved, so the persisted coverage flag stays false.
+    """
+    path = Path(path)
+    doc = dict(verdict)
+    sealed = doc.get("registered_measured_s")
+    sealed = float(sealed) if _number(sealed) else None
+    charge = sealed if sealed is not None else 0.0
+    reserve = FAILURE_COST_MIN_TAIL_S
+    doc.update(verdict="incomplete", sealed_registered_measured_s=sealed,
+               cost_coverage_proven=False, cost_coverage_unproven=True,
+               cost_coverage_status="pending_external_return",
+               registered_cost_role="withdrawal_covering_reservation")
+    observation_path = path.parent / "failure_cost_observation.json"
+
+    for round_no in range(1, FAILURE_COST_ROUNDS + 1):
+        pre = time.perf_counter() - t0
+        charge = max(charge, pre + reserve)
+        doc.update(registered_measured_s=charge, observed_elapsed_s=pre,
+                   hard_deadline_exceeded=pre > wall_cap_s,
+                   withdrawal_round=round_no)
+        _write_json(path, doc)
+        after_verdict = time.perf_counter() - t0
+        if after_verdict > charge or (after_verdict > wall_cap_s
+                                      and not doc["hard_deadline_exceeded"]):
+            reserve = max(FAILURE_COST_MIN_TAIL_S, 2.0 * (after_verdict - pre) + 3.0)
+            continue
+        verdict_sha = _sha(path)
+        before_observation = time.perf_counter() - t0
+        if before_observation > charge or (before_observation > wall_cap_s
+                                           and not doc["hard_deadline_exceeded"]):
+            reserve = max(FAILURE_COST_MIN_TAIL_S, 2.0 * (before_observation - pre) + 3.0)
+            continue
+        observation = {
+            "schema": "w1_i_failure_cost_observation_v1",
+            "launch_id": doc.get("launch_id"),
+            "state": "pending_external_return", "cost_coverage_proven": False,
+            "verdict_sha256": verdict_sha, "elapsed_after_verdict_write_s": after_verdict,
+            "elapsed_before_observation_write_s": before_observation,
+            "registered_measured_s": charge, "wall_cap_s": wall_cap_s,
+            "hard_deadline_exceeded": doc["hard_deadline_exceeded"],
+        }
+        _write_json(observation_path, observation)
+        after_observation = time.perf_counter() - t0
+        if after_observation <= charge and not (after_observation > wall_cap_s
+                                                and not doc["hard_deadline_exceeded"]):
+            return
+        reserve = max(FAILURE_COST_MIN_TAIL_S, 2.0 * (after_observation - pre) + 3.0)
+
+    # No last write can prove its own completion.  Keep the highest sampled
+    # lower bound, explicitly unproven; a stale observation cannot bind these
+    # new verdict bytes.  Never fabricate an in-budget or covered result.
+    last = time.perf_counter() - t0
+    doc.update(registered_measured_s=max(charge, last), observed_elapsed_s=last,
+               hard_deadline_exceeded=last > wall_cap_s,
+               cost_coverage_status="unproven_rounds_exhausted",
+               withdrawal_rounds_exhausted=True)
+    _write_json(path, doc)
 
 
 def _attempt_dir(root: Path) -> Path:
@@ -258,10 +327,20 @@ def run(args, *, t0: float = _OUTER_T0) -> int:
               "command": command, "source_sha256": before}
     launch_path = out_dir / "outer_launch.json"
     _write_json(launch_path, launch)
-    print(f"Synthetic attempt: {out_dir}", flush=True)
+    verdict_path = out_dir / "acceptance_verdict.json"
+    try:
+        print(f"Synthetic attempt: {out_dir}", flush=True)
+    except OSError:
+        _write_incomplete_costed(verdict_path, {
+            "schema": "w1_i_synthetic_outer_verdict_v1", "launch_id": launch_id,
+            "registered_measured_s": None, "wall_cap_s": args.wall_cap_s,
+            "problems": ["launcher_stdout_write_failed"]}, t0=t0, wall_cap_s=args.wall_cap_s)
+        return 3
     if time.perf_counter() >= t0 + args.wall_cap_s - args.reserve_s:
-        _write_json(out_dir / "acceptance_verdict.json",
-                    {"verdict": "incomplete", "problems": ["deadline_before_uv"]})
+        _write_incomplete_costed(verdict_path, {
+            "schema": "w1_i_synthetic_outer_verdict_v1", "launch_id": launch_id,
+            "registered_measured_s": None, "wall_cap_s": args.wall_cap_s,
+            "problems": ["deadline_before_uv"]}, t0=t0, wall_cap_s=args.wall_cap_s)
         return 3
 
     stdout_path, stderr_path = out_dir / "worker_stdout.log", out_dir / "worker_stderr.log"
@@ -356,16 +435,15 @@ def run(args, *, t0: float = _OUTER_T0) -> int:
                "receipt_write_completed_elapsed_s": after_receipt,
                "registered_measured_s": registered, "wall_cap_s": args.wall_cap_s,
                "problems": problems}
-    verdict_path = out_dir / "acceptance_verdict.json"
+    if problems:
+        _write_incomplete_costed(verdict_path, verdict, t0=t0, wall_cap_s=args.wall_cap_s)
+        return 3
     _write_json(verdict_path, verdict)
     verdict_sha = _sha(verdict_path)
     after_verdict = time.perf_counter() - t0
     if not _number(registered) or after_verdict > registered or after_verdict > args.wall_cap_s:
-        verdict.update(verdict="incomplete", problems=problems + ["verdict_write_not_covered"],
-                       observed_elapsed_s=after_verdict)
-        _write_json(verdict_path, verdict)
-        return 3
-    if problems:
+        verdict.update(problems=problems + ["verdict_write_not_covered"])
+        _write_incomplete_costed(verdict_path, verdict, t0=t0, wall_cap_s=args.wall_cap_s)
         return 3
     # Output can itself block.  It is deliberately *not* a complete claim:
     # a reader must also have the post-flush observation and successful
@@ -378,15 +456,13 @@ def run(args, *, t0: float = _OUTER_T0) -> int:
     try:
         print(event, flush=True)
     except OSError:
-        verdict.update(verdict="incomplete", problems=["stdout_write_failed"],
-                       observed_elapsed_s=time.perf_counter() - t0)
-        _write_json(verdict_path, verdict)
+        verdict.update(problems=["stdout_write_failed"])
+        _write_incomplete_costed(verdict_path, verdict, t0=t0, wall_cap_s=args.wall_cap_s)
         return 3
     after_stdout = time.perf_counter() - t0
     if after_stdout > registered or after_stdout > args.wall_cap_s:
-        verdict.update(verdict="incomplete", problems=["stdout_not_covered"],
-                       observed_elapsed_s=after_stdout)
-        _write_json(verdict_path, verdict)
+        verdict.update(problems=["stdout_not_covered"])
+        _write_incomplete_costed(verdict_path, verdict, t0=t0, wall_cap_s=args.wall_cap_s)
         return 3
     output_observation = {
         "schema": "w1_i_outer_stdout_observation_v1", "state": "pending_supervisor_return",
@@ -395,12 +471,16 @@ def run(args, *, t0: float = _OUTER_T0) -> int:
         "stdout_flushed_elapsed_s": after_stdout,
         "registered_measured_s": registered, "wall_cap_s": args.wall_cap_s,
     }
-    _write_json(out_dir / "outer_stdout_observation.json", output_observation)
+    try:
+        _write_json(out_dir / "outer_stdout_observation.json", output_observation)
+    except OSError:
+        verdict.update(problems=["stdout_observation_write_failed"])
+        _write_incomplete_costed(verdict_path, verdict, t0=t0, wall_cap_s=args.wall_cap_s)
+        return 3
     after_observation = time.perf_counter() - t0
     if after_observation > registered or after_observation > args.wall_cap_s:
-        verdict.update(verdict="incomplete", problems=["stdout_observation_write_not_covered"],
-                       observed_elapsed_s=after_observation)
-        _write_json(verdict_path, verdict)
+        verdict.update(problems=["stdout_observation_write_not_covered"])
+        _write_incomplete_costed(verdict_path, verdict, t0=t0, wall_cap_s=args.wall_cap_s)
         return 3
     return 0
 
