@@ -1340,6 +1340,29 @@ def _checkpoint_root_stats_problems(rs, name: str,
     return problems
 
 
+def expected_call_matrix(plan: FitPlan, n_windows: int) -> dict:
+    """Exact §8.2 call matrix for one registered fit stage.
+
+    Module-level so the R admission freezes the SAME numbers the driver
+    enforces at run time (single definition, no mirrored copy).
+    """
+    micros = plan.steps * plan.grad_accum
+    return {"conditioner_forward_calls": micros + plan.n_probes,
+            "backbone_forward_calls": micros + plan.n_probes,
+            "loss_calls": micros,
+            "adamw_step_calls": plan.steps,
+            "backward_calls": micros,
+            "clip_calls": plan.steps,
+            "probe_calls": plan.n_probes,
+            "checkpoint_saves": 2,
+            "production_decode_calls": n_windows * (plan.n_probes + 1),
+            "production_fk_batch_calls": 2 * micros
+            + n_windows * (plan.n_probes + 1),
+            "metric_decode_calls": n_windows * (plan.n_probes + 1),
+            "window_consumptions_total": micros * plan.micro_batch,
+            "epochs_restarted": None}
+
+
 class FitDriver:
     """D1/D6 fitting over the audited Trainer update units (plan §7).
 
@@ -1510,21 +1533,7 @@ class FitDriver:
             raise FitDiagnosticError("empty_loader_drop_last")
 
     def _expected_call_matrix(self, plan: FitPlan) -> dict:
-        micros = plan.steps * plan.grad_accum
-        n_w = len(self.registration.windows)
-        return {"conditioner_forward_calls": micros + plan.n_probes,
-                "backbone_forward_calls": micros + plan.n_probes,
-                "loss_calls": micros,
-                "adamw_step_calls": plan.steps,
-                "backward_calls": micros,
-                "clip_calls": plan.steps,
-                "probe_calls": plan.n_probes,
-                "checkpoint_saves": 2,
-                "production_decode_calls": n_w * (plan.n_probes + 1),
-                "production_fk_batch_calls": 2 * micros + n_w * (plan.n_probes + 1),
-                "metric_decode_calls": n_w * (plan.n_probes + 1),
-                "window_consumptions_total": micros * plan.micro_batch,
-                "epochs_restarted": None}
+        return expected_call_matrix(plan, len(self.registration.windows))
 
     def call_matrix_problems(self, snapshot: dict | None = None) -> list[str]:
         problems = []

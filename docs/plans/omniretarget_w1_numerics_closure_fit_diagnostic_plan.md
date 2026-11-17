@@ -4,6 +4,8 @@
 
 **当前状态注记（2026-11-16）：**上段为起草时快照。N0/N1 和 I 的合成实现已交付；两轮审阅修复后，当前实现 `77938bf` 的完整纯合成验收 `attempt_019` 通过，含 D1→D6→F、115 项反例及外层实际返回成本覆盖，见 §39。`attempt_018` 的数值链和 uv wait 事实保留，但其最终 stdout flush 成本未被采样覆盖；`attempt_017` 外层覆盖也缺证据（§35）；`attempt_016` 为第十五轮代码历史结果。R/真实 D1/D6/F 仍未实施、未授权、未运行；本注记不授予新权限。
 
+**当前状态注记（2026-11-17）：**R 元数据准入与真实诊断入口已实现并通过反例回归（§40）；真实 R 准入已在监督器下运行一次，因登记缓存的条件代码键绑定对当前树 fail-closed（唯一条件文件差异为 `largebox_static_frame` 的可选插桩参数，`f4724f7`），权威结果 `r_admission/attempt_002` `admission_passed=false`，处理选项待复阅裁决（§40 与验证记录 §29）。真实 D1/D6/F 仍未实施、未授权、未运行。
+
 ## 1. 目标与当前基线
 
 下一阶段从“重复全链审计”转向两个可区分的问题：
@@ -494,3 +496,16 @@ N0 attempt_006：coverage_complete=true、0 异常、写盘前采样 53.91s、�
 监督器之外的只读观察器在其启动前采样，并实际等待监督器退出；输出 flush、工作进程和监督器 wait、返回观察器的即时采样与采样文件 fsync 均纳入覆盖对账。统一换算为较早的观察器起点：工作进程内观察 **1392.540328s**、uv wait **1393.488367s**、监督器 stdout flush **1393.541100s**、监督器 wait **1393.552560s**、外层返回证明写后 **1393.589414s**、观察器实际返回后采样 **1393.667601s**、采样文件写后 **1393.687296s ≤ 登记 1396.483622s ≤ 3300s**。登记使用较晚的监督器起点计算；与较早观察器起点的耗时比较更保守。各 D1/D6/F 返回观察、报告和证明 SHA 另经只读对账，D1/D6 使用同一累计时钟，不相加。
 
 运行前后 66 个实现/环境文件 SHA 一致，`attempt_016/017/018` 的 43/43/48 个文件 SHA 不变；独立事后检查不执行模型、FK 或真实数据计算，不计入合成阶段预算。完整证据、指标与限制见 [I 阶段验证记录 §28](../verification/omniretarget_w1_smallset_fit_diagnostic.md)。真实 R/D1/D6/F 仍未实施、未授权、未运行，需 §8.3 新冻结和明确授权；T6 与既有结论保持。
+
+## 40. R 准入与真实诊断入口实施记录（2026-11-17）
+
+按 §3.2/§6.3/§7/§8 完成首个 R 阶段实施交付：新增独立模块 `src/ireset/eval/w1_smallset_fit_r_admission.py`、worker CLI `scripts/run_w1_smallset_fit_real.py`（`--mode r-admit`/`chain`）、外层监督器 `scripts/run_w1_smallset_fit_real_supervisor.py` 与 38 项反例测试 `tests/test_w1_smallset_fit_r_admission.py`。方案唯一实现改动为把 `FitDriver._expected_call_matrix` 提取为模块级纯函数（R 与驱动共享单一调用矩阵定义，行为不变）。要点：
+
+- **R 仅元数据**（§3.2）：缓存身份→预注册/manifest 绑定链复验（复用已审计 `verify_preregistration`/`verify_cache_contents`）、六窗选择（`pilot6 ∩ train24` 各 `(demo,0,60)`，D1=规范字典序首项，只读注册键）、逐窗字节哈希+NPZ 头、§6.3 运行时元数据对照 T6 注册（共享 T6 实现）、`RUNTIME_REQUIREMENTS` 绑定字节、26 文件实现身份+配置 yaml 交叉核对、预算/精确调用矩阵（与驱动共享 `expected_call_matrix`；F 重放类为上限）/磁盘与授权模板；输出封口 `r_admission.json` 并做返回覆盖。
+- **物化仅在计费区间**（§3.2）：`materialize_fit_apparatus`（root_stats/tokenizer/metric_decode/生产 LossAssembler+`G1TorchFK`+场景编译，编译或缓存命中如实计数，真实路径拒绝注入）与 `materialize_real_world`（`materialize_for_fit` 硬门仅限已启动未越限 D1/D6、准入全绑定先复验、逐窗 clip+start=0 切窗+逐窗 x0 SHA、D6 对 D1 共享窗位逐位绑定）。fixture 模式仅限测试并显式不作生产等价声明。
+- **真实链编排**（§7/§8.1/§8.3）：授权门（六项 checklist 全 True+封口准入包/实现字节/预算/矩阵绑定）→ D1（t0=监督器 uv 前）→ D6 自有 t0 内先消费 D1 收据再物化 → F 自有 t0 物化装置并 `run_f_verification`；每阶段独立预算/封口/返回覆盖，链摘要按 6120s 封口；外层监督器复用合成监督器的实际返回/收据/撤回成本纪律并逐阶段核对 D1 1800s/D6 3600s/F 600s。
+- **测试**：新模块 38 项反例全过（准入拒绝、来源/配置/条件代码/运行时/实现漂移、预算耗尽撤回、授权门九类、物化窗口/注入/共享窗位篡改拒绝、调用矩阵一致性、监督器六类 incomplete）；合并回归 126 passed（含 I 17 项、N0/N1 与外层返回测试）。
+
+**真实 R 运行（监督器下两次）：**`r_admission/attempt_001` 为输出目录预留冲突的 worker 崩溃（fail-closed 保留）；权威 **`attempt_002`** 完整执行且封口/返回覆盖成立（登记 9.637s≤120s），但 `admission_passed=false`——登记缓存键绑定 SOURCE 运行时的条件代码字节（`d73f411d…`），当前树 `distance_adapter.py` 因 `f4724f7` 的可选插桩参数而字节不同，已审计 `verify_cache_contents` 拒绝（`cache_condition_code_drifted`/`schedule_key_not_reproducible`/`schedule_file_missing`）。这是对 §3.2 与已审计门的正确 fail-closed，不是实现缺陷；diff 核验该差异为纯插桩（数值语义不变）。处理选项（(a) 恢复登记字节/(b) 当前代码重建并登记新缓存后重跑 R/(c) §3.2 修订允许内容核验消费）须用户裁决，本轮不自动执行。R 的六窗选择、运行时对照、实现身份、调用矩阵与磁盘腿全部通过，冻结材料（除缓存消费阻塞外）已可用于 §8.3 复阅。
+
+**边界：真实 D1/D6/F 未实施、未授权、未运行；T6 与既有结论、`partial/null/false/not_ready/不接入` 保持；合成权威验收仍为 `attempt_019`（§39）。**
