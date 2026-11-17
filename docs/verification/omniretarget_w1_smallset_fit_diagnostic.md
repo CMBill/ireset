@@ -513,3 +513,10 @@
 **测试**：[tests/test_w1_smallset_fit_r_admission.py](../../tests/test_w1_smallset_fit_r_admission.py) 扩至 **51 passed**（新增 13 项：替代缓存绑定无记录/参照 SHA 错/逐 demo 不等三类拒绝、有效记录绑定+复验+双绑定物化 x0 位元一致、漂移替代缓存拒绝、默认绑定=SOURCE 登记缓存、迁移比较助手单位覆盖（集合不匹配/缺文件/值漂移/正例记录）、夹具重建发布迁移记录且 R 绑定通过、值漂移重建 incomplete 不发布 identity 且索引/核验一致、链条件事实七态（全过/D6 负/D1 负/非法跳过/无 handoff 即运行/F 阶段集错/D6 磁盘矛盾））。夹具缓存的调度值改为与重建相同的推理路径生成（§41 迁移前提的忠实建模：仅代码字节不同）。相关回归：拟合链 `pytest -q tests/test_w1_smallset_fit_r_admission.py tests/test_w1_smallset_fit_diagnostic.py tests/test_w1_i_outer_return.py` **106 passed（216.89s）**；W1 缓存阶段既有回归 `tests/test_omniretarget_w1_review.py` **40 passed（403.64s）**。未运行全项目套件。
 
 **边界：缓存重建未执行（待 §41.2 明确授权）；真实 D1/D6/F 未实施、未授权、未运行；T6 与既有结论、`partial/null/false/not_ready/不接入` 保持；R 权威结果仍为 `r_admission/attempt_002`（admission_passed=false，§29）；合成权威验收仍为 `attempt_019`。**
+
+### 30.1 快速核对修复（2026-11-17，对 3f256fe 的两处审阅意见）
+
+1. **缓存选择未贯通**：worker CLI 与监督器原先都不能指定 `--cache-root`，worker 调 R 恒用默认旧缓存。现已贯通"监督器 → worker → `run_r_admission(cache_root=...)`"：监督器把解析后的缓存目录写入命令与 `outer_launch.json`、收据 `cache_root`；r-admit 模式核验产生的准入包 `package.cache_binding.path` 与请求目录按解析后路径严格相等（否则 `cache_binding_mismatch` 使裁决 incomplete）；chain 模式拒绝 `--cache-root`（链消费准入包冻结的 `cache_binding`，CLI 覆盖会绕过记录绑定）。
+2. **迁移门未落实 55/55 覆盖**：`_migration_record_problems` 原只检查 `per_demo` 非空与已有条目的布尔值（1/55 或 56/55 均可通过）。现要求 `per_demo` 的 demo 集合与登记集合（绑定缓存 identity 的 `schedule_rows`，`verify_cache_contents` 已对账 manifest admitted）**严格相等**：缺项 `r_cache_migration_demo_missing:<n>/<55>`、额外项 `r_cache_migration_demo_extra:<n>`、替换项两者并报、任一 `bitwise_equal≠true` 报 `r_cache_migration_demo_not_equal:<n>/<55>`；另核对被参照的登记 identity 自身 `schedule_rows` 集合与期望一致（`r_cache_migration_reference_demo_set`），期望集为空/重复亦拒绝。以真实 SOURCE 登记缓存只读核对：1/55→`missing:54/55`、55/55→`[]`、56/55→`extra:1`、替换→`missing:1/55+extra:1`。
+
+**测试**：新模块 **53 passed**（新增：1/8、9/8、替换三类集合覆盖反例；监督器 `--cache-root` 命令贯通断言与 `cache_binding_mismatch` 裁决；以 55 项期望集直接验证门函数 1/55、55/55、56/55）。拟合链合并回归 **108 passed（219.27s）**。缓存重建仍未执行（待 §41.2 明确授权）；真实 D1/D6/F 未实施、未授权、未运行；其余边界同上节。

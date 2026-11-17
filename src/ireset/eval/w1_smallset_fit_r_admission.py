@@ -337,31 +337,63 @@ def _resolve_cache_root(source_root: Path, cache_root: Path | None) -> tuple[Pat
 
 def _migration_record_problems(root: Path, source_cache: Path,
                                cache_root: Path, bound_identity: dict,
-                               ) -> list[str]:
+                               expected_demos) -> list[str]:
     """§3.2 revision: a cache that REPLACES the SOURCE's registered one is
     never a default substitution -- it must carry a migration record proving
-    bitwise value equality against the registered cache (the rebuild writes
-    it from the recorded reference identity SHA)."""
+    bitwise value equality against the registered cache for EVERY registered
+    demo (the rebuild writes it from the recorded reference identity SHA).
+    The per-demo set must equal the registered demo set EXACTLY: a missing,
+    extra or substituted demo is a refusal, never a partial pass."""
     if cache_root == source_cache:
         return []
     rec = bound_identity.get("migration_check")
     if not isinstance(rec, dict):
         return ["r_cache_migration_record_missing"]
+    problems: list[str] = []
     if rec.get("passed") is not True:
-        return ["r_cache_migration_not_passed"]
+        problems.append("r_cache_migration_not_passed")
     reference = rec.get("reference_cache") or {}
     registered_identity = source_cache / "cache_identity.json"
     if not registered_identity.is_file() or \
             reference.get("sha256") != sha256_file(registered_identity) or \
             reference.get("path") != path_for_record(registered_identity):
-        return ["r_cache_migration_reference_mismatch"]
-    if not isinstance(rec.get("per_demo"), dict) or not rec["per_demo"]:
-        return ["r_cache_migration_per_demo_missing"]
-    bad = [d for d, v in rec["per_demo"].items()
-           if not isinstance(v, dict) or v.get("bitwise_equal") is not True]
+        problems.append("r_cache_migration_reference_mismatch")
+    expected = [d for d in (expected_demos or []) if isinstance(d, str)]
+    expected_set = set(expected)
+    if not expected_set or len(expected_set) != len(expected):
+        problems.append(f"r_cache_migration_expected_set_invalid:"
+                        f"{len(expected)}:{len(expected_set)}")
+    per_demo = rec.get("per_demo")
+    if not isinstance(per_demo, dict) or not per_demo:
+        problems.append("r_cache_migration_per_demo_missing")
+        return problems
+    got = set(per_demo)
+    missing = sorted(expected_set - got)
+    extra = sorted(got - expected_set)
+    if missing:
+        problems.append(f"r_cache_migration_demo_missing:"
+                        f"{len(missing)}/{len(expected_set)}:{missing[:4]}")
+    if extra:
+        problems.append(f"r_cache_migration_demo_extra:"
+                        f"{len(extra)}:{extra[:4]}")
+    bad = [d for d in sorted(got & expected_set)
+           if not isinstance(per_demo[d], dict)
+           or per_demo[d].get("bitwise_equal") is not True]
     if bad:
-        return [f"r_cache_migration_demo_not_equal:{sorted(bad)[:4]}"]
-    return []
+        problems.append(f"r_cache_migration_demo_not_equal:"
+                        f"{len(bad)}/{len(expected_set)}:{bad[:4]}")
+    # the referenced registered identity must itself cover the same demos --
+    # a migration record cannot vouch for demos the reference never had
+    if registered_identity.is_file():
+        try:
+            ref_rows = json.loads(registered_identity.read_text())
+            ref_set = {r.get("demo") for r in ref_rows.get("schedule_rows", [])}
+        except (OSError, ValueError):
+            ref_set = None
+        if ref_set is not None and ref_set != expected_set:
+            problems.append(f"r_cache_migration_reference_demo_set:"
+                            f"{len(ref_set or ())}/{len(expected_set)}")
+    return problems
 
 
 def run_r_admission(*, out_dir: Path, budget: StageBudget,
@@ -452,8 +484,13 @@ def run_r_admission(*, out_dir: Path, budget: StageBudget,
         if not cache_check["passed"]:
             problems.append(
                 f"r_cache_reverify_failed:{cache_check['problems'][:6]}")
+        # the registered demo set is the bound identity's schedule_rows --
+        # verify_cache_contents has already reconciled that set with the
+        # manifest's admitted rows
+        registered_demos = [r.get("demo")
+                            for r in cache_identity.get("schedule_rows", [])]
         migration_problems = _migration_record_problems(
-            root, source_cache, cache_root, cache_identity)
+            root, source_cache, cache_root, cache_identity, registered_demos)
         problems += migration_problems
         source_binding["preregistration_verification"] = {
             "passed": prereg_check["passed"],
@@ -744,9 +781,12 @@ def admission_recheck_problems(admission: dict, *, project_root: Path | None = N
         problems.append(
             f"admission_cache_drifted:{cache_check['problems'][:4]}")
     if cache_rec.get("path") and cache_root.resolve() != source_cache.resolve():
+        registered_demos = [r.get("demo")
+                            for r in cache_identity.get("schedule_rows", [])]
         problems += [f"admission_cache_migration:{p}" for p in
                      _migration_record_problems(root, source_cache,
-                                                cache_root, cache_identity)]
+                                                cache_root, cache_identity,
+                                                registered_demos)]
     rows = {r.get("demo"): r for r in manifest.get("rows", [])
             if isinstance(r, dict)}
     schedule_rows = {rec.get("demo"): rec

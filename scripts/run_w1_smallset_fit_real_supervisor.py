@@ -277,8 +277,25 @@ def _stage_report_matches(stage: str, report: dict, summary: dict) -> bool:
     return mean is all(entry["mean_fit_passed"] for entry in stages)
 
 
+def _cache_binding_matches(summary: dict, expected_cache_root) -> bool:
+    """The produced admission package must bind the REQUESTED cache dir
+    (plan §41): path equality after resolution; the identity SHA and the
+    migration record are checked by the worker's own admission legs."""
+    binding = (summary.get("package") or {}).get("cache_binding") or {}
+    recorded = binding.get("path")
+    if not isinstance(recorded, str) or not recorded:
+        return False
+    rec = Path(recorded)
+    if not rec.is_absolute():
+        rec = ROOT / recorded
+    try:
+        return rec.resolve() == Path(expected_cache_root).resolve()
+    except OSError:
+        return False
+
+
 def _candidate_problems(doc: dict, launch_id: str, t0: float,
-                        mode: str) -> list[str]:
+                        mode: str, expected_cache_root=None) -> list[str]:
     problems = []
     launch = doc.get("outer_launch")
     if (not isinstance(launch, dict) or launch.get("launch_id") != launch_id
@@ -292,6 +309,9 @@ def _candidate_problems(doc: dict, launch_id: str, t0: float,
     if mode == "r-admit":
         if not _r_summary_valid(doc):
             problems.append("r_admission_incomplete")
+        if expected_cache_root is not None and \
+                not _cache_binding_matches(doc, expected_cache_root):
+            problems.append("cache_binding_mismatch")
         return problems
     admission, authorization = doc.get("admission"), doc.get("authorization")
     if (not isinstance(admission, dict) or not admission.get("sha256")
@@ -366,6 +386,8 @@ def run(args, *, t0: float = _OUTER_T0) -> int:
         expected_cap = args.wall_cap_s
         command = ["uv", "run", "--locked", "python", str(WORKER),
                    "--mode", "r-admit", "--output-dir", str(out_dir)]
+        if getattr(args, "cache_root", None):
+            command += ["--cache-root", str(Path(args.cache_root).resolve())]
     command += ["--outer-t0-hex", t0.hex(), "--launch-id", launch_id,
                 "--wall-cap-s", str(args.wall_cap_s),
                 "--reserve-s", str(args.reserve_s)]
@@ -373,6 +395,8 @@ def run(args, *, t0: float = _OUTER_T0) -> int:
               "mode": args.mode, "launch_id": launch_id,
               "t0_perf_counter": t0, "wall_cap_s": args.wall_cap_s,
               "reserve_s": args.reserve_s, "command": command,
+              "cache_root": (str(Path(args.cache_root).resolve())
+                             if getattr(args, "cache_root", None) else None),
               "source_sha256": before}
     launch_path = out_dir / "outer_launch.json"
     _write_json(launch_path, launch)
@@ -428,7 +452,9 @@ def run(args, *, t0: float = _OUTER_T0) -> int:
     problems, summary, proof, summary_binding = _proof_problems(
         out_dir / summary_name, out_dir / "return_observation.json",
         t0, expected_cap)
-    problems += _candidate_problems(summary, launch_id, t0, args.mode)
+    problems += _candidate_problems(summary, launch_id, t0, args.mode,
+                                    expected_cache_root=getattr(
+                                        args, "cache_root", None))
     if rc != 0:
         problems.append(f"worker_exit:{rc}")
     if timed_out:
@@ -487,6 +513,7 @@ def run(args, *, t0: float = _OUTER_T0) -> int:
     receipt = {"schema": "w1_real_fit_outer_return_observation_v1",
                "mode": args.mode, "launch_id": launch_id,
                "t0_perf_counter": t0, "uv_pid": process.pid,
+               "cache_root": launch.get("cache_root"),
                "wait_return_code": rc, "worker_hard_deadline_timeout": timed_out,
                "wait_return_perf_counter": wait_time,
                "wait_elapsed_s": wait_elapsed,
@@ -577,6 +604,9 @@ def main() -> int:
     parser.add_argument("--output-root", default=None)
     parser.add_argument("--admission", default=None)
     parser.add_argument("--authorization", default=None)
+    parser.add_argument("--cache-root", default=None,
+                        help="r-admit mode: the cache attempt dir the R "
+                             "admission must bind (plan §41 migration)")
     parser.add_argument("--impl-sha", default=None)
     parser.add_argument("--fixture", action="store_true")
     parser.add_argument("--wall-cap-s", type=float, default=None)

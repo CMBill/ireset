@@ -62,8 +62,11 @@ def _run_r(args) -> dict:
         else _exclusive_attempt_dir(Path(args.output_root or DEFAULT_R_ROOT))
     budget = StageBudget(stage="R", wall_cap_s=args.wall_cap_s,
                          reserve_s=args.reserve_s, t0=args.budget_t0)
-    out = radm.run_r_admission(out_dir=out_dir, budget=budget)
-    return {"out_dir": str(out_dir), "mode": "r-admit", **out}
+    cache_root = Path(args.cache_root) if args.cache_root else None
+    out = radm.run_r_admission(out_dir=out_dir, budget=budget,
+                               cache_root=cache_root)
+    return {"out_dir": str(out_dir), "mode": "r-admit",
+            "cache_root": str(cache_root) if cache_root else None, **out}
 
 
 def _run_chain(args) -> dict:
@@ -89,6 +92,10 @@ def main() -> int:
                     help="parent for chain mode attempt directories")
     ap.add_argument("--admission", help="sealed r_admission.json (chain mode)")
     ap.add_argument("--authorization", help="§8.3 authorization JSON (chain mode)")
+    ap.add_argument("--cache-root",
+                    help="r-admit mode: bind this cache attempt dir instead "
+                         "of the SOURCE's registered cache (plan §41; the "
+                         "bound cache must carry a valid migration record)")
     ap.add_argument("--impl-sha", help="expected implementation identity sha")
     ap.add_argument("--outer-t0-hex", help="supervisor monotonic start as float.hex")
     ap.add_argument("--launch-id", help="supervisor launch identity")
@@ -120,6 +127,11 @@ def main() -> int:
     else:
         if not args.admission or not args.authorization:
             ap.error("--mode chain requires --admission and --authorization")
+        if args.cache_root:
+            # the chain binds whatever the ADMISSION froze -- a CLI override
+            # would bypass the recorded cache_binding (plan §41)
+            ap.error("--cache-root is r-admit only; the chain consumes the "
+                     "admission package's cache_binding")
         args.wall_cap_s = args.wall_cap_s
         args.reserve_s = args.reserve_s
         runner = _run_chain
@@ -138,6 +150,7 @@ def main() -> int:
         "label_verdict": disk.get("label_verdict"),
         "admission_passed": disk.get("admission_passed"),
         "problems": (disk.get("problems") or [])[:8],
+        "cache_binding": (disk.get("package") or {}).get("cache_binding"),
         "d1": {k: disk.get("d1", {}).get(k)
                for k in ("local_complete_evidence", "local_mean_fit_passed",
                          "local_conclusion", "return_coverage")} if disk.get("d1") else None,

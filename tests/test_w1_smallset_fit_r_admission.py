@@ -904,6 +904,36 @@ def test_replacement_cache_binding_requires_migration_record(
         assert any("r_cache_migration_demo_not_equal" in p
                    for p in result["summary_doc"]["problems"])
 
+        # COVERAGE: a record that only proves 1 of the 8 registered demos
+        # must be refused (the gate is set equality, not non-emptiness)
+        one = _migration_record(fixture)
+        one["per_demo"] = {PILOT6[0]: {"bitwise_equal": True,
+                                       "n_intervals": 4}}
+        _rebind_cache_identity(dst, "attempt_002", one)
+        result = _run_r(tmp_path, fixture, cache_root=dst)
+        assert any("r_cache_migration_demo_missing" in p
+                   for p in result["summary_doc"]["problems"])
+
+        # COVERAGE: an extra demo makes it 9/8 -- also refused
+        extra = _migration_record(fixture)
+        extra["per_demo"]["sub99_largebox_999"] = {"bitwise_equal": True,
+                                                   "n_intervals": 4}
+        _rebind_cache_identity(dst, "attempt_002", extra)
+        result = _run_r(tmp_path, fixture, cache_root=dst)
+        assert any("r_cache_migration_demo_extra" in p
+                   for p in result["summary_doc"]["problems"])
+
+        # COVERAGE: a substituted demo (one missing, one invented) is both
+        subst = _migration_record(fixture)
+        subst["per_demo"].pop(PILOT6[0])
+        subst["per_demo"]["sub99_largebox_999"] = {"bitwise_equal": True,
+                                                   "n_intervals": 4}
+        _rebind_cache_identity(dst, "attempt_002", subst)
+        result = _run_r(tmp_path, fixture, cache_root=dst)
+        problems = result["summary_doc"]["problems"]
+        assert any("r_cache_migration_demo_missing" in p for p in problems)
+        assert any("r_cache_migration_demo_extra" in p for p in problems)
+
         # a valid record -> the replacement cache is bound and the package
         # records it (the SOURCE's registered identity stays the chain root)
         _rebind_cache_identity(dst, "attempt_002", _migration_record(fixture))
@@ -956,6 +986,43 @@ def test_drifted_replacement_cache_refused(fixture, tmp_path):
                    for p in result["summary_doc"]["problems"])
     finally:
         shutil.rmtree(dst)
+
+
+def test_migration_gate_requires_exact_55_coverage(fixture, tmp_path):
+    """The gate is set EQUALITY against the registered demo set (55 in the
+    real SOURCE): 1/55 and 56/55 both refuse -- only 55/55 passes."""
+    registered = fixture["source_root"] / "cache/attempt_001/cache_identity.json"
+    saved = registered.read_text()
+    demos = [f"sub{i % 8}_largebox_{i:03d}" for i in range(55)]
+    registered_doc = json.loads(saved)
+    registered_doc["schedule_rows"] = [{"demo": d, "key": "k" * 16}
+                                       for d in demos]
+    bound = tmp_path / "new_cache"
+    bound.mkdir()
+    (bound / "cache_identity.json").write_text("{}")
+    try:
+        registered.write_text(json.dumps(registered_doc))
+
+        def gate(per_demo):
+            ident = {"migration_check": {
+                "reference_cache": {"path": radm.path_for_record(registered),
+                                    "sha256": radm.sha256_file(registered)},
+                "per_demo": per_demo, "passed": True}}
+            return radm._migration_record_problems(
+                PROJECT_ROOT, registered.parent, bound, ident, demos)
+
+        all_ok = {d: {"bitwise_equal": True, "n_intervals": 1} for d in demos}
+        assert gate(all_ok) == []
+        one = {demos[0]: {"bitwise_equal": True, "n_intervals": 1}}
+        problems = gate(one)
+        assert any("r_cache_migration_demo_missing:54/55" in p
+                   for p in problems)
+        extra = dict(all_ok)
+        extra["sub99_largebox_999"] = {"bitwise_equal": True, "n_intervals": 1}
+        problems = gate(extra)
+        assert any("r_cache_migration_demo_extra:1:" in p for p in problems)
+    finally:
+        registered.write_text(saved)
 
 
 def test_default_binding_is_the_source_registered_cache(fixture, admission,
@@ -1320,6 +1387,14 @@ def _populate_r(out: Path, command, mutation):
                "call_matrix": {"sha256": "a" * 64},
                "runtime_binding": {"requirements": {}},
                "code_identity": {"implementation_files_sha256": "b" * 64}}
+    if "--cache-root" in command:
+        package["cache_binding"] = {
+            "path": command[command.index("--cache-root") + 1],
+            "cache_identity": {"sha256": "c" * 64},
+            "is_source_registered_cache": False,
+            "migration_check": {"passed": True}, "migration_problems": []}
+    if mutation == "cache_binding_mismatch":
+        package["cache_binding"]["path"] = str(out / "some_other_cache")
     zero = {"array_value_reads": 0, "checkpoint_reads": 0,
             "cohort_created": False}
     extra = {"schema": "w1_smallset_fit_r_admission_v1", "kind": "r_admission",
@@ -1349,6 +1424,7 @@ def _populate_r(out: Path, command, mutation):
     ("r_not_passed", "r_admission_incomplete"),
     ("r_zero_declarations_broken", "r_admission_incomplete"),
     ("r_windows_incomplete", "r_admission_incomplete"),
+    ("cache_binding_mismatch", "cache_binding_mismatch"),
     ("late_wait", "actual_wait_not_covered"),
     ("nonzero", "worker_exit:1"),
     ("source_drift", "implementation_changed_during_run"),
@@ -1372,6 +1448,10 @@ def test_r_supervisor_requires_actual_wait_and_valid_summary(
         def __init__(self, command, **kwargs):
             assert command[:3] == ["uv", "run", "--locked"]
             assert "--mode" in command and "r-admit" in command
+            # supervisor -> worker cache selection is threaded through
+            assert "--cache-root" in command
+            assert command[command.index("--cache-root") + 1] == \
+                str((tmp_path / "cache_new").resolve())
             _populate_r(tmp_path / "attempt_001", command, mutation)
 
         def wait(self, timeout=None):
@@ -1382,7 +1462,9 @@ def test_r_supervisor_requires_actual_wait_and_valid_summary(
     args = SimpleNamespace(mode="r-admit", output_root=tmp_path,
                            wall_cap_s=120.0, reserve_s=10.0,
                            admission=None, authorization=None, impl_sha=None,
-                           fixture=False)
+                           fixture=False,
+                           cache_root=str(tmp_path / "cache_new"))
+    (tmp_path / "cache_new").mkdir()
     rc = supervisor.run(args, t0=100.0)
     out = tmp_path / "attempt_001"
     verdict = json.loads((out / "acceptance_verdict.json").read_text())
