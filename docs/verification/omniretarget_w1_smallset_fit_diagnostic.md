@@ -571,3 +571,11 @@
 相关合并回归：`uv run --locked pytest -q tests/test_w1_smallset_fit_r_admission.py tests/test_w1_smallset_fit_diagnostic.py tests/test_w1_i_outer_return.py --tb=short` **113 passed（212.70s）**，其中 R/迁移/链模块 58 项、I 17 项、外层 38 项。日志：`derived/audit/w1_smallset_fit_diagnostic/budget_serialization_fix_20261117/regression.log`。未运行全项目套件或新的真实训练/FK/重放。
 
 本轮事前为旧真实 `attempt_001`、R `attempt_004`、已消费授权、新迁移缓存及 SOURCE 登记缓存建立 245 文件 SHA 清单（`budget_serialization_fix_20261117/protected_sha256_before.json`），相关工件只读保留。修复实现本地提交后执行一次 R 元数据重新冻结，授权草案另存且保持未授权；结果后续追加，不将旧链改判为严格完整验收，不恢复其执行权限。
+
+### 33.1 修复提交后的 R 与未授权草案冻结
+
+修复提交 **`0c4572d`** 后，按本轮用户提出的“修复预算序列化后重新冻结 R/授权”执行一次元数据 R，复用既有迁移缓存，不重建缓存、不执行真实 D1/D6/F。监督器输出 **`r_admission/attempt_005`**：`admission_passed=true`、problems=[]，裁决 `candidate_complete`/problems=[]；封口及进程返回覆盖通过。独立观察器在监督器启动前采样，实际 wait **6.205094s**、观察报告写盘后采样 **6.211709s ≤ 登记 9.198464s ≤ 120s**。观察器证据及 R 工件 SHA：`budget_serialization_fix_20261117/r_refreeze_observer.json`。新 R SHA=`aeee97d1…`，实现身份 SHA=`b8ebf5e2…`，迁移缓存及六窗仍为原冻结值。
+
+新草案独占写入 **`authorization_draft/attempt_002/authorization_draft.json`**（SHA=`77a39abb…`），`authorized=false`、`template_only=true`、六项 checklist 均为 null；绑定 R `attempt_005`、最终实现/调用矩阵/预算/迁移缓存，方案固定为 **`plan_revision=0c4572d`**、该提交正文 SHA=`f555be49…`（本段仅为事后执行记录）。`prior_consumption` 绑定旧真实链摘要/裁决/D1/F 报告及已消费授权 SHA，保留 1000 更新/101 probes、D6 合法跳过、F `fit_insufficient` 和外层 incomplete；旧封口登记成本与撤回覆盖预留分列，不将预留当作实测成本，也不重置历史。
+
+以当前 `authorization_problems` 自检新草案仅有预期 7 项（未授权+六项 checklist 未确认）；旧已消费授权对新 R 则因准入包 SHA 与实现身份 SHA 不符被拒。自检存于 `budget_serialization_fix_20261117/authorization_refreeze_check.json`。最终 245 文件保护清单复核零漂移。新真实链尚未获授权、未启动；旧真实运行仍为 §32 的严格外层 incomplete，未事后补写或重签。
