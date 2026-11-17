@@ -520,3 +520,28 @@
 2. **迁移门未落实 55/55 覆盖**：`_migration_record_problems` 原只检查 `per_demo` 非空与已有条目的布尔值（1/55 或 56/55 均可通过）。现要求 `per_demo` 的 demo 集合与登记集合（绑定缓存 identity 的 `schedule_rows`，`verify_cache_contents` 已对账 manifest admitted）**严格相等**：缺项 `r_cache_migration_demo_missing:<n>/<55>`、额外项 `r_cache_migration_demo_extra:<n>`、替换项两者并报、任一 `bitwise_equal≠true` 报 `r_cache_migration_demo_not_equal:<n>/<55>`；另核对被参照的登记 identity 自身 `schedule_rows` 集合与期望一致（`r_cache_migration_reference_demo_set`），期望集为空/重复亦拒绝。以真实 SOURCE 登记缓存只读核对：1/55→`missing:54/55`、55/55→`[]`、56/55→`extra:1`、替换→`missing:1/55+extra:1`。
 
 **测试**：新模块 **53 passed**（新增：1/8、9/8、替换三类集合覆盖反例；监督器 `--cache-root` 命令贯通断言与 `cache_binding_mismatch` 裁决；以 55 项期望集直接验证门函数 1/55、55/55、56/55）。拟合链合并回归 **108 passed（219.27s）**。缓存重建仍未执行（待 §41.2 明确授权）；真实 D1/D6/F 未实施、未授权、未运行；其余边界同上节。
+
+## 31. 缓存重建执行与新缓存 R 验收（2026-11-17，§41.2 授权后）
+
+按用户对 §41.2 冻结表的明确授权执行缓存重建与绑定新缓存的 R 验收；§8.3 授权材料（草案）随后冻结。真实 D1/D6/F 仍未执行。
+
+### 31.1 缓存重建（预算 7200s，实际 64.2s）
+
+命令：`uv run --locked python scripts/precompute_m3_cache.py --workers 4 --native-threads 1 --training-manifest <SOURCE training_manifest.json> --out-dir derived/experiments/omniretarget_first/20261117_84a1b06_w1_smallset_fit_cache_rebuild/cache --verify-against-cache <SOURCE 登记缓存 attempt_001>`（墙钟 67.0s，台账 64.2s）。运行根 `20261117_84a1b06_w1_smallset_fit_cache_rebuild/`（新台账，历史 0）。结果：
+
+- `cache/attempt_001` **complete=true**：55 份键控调度（当前代码键可复现）+ root_stats（4,351 帧/24 train 文件）；执行记录 parallel/4/1，事前 running 行、终态 done，索引一行对账一致。
+- **迁移核验通过**：`migration_check.passed=true`，`per_demo` 55/55 全部 `bitwise_equal=true`，`reference_cache.sha256` 精确等于 SOURCE 登记缓存 identity SHA `90af39f1…`——"条件代码唯一差异为纯插桩、数值语义不变"前提经 55 demo 位元比对成立。
+- `verify_cache_contents` 在当前代码下全过；SOURCE 登记缓存 57 文件执行前后逐字节不变（基线快照对账）。
+
+### 31.2 绑定新缓存的 R 验收
+
+`python3 scripts/run_w1_smallset_fit_real_supervisor.py --mode r-admit --cache-root <新缓存 attempt>` 运行两次：
+
+- `r_admission/attempt_003`（保留）：`admission_passed=true`、缓存绑定/迁移/运行时/矩阵全过，但监督器裁决 incomplete（`launch_identity_mismatch`/`candidate_state_invalid`）——暴露真实接口缺陷：R 的封口摘要缺少 `outer_launch`/`label_verdict` 绑定（chain 模式同样缺失）。修复：`run_r_admission`/`run_real_chain` 新增 `outer_launch` 参数，在**封口前**嵌入 `outer_launch`（launch_id/t0/cli_entry/supervisor_declared）与 `label_verdict="pending_outer_return"`；worker CLI 以监督器 t0/launch_id 构造传入。新模块测试 54 passed（新增封口内嵌 outer_launch 与监督器 candidate 检查直验、无监督回退形态）。
+- 权威 **`r_admission/attempt_004`**（监督器 exit 0，裁决 **candidate_complete / problems=[]**）：`admission_passed=true`、problems=[]；封口 `sealed_within_budget`（登记 9.166s≤120s）、返回覆盖 covered、stdout 观察覆盖；**封口内** outer_launch 绑定监督器 t0/launch_id（`t0==seal.t0`）；`cache_binding.path` 精确指向新缓存 attempt，identity SHA `da4bb292…` 与重建产物一致，`is_source_registered_cache=false`、迁移 55/55 passed、`migration_problems=[]`；六窗与 D1=`sub10_largebox_097:0:60`；运行时元数据与 T6 零偏差；实现身份 26 文件无缺失（当前树字节；提交不改字节，包保持可消费）；收据 wait 6.079s≤登记 9.166s、worker rc 0。
+
+### 31.3 §8.3 授权材料冻结（草案）
+
+`derived/audit/w1_smallset_fit_diagnostic/authorization_draft/attempt_001/authorization_draft.json`（SHA `595e97cd…`，`authorized=false`/`template_only=true`）：绑定 attempt_004 封口准入包 SHA、cohort `w1_patched_smallset_fit_v1`、includes 提案 ["D1","D6","F"]、预算 caps、调用矩阵 SHA、实现身份 SHA、方案文档 SHA、缓存迁移三项（绑定路径/绑定 identity SHA/参照 identity SHA/55）；六项 checklist 全 null 并附逐项语义说明与执行契约（每阶段一次/不重试/未知历史停止/D1→D6 条件）。自检：以当前 `authorization_problems` 核验该草案，仅剩预期门项（`authorization_not_authorized`+六项 checklist），其余绑定全部成立——用户复阅后将 checklist 置 true、`authorized=true` 即构成 §8.3 明确授权；授权前不执行任何 D1/D6/F 数值单元。
+
+**边界：缓存重建与 R 验收已完成；§8.3 草案仅为模板，真实 D1/D6/F 未实施、未授权、未运行；T6 `audit_incomplete`/539 gaps、cohort 34 次更新/1347.195507s、一次性授权已消费、`partial/null/false/not_ready/不接入` 保持；本轮未运行全项目套件（仅本交付 54 passed）。**

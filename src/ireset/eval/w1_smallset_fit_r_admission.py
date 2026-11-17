@@ -407,6 +407,7 @@ def run_r_admission(*, out_dir: Path, budget: StageBudget,
                     disk_probe: Callable[[Path], int] | None = None,
                     git_identity: Callable[[Path], dict] | None = None,
                     cache_root: Path | None = None,
+                    outer_launch: dict | None = None,
                     ) -> dict:
     """One R window: metadata admission under the §8.1 R budget (120s/15s).
 
@@ -663,6 +664,14 @@ def run_r_admission(*, out_dir: Path, budget: StageBudget,
         "forward_calls": 0, "backward_calls": 0, "optimizer_steps": 0,
         "cohort_created": False, "attempt_created": False,
         "claim_created": False, "authorization_issued": False}
+    # the sealed document is a CANDIDATE until an outer supervisor proves
+    # the actual process return; the launch identity must be INSIDE the
+    # sealed bytes (the supervisor's candidate checks bind it)
+    facts["outer_launch"] = dict(outer_launch) if outer_launch else {
+        "launch_id": None, "t0_perf_counter": budget.t0,
+        "cli_entry_perf_counter": time.perf_counter(),
+        "supervisor_declared": False}
+    facts["label_verdict"] = "pending_outer_return"
     facts["budget"] = budget.facts()
     path = out_dir / "r_admission.json"
     seal = _write_summary_sealed(path, facts, budget,
@@ -1333,6 +1342,7 @@ def run_real_chain(*, admission_path: Path, authorization_path: Path,
                    teacher_npz_dir: Path | None = None,
                    omomo_pt_dir: Path | None = None,
                    impl_sha: str | None = None,
+                   outer_launch: dict | None = None,
                    ) -> dict:
     """Authorized real chain: D1 -> conditional D6 -> F under §8.1 budgets.
 
@@ -1559,6 +1569,13 @@ def run_real_chain(*, admission_path: Path, authorization_path: Path,
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
         problems.append(f"chain_error:{type(exc).__name__}:{str(exc)[:200]}")
     facts["problems"] = problems
+    # the sealed chain summary is a candidate until the outer supervisor
+    # proves the actual return; the launch identity is inside the seal
+    facts["outer_launch"] = dict(outer_launch) if outer_launch else {
+        "launch_id": None, "t0_perf_counter": chain_t0,
+        "cli_entry_perf_counter": time.perf_counter(),
+        "supervisor_declared": False}
+    facts["label_verdict"] = "pending_outer_return"
     facts["chain_budget"] = chain_budget.facts()
     outputs = write_acceptance_outputs(run_root, facts, chain_budget,
                                        withdraw=dict(CHAIN_WITHDRAW_ON_EXCEED))

@@ -57,6 +57,13 @@ def _exclusive_attempt_dir(out_root: Path) -> Path:
     raise RuntimeError(f"no free attempt number under {out_root}")
 
 
+def _outer_launch(args) -> dict:
+    return {"launch_id": args.launch_id,
+            "t0_perf_counter": args.budget_t0,
+            "cli_entry_perf_counter": _T0,
+            "supervisor_declared": bool(args.outer_t0_hex)}
+
+
 def _run_r(args) -> dict:
     out_dir = Path(args.output_dir) if args.output_dir \
         else _exclusive_attempt_dir(Path(args.output_root or DEFAULT_R_ROOT))
@@ -64,7 +71,8 @@ def _run_r(args) -> dict:
                          reserve_s=args.reserve_s, t0=args.budget_t0)
     cache_root = Path(args.cache_root) if args.cache_root else None
     out = radm.run_r_admission(out_dir=out_dir, budget=budget,
-                               cache_root=cache_root)
+                               cache_root=cache_root,
+                               outer_launch=_outer_launch(args))
     return {"out_dir": str(out_dir), "mode": "r-admit",
             "cache_root": str(cache_root) if cache_root else None, **out}
 
@@ -77,7 +85,8 @@ def _run_chain(args) -> dict:
         authorization_path=Path(args.authorization),
         run_root=run_root, chain_t0=args.budget_t0,
         device="cpu" if args.fixture else args.device,
-        fixture=args.fixture, impl_sha=args.impl_sha or None)
+        fixture=args.fixture, impl_sha=args.impl_sha or None,
+        outer_launch=_outer_launch(args))
     return {"out_dir": str(run_root), "mode": "chain", **out}
 
 

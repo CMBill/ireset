@@ -1025,6 +1025,34 @@ def test_migration_gate_requires_exact_55_coverage(fixture, tmp_path):
         registered.write_text(saved)
 
 
+def test_sealed_r_document_embeds_outer_launch(fixture, tmp_path):
+    """The launch identity must be INSIDE the sealed bytes (the supervisor's
+    candidate checks bind it); unsupervised runs carry supervisor_declared
+    False with the budget t0."""
+    out = tmp_path / "r_supervised"
+    budget = StageBudget(stage="R", wall_cap_s=600.0, reserve_s=10.0)
+    result = radm.run_r_admission(
+        out_dir=out, budget=budget, project_root=fixture["proj"],
+        source_root=fixture["source_root"], teacher_npz_dir=fixture["npz_dir"],
+        omomo_pt_dir=fixture["pt_dir"], runtime_probe=_runtime_probe,
+        disk_probe=_disk_probe(), git_identity=_stub_git,
+        outer_launch={"launch_id": "abc123", "t0_perf_counter": budget.t0,
+                      "cli_entry_perf_counter": budget.t0 + 1.5,
+                      "supervisor_declared": True})
+    doc = result["summary_doc"]
+    assert doc["label_verdict"] == "pending_outer_return"
+    assert doc["outer_launch"]["launch_id"] == "abc123"
+    assert doc["outer_launch"]["supervisor_declared"] is True
+    supervisor = _load_supervisor()
+    assert supervisor._candidate_problems(doc, "abc123", budget.t0,
+                                          "r-admit") == []
+    # an unsupervised run is still a well-formed candidate for the fields
+    result2 = _run_r(tmp_path, fixture)
+    doc2 = result2["summary_doc"]
+    assert doc2["label_verdict"] == "pending_outer_return"
+    assert doc2["outer_launch"]["supervisor_declared"] is False
+
+
 def test_default_binding_is_the_source_registered_cache(fixture, admission,
                                                         tmp_path):
     doc = admission["doc"]

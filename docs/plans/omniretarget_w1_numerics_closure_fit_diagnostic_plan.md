@@ -510,6 +510,8 @@ N0 attempt_006：coverage_complete=true、0 异常、写盘前采样 53.91s、�
 
 **边界：真实 D1/D6/F 未实施、未授权、未运行；T6 与既有结论、`partial/null/false/not_ready/不接入` 保持；合成权威验收仍为 `attempt_019`（§39）。**
 
+**§41.2 执行记录（2026-11-17，授权后）：**缓存重建已完成（独立运行根 `20261117_84a1b06_w1_smallset_fit_cache_rebuild/`，55 份调度+train24 root_stats，台账 64.2s/7200s，迁移核验 55/55 位元相等、参照=登记缓存 identity SHA `90af39f1…`，`verify_cache_contents` 全过，SOURCE 57 文件零漂移）；R 以 `--cache-root` 绑定新缓存重跑，权威 `r_admission/attempt_004` `admission_passed=true`（监督器 candidate_complete，attempt_003 为 launch 绑定缺陷的保留证据，已修复为封口前嵌入 `outer_launch`）。§8.3 授权草案已冻结（`authorization_draft/attempt_001`，authorized=false/template_only，绑定准入包 SHA/实现身份/矩阵/方案 SHA/迁移三项，六项 checklist 待用户置 true）；真实 D1/D6/F 未实施、未执行。详见验证记录 §31。
+
 ## 41. §3.2 缓存迁移与绑定修订（2026-11-17，用户裁决选 (b) 后修订）
 
 R 权威运行 `r_admission/attempt_002`（§40）确认登记缓存对当前代码 fail-closed 后，用户裁决以选 (b) 推进：在独立运行根重建并登记当前代码的键控缓存。本节修订 §3.2 的来源绑定并冻结缓存重建的范围、预算、调用与失败停止规则；§3.2 其余条款（只读 SOURCE、注册 train24/manifest、窗位选择规则、物化计费、禁止 val/test）全部不变。
