@@ -1,25 +1,28 @@
 # 文档索引
 
-最后更新：2026-11-11。**当前工作是数值缺口有限收口与受控拟合诊断：N0/N1 已完成（attempt_006 权威），I 阶段第十六轮审阅修复及合成回归已完成；当前代码未重跑完整合成验收。attempt_016 是第十五轮旧代码的历史结果；R/真实 D1/D6/F 未实施、未授权、未运行。** 已结束阶段集中转入历史导航，冻结原文及实验产物保持原路径、原字节。
+最后更新：2026-11-16。**数值缺口有限收口与受控拟合诊断：N0/N1 已完成；I 阶段当前实现的完整纯合成验收 `attempt_019` 通过，含 D1→D6→F、115 项反例及实际返回成本覆盖。R/真实 D1/D6/F 未实施、未授权、未运行。** 已结束阶段集中转入历史导航，冻结原文及实验产物保持原路径、原字节。
 
 ## 当前状态
 
+- **2026-11-16 I 当前实现合成验收通过**：`attempt_019` 的微型 D1→D6→F 与 **115/115** 反例通过；监督器实际返回后的外层采样文件写盘 **1393.687296s ≤ 登记 1396.483622s ≤ 3300s**（以更早的观察器 t0 计）。
+- **2026-11-16 撤回成本复审修复**：`77938bf` 对撤回和失败成本证明写盘做有界重算；原封口成本单列，尚未获外层返回证明时不冒称覆盖已证明，详见验证记录 §27。
+- **2026-11-16 I 阶段审阅修复**：阶段名、阶段报告正文与哈希绑定、stdout flush 计费问题分别修复；`attempt_018` 的 D1→D6→F 数值链和 **115/115** 反例事实保留，但其 **1454.429s** 观察早于最终 stdout flush，严格完整验收不能由该次证明。
 - 数据/资产/配对、运动学与独立验收基础已建立；W1有限动作基线已完成，但最终交互方法仍 `not_ready`。
 - W1 D/E的两模型各完成4000步；Teacher raw 2/31、确定性/扩散raw各0/31，持续双手交互与有效加速尚未证实。
 - 最新T6（2026-11-06）为 **0 direct failures、539 mandatory gaps**（350 precision/189 sensitivity/0 bound）；证据完整，但 `covered_contract_passed=false`、`audit_incomplete`。没有新生产checkpoint或质量评估。
 - T6一次性授权已消费；cohort累计34次诊断更新、1347.195507/3240秒。剩余墙钟不构成新运行权限，不自动重试。
 - N0/N1（2026-11-07，attempt_006 权威）：350 precision_limited + 189 cross_path_sensitive + 0 implementation_issue_candidate；同输入公式逐位验证、六类47合成用例全过。
-- **I 阶段（2026-11-11，第十六轮审阅修订后）**：4 P1+1 P2 与教师目标转换截止回归已修复；四文件合并回归 **75 passed**，含 **115/115** 合成反例。`attempt_016` 的微型 D1→D6→F 完整验收仅对应旧代码 `199f3fd`，当前实现未重跑完整验收。真实拟合仍须 §8.3 新冻结与授权。
+- **I 阶段历史（2026-11-11）**：第十六轮 4 P1+1 P2 与教师目标转换截止回归已修复；`attempt_017` 的数值链通过，但该次缺少 uv 启动前起点与实际 wait 的成本覆盖证明。`attempt_016` 为旧代码 `199f3fd` 的历史结果。两者保留原状，新验收见 `attempt_018`。
 - `objective_coverage=partial`、`full_objective_contract_passed=null`、`factor_selected=false`、`auto_execute=false`、`production_integration=false`保持。
 
 ## 当前入口
 
 | 文档 | 用途与状态 |
 | --- | --- |
-| [I 阶段小集拟合诊断器验证记录](verification/omniretarget_w1_smallset_fit_diagnostic.md) | **第十六轮 4 P1+1 P2 与教师转换截止回归已修复**：参数/梯度/AdamW 状态名册、pre-backward 截止、教师 decode/FK 精度、身份拒绝后零参考构造及稀疏 checkpoint 收口；75 项合并回归、115/115 合成反例。`attempt_016` 是旧代码历史验收，当前代码未重跑完整合成验收；真实 R/D1/D6/F 未授权 |
+| [I 阶段小集拟合诊断器验证记录](verification/omniretarget_w1_smallset_fit_diagnostic.md) | **当前实现完整纯合成验收通过**：`attempt_019` 的 D1→D6→F、115 项反例和外层实际返回成本覆盖已核对（§28）；真实 R/D1/D6/F 未授权 |
 | [N1 最小合成验证与有限数值收口说明](verification/omniretarget_w1_n1_synthetic_closure.md) | **N1已收口（2026-11-07，五轮复阅修订后 attempt_006）**：C1 audited vs 独立节点图逐位对照、C5 三例门失败全区间内、C6 八偏差全经N0检测器检出；六类47用例全过，go=no_go→go_for_conditional_fit_diagnostics_review。封口=登记成本同盘覆盖+写后核验；返回核验先读盘后采样、return_observation.json SHA绑定证明且所有退出路径核验；撤回走覆盖成本循环 |
 | [N0 坐标级数值缺口分析记录](verification/omniretarget_w1_n0_coordinate_analysis.md) | **N0已收口（2026-11-07，五轮复阅修订后 attempt_006）**：uint32存在性/单侧可辨识位（4行）；same_input公式门+delta_measured一致性；分侧写界；roster精确集合；来源闭链（journal逐级SHA+registration三阶段严格校验+F重放双锚）；旧629全三类交付（381/223/25）；封口=登记成本覆盖封口与返回+终态时序；返回核验先读盘后采样+SHA绑定观察文件+撤回覆盖成本循环。结论=350 precision_limited+189 cross_path_sensitive+0 implementation_issue_candidate |
-| [数值缺口有限收口与受控拟合诊断方案](plans/omniretarget_w1_numerics_closure_fit_diagnostic_plan.md) | **v0.4+§14–§34修订对照**：N0/N1 已完成；I 共享 Trainer 的实现与第十六轮合成回归完成，但当前代码的完整合成验收未重跑。后续 R 新冻结/授权→D1 单窗/D6 六窗→F 收口；平均门、预算及 8206 次/路径 forward 上限不放宽，真实拟合须新明确授权 |
+| [数值缺口有限收口与受控拟合诊断方案](plans/omniretarget_w1_numerics_closure_fit_diagnostic_plan.md) | **v0.4+§14–§39修订与运行记录**：N0/N1 及 I 当前实现合成验收已完成；真实拟合须新冻结及明确授权 |
 | [最新T6执行报告](verification/omniretarget_w1_gradient_numerics_retest_report.md) | **已执行的基线，不是待执行任务**：329 failures清零，539 gaps保留；一次性授权已消费，完整目标与交互质量不通过 |
 | [项目整体实现方案](plans/interaction_retarget_impl_plan.md) | 总体目标、坐标/资产约定和最终质量/端到端加速标准；其历史完成快照不能覆盖最新裁决 |
 | [已完成阶段归档](archive/omniretarget_completed_20261106/README.md) | A2、W1训练/归因/融合、合成/真实目标与FK审计、更新审计/迁移、数值修复/T6的分组导航、实际结论和边界 |

@@ -2,16 +2,18 @@
 
 日期：2026-11-07。方案：[数值缺口有限收口与受控拟合诊断方案 v0.4](../plans/omniretarget_w1_numerics_closure_fit_diagnostic_plan.md) §6/§7（I 阶段交付）。
 
-**性质：纯合成实现与验证交付。本记录不含任何真实数据读取、真实 checkpoint、真实模型/优化器构造、真实 forward/backward/FK/AdamW 或真实训练更新；全部模块与测试在合成世界（合成 tokenizer/关节限位/教师窗/15-site FK 替身）上离线运行，不声称与生产 CUDA/foreach 等价。** 真实 R 冻结与真实 D1/D6/F 执行仍须方案 §8.3 的新冻结材料与新明确授权，本交付不创建 cohort/attempt/授权，不恢复旧 T6 一次性授权。
+**性质：纯合成实现与验证交付。本记录不含任何真实数据读取、真实 checkpoint、真实模型/优化器构造、真实 forward/backward/FK/AdamW 或真实训练更新；全部模块与测试在合成世界（合成 tokenizer/关节限位/教师窗/15-site FK 替身）上离线运行，不声称与生产 CUDA/foreach 等价。** 真实 R 冻结与真实 D1/D6/F 执行仍须方案 §8.3 的新冻结材料与新明确授权，本交付不创建真实 cohort/attempt/授权，不恢复旧 T6 一次性授权。
 
-**2026-11-11 当前状态：**第十六轮 4 P1 + 1 P2 与本轮引入的一处教师转换截止回归已修复，最终实现 `aa30368` 的合并回归 **75 passed**，其中 115 项反例电池全捕获；详见 [§23](#23-第十六轮独立审阅修订2026-11-114-p1--1-p2及教师转换截止回归)。**本轮未重跑完整合成验收**，`attempt_016` 仅是第十五轮旧代码 `199f3fd` 的历史验收，不能作为当前代码的完整验收或真实拟合证据；后文各轮“权威”按当时代码与日期理解。
+**2026-11-16 当前状态：**审阅 `b4d5729` 后修复 2 P1+1 P2（§26），复审 `eba46de` 的撤回成本 1 P2 已修复（§27）；当前实现 `77938bf` 的完整纯合成验收 `attempt_019` 通过，见 §28。`attempt_018` 的数值链和 uv wait 事实保留，但其最终 stdout flush 缺成本覆盖证明；`attempt_017` 也缺外层返回证明。不把合成结果当作真实拟合证据。
 
 ## 1. 交付物
 
 | 文件 | 内容 |
 | --- | --- |
 | [src/ireset/eval/w1_smallset_fit_diagnostic.py](../../src/ireset/eval/w1_smallset_fit_diagnostic.py) | I 阶段独立诊断模块：FitPlan/FitRegistration、StageBudget、运行时硬门、`metric_decode_v1`、§7.1/§7.2 物理指标、probe 机制、FitDriver（复用已审计 Trainer 更新单元）、§7.4 第 1–3 项本地核验、D1→D6 交接、F 逐位重放、attempt 台账、R 只读元数据守卫、35 项合成反例电池、合成验收运行器 |
-| [scripts/verify_w1_smallset_fit_diagnostic.py](../../scripts/verify_w1_smallset_fit_diagnostic.py) | 合成验收 CLI（唯一入口，synthetic-only）：微型 D1→本地核验→交接判定→（D1 过门时）微型 D6→F 逐位重放→反例电池；t0 先于重导入、独占 attempt 目录、封口发布-核验、返回覆盖证明、fail-closed 退出码 |
+| [scripts/verify_w1_smallset_fit_diagnostic.py](../../scripts/verify_w1_smallset_fit_diagnostic.py) | 仅合成的验收工作进程：微型 D1→本地核验→交接判定→D6→F 逐位重放→反例电池；摘要为等待外层返回核验的候选 |
+| [scripts/run_w1_i_synthetic_acceptance.py](../../scripts/run_w1_i_synthetic_acceptance.py) | 标准库监督器：uv 启动前采样，实际 wait 后对账登记成本、来源 SHA 和阶段证明，完成观察绑定裁决文件 SHA |
+| [tests/test_w1_i_outer_return.py](../../tests/test_w1_i_outer_return.py) | 外层真实子进程 wait、阶段返回、缺失证明、源漂移、越界和慢写盘反例 |
 | [tests/test_w1_smallset_fit_diagnostic.py](../../tests/test_w1_smallset_fit_diagnostic.py) | 16 项测试：冻结常量、注册校验、解码/公式/尖峰、状态分层校验器、台账/R 守卫/参数契约、D6 数据分母、微型阶段+F 逐位重放、交接门、预算停止，及完整 35 项反例电池 |
 
 ## 2. 复用边界（方案 §6.1）
@@ -408,4 +410,69 @@
 
 **历史临时结果更正：**复跑旧四类攻击时，旧脚本曾覆盖 `/tmp/opencode/review_i_round15_previous_attacks_20261111_results.json`；已从原完整日志 `review_i_round15_previous_attacks_20261111.log` 恢复原内容（SHA-256 `e5541f2880c89144806f556b49bc0610a80d31fb62dd98ca6f61ea430db55b51`，文件时间戳改变），新结果另存于上述 `verify_i_round16_previous_attacks_20261111_results.json`。仓库历史产物和 `attempt_016` 未改写。
 
-**验收与授权边界：**本轮没有运行完整微型 D1→D6→F 合成验收或权威工件的 fresh 预测；`attempt_016` 的 `fit_pass`、110/110 和 1495.72s 仅对应第十五轮 `199f3fd`，不作为新实现的验收结果。R/真实 D1/D6/F 未实施、未授权、未运行；真实拟合仍须 §8.3 新冻结材料与新明确授权。T6 `audit_incomplete`/539 gaps、cohort 34 次更新/1347.195507s、一次性授权已消费，以及 `partial/null/false/not_ready/不接入` 保持；合成检查不证明真实拟合、泛化、碰撞、抓握或生产接入。
+**验收与授权边界（本节修复轮的历史快照）：**当时没有运行完整微型 D1→D6→F 合成验收或权威工件的 fresh 预测；`attempt_016` 的 `fit_pass`、110/110 和 1495.72s 仅对应第十五轮 `199f3fd`，不作为新实现的验收结果。后续 `attempt_017` 见 §24。R/真实 D1/D6/F 未实施、未授权、未运行；真实拟合仍须 §8.3 新冻结材料与新明确授权。T6 `audit_incomplete`/539 gaps、cohort 34 次更新/1347.195507s、一次性授权已消费，以及 `partial/null/false/not_ready/不接入` 保持；合成检查不证明真实拟合、泛化、碰撞、抓握或生产接入。
+
+## 24. 当前实现合成验收运行（2026-11-11：数值链通过，外层计费证据未闭合）
+
+按用户要求执行 `TMPDIR=/tmp/opencode uv run --locked python scripts/verify_w1_smallset_fit_diagnostic.py --wall-cap-s 3300 --reserve-s 300`，独占创建 `derived/audit/w1_smallset_fit_diagnostic/attempt_017/`；运行时 HEAD `799702b96986f8ce518381182faea09d4fe2e69d`、实现修复至 `aa30368`，工作区干净，相关实现及环境文件的 SHA 在运行前后未变。后台进程已结束，stdout 给出 `label_verdict=complete`，stderr 为空；**没有单独保存进程实际 wait 时间或可独立核验的退出码**。`attempt_016` 的 43 个文件在本次运行前后逐一 SHA-256 相等，文件数仍为 43；没有覆盖历史工件。
+
+- **微型 D1**：CPU 合成世界、300 步、每 30 步 probe 共 11 次；覆盖 11/11，实际更新 300、backward/micro 1200、窗口消费 1200，conditioner/backbone 各 1211 次，调用矩阵无问题。最终四项为 **0.0011507113m / 0.0028825341rad / 0.0018577272rad / 0.0012062979m**，四门均过，`local_complete_evidence=true`；D1 交接 `handoff_ready=true`、`problems=[]`。
+- **微型 D6**：同为 300 步/11 次 probe，覆盖 **66/66**，六窗四门逐窗均过，根位置 RMSE 六窗宏平均 **0.0063342440m**（宏平均不是门）。实际更新 300、backward/micro 1200、窗口消费 7200，conditioner/backbone 各 1211 次，调用矩阵无问题。D1/D6 的报告成本来自同一合成总时钟，D6 **1384.724s 是累计值，不应与 D1 237.038s 相加**。
+- **F 与反例**：F 对两阶段 initial/last 各执行一次 fresh probe，每阶段 conditioner/backbone 各 2 次；报告 `replay_passed=true`、`complete_evidence=true`、`mean_fit_passed=true`、`verdict=fit_pass`，精度策略 `bitwise_no_tolerance`。115 个反例全部 `caught=true`，与冻结 ID 集合精确相等。教师/预测规范解码均报告重解码逐位绑定；**中间 FK 状态绑定仍为 `not_evaluated`，重放范围仅 initial/last，尖峰门仍 `not_evaluated`**。
+- **四份进程内证明只读对账**：D1、D6、F、总报告均 `sealed_within_budget`，对应 `return_observation.json` 均 `covered=true`、summary SHA 精确匹配且满足 `elapsed ≤ registered ≤ cap`。分别为 **233.039≤237.038≤3300s**、**1380.726≤1384.724≤3300s**、**1.691≤5.690≤600s**、**1480.303≤1484.301≤3300s**；总 summary SHA `ac866168c3bf743109919c851b9c50dbc1b07542288c90064bbab200c97ccb3b`。这四项是**进程内覆盖检查的记录**，不是实测外层 `wait()` 证明。
+- **独立只读检查**：解析报告及全部登记工件文件大小/SHA、探针与窗口键、300 条每步 micro/样本计数、实际/期望调用矩阵、四份证明和交接候选绑定；无额外模型/FK/训练调用。脚本与结果、运行前 `attempt_016` 清单及检查输出、stdout/stderr 副本位于独立的 `derived/audit/w1_smallset_fit_diagnostic_postcheck/attempt_017/`，**这些事后检查不计入合成阶段预算，也不证明阶段内做过额外工作**。
+
+**尚未闭合的 §8.2 边界：**现有 CLI 的 `_T0` 在 Python 脚本中采样（重模块 import 之前，但在 `uv` 启动之后），且 `verify_return_coverage` 在该进程返回之前采样；本次没有父进程在启动 `uv` 前采样并在实际 `wait()` 返回时记录可与登记成本对账的证明。进程结束通知后的额外单调钟采样为 CLI t0 后 **1518.517s**，虽低于 3300s，但超过登记 **1484.301s**，因此不能用该迟采样证明真实返回被登记成本覆盖；它也**不证明真实返回超限**。该采样的工具输出转录保存在独立 postcheck 目录，未改写 `attempt_017` 的封口或声明。按证据缺失处理：数值链和进程内证明事实保留，**不宣称满足 §8.2 的外层实际返回覆盖，也不宣称严格完整合成验收已闭合**；不自动重跑或补记成本。后续须先审阅并补齐外层起点与实际 wait 覆盖机制及反例，再决定是否另开合成 attempt。
+
+本次未改代码或运行全项目测试；上轮 `75 passed` 是 `aa30368` 上的既有回归，本次新运行的是上述合成验收及其 115 项电池。R/真实 D1/D6/F 未实施、未授权、未运行；真实拟合仍须 §8.3 新冻结及明确授权，T6 `audit_incomplete`/539 gaps、已消费授权与 `partial/null/false/not_ready/不接入` 不变。
+
+## 25. 外层实际返回修复与新的合成验收（2026-11-12）
+
+以下保留当时的实现和采样事实；该版“完成观察”发生在最终 stdout flush 之前，其完整计费声明已按 §26 更正。
+
+本地提交 `b4d5729` 增加独立纯合成监督器，在启动 `uv` 前登记单调时钟，在实际 `wait()` 返回后保存退出码、返回时刻及封口/代码 SHA 绑定，并对登记成本和 3300s 硬截止做 fail-closed 对账。D1、D6、F 函数实际返回后再覆盖采样；D1 返回未覆盖不能交接。摘要与监督器磁盘裁决均是候选，最终完成观察在裁决文件写入并采样通过之后发出，并绑定其 SHA；观察缺失不构成完成证明。
+
+相关组合回归 **89 passed（257.19s）**；该组合回归在外层完成观察细化前启动，最终外层测试另 **15 passed（4.63s）**，包含真实子进程延迟退出、实际 wait 超过登记成本、非零退出、缺失/错误证明、返回晚于登记成本、源漂移和慢写盘。新增测试首次单独运行时有 2 项因测试文件依赖其他文件加入 `src` 路径而导入失败，补齐测试自身路径后独立重跑 15 项全过；不涉及数值实现失败。启动 `attempt_018` 之前，为 `attempt_016` 与 `attempt_017` 各 43 文件建立 SHA 清单。
+
+`TMPDIR=/tmp/opencode python3 scripts/run_w1_i_synthetic_acceptance.py --wall-cap-s 3300 --reserve-s 300` 完成纯 CPU 合成 `derived/audit/w1_smallset_fit_diagnostic/attempt_018/`，运行时 HEAD `b4d572992a8a4016605263d10520977261e8bacc`，工作进程和监督器 exit 0，stderr 均为空；源文件、入口脚本和依赖清单的运行前后 SHA 一致。
+
+- **D1 与交接**：300 步、11/11 probe，四项平均门分别为 **0.0011507113m / 0.0028825341rad / 0.0018577272rad / 0.0012062979m**，均通过；`handoff_ready=true`。更新 300、backward/micro 1200、窗消费 1200，conditioner/backbone 各 1211 次，调用矩阵无问题。
+- **D6 与 F**：300 步、**66/66** 窗行覆盖，六窗四门逐窗通过；根位置 RMSE 宏平均 **0.0063342440m**（宏平均不是门）。更新 300、backward/micro 1200、窗消费 7200，conditioner/backbone 各 1211 次。F 两阶段 initial/last 各一次 fresh probe，逐位重放与四门通过，`fit_pass`；**中间 FK 状态绑定和尖峰门仍为 `not_evaluated`，重放范围仅 initial/last**。
+- **反例与时钟**：115 项反例全部捕获，ID 与冻结集合精确一致。D1 返回/观察/登记 **230.665908≤230.666156≤234.663422s**，D6 为 **1354.765862≤1354.766062≤1358.763733s**（D1 与 D6 使用同一总时钟，不能相加），F 自身为 **1.729788≤1.729915≤5.727993≤600s**。父进程 t0 早于 CLI 入口 **0.259984s**；总进程内观察 **1453.397201s**，uv 实际 wait 返回 **1454.380406s**，返回证明写后 **1454.428601s**，裁决文件写后观察 **1454.429314s**，登记 **1457.394136≤3300s**，全部落在覆盖链中。
+- **证据与只读对账**：总摘要 SHA `b7894257236dab5cc3a0586eb151c82f8fe4815ce071b5b55d7795a917bed6ce`，外层返回证明 SHA `36755bbe3833178bcb843f35df71cb0dc7eea46f4df3f0a00bfc88ba87f6d7e2`，磁盘候选裁决 SHA `e37847ef40ec332ff68501d022528b8b6ef4836f6c7e582d82e48405da1ea5ce` 与完成观察一致。独立检查逐项核对摘要/证明 SHA、各阶段保存工件大小与 SHA、窗口键及 probe、300 条 micro/窗计数、调用矩阵、交接候选、阶段返回和实际 wait 成本；`attempt_016`、`attempt_017` 各 **43/43 文件 SHA 不变**。脚本、运行日志、事前清单及结果位于 `derived/audit/w1_smallset_fit_diagnostic_postcheck/outer_20261112/`；事后检查不计入合成预算，也不执行模型或 FK。
+
+**后续审阅更正：**以上 1454.429314s 采样早于最终 stdout flush；因此不再宣称 `attempt_018` 的严格完整合成验收已闭合，见 §26。数值链、实际 wait 和已记录的只读对账事实保留；不包含真实 R/D1/D6/F 或全项目测试，也不能证明真实拟合、泛化、碰撞、抓握、无尖峰或生产资格。真实拟合仍须 §8.3 新冻结和明确授权；T6 与既有结论保持。
+
+## 26. 外层监督器审阅修复（2026-11-16）
+
+独立审阅 `b4d5729` 复现 2 P1+1 P2：受控时钟下最终 stdout 阻塞至硬截止后仍报告完成；在历史工件副本中将 F 报告改为 incomplete 并重签证明后仍报告完成；F 阶段名为列表或映射时抛未捕获 TypeError 且无外层裁决。复现仅使用合成临时夹具和历史工件副本。
+
+| 审阅问题 | 修复及本地提交 |
+| --- | --- |
+| 异常阶段名 | 集合比较前检查字符串类型，错误结构落 `fresh_replay_incomplete` 裁决（`94ccb45`）。 |
+| 阶段报告与摘要矛盾 | 对 proof 绑定的 D1/D6/F 报告正文和摘要状态逐项对账；收据绑定实际核验字节的报告/返回证明 SHA；F 报告 incomplete、阶段状态篡改及合法 `fit_insufficient` 控制均覆盖（`a51db20`）。 |
+| 最终 stdout 未计费 | 输出改为不可消费的待覆盖事件；flush 返回后检查登记成本和硬截止并写出绑定观察，消费者还须确认监督器成功退出。慢 stdout、慢观察写盘和断管均拒绝完成（`eba46de`）。 |
+
+定点测试分别为 **17、22、26 passed**。最终执行 `TMPDIR=/tmp/opencode uv run --locked pytest -q tests/test_w1_i_outer_return.py tests/test_w1_smallset_fit_diagnostic.py tests/test_w1_smallset_fit_review16.py`，**68 passed（237.66s）**。审阅者复现脚本的隔离副本（结果 `/tmp/opencode/w1_i_reviewfix_20261116_yp43ot/probe_results.json`）对慢最终输出、F 报告 incomplete、列表阶段名均返回 3 且裁决 incomplete；历史 `attempt_018` 副本中的 F 矛盾也被拒。新测试同时覆盖映射阶段名、D1/D6 报告不一致、合法 `fit_insufficient`、stdout 在登记成本内/硬上限内外越线、慢观察写盘和断管。`attempt_016/017` 各 43 文件与原清单一致，`attempt_018` 的保存量、调用矩阵和 115 项反例作只读对账通过。
+
+原 `attempt_018` 的数值链与 uv wait 事实保留，但没有最终 stdout flush 采样，不能通过事后补写证据宣称严格完整合成验收；本轮未改写历史工件，也未自动启动新的完整合成 attempt。未运行全项目套件；真实 R/D1/D6/F 未实施、未授权、未运行。
+
+## 27. 撤回写盘成本复审修复（2026-11-16）
+
+复审 `eba46de` 提出 1 P2：最终 stdout/观察写盘越过登记成本后，旧实现撤回为 incomplete，但直接写裁决后返回，未复查撤回写盘。审阅者受控例中原封口 **20s**、首次越线观察 **21s**，撤回写盘返回时已到 **101s**，磁盘仍只记录 20s/21s；该情况只证明失败成本记录不足，不证明历史 `attempt_018` 确曾越限。
+
+本地提交 `77938bf` 增加 `_write_incomplete_costed`：启动前截止、启动器或最终 stdout 写入失败、最终 stdout/观察/候选裁决/返回证明写入越界、worker 超时及其余已识别 incomplete 共用有界成本登记。每次撤回裁决与成本观察写后采样；记录成本预留只升不降，原封口成本存于 `sealed_registered_measured_s`，不能改写 worker 封口或把预留当实测。失败成本观察绑定被核验的裁决 SHA；监督器实际返回仍需外部观察，所以磁盘 `cost_coverage_proven=false`、状态 `pending_external_return`。持续慢写耗尽轮数时保留最高已采样下界并标 `unproven_rounds_exhausted`，不冒称最终写盘成本已覆盖；无法写盘时也不生成覆盖通过声明。
+
+外层测试 **38 passed（4.77s）**，包括 9 类失败入口的慢撤回、慢失败观察写入、慢裁决哈希读取及有界轮数耗尽。相关合并回归 `TMPDIR=/tmp/opencode uv run --locked pytest -q tests/test_w1_i_outer_return.py tests/test_w1_smallset_fit_diagnostic.py tests/test_w1_smallset_fit_review16.py` 为 **80 passed（238.81s）**。审阅者原复现脚本的隔离副本结果 `/tmp/opencode/w1_i_withdrawal_fix_20261116_lBU6NO/withdrawal_results.json`：控制例 rc=0；两种攻击均 rc=3/incomplete，原封口 **20s** 不变、撤回后已观测 **101s**、提高的预留 **264s**，且覆盖仍待外层实际返回证明。未重写历史工件，未自动重跑完整 D1→D6→F 合成验收，也未运行全项目套件；真实 R/D1/D6/F 未实施、未授权、未运行。
+
+## 28. 当前实现完整合成验收（2026-11-16）
+
+应用户明确要求，在 HEAD `77938bf14f8cb9c55385da97148a5ff1e37570ef` 上执行一次独占的纯 CPU 合成 `derived/audit/w1_smallset_fit_diagnostic/attempt_019/`。实际监督器调用为 `TMPDIR=/tmp/opencode python3 scripts/run_w1_i_synthetic_acceptance.py --wall-cap-s 3300 --reserve-s 300`；独立外层观察器先采样单调钟，再启动监督器，持续等待其实际退出并在收到成功退出后立即采样。工作进程、监督器、观察器和返回采样脚本均 exit 0；worker 和监督器 stderr 为空。
+
+- **D1 与交接**：300 步、11/11 probe，最终四项平均指标为 **0.0011507113m / 0.0028825341rad / 0.0018577272rad / 0.0012062979m**，四门通过，`handoff_ready=true`。实际更新 300、backward/micro 1200、窗消费 1200，conditioner/backbone 各 1211 次，调用矩阵无问题。
+- **D6 与 F**：300 步、**66/66** 窗行覆盖，六窗四门逐窗通过，根位置 RMSE 宏平均 **0.0063342440m**（宏平均不是门）。实际更新 300、backward/micro 1200、窗消费 7200，conditioner/backbone 各 1211 次；F 两阶段 initial/last 各一次 fresh probe 逐位一致，`complete_evidence=true`、`replay_passed=true`、`verdict=fit_pass`。**中间 FK 状态绑定及尖峰门仍为 `not_evaluated`，重放范围仅 initial/last。**
+- **反例和阶段返回**：115 项反例全部捕获，ID 与冻结集合精确一致。D1 函数返回/观察/登记 **224.548685≤224.548820≤228.546531s**，D6 为 **1298.104051≤1298.104217≤1302.101710s**（同一合成总时钟、不可相加），F 自身为 **1.639494≤1.639626≤5.637653≤600s**；报告正文及证明的实际 SHA 与外层收据逐项一致。
+- **总成本链**：以更早的观察器起点为零点，监督器 t0 晚 **0.054710s**；换算后进程内观察 **1392.540328s**、uv 实际 wait **1393.488367s**、监督器 stdout flush **1393.541100s**、监督器实际 wait **1393.552560s**、外层 wait 证明写后 **1393.589414s**、观察器退出后即时采样 **1393.667601s**、采样文件 fsync 后 **1393.687296s ≤ 登记 1396.483622s ≤ 3300s**。此处把较早起点的耗时与按监督器起点登记的成本比较，包含约 0.055s 外层启动余量。外层返回采样在工具收到观察器 exit 0 后立即执行；采样脚本对采样文件写盘自身再次采样并以 exit 0 确认覆盖。
+- **只读对账与保护**：摘要 SHA `626392e31fc21f7f7bbed0c6faa580f4b86a3969f3ecf04b093b70952b26855f`，外层监督器返回证明 SHA `35520d7fa813e3e40f62e18e22332224e569b21b40b2146a307fd14dcb129451`，观察器返回采样 SHA `03c31644e21cb5e3b0b81433911c7570e5d289076fe4d4f3f02b338024bfc8be`。独立核对全部登记工件大小/SHA、probe 与窗键、300 条 micro/样本计数、调用矩阵、交接、各阶段/F 和外层证明；66 个实现/环境文件 SHA 与启动前一致，历史 `attempt_016/017/018` 分别 **43/43/48 文件**均不变。脚本、运行日志、事前清单和独立检查结果位于 `derived/audit/w1_smallset_fit_diagnostic_postcheck/outer_77938bf_20261116/`；事后只读对账及其结果报告独立于已完成的计费窗口，不执行模型或 FK。
+
+本次只执行纯合成验收及其 115 项电池，未运行全项目套件；此前 `77938bf` 的相关合并回归为 80 passed（§27）。真实 R/D1/D6/F 仍未实施、未授权、未运行；真实拟合须 §8.3 新冻结及明确授权。合成通过不证明真实拟合、泛化、碰撞、抓握、无尖峰或生产资格；T6 `audit_incomplete`/539 gaps 与 `partial/null/false/not_ready/不接入` 保持。
