@@ -32,6 +32,7 @@ import hashlib
 import json
 import sys
 import time
+import zipfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -277,6 +278,67 @@ def _replace_index_row(out_root: Path, attempt: str, entry: dict) -> None:
     idx_path.write_text(json.dumps(index, indent=2, ensure_ascii=False))
 
 
+def _verify_schedule_migration(reference_dir: Path, jobs: list[tuple],
+                               attempt_dir: Path) -> tuple[dict | None, list[str]]:
+    """Cache-migration validation (fit plan §41): a cache rebuilt under the
+    CURRENT condition code may replace the registered SOURCE cache ONLY if
+    every schedule's values are BITWISE EQUAL to the registered ones (the
+    only permitted code delta is instrumentation; any value drift falsifies
+    that premise).  Reference files are located by the REFERENCE identity's
+    recorded keys; the comparison is of the ``intervals`` arrays."""
+    ref_identity_path = Path(reference_dir) / "cache_identity.json"
+    if not ref_identity_path.is_file():
+        return None, [f"migration_reference_identity_missing:{reference_dir}"]
+    ref_identity = json.loads(ref_identity_path.read_text())
+    if ref_identity.get("complete") is not True:
+        return None, ["migration_reference_not_complete"]
+    ref_rows = {r.get("demo"): r
+                for r in ref_identity.get("schedule_rows", [])}
+    job_demos = {j[0] for j in jobs}
+    if set(ref_rows) != job_demos:
+        problems = [f"migration_reference_demo_set_mismatch:"
+                    f"missing={sorted(job_demos - set(ref_rows))[:4]}:"
+                    f"extra={sorted(set(ref_rows) - job_demos)[:4]}"]
+        return None, problems
+    per_demo: dict = {}
+    problems: list[str] = []
+    for demo, _dpath, key, _attempt_dir in jobs:
+        ref_file = (Path(reference_dir) / "schedules"
+                    / w1.schedule_cache_filename(demo, ref_rows[demo].get("key", "")))
+        new_file = (Path(attempt_dir) / "schedules"
+                    / w1.schedule_cache_filename(demo, key))
+        try:
+            if not ref_file.is_file():
+                problems.append(f"migration_reference_schedule_missing:{demo}")
+                continue
+            if not new_file.is_file():
+                problems.append(f"migration_new_schedule_missing:{demo}")
+                continue
+            with np.load(ref_file, allow_pickle=True) as zr, \
+                    np.load(new_file, allow_pickle=True) as zn:
+                ref_iv = np.asarray(zr["intervals"])
+                new_iv = np.asarray(zn["intervals"])
+            equal = (ref_iv.dtype == new_iv.dtype and ref_iv.shape == new_iv.shape
+                     and np.array_equal(ref_iv, new_iv))
+            per_demo[demo] = {"bitwise_equal": bool(equal),
+                              "n_intervals": int(new_iv.shape[0])}
+            if not equal:
+                problems.append(f"migration_value_drift:{demo}")
+        except (OSError, ValueError, KeyError, zipfile.BadZipFile) as exc:
+            problems.append(f"migration_unreadable:{demo}:{type(exc).__name__}")
+    if problems:
+        return None, problems
+    record = {
+        "reference_cache": {"path": path_for_record(ref_identity_path),
+                            "sha256": integ.sha256_file(ref_identity_path)},
+        "per_demo": per_demo,
+        "passed": True,
+        "note": "rebuild-vs-registered bitwise schedule comparison "
+                "(fit plan §41 migration leg)",
+    }
+    return record, []
+
+
 def _run_w1_attempt(args, manifest: dict, prereg: dict, prereg_rec: dict,
                     manifest_path: Path, prereg_path: Path, out_root: Path,
                     attempt_dir: Path, hist: float, remaining: float,
@@ -285,7 +347,8 @@ def _run_w1_attempt(args, manifest: dict, prereg: dict, prereg_rec: dict,
     """One (already allocated, already ledger-registered) cache attempt."""
 
     def _register_incomplete(n_schedules: int, missing: list[str],
-                             *, append_index: bool) -> None:
+                             *, append_index: bool,
+                             reason: str = "cache_budget_exhausted") -> None:
         # INCOMPLETE attempt: record what is missing (or that only the
         # budget ran out), never fabricate stats; consumers refuse this
         # attempt (the identity carries complete=False). consumed_s is
@@ -304,7 +367,7 @@ def _run_w1_attempt(args, manifest: dict, prereg: dict, prereg_rec: dict,
             "assets_sha256": assets_sha,
             "schedule_cache_key_version": w1.SCHEDULE_KEY_VERSION,
             "complete": False,
-            "incomplete_reason": "cache_budget_exhausted",
+            "incomplete_reason": reason,
             "missing_demos": missing,
             "budget": {"total_s": w1.CACHE_BUDGET_S,
                        "historical_s": round(hist, 1),
@@ -318,7 +381,7 @@ def _run_w1_attempt(args, manifest: dict, prereg: dict, prereg_rec: dict,
             json.dumps(identity, indent=2, ensure_ascii=False))
         row = {
             "attempt": attempt_dir.name, "complete": False,
-            "incomplete_reason": "cache_budget_exhausted",
+            "incomplete_reason": reason,
             "n_schedules": n_schedules,
             "identity": path_for_record(attempt_dir / "cache_identity.json"),
         }
@@ -332,7 +395,7 @@ def _run_w1_attempt(args, manifest: dict, prereg: dict, prereg_rec: dict,
                      time.time() - t0,
                      {"attempt": attempt_dir.name,
                       "n_schedules": n_schedules, "complete": False,
-                      "incomplete_reason": "cache_budget_exhausted"},
+                      "incomplete_reason": reason},
                      status="done")
 
     def write_incomplete(n_schedules: int, missing: list[str]) -> int:
@@ -402,6 +465,23 @@ def _run_w1_attempt(args, manifest: dict, prereg: dict, prereg_rec: dict,
         return write_incomplete(len(rows),
                                 [j[0] for j in jobs[len(rows):]])
 
+    # fit plan §41: a replacement cache must PROVE bitwise value equality
+    # against the registered SOURCE cache before its identity is published;
+    # the comparison is billed work (an overrun here is an incomplete too).
+    migration_check = None
+    if getattr(args, "verify_against_cache", None) is not None:
+        migration_check, migration_problems = _verify_schedule_migration(
+            Path(args.verify_against_cache), jobs, attempt_dir)
+        if migration_problems:
+            _register_incomplete(len(rows), [], append_index=True,
+                                 reason="migration_value_drift")
+            print(f"[w1-cache] INCOMPLETE (migration check failed): "
+                  f"{migration_problems[:6]}")
+            return 2
+        if time.perf_counter() > deadline:
+            return write_incomplete(len(rows),
+                                    [j[0] for j in jobs[len(rows):]])
+
     files_blob = json.dumps(stats_facts["files"],
                             ensure_ascii=False, separators=(",", ":"))
     identity = {
@@ -445,6 +525,8 @@ def _run_w1_attempt(args, manifest: dict, prereg: dict, prereg_rec: dict,
         "execution": exec_blocks,
         "total_wall_s": round(time.time() - t0, 1),
     }
+    if migration_check is not None:
+        identity["migration_check"] = migration_check
     # round-4 review fix 3: the FINAL hashing is inside the budget — the
     # last check sat at the stats phase, so a slow manifest/identity hash
     # after it still registered complete=true with consumed_s already past
@@ -552,6 +634,11 @@ def main() -> int:
     ap.add_argument("--out-dir", type=Path, default=None,
                     help="W1 mode: cache root (writes attempt_NNN inside; "
                          "must resolve under derived/)")
+    ap.add_argument("--verify-against-cache", type=Path, default=None,
+                    help="W1 mode cache migration (fit plan §41): an "
+                         "EXISTING registered cache attempt dir whose "
+                         "schedule values the new cache must reproduce "
+                         "BITWISE before its identity is published")
     args = ap.parse_args()
     if args.training_manifest is not None or args.out_dir is not None:
         if args.training_manifest is None or args.out_dir is None:

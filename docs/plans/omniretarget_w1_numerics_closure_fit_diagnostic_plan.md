@@ -4,7 +4,7 @@
 
 **当前状态注记（2026-11-16）：**上段为起草时快照。N0/N1 和 I 的合成实现已交付；两轮审阅修复后，当前实现 `77938bf` 的完整纯合成验收 `attempt_019` 通过，含 D1→D6→F、115 项反例及外层实际返回成本覆盖，见 §39。`attempt_018` 的数值链和 uv wait 事实保留，但其最终 stdout flush 成本未被采样覆盖；`attempt_017` 外层覆盖也缺证据（§35）；`attempt_016` 为第十五轮代码历史结果。R/真实 D1/D6/F 仍未实施、未授权、未运行；本注记不授予新权限。
 
-**当前状态注记（2026-11-17）：**R 元数据准入与真实诊断入口已实现并通过反例回归（§40）；真实 R 准入已在监督器下运行一次，因登记缓存的条件代码键绑定对当前树 fail-closed（唯一条件文件差异为 `largebox_static_frame` 的可选插桩参数，`f4724f7`），权威结果 `r_admission/attempt_002` `admission_passed=false`，处理选项待复阅裁决（§40 与验证记录 §29）。真实 D1/D6/F 仍未实施、未授权、未运行。
+**当前状态注记（2026-11-17）：**R 元数据准入与真实诊断入口已实现并通过反例回归（§40）；真实 R 准入已在监督器下运行一次，因登记缓存的条件代码键绑定对当前树 fail-closed（唯一条件文件差异为 `largebox_static_frame` 的可选插桩参数，`f4724f7`），权威结果 `r_admission/attempt_002` `admission_passed=false`。用户裁决选 (b)：本节新增 §41 缓存迁移与绑定修订——双来源绑定、替代缓存迁移证明硬门、重建范围/预算/调用/停止规则冻结（待授权执行）；c102ae1 复阅修复 §7.4 第 3 项顺序与合法负结果误判。真实 D1/D6/F 仍未实施、未授权、未运行。
 
 ## 1. 目标与当前基线
 
@@ -509,3 +509,33 @@ N0 attempt_006：coverage_complete=true、0 异常、写盘前采样 53.91s、�
 **真实 R 运行（监督器下两次）：**`r_admission/attempt_001` 为输出目录预留冲突的 worker 崩溃（fail-closed 保留）；权威 **`attempt_002`** 完整执行且封口/返回覆盖成立（登记 9.637s≤120s），但 `admission_passed=false`——登记缓存键绑定 SOURCE 运行时的条件代码字节（`d73f411d…`），当前树 `distance_adapter.py` 因 `f4724f7` 的可选插桩参数而字节不同，已审计 `verify_cache_contents` 拒绝（`cache_condition_code_drifted`/`schedule_key_not_reproducible`/`schedule_file_missing`）。这是对 §3.2 与已审计门的正确 fail-closed，不是实现缺陷；diff 核验该差异为纯插桩（数值语义不变）。处理选项（(a) 恢复登记字节/(b) 当前代码重建并登记新缓存后重跑 R/(c) §3.2 修订允许内容核验消费）须用户裁决，本轮不自动执行。R 的六窗选择、运行时对照、实现身份、调用矩阵与磁盘腿全部通过，冻结材料（除缓存消费阻塞外）已可用于 §8.3 复阅。
 
 **边界：真实 D1/D6/F 未实施、未授权、未运行；T6 与既有结论、`partial/null/false/not_ready/不接入` 保持；合成权威验收仍为 `attempt_019`（§39）。**
+
+## 41. §3.2 缓存迁移与绑定修订（2026-11-17，用户裁决选 (b) 后修订）
+
+R 权威运行 `r_admission/attempt_002`（§40）确认登记缓存对当前代码 fail-closed 后，用户裁决以选 (b) 推进：在独立运行根重建并登记当前代码的键控缓存。本节修订 §3.2 的来源绑定并冻结缓存重建的范围、预算、调用与失败停止规则；§3.2 其余条款（只读 SOURCE、注册 train24/manifest、窗位选择规则、物化计费、禁止 val/test）全部不变。
+
+### 41.1 双来源绑定（对 §3.2 的修订）
+
+- **原 SOURCE（不变，仍只读）**：`derived/experiments/omniretarget_first/20261012_21e5784_w1_a3bc_reviewfix8/w1_reviewfix8/` 继续是注册预注册、训练 manifest、输入哈希、派生场景、A1 资产闭包与 `pilot6 ∩ train24` 窗位选择的唯一绑定根；其**登记缓存**（`cache/attempt_001`，identity SHA 与条件代码键 `d73f411d…`）保留原字节，作为缓存迁移的**参照系**，永不被改写。
+- **新缓存来源（显式登记，非默认替换）**：缓存重建在**独立运行根**（`derived/experiments/omniretarget_first/<运行根>/`，自带 cache/attempts/costs 台账）产出 `cache/attempt_NNN`；R、入口复验与真实链的物化统一绑定该缓存目录路径与其 `cache_identity.json` SHA（准入包新增 `cache_binding` 记录：路径、identity SHA、`is_source_registered_cache`、迁移记录）。"不得默认当前最新 cache 可以替换登记版本"保留：替换不是默认行为，而是"显式登记 + §41.2 迁移证明 + 本节修订授权"的共同结果；SOURCE 树内未来出现的任何新 cache 尝试不因此获得绑定资格。
+- **迁移证明（硬门）**：替代缓存要被绑定，其 identity 必须携带 `migration_check={reference_cache:{path,sha256=登记缓存 identity SHA}, per_demo:{55/55 全部 bitwise_equal=true}, passed:true}`——即以当前代码重推的 55 份调度值与登记缓存**逐 demo 位元相等**；参照不是登记缓存、记录缺失、`passed≠true` 或任一 demo 不等，R 拒绝绑定（`r_cache_migration_*`）。前提是"条件代码唯一差异为纯插桩、数值语义不变"（§40 已核验 diff）；若位元比对失败，该前提被证伪，重建按失败停止且不得发布完整 identity。
+- **消费统一**：`verify_cache_contents`、逐窗调度/root_stats 绑定、`materialize_fit_apparatus`/`materialize_real_world` 全部消费绑定缓存；预注册/manifest 绑定链仍从 SOURCE 登记缓存 identity 起算。
+
+### 41.2 缓存重建范围、预算与调用矩阵（冻结，待授权后执行）
+
+| 项目 | 冻结值 |
+| --- | --- |
+| 运行根 | `derived/experiments/omniretarget_first/<独立运行根>/`（新 cohort 台账，历史为 0） |
+| 输入 | 只读 SOURCE 预注册+训练 manifest（执行前先跑 `verify_preregistration` 全腿）；不改写 SOURCE 任何字节 |
+| 重建范围 | **全部 55 份** admitted（train24+val31）键控调度 + **仅 train24** 的 root_stats——现有核验器契约要求全 55 份，六窗子集无法通过 |
+| 预算 | `CACHE_BUDGET_S=7200s`（既有登记常量），独立台账内先扣历史；预算耗尽=诚实 incomplete |
+| 执行语义 | 复用已审计 `scripts/precompute_m3_cache.py` W1 模式：事前 running 台账行、SIGKILL 残行=未知=停止、崩溃=crashed 行、逐块截止检查、identity/index/ledger 三方对账；`--workers 4 --native-threads 1`（登记执行语义） |
+| 调用 | 55 次键控调度推理（逐 demo 一次）+ 24 次 root_stats clip 加载 + 迁移腿 55 次位元比对（登记缓存读取+比对均计费）；无模型/FK/前向/更新 |
+| 迁移腿 | `--verify-against-cache <SOURCE 登记缓存 attempt>`：全部 55 demo 位元比对在 identity 发布前完成；任一失败=该尝试 incomplete（`migration_value_drift`），不发布完整 identity；迁移记录（参照 identity SHA+逐 demo 结论）写入 identity |
+| 验收 | 新缓存 `verify_cache_contents` 全过（当前代码键可复现）；R 以 `cache_root=<新缓存 attempt>` 重跑且 `admission_passed=true`；原缓存与失败记录原样保留 |
+
+**授权前置**：缓存重建是真实计费运行，须在用户复阅本节后明确授权（范围=本表冻结值）；未授权不执行。重建完成并登记后，按 §40 的 R 流程以新缓存重跑 R，产出 `admission_passed=true` 的准入包，方可进入 §8.3 真实诊断冻结。
+
+### 41.3 c102ae1 定向复阅修订（2026-11-17）
+
+复阅 c102ae1 的真实入口/监督器/链编排，发现并修复两处：①**§7.4 第 3 项顺序违反**——D6 曾先物化六窗再消费 D1 收据；现改为 D6 计费区间内先物化验证装置（handoff 复核所需的最小 apparatus），`resolve_handoff` 通过后才物化训练窗（apparatus 以参数传入复用，不重复构造）；②**合法负结果误判 incomplete**——D1 完整但平均门未过时按 §7.2 跳过 D6 属完整链，worker CLI/监督器现按 `authorized_includes`/`d6_ran`/`d6.skipped_reason` 条件验收（`d1_incomplete`/`d1_mean_fit_gate_not_passed`/`d6_not_authorized`/`handoff_not_ready` 四种合法跳过；D1 负结果 + F 单阶段验证 = candidate_complete，最终裁决 fit_insufficient 由 F 报告承载）；监督器对 d6 磁盘报告/证明的核验相应条件化。链摘要新增 `authorized_includes`/`d6_ran` 字段。相关回归：拟合链 106 passed（含新迁移/绑定/链语义 13 项），W1 缓存阶段既有回归 40 passed。

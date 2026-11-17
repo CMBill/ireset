@@ -179,21 +179,40 @@ def main() -> int:
         return 3
     if out["mode"] == "r-admit":
         return 0 if disk.get("admission_passed") is True else 1
-    f_stages = ((disk.get("f") or {}).get("stages") or [])
+    d1 = disk.get("d1") or {}
+    d6 = disk.get("d6") or {}
+    f = disk.get("f") or {}
+    f_stages = f.get("stages") or []
+    d6_ran = disk.get("d6_ran") is True
+    includes = set(disk.get("authorized_includes") or [])
+    # evidence completeness decides the exit code -- the SCIENTIFIC verdict
+    # (fit_pass / fit_insufficient) lives in the F report; a D6 skipped by
+    # the plan's own gates (§7.2/§7.4 item 3) is a complete chain, not a
+    # failure of evidence.
+    d6_ok = (
+        (d6_ran and d1.get("local_mean_fit_passed") is True
+         and (disk.get("d1_handoff") or {}).get("handoff_ready") is True
+         and d6.get("local_complete_evidence") is True
+         and d6.get("return_coverage") is True
+         and not d6.get("call_matrix_problems"))
+        or (not d6_ran and d6.get("skipped_reason") in
+            ("d1_incomplete", "d1_mean_fit_gate_not_passed",
+             "d6_not_authorized", "handoff_not_ready")))
     accept = (
-        (disk.get("d1") or {}).get("local_complete_evidence") is True
-        and (disk.get("d1") or {}).get("return_coverage") is True
-        and not (disk.get("d1") or {}).get("call_matrix_problems")
-        and (disk.get("d1_handoff") or {}).get("handoff_ready") is True
-        and (disk.get("d6") or {}).get("local_complete_evidence") is True
-        and (disk.get("d6") or {}).get("return_coverage") is True
-        and not (disk.get("d6") or {}).get("call_matrix_problems")
-        and (disk.get("f") or {}).get("complete_evidence") is True
-        and (disk.get("f") or {}).get("return_coverage") is True
-        and (disk.get("f") or {}).get("replay_passed") is True
-        and len(f_stages) == 2
-        and {s.get("stage") for s in f_stages} == {"D1", "D6"}
-        and all(s.get("replay_passed") is True for s in f_stages))
+        d1.get("local_complete_evidence") is True
+        and d1.get("return_coverage") is True
+        and not d1.get("call_matrix_problems")
+        and d6_ok
+        and f.get("complete_evidence") is True
+        and f.get("return_coverage") is True
+        and f.get("replay_passed") is True
+        and len(f_stages) == (2 if d6_ran else 1)
+        and {s.get("stage") for s in f_stages}
+        == ({"D1", "D6"} if d6_ran else {"D1"})
+        and all(s.get("replay_passed") is True for s in f_stages)
+        and (d6_ran or d1.get("local_mean_fit_passed") is False
+             or d6.get("skipped_reason") == "d6_not_authorized")
+        and bool(includes))
     return 0 if accept else 1
 
 

@@ -134,9 +134,18 @@ def _fixture_project(tmp: Path) -> dict:
         np.savez(derived_path, **scene)
         key = w1.schedule_cache_key(npz_sha, pt_sha, assets_sha, code_sha)
         sched_file = cache_dir / "schedules" / w1.schedule_cache_filename(demo, key)
-        np.savez(sched_file, intervals=np.array(
-            [[0, 5, 55, 0], [1, 5, 55, 0], [2, 0, 40, 1], [3, 0, 40, 1]],
-            dtype=np.int64))
+        # the registered cache's values are what the SAME inference path
+        # produces (the §41 migration premise: only the code BYTES differ);
+        # generating them here keeps rebuild-vs-registered comparisons
+        # bitwise-equal in the tests
+        from ireset.embodied.contact_sites import infer_reference_schedule
+        from ireset.data.teacher import schedule_to_cache
+
+        schedule = infer_reference_schedule(np.asarray(scene["human_joints"]),
+                                            np.asarray(scene["source_obj_pose"]),
+                                            fps=FPS,
+                                            box_scale=float(scene["similarity_scale"]))
+        np.savez(sched_file, intervals=schedule_to_cache(schedule))
         schedules[demo] = {"key": key[:16], "sha256": _sha(sched_file),
                            "full_windows": (T_FIX - 60) // 30 + 1}
         rows.append({
@@ -287,7 +296,8 @@ def _stub_git(_root):
 
 
 def _run_r(tmp: Path, fixture: dict, *, mutate=None, monkeypatch=None,
-           runtime_probe=None, disk_probe=None, wall_cap_s=600.0) -> dict:
+           runtime_probe=None, disk_probe=None, wall_cap_s=600.0,
+           cache_root: Path | None = None) -> dict:
     if mutate is not None:
         mutate(fixture)
     out = tmp / f"r_out_{len(list(tmp.iterdir())) if tmp.exists() else 0}"
@@ -298,7 +308,7 @@ def _run_r(tmp: Path, fixture: dict, *, mutate=None, monkeypatch=None,
         omomo_pt_dir=fixture["pt_dir"],
         runtime_probe=runtime_probe or _runtime_probe,
         disk_probe=disk_probe or _disk_probe(),
-        git_identity=_stub_git)
+        git_identity=_stub_git, cache_root=cache_root)
     return result
 
 
@@ -829,8 +839,445 @@ def test_frozen_call_matrix_matches_plan_and_driver():
 
 
 # --------------------------------------------------------------------------
-# supervisor (real-fit outer return supervision)
+# §41 cache migration: dual-source binding + rebuild value proof
 # --------------------------------------------------------------------------
+
+def _copy_cache_attempt(fixture: dict, src_name: str, dst_name: str) -> Path:
+    src = fixture["source_root"] / "cache" / src_name
+    dst = fixture["source_root"] / "cache" / dst_name
+    shutil.copytree(src, dst)
+    return dst
+
+
+def _rebind_cache_identity(dst: Path, attempt_name: str,
+                           migration: dict | None) -> None:
+    ident_path = dst / "cache_identity.json"
+    ident = json.loads(ident_path.read_text())
+    ident["attempt"] = attempt_name
+    if migration is None:
+        ident.pop("migration_check", None)
+    else:
+        ident["migration_check"] = migration
+    ident_path.write_text(json.dumps(ident, indent=1))
+
+
+def _migration_record(fixture: dict) -> dict:
+    ref = fixture["source_root"] / "cache/attempt_001/cache_identity.json"
+    return {"reference_cache": {"path": str(ref),
+                                "sha256": radm.sha256_file(ref)},
+            "per_demo": {d: {"bitwise_equal": True, "n_intervals": 4}
+                         for d in PILOT6 + VAL_DEMOS},
+            "passed": True}
+
+
+def test_replacement_cache_binding_requires_migration_record(
+        fixture, admission, tmp_path):
+    """A cache that REPLACES the registered one must carry the §41
+    migration record; the SOURCE cache itself needs none."""
+    dst = _copy_cache_attempt(fixture, "attempt_001",
+                              "attempt_002")
+    try:
+        # no migration record -> refused
+        _rebind_cache_identity(dst, "attempt_002", None)
+        result = _run_r(tmp_path, fixture, cache_root=dst)
+        assert any("r_cache_migration_record_missing" in p
+                   for p in result["summary_doc"]["problems"])
+
+        # wrong reference sha -> refused
+        _rebind_cache_identity(dst, "attempt_002", _migration_record(fixture))
+        ident_path = dst / "cache_identity.json"
+        bad = json.loads(ident_path.read_text())
+        bad["migration_check"]["reference_cache"]["sha256"] = "0" * 64
+        ident_path.write_text(json.dumps(bad, indent=1))
+        result = _run_r(tmp_path, fixture, cache_root=dst)
+        assert any("r_cache_migration_reference_mismatch" in p
+                   for p in result["summary_doc"]["problems"])
+
+        # a demo not proven bitwise-equal -> refused
+        bad = json.loads(ident_path.read_text())
+        bad["migration_check"]["reference_cache"]["sha256"] = \
+            _migration_record(fixture)["reference_cache"]["sha256"]
+        bad["migration_check"]["per_demo"][PILOT6[0]] = {"bitwise_equal": False,
+                                                         "n_intervals": 4}
+        ident_path.write_text(json.dumps(bad, indent=1))
+        result = _run_r(tmp_path, fixture, cache_root=dst)
+        assert any("r_cache_migration_demo_not_equal" in p
+                   for p in result["summary_doc"]["problems"])
+
+        # a valid record -> the replacement cache is bound and the package
+        # records it (the SOURCE's registered identity stays the chain root)
+        _rebind_cache_identity(dst, "attempt_002", _migration_record(fixture))
+        result = _run_r(tmp_path, fixture, cache_root=dst)
+        doc = result["summary_doc"]
+        assert doc["admission_passed"] is True, doc["problems"]
+        cb = doc["package"]["cache_binding"]
+        assert cb["is_source_registered_cache"] is False
+        assert cb["migration_check"]["passed"] is True
+        assert doc["package"]["source_binding"]["registered_cache_identity"]
+        # the re-verification consumes the bound cache too
+        assert radm.admission_recheck_problems(
+            doc, project_root=fixture["proj"],
+            source_root=fixture["source_root"],
+            teacher_npz_dir=fixture["npz_dir"],
+            omomo_pt_dir=fixture["pt_dir"], runtime_probe=_runtime_probe,
+            disk_probe=_disk_probe()) == []
+        # the world materializes identically from either binding (values
+        # are bitwise equal by the migration record's own premise): the
+        # replacement doc's cache_binding points at attempt_002
+        _, world_a = _mini_world(fixture, admission, tmp_path, stage="D1")
+        budget = StageBudget(stage="D1", wall_cap_s=600.0, reserve_s=10.0)
+        world_b = radm.materialize_real_world(
+            admission=doc, stage="D1", budget=budget, device="cpu",
+            fixture=True, project_root=fixture["proj"],
+            source_root=fixture["source_root"],
+            teacher_npz_dir=fixture["npz_dir"],
+            omomo_pt_dir=fixture["pt_dir"])
+        assert world_b.facts["windows"][0]["x0_sha256"] == \
+            world_a.facts["windows"][0]["x0_sha256"]
+    finally:
+        shutil.rmtree(dst)
+
+
+def test_drifted_replacement_cache_refused(fixture, tmp_path):
+    dst = _copy_cache_attempt(fixture, "attempt_001",
+                              "attempt_002")
+    try:
+        _rebind_cache_identity(dst, "attempt_002", _migration_record(fixture))
+        rec = next(r for r in json.loads(
+            (dst / "cache_identity.json").read_text())["schedule_rows"]
+            if r["demo"] == PILOT6[0])
+        sched = dst / "schedules" / w1.schedule_cache_filename(PILOT6[0],
+                                                               rec["key"])
+        saved = sched.read_bytes()
+        sched.write_bytes(saved + b"drift")
+        result = _run_r(tmp_path, fixture, cache_root=dst)
+        assert result["summary_doc"]["admission_passed"] is False
+        assert any("r_cache_reverify_failed" in p
+                   for p in result["summary_doc"]["problems"])
+    finally:
+        shutil.rmtree(dst)
+
+
+def test_default_binding_is_the_source_registered_cache(fixture, admission,
+                                                        tmp_path):
+    doc = admission["doc"]
+    cb = doc["package"]["cache_binding"]
+    assert cb["is_source_registered_cache"] is True
+    assert cb["migration_check"] is None
+    assert cb["path"].endswith("cache/attempt_001")
+
+
+# --------------------------------------------------------------------------
+# precompute_m3_cache migration leg (plan §41)
+# --------------------------------------------------------------------------
+
+def _load_precompute():
+    spec = importlib.util.spec_from_file_location(
+        "precompute_m3_cache", ROOT / "scripts/precompute_m3_cache.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _precompute_args(fixture: dict, out_dir: Path,
+                     verify: Path | None) -> "argparse.Namespace":
+    import argparse as _ap
+
+    return _ap.Namespace(workers=1, cpu_budget=16, native_threads=1,
+                         force=False,
+                         training_manifest=(fixture["source_root"]
+                                            / "audit/attempt_001"
+                                            / "training_manifest.json"),
+                         out_dir=out_dir, verify_against_cache=verify)
+
+
+@pytest.fixture()
+def precompute_env():
+    return _load_precompute()
+
+
+def test_cache_rebuild_publishes_migration_record(fixture, precompute_env,
+                                                  tmp_path, monkeypatch):
+    pre = precompute_env
+
+
+def test_cache_rebuild_publishes_migration_record(fixture, precompute_env,
+                                                  tmp_path, monkeypatch):
+    import ireset.data.a2_integrity as integ_mod
+
+    pre = precompute_env
+    monkeypatch.setattr(integ_mod, "guard_output_dir", lambda p: Path(p))
+    monkeypatch.setattr(pre, "PROJECT_ROOT", fixture["proj"])
+    monkeypatch.setattr(pre, "TEACHER_TRAJ_DIR", fixture["npz_dir"])
+    monkeypatch.setattr(pre, "OMOMO_NEW_DIR", fixture["pt_dir"])
+    run_root = tmp_path / "rebuild_run"
+    # the §41 scenario: the rebuild is bound to the SOURCE's REGISTERED
+    # cache; identical values -> the migration record is published inside
+    # the SAME billed attempt and references the registered identity bytes
+    registered = fixture["source_root"] / "cache/attempt_001"
+    rc = pre.run_w1(_precompute_args(fixture, run_root / "cache", registered))
+    assert rc == 0
+    rebuilt = sorted((run_root / "cache").glob("attempt_*"))[0]
+    ident = json.loads((rebuilt / "cache_identity.json").read_text())
+    assert ident["complete"] is True
+    mig = ident["migration_check"]
+    assert mig["passed"] is True
+    assert len(mig["per_demo"]) == 8
+    assert all(v["bitwise_equal"] for v in mig["per_demo"].values())
+    assert mig["reference_cache"]["sha256"] == \
+        radm.sha256_file(registered / "cache_identity.json")
+    check = w1.verify_cache_contents(rebuilt, fixture["manifest"],
+                                     fixture["preregistration"],
+                                     fixture["proj"])
+    assert check["passed"], check["problems"]
+    # the fit admission binds the rebuilt cache and passes
+    budget = StageBudget(stage="R", wall_cap_s=600.0, reserve_s=10.0)
+    result = radm.run_r_admission(
+        out_dir=tmp_path / "r_out", budget=budget,
+        project_root=fixture["proj"], source_root=fixture["source_root"],
+        teacher_npz_dir=fixture["npz_dir"], omomo_pt_dir=fixture["pt_dir"],
+        runtime_probe=_runtime_probe, disk_probe=_disk_probe(),
+        git_identity=_stub_git, cache_root=rebuilt)
+    doc = result["summary_doc"]
+    assert doc["admission_passed"] is True, doc["problems"]
+    assert doc["package"]["cache_binding"]["is_source_registered_cache"] is False
+
+
+def test_cache_rebuild_refuses_value_drift(fixture, precompute_env, tmp_path,
+                                           monkeypatch):
+    import ireset.data.a2_integrity as integ_mod
+
+    pre = precompute_env
+    monkeypatch.setattr(integ_mod, "guard_output_dir", lambda p: Path(p))
+    monkeypatch.setattr(pre, "PROJECT_ROOT", fixture["proj"])
+    monkeypatch.setattr(pre, "TEACHER_TRAJ_DIR", fixture["npz_dir"])
+    monkeypatch.setattr(pre, "OMOMO_NEW_DIR", fixture["pt_dir"])
+    run_root = tmp_path / "rebuild_run"
+    # a reference copy whose values no longer match what the current code
+    # infers: the rebuild must close INCOMPLETE, never publish an identity
+    reference = tmp_path / "tampered_reference"
+    shutil.copytree(fixture["source_root"] / "cache/attempt_001", reference)
+    rec = next(r for r in json.loads(
+        (reference / "cache_identity.json").read_text())["schedule_rows"]
+        if r["demo"] == PILOT6[0])
+    sched = reference / "schedules" / w1.schedule_cache_filename(PILOT6[0],
+                                                                 rec["key"])
+    with np.load(sched, allow_pickle=True) as z:
+        intervals = z["intervals"].copy()
+    if intervals.shape[0] == 0:
+        intervals = np.array([[0, 5, 55, 0]], dtype=np.int64)
+    else:
+        intervals[0, 2] += 1
+    np.savez(sched, intervals=intervals)
+    rc = pre.run_w1(_precompute_args(fixture, run_root / "cache", reference))
+    assert rc == 2
+    attempt = sorted((run_root / "cache").glob("attempt_*"))[0]
+    ident = json.loads((attempt / "cache_identity.json").read_text())
+    assert ident["complete"] is False
+    assert ident["incomplete_reason"] == "migration_value_drift"
+    idx = json.loads((run_root / "cache" / "attempts_index.json").read_text())
+    rows = [r for r in idx["attempts"] if r["attempt"] == attempt.name]
+    assert rows and rows[0]["complete"] is False
+    check = w1.verify_cache_contents(attempt, fixture["manifest"],
+                                     fixture["preregistration"],
+                                     fixture["proj"])
+    assert check["passed"] is False
+
+
+def test_migration_helper_direct(fixture, tmp_path):
+    """Unit coverage of the comparison helper: set mismatch, missing file,
+    value drift, and the positive record."""
+    pre = _load_precompute()
+
+    jobs = [(d, "", "k" * 16, "") for d in PILOT6]
+    reference = tmp_path / "ref_cache"
+    (reference / "schedules").mkdir(parents=True)
+    (reference / "cache_identity.json").write_text(json.dumps(
+        {"complete": True,
+         "schedule_rows": [{"demo": d, "key": "k" * 16} for d in PILOT6]}))
+    # no new schedules -> missing
+    record, problems = pre._verify_schedule_migration(reference, jobs,
+                                                      tmp_path / "new")
+    assert record is None and problems
+    # value drift: reference has different intervals than the new attempt
+    new = tmp_path / "new"
+    (new / "schedules").mkdir(parents=True)
+    for d in PILOT6:
+        np.savez(reference / "schedules" / f"{d}__{'k' * 16}.npz",
+                 intervals=np.array([[0, 5, 55, 0]], dtype=np.int64))
+        np.savez(new / "schedules" / f"{d}__{'k' * 16}.npz",
+                 intervals=np.array([[0, 5, 56, 0]], dtype=np.int64))
+    record, problems = pre._verify_schedule_migration(reference, jobs, new)
+    assert record is None
+    assert all("migration_value_drift" in p for p in problems)
+    # equal values -> the record binds the reference identity bytes
+    for d in PILOT6:
+        np.savez(new / "schedules" / f"{d}__{'k' * 16}.npz",
+                 intervals=np.array([[0, 5, 55, 0]], dtype=np.int64))
+    record, problems = pre._verify_schedule_migration(reference, jobs, new)
+    assert problems == [] and record["passed"] is True
+    assert record["reference_cache"]["sha256"] == \
+        radm.sha256_file(reference / "cache_identity.json")
+
+
+# --------------------------------------------------------------------------
+# chain conditional facts (D6 skipped by the plan's own gates)
+# --------------------------------------------------------------------------
+
+def _chain_stage_report(tmp: Path, stage: str, t0: float, cap: float,
+                        registered: float, elapsed: float, mean: bool,
+                        extra: dict | None = None) -> dict:
+    doc = {"schema": "w1_smallset_fit_diagnostic_v1", "stage": stage,
+           "local_complete_evidence": True, "local_mean_fit_passed": mean,
+           "local_conclusion": "complete_fit" if mean else "fit_insufficient",
+           "final_verification_status": "pending_F",
+           "call_matrix": {"expected": {}, "actual": {}, "problems": []},
+           "identity": {"module": "m", "stage": stage},
+           "materialization": {"counters": {}},
+           "problems": [], "failure": None}
+    doc.update(extra or {})
+    return _seal_and_proof(tmp / "stage_report.json", t0, cap, registered,
+                           elapsed, doc)
+
+
+def _chain_f_report(stages: list[str], means: dict) -> dict:
+    entries = [{"stage": s, "replay_enabled": True, "replay_passed": True,
+                "complete_evidence": True, "local_reverify_problems": [],
+                "replay_problems": [], "skip_reason": None,
+                "mean_fit_passed": means[s]} for s in stages]
+    mean = all(means[s] for s in stages)
+    doc = {"schema": "w1_smallset_fit_f_report_v1", "stages": entries,
+           "replay_passed": True, "complete_evidence": True,
+           "mean_fit_passed": mean,
+           "verdict": "fit_pass" if mean else "fit_insufficient",
+           "final_verification_status": "final_F",
+           "tolerance_policy": "bitwise_no_tolerance"}
+    return doc
+
+
+def _chain_facts(d6_ran: bool, d1_mean: bool = True,
+                 d6_mean: bool = True, includes=("D1", "D6", "F"),
+                 skip_reason: str | None = None) -> dict:
+    facts = {
+        "schema": "w1_smallset_fit_real_run_v1", "kind": "real_fit_chain",
+        "cohort_id": radm.COHORT_ID,
+        "admission": {"path": "a.json", "sha256": "a" * 64},
+        "authorization": {"path": "b.json", "sha256": "b" * 64},
+        "authorized_includes": list(includes), "d6_ran": d6_ran,
+        "d1": {"local_complete_evidence": True,
+               "local_mean_fit_passed": d1_mean,
+               "local_conclusion": "complete_fit" if d1_mean
+               else "fit_insufficient",
+               "seal": "sealed_within_budget", "return_coverage": True,
+               "stage_returned_elapsed_s": 3.0, "call_matrix_problems": []},
+        "d1_handoff": {"handoff_ready": True if d6_ran else None,
+                       "problems": []},
+        "d6": ({"local_complete_evidence": True,
+                "local_mean_fit_passed": d6_mean,
+                "local_conclusion": "complete_fit" if d6_mean
+                else "fit_insufficient", "seal": "sealed_within_budget",
+                "return_coverage": True, "stage_returned_elapsed_s": 3.0,
+                "call_matrix_problems": []}
+               if d6_ran else {"skipped_reason": skip_reason}),
+        "f": {"complete_evidence": True, "replay_passed": True,
+              "mean_fit_passed": all([d1_mean] + ([d6_mean] if d6_ran else [])),
+              "verdict": "fit_pass" if all([d1_mean]
+                                            + ([d6_mean] if d6_ran else []))
+              else "fit_insufficient",
+              "return_coverage": True, "stage_returned_elapsed_s": 3.0,
+              "stages": [{"stage": s, "replay_enabled": True,
+                          "replay_passed": True, "skip_reason": None,
+                          "replay_problems": [],
+                          "mean_fit_passed": {"D1": d1_mean,
+                                              "D6": d6_mean}[s]}
+                         for s in (("D1", "D6") if d6_ran else ("D1",))]},
+    }
+    return facts
+
+
+@pytest.mark.parametrize("mutation,expected", [
+    ("full_pass", None),
+    ("d6_negative", None),
+    ("d1_negative", None),
+    ("d6_skip_invalid", "d6_state_invalid"),
+    ("d6_ran_without_handoff", "stage_facts_incomplete"),
+    ("f_stage_set_wrong", "fresh_replay_incomplete"),
+    ("d6_facts_mismatch", "d6:report_facts_mismatch"),
+])
+def test_chain_candidate_semantics(tmp_path, mutation, expected):
+    """The supervisor accepts complete chains with legitimate D6 skips and
+    negative mean-gate outcomes; inconsistent states stay incomplete."""
+    supervisor = _load_supervisor()
+    out = tmp_path / "attempt_001"
+    out.mkdir()
+    d1_mean = mutation != "d1_negative"
+    d6_ran = mutation not in ("d1_negative", "d6_skip_invalid")
+    d6_mean = mutation != "d6_negative"
+    skip = "d1_mean_fit_gate_not_passed" if mutation == "d1_negative" else \
+        "d6_not_authorized"
+    facts = _chain_facts(d6_ran, d1_mean=d1_mean, d6_mean=d6_mean,
+                         skip_reason=skip)
+    if mutation == "d6_skip_invalid":
+        facts["d6"] = {"skipped_reason": "some_nonsense"}
+    if mutation == "d6_ran_without_handoff":
+        facts["d1_handoff"] = {"handoff_ready": False, "problems": ["x"]}
+    if mutation == "f_stage_set_wrong":
+        facts["d6_ran"] = True
+        facts["f"]["stages"] = facts["f"]["stages"][:1]
+        facts["f"]["stages"][0]["stage"] = "D1"
+    # disk reports
+    _chain_stage_report(out / "d1", "D1", 100.0, 1800.0, 20.0, 4.0, d1_mean)
+    d6_disk_mean = d6_mean
+    if mutation == "d6_facts_mismatch":
+        d6_disk_mean = not d6_mean
+    if d6_ran:
+        _chain_stage_report(out / "d6", "D6", 130.0, 3600.0, 20.0, 4.0,
+                            d6_disk_mean)
+    stages = ("D1", "D6") if d6_ran else ("D1",)
+    means = {"D1": d1_mean, "D6": d6_mean}
+    _seal_and_proof(out / "f" / "f_report.json", 160.0, 600.0, 5.0, 4.0,
+                    _chain_f_report(list(stages), means))
+    # summary + proof
+    summary_doc = dict(facts)
+    summary_doc["outer_launch"] = {"launch_id": "launch",
+                                   "t0_perf_counter": 100.0,
+                                   "cli_entry_perf_counter": 101.0,
+                                   "supervisor_declared": True}
+    summary_doc["label_verdict"] = "pending_outer_return"
+    summary_doc["seal"] = {"status": "sealed_within_budget", "terminal": True,
+                           "t0_perf_counter": 100.0, "wall_cap_s": 6120.0,
+                           "measured_wall_s_at_summary": 30.0}
+    summary_doc["budget"] = {"t0_perf_counter": 100.0, "wall_cap_s": 6120.0,
+                             "measured_wall_s_at_summary": 30.0}
+    (out / "acceptance_summary.json").write_text(json.dumps(summary_doc))
+    proof = {"schema": "n0_return_observation_v1", "covered": True,
+             "elapsed_s": 9.0, "registered_measured_s": 30.0,
+             "wall_cap_s": 6120.0,
+             "summary_sha256": supervisor._sha(out / "acceptance_summary.json")}
+    (out / "return_observation.json").write_text(json.dumps(proof))
+    # the stage proofs must bind the ACTUAL report bytes
+    for sub, cap in (("d1", 1800.0), ("d6", 3600.0), ("f", 600.0)):
+        rpt = out / sub / ("f_report.json" if sub == "f" else "stage_report.json")
+        if not rpt.is_file():
+            continue
+        prf = {"schema": "n0_return_observation_v1", "covered": True,
+               "elapsed_s": 4.0, "registered_measured_s": 30.0,
+               "wall_cap_s": cap,
+               "summary_sha256": supervisor._sha(rpt)}
+        (rpt.parent / "return_observation.json").write_text(json.dumps(prf))
+    problems = supervisor._candidate_problems(
+        summary_doc, "launch", 100.0, "chain")
+    for sub, cap in (("d1", 1800.0), ("d6", 3600.0), ("f", 600.0)):
+        rpt = out / sub / ("f_report.json" if sub == "f" else "stage_report.json")
+        if not rpt.is_file():
+            continue
+        doc, _ = supervisor._object_and_sha(rpt)
+        if not supervisor._stage_report_matches(sub, doc, summary_doc):
+            problems.append(f"{sub}:report_facts_mismatch")
+    if expected is None:
+        assert problems == [], problems
+    else:
+        assert expected in problems
 
 _supervisor_spec = importlib.util.spec_from_file_location(
     "w1_real_fit_supervisor",

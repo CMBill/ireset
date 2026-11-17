@@ -328,6 +328,42 @@ def select_windows(prereg: dict, manifest: dict,
     return windows, problems
 
 
+def _resolve_cache_root(source_root: Path, cache_root: Path | None) -> tuple[Path, Path]:
+    """(bound cache attempt dir, the SOURCE's own registered cache dir)."""
+    source_cache = Path(source_root) / "cache/attempt_001"
+    return (Path(cache_root) if cache_root is not None else source_cache,
+            source_cache)
+
+
+def _migration_record_problems(root: Path, source_cache: Path,
+                               cache_root: Path, bound_identity: dict,
+                               ) -> list[str]:
+    """§3.2 revision: a cache that REPLACES the SOURCE's registered one is
+    never a default substitution -- it must carry a migration record proving
+    bitwise value equality against the registered cache (the rebuild writes
+    it from the recorded reference identity SHA)."""
+    if cache_root == source_cache:
+        return []
+    rec = bound_identity.get("migration_check")
+    if not isinstance(rec, dict):
+        return ["r_cache_migration_record_missing"]
+    if rec.get("passed") is not True:
+        return ["r_cache_migration_not_passed"]
+    reference = rec.get("reference_cache") or {}
+    registered_identity = source_cache / "cache_identity.json"
+    if not registered_identity.is_file() or \
+            reference.get("sha256") != sha256_file(registered_identity) or \
+            reference.get("path") != path_for_record(registered_identity):
+        return ["r_cache_migration_reference_mismatch"]
+    if not isinstance(rec.get("per_demo"), dict) or not rec["per_demo"]:
+        return ["r_cache_migration_per_demo_missing"]
+    bad = [d for d, v in rec["per_demo"].items()
+           if not isinstance(v, dict) or v.get("bitwise_equal") is not True]
+    if bad:
+        return [f"r_cache_migration_demo_not_equal:{sorted(bad)[:4]}"]
+    return []
+
+
 def run_r_admission(*, out_dir: Path, budget: StageBudget,
                     project_root: Path | None = None,
                     source_root: Path | None = None,
@@ -338,6 +374,7 @@ def run_r_admission(*, out_dir: Path, budget: StageBudget,
                     runtime_probe: Callable[[], dict] | None = None,
                     disk_probe: Callable[[Path], int] | None = None,
                     git_identity: Callable[[Path], dict] | None = None,
+                    cache_root: Path | None = None,
                     ) -> dict:
     """One R window: metadata admission under the §8.1 R budget (120s/15s).
 
@@ -345,10 +382,14 @@ def run_r_admission(*, out_dir: Path, budget: StageBudget,
     when every binding leg verified.  No array value, checkpoint,
     tokenizer, training module or FK is touched -- the reader refuses them
     structurally and the zero declarations are written into the sealed
-    summary."""
+    summary.  ``cache_root`` binds a REPLACEMENT cache (plan §3.2 revision,
+    §41): the SOURCE's registered cache stays the identity-chain root, the
+    bound cache must be consumable under the CURRENT code and carry a valid
+    migration record."""
     reader = reader or MetadataOnlyReader()
     root = Path(project_root or PROJECT_ROOT)
     source_root = Path(source_root or root / SOURCE_ROOT_REL)
+    cache_root, source_cache = _resolve_cache_root(source_root, cache_root)
     # the T6 registration is a REAL project artifact, independent of any
     # fixture root the caller passes for tests
     t6_registration = Path(t6_registration or PROJECT_ROOT / T6_REGISTRATION_REL)
@@ -369,13 +410,17 @@ def run_r_admission(*, out_dir: Path, budget: StageBudget,
 
         # -- SOURCE identity chain (cache_identity -> prereg/manifest) ------
         budget.check("r_source_binding")
-        cache_dir = source_root / "cache/attempt_001"
-        cache_identity_path = cache_dir / "cache_identity.json"
+        source_identity_path = source_cache / "cache_identity.json"
+        source_chain_identity = reader.read_json(source_identity_path)
+        source_binding: dict = {"registered_cache_identity":
+                                _file_record(source_identity_path)}
+        # the preregistration/manifest binding chain starts at the SOURCE's
+        # own registered cache identity, even when a replacement cache is
+        # bound for schedules/root_stats (plan §41)
+        cache_identity_path = cache_root / "cache_identity.json"
         cache_identity = reader.read_json(cache_identity_path)
-        source_binding: dict = {"cache_identity":
-                                _file_record(cache_identity_path)}
-        prereg_rec = cache_identity.get("preregistration") or {}
-        manifest_rec = cache_identity.get("training_manifest") or {}
+        prereg_rec = source_chain_identity.get("preregistration") or {}
+        manifest_rec = source_chain_identity.get("training_manifest") or {}
         prereg_path = root / str(prereg_rec.get("path", ""))
         manifest_path = root / str(manifest_rec.get("path", ""))
         prereg: dict = {}
@@ -403,16 +448,20 @@ def run_r_admission(*, out_dir: Path, budget: StageBudget,
         if not prereg_check["passed"]:
             problems.append(f"r_preregistration_reverify_failed:"
                             f"{prereg_check['problems'][:6]}")
-        cache_check = w1.verify_cache_contents(cache_dir, manifest, prereg, root)
+        cache_check = w1.verify_cache_contents(cache_root, manifest, prereg, root)
         if not cache_check["passed"]:
             problems.append(
                 f"r_cache_reverify_failed:{cache_check['problems'][:6]}")
+        migration_problems = _migration_record_problems(
+            root, source_cache, cache_root, cache_identity)
+        problems += migration_problems
         source_binding["preregistration_verification"] = {
             "passed": prereg_check["passed"],
             "problems": prereg_check["problems"][:10]}
         source_binding["cache_verification"] = {
             "passed": cache_check["passed"],
             "problems": cache_check["problems"][:10]}
+        source_binding["cache_migration_problems"] = migration_problems
         a1_assets_path = root / str((prereg.get("assets") or {})
                                     .get("a1_assets_path", ""))
         if a1_assets_path.is_file():
@@ -456,7 +505,7 @@ def run_r_admission(*, out_dir: Path, budget: StageBudget,
                     problems.append(f"r_window_derived_sha_mismatch:{w.demo}")
             else:
                 problems.append(f"r_window_derived_missing:{w.demo}")
-            sched_path = cache_dir / "schedules" / w1.schedule_cache_filename(
+            sched_path = cache_root / "schedules" / w1.schedule_cache_filename(
                 w.demo, sched.get("key") or "")
             if sched_path.is_file():
                 rec["schedule_members"] = npz_members(sched_path)
@@ -476,8 +525,16 @@ def run_r_admission(*, out_dir: Path, budget: StageBudget,
             "admission.motion / T / full_windows) -- never fit, collision "
             "or contact results, never val/test demos.")
         package["source_binding"] = source_binding
+        package["cache_binding"] = {
+            "path": path_for_record(cache_root),
+            "cache_identity": _file_record(cache_identity_path),
+            "is_source_registered_cache": cache_root == source_cache,
+            "condition_code_sha256": cache_identity.get("condition_code_sha256"),
+            "schedule_key_version": cache_identity.get("schedule_cache_key_version"),
+            "migration_check": cache_identity.get("migration_check"),
+            "migration_problems": migration_problems}
         rs_rec = cache_identity.get("root_stats") or {}
-        rs_path = cache_dir / "root_stats.npz"
+        rs_path = cache_root / "root_stats.npz"
         if rs_path.is_file():
             package["root_stats"] = _npz_header_record(rs_path)
             if sha256_file(rs_path) != rs_rec.get("file_sha256"):
@@ -641,22 +698,39 @@ def admission_recheck_problems(admission: dict, *, project_root: Path | None = N
         omomo_pt_dir)
     problems: list[str] = []
     binding = package.get("source_binding") or {}
-    for key in ("cache_identity", "preregistration", "training_manifest",
-                "a1_frozen_lists", "a1_assets"):
+    for key in ("registered_cache_identity", "preregistration",
+                "training_manifest", "a1_frozen_lists", "a1_assets"):
         rec = binding.get(key)
         if not isinstance(rec, dict) or not rec.get("path"):
             continue
         p = root / str(rec["path"])
         if not p.is_file() or sha256_file(p) != rec.get("sha256"):
             problems.append(f"admission_source_drifted:{key}")
-    cache_dir = source_root / "cache/attempt_001"
-    cache_identity_path = cache_dir / "cache_identity.json"
+    # the prereg/manifest chain starts at the SOURCE's registered cache
+    # identity; the BOUND cache (package.cache_binding) is what is
+    # re-verified and consumed for schedules/root_stats (plan §41)
+    source_cache = source_root / "cache/attempt_001"
+    source_identity_path = source_cache / "cache_identity.json"
+    source_chain_identity = json.loads(source_identity_path.read_text()) \
+        if source_identity_path.is_file() else {}
+    cache_rec = package.get("cache_binding") or {}
+    cache_root = Path(cache_rec.get("path")
+                      or source_root / "cache/attempt_001")
+    if not (root / str(cache_rec.get("path") or "")).is_dir() \
+            and cache_rec.get("path"):
+        cache_root = root / str(cache_rec["path"])
+    cache_identity_path = cache_root / "cache_identity.json"
     cache_identity = json.loads(cache_identity_path.read_text()) \
         if cache_identity_path.is_file() else {}
-    prereg_path = root / str((cache_identity.get("preregistration") or {})
+    cache_id_rec = cache_rec.get("cache_identity") or {}
+    if cache_id_rec.get("sha256"):
+        if not cache_identity_path.is_file() or \
+                sha256_file(cache_identity_path) != cache_id_rec["sha256"]:
+            problems.append("admission_cache_identity_drifted")
+    prereg_path = root / str((source_chain_identity.get("preregistration") or {})
                              .get("path", ""))
-    manifest_path = root / str((cache_identity.get("training_manifest") or {})
-                               .get("path", ""))
+    manifest_path = root / str((source_chain_identity.get("training_manifest")
+                                or {}).get("path", ""))
     prereg = json.loads(prereg_path.read_text()) if prereg_path.is_file() else {}
     manifest = json.loads(manifest_path.read_text()) \
         if manifest_path.is_file() else {}
@@ -665,10 +739,14 @@ def admission_recheck_problems(admission: dict, *, project_root: Path | None = N
     if not prereg_check["passed"]:
         problems.append(f"admission_preregistration_drifted:"
                         f"{prereg_check['problems'][:4]}")
-    cache_check = w1.verify_cache_contents(cache_dir, manifest, prereg, root)
+    cache_check = w1.verify_cache_contents(cache_root, manifest, prereg, root)
     if not cache_check["passed"]:
         problems.append(
             f"admission_cache_drifted:{cache_check['problems'][:4]}")
+    if cache_rec.get("path") and cache_root.resolve() != source_cache.resolve():
+        problems += [f"admission_cache_migration:{p}" for p in
+                     _migration_record_problems(root, source_cache,
+                                                cache_root, cache_identity)]
     rows = {r.get("demo"): r for r in manifest.get("rows", [])
             if isinstance(r, dict)}
     schedule_rows = {rec.get("demo"): rec
@@ -678,7 +756,7 @@ def admission_recheck_problems(admission: dict, *, project_root: Path | None = N
         row = rows.get(demo) or {}
         inputs = row.get("inputs") or {}
         derived = row.get("derived") or {}
-        sched_path = cache_dir / "schedules" / w1.schedule_cache_filename(
+        sched_path = cache_root / "schedules" / w1.schedule_cache_filename(
             demo, (schedule_rows.get(demo) or {}).get("key") or "")
         for label, p, want in (
                 ("teacher_npz", Path(npz_dir) / f"{demo}_original.npz",
@@ -807,6 +885,18 @@ class FitApparatus:
                 "counters": dict(self.counters)}
 
 
+def _bound_cache_root(root: Path, package: dict,
+                      source_root: Path | None) -> Path:
+    """The cache attempt dir the admission package froze (plan §41)."""
+    rec = package.get("cache_binding") or {}
+    p = rec.get("path")
+    if not p:
+        src = Path(source_root or root / SOURCE_ROOT_REL)
+        return src / "cache/attempt_001"
+    c = Path(p)
+    return c if c.is_absolute() else root / c
+
+
 def materialize_fit_apparatus(*, admission: dict, budget: StageBudget,
                               device: str = "cuda", fixture: bool = False,
                               fk=None, static_frame=None,
@@ -828,10 +918,9 @@ def materialize_fit_apparatus(*, admission: dict, budget: StageBudget,
         runtime_probe=runtime_probe)
     if problems:
         raise FitDiagnosticError(f"materialize_admission_drifted:{problems[:6]}")
-    source_root, _, _ = _registered_dirs(root, source_root, teacher_npz_dir,
-                                         omomo_pt_dir)
-    stats = _read_root_stats(source_root / "cache/attempt_001/root_stats.npz",
-                             budget, counters)
+    cache_root = _bound_cache_root(root, admission.get("package") or {},
+                                   source_root)
+    stats = _read_root_stats(cache_root / "root_stats.npz", budget, counters)
     budget.check("materialize_joint_range")
     if fixture:
         joint_range = np.stack([-2.0 + 0.02 * np.arange(J_JOINTS),
@@ -1004,33 +1093,10 @@ def _window_item(clip, tokenizer: StateTokenizer, start: int, fi: int) -> dict:
     }
 
 
-def materialize_real_world(*, admission: dict, stage: str,
-                           budget: StageBudget, device: str = "cuda",
-                           fixture: bool = False, fk=None,
-                           static_frame=None,
-                           project_root: Path | None = None,
-                           source_root: Path | None = None,
-                           teacher_npz_dir: Path | None = None,
-                           omomo_pt_dir: Path | None = None,
-                           d1_probe_inputs: Path | None = None,
-                           ) -> RealFitWorld:
-    """Materialize the registered windows inside the CURRENT billed window.
-
-    §3.2: the admission package is re-verified against disk first; the
-    apparatus and every registered-window clip are guarded units of THIS
-    stage.  A failure raises; the stage records it as incomplete."""
-    materialize_for_fit({"stage": stage}, budget)
-    if not fixture and (fk is not None or static_frame is not None):
-        raise FitDiagnosticError("real_world_production_fk_injection_forbidden")
-    root = Path(project_root or PROJECT_ROOT)
-    budget.check("materialize_entry")
-    apparatus = materialize_fit_apparatus(
-        admission=admission, budget=budget, device=device, fixture=fixture,
-        fk=fk, static_frame=static_frame, project_root=root,
-        source_root=source_root, teacher_npz_dir=teacher_npz_dir,
-        omomo_pt_dir=omomo_pt_dir)
-    counters = apparatus.counters
-    package = admission["package"]
+def registrations_from_package(package: dict) -> tuple[FitRegistration,
+                                                        FitRegistration]:
+    """The frozen D1/D6 registrations derived from the admission package
+    (available before any world materialization, §7.4 item 3)."""
     windows = [WindowKey(rec["demo"], rec["start"], rec["end"])
                for rec in package["windows"]]
     d6_registration = FitRegistration(
@@ -1040,13 +1106,48 @@ def materialize_real_world(*, admission: dict, stage: str,
         stage="D1", windows=(d6_registration.windows[0],), splits=("train",))
     if len(d6_registration.windows) != 6:
         raise FitDiagnosticError("materialize_window_count_invalid")
+    return d1_registration, d6_registration
+
+
+def materialize_real_world(*, admission: dict, stage: str,
+                           budget: StageBudget, device: str = "cuda",
+                           fixture: bool = False, fk=None,
+                           static_frame=None,
+                           project_root: Path | None = None,
+                           source_root: Path | None = None,
+                           teacher_npz_dir: Path | None = None,
+                           omomo_pt_dir: Path | None = None,
+                           d1_probe_inputs: Path | None = None,
+                           apparatus: FitApparatus | None = None,
+                           ) -> RealFitWorld:
+    """Materialize the registered windows inside the CURRENT billed window.
+
+    §3.2: the admission package is re-verified against disk first; every
+    registered-window clip is a guarded unit of THIS stage.  ``apparatus``
+    may be supplied when the caller already materialized it in the SAME
+    billed window (e.g. the D6 handoff check, §7.4 item 3) -- it is then
+    reused instead of rebuilt.  A failure raises; the stage records it as
+    incomplete."""
+    materialize_for_fit({"stage": stage}, budget)
+    if not fixture and (fk is not None or static_frame is not None):
+        raise FitDiagnosticError("real_world_production_fk_injection_forbidden")
+    root = Path(project_root or PROJECT_ROOT)
+    budget.check("materialize_entry")
+    if apparatus is None:
+        apparatus = materialize_fit_apparatus(
+            admission=admission, budget=budget, device=device, fixture=fixture,
+            fk=fk, static_frame=static_frame, project_root=root,
+            source_root=source_root, teacher_npz_dir=teacher_npz_dir,
+            omomo_pt_dir=omomo_pt_dir)
+    counters = apparatus.counters
+    package = admission["package"]
+    d1_registration, d6_registration = registrations_from_package(package)
     want = 1 if stage == "D1" else 6
     stage_windows = d6_registration.windows[:want]
 
-    source_root, _, _ = _registered_dirs(root, source_root, teacher_npz_dir,
-                                         omomo_pt_dir)
-    cache_dir = source_root / "cache/attempt_001"
-    cache_identity = json.loads((cache_dir / "cache_identity.json").read_text())
+    cache_root = _bound_cache_root(root, package, source_root)
+    cache_identity = json.loads(
+        (cache_root / "cache_identity.json").read_text())
     manifest_path = root / str((cache_identity.get("training_manifest") or {})
                                .get("path", ""))
     manifest = json.loads(manifest_path.read_text())
@@ -1066,7 +1167,7 @@ def materialize_real_world(*, admission: dict, stage: str,
             counters.get("registered_window_reads", 0) + 1
         row = rows.get(w.demo) or {}
         inputs = row.get("inputs") or {}
-        cache_file = cache_dir / "schedules" / w1.schedule_cache_filename(
+        cache_file = cache_root / "schedules" / w1.schedule_cache_filename(
             w.demo, w1.schedule_cache_key(inputs.get("npz_sha256", ""),
                                           inputs.get("pt_sha256", ""),
                                           assets_sha or "", code_sha))
@@ -1075,7 +1176,7 @@ def materialize_real_world(*, admission: dict, stage: str,
                 f"materialize_schedule_cache_missing:{w.demo}:{cache_file.name}")
         # load_w1_derived_clip takes the SCHEDULES dir (the keyed-cache
         # layout used by every W1 consumer)
-        clip = w1.load_w1_derived_clip(row, cache_dir / "schedules", root,
+        clip = w1.load_w1_derived_clip(row, cache_root / "schedules", root,
                                        assets_sha or "", code_sha)
         if clip.validation.get("drop") or clip.validation.get("clamped"):
             raise FitDiagnosticError(
@@ -1279,31 +1380,54 @@ def run_real_chain(*, admission_path: Path, authorization_path: Path,
             "materialization_counters": d1_world.facts["counters"]}
         d6_plan = d6_world = d6_identity = None
         d6_dir = run_root / "d6"
-        if (facts["d1"]["local_complete_evidence"] is True
-                and facts["d1"]["local_mean_fit_passed"] is True
-                and facts["d1"]["return_coverage"] is True):
-            # D6's OWN window starts here: the handoff resolution (and the
-            # verification apparatus it needs) is D6-billed; the training
-            # materialization happens only after handoff_ready (§7.4 item 3).
+        d1_registration = d1_world.registration_for("D1")
+        d6_ran = False
+        facts["authorized_includes"] = list(auth["includes"])
+        if facts["d1"]["local_complete_evidence"] is not True \
+                or facts["d1"]["return_coverage"] is not True:
+            facts["d1_handoff"] = {"handoff_ready": None,
+                                   "skipped_reason": "d1_incomplete"}
+            facts["d6"] = {"skipped_reason": "d1_incomplete"}
+        elif facts["d1"]["local_mean_fit_passed"] is not True:
+            # §7.2: a complete negative local result is never retried with
+            # D6; the local fact goes to F for final verification.
+            facts["d1_handoff"] = {"handoff_ready": False,
+                                   "skipped_reason":
+                                       "d1_mean_fit_gate_not_passed"}
+            facts["d6"] = {"skipped_reason": "d1_mean_fit_gate_not_passed"}
+        elif "D6" not in auth["includes"]:
+            facts["d1_handoff"] = {"handoff_ready": False,
+                                   "skipped_reason": "d6_not_authorized"}
+            facts["d6"] = {"skipped_reason": "d6_not_authorized"}
+        else:
+            # D6's OWN window starts here.  §7.4 item 3: the handoff
+            # re-verification (and the verification apparatus it requires)
+            # is D6-billed and precedes ANY training materialization.
             budget_d6 = budget_for_stage("D6", t0=clock(), clock=clock)
             d6_plan = FitPlan("D6")
-            d6_world = materialize_real_world(
-                admission=admission, stage="D6", budget=budget_d6,
-                device=device, fixture=fixture, fk=fk,
-                static_frame=static_frame, project_root=root,
-                source_root=source_root, teacher_npz_dir=teacher_npz_dir,
-                omomo_pt_dir=omomo_pt_dir,
-                d1_probe_inputs=d1_dir / "probe_inputs.npz")
-            budget_d6.check("d6_world_ready")
+            d6_apparatus = materialize_fit_apparatus(
+                admission=admission, budget=budget_d6, device=device,
+                fixture=fixture, fk=fk, static_frame=static_frame,
+                project_root=root, source_root=source_root,
+                teacher_npz_dir=teacher_npz_dir, omomo_pt_dir=omomo_pt_dir)
+            budget_d6.check("d6_apparatus_ready")
             handoff = resolve_handoff(
-                d1_dir, d1_plan, d6_world.decoder,
-                d6_world.registration_for("D1"), auth, budget_d6,
-                expected_identity=d1_identity,
-                production_decoder=d6_world.loss_fn)
+                d1_dir, d1_plan, d6_apparatus.decoder, d1_registration, auth,
+                budget_d6, expected_identity=d1_identity,
+                production_decoder=d6_apparatus.loss_fn)
             facts["d1_handoff"] = {"handoff_ready": handoff["handoff_ready"],
                                    "problems": handoff["problems"][:5]}
             if handoff["handoff_ready"]:
                 budget_d6.check("d6_handoff_resolved")
+                d6_world = materialize_real_world(
+                    admission=admission, stage="D6", budget=budget_d6,
+                    device=device, fixture=fixture, fk=fk,
+                    static_frame=static_frame, project_root=root,
+                    source_root=source_root, teacher_npz_dir=teacher_npz_dir,
+                    omomo_pt_dir=omomo_pt_dir,
+                    d1_probe_inputs=d1_dir / "probe_inputs.npz",
+                    apparatus=d6_apparatus)
+                budget_d6.check("d6_world_ready")
                 d6_identity = _stage_identity(admission, d6_plan,
                                               d6_world.registration_for("D6"),
                                               d6_dir)
@@ -1339,25 +1463,22 @@ def run_real_chain(*, admission_path: Path, authorization_path: Path,
                     "stage_returned_elapsed_s": d6_returned,
                     "call_matrix_problems": d6_summary["call_matrix"]["problems"],
                     "materialization_counters": d6_world.facts["counters"]}
+                d6_ran = True
             else:
                 facts["d6"] = {"skipped_reason": "handoff_not_ready",
                                "handoff_problems": handoff["problems"][:6]}
-        else:
-            facts["d1_handoff"] = {
-                "handoff_ready": False,
-                "skipped_reason": "d1_incomplete_or_mean_fit_gate_not_passed",
-                "note": "D6 is never appended as a retry (plan §7.2)"}
+        facts["d6_ran"] = d6_ran
         # F verifies whatever completed locally; a complete negative result
         # is verifiable too (plan §7.3).
         f_specs = []
         if facts["d1"].get("local_complete_evidence") is True:
             f_specs.append({"stage_dir": d1_dir, "plan": d1_plan,
-                            "registration": d1_world.registration_for("D1"),
+                            "registration": d1_registration,
                             "decoder": d1_world.decoder,
                             "loss_fn": d1_world.loss_fn,
                             "identity": d1_identity})
-        if (facts.get("d6") or {}).get("local_complete_evidence") is True \
-                and facts["d6"].get("return_coverage") is True:
+        if d6_ran and (facts.get("d6") or {}).get("local_complete_evidence") \
+                is True and facts["d6"].get("return_coverage") is True:
             f_specs.append({"stage_dir": d6_dir, "plan": d6_plan,
                             "registration": d6_world.registration_for("D6"),
                             "decoder": d6_world.decoder,

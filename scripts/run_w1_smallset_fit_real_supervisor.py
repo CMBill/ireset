@@ -225,7 +225,6 @@ def _stage_report_matches(stage: str, report: dict, summary: dict) -> bool:
                 and isinstance(mean, bool)
                 and report.get("local_conclusion") == ("complete_fit" if mean
                                                        else "fit_insufficient")
-                and (stage != "d1" or mean is True)
                 and report.get("final_verification_status") == "pending_F"
                 and report.get("problems") == []
                 and report.get("failure", "missing") is None
@@ -240,6 +239,8 @@ def _stage_report_matches(stage: str, report: dict, summary: dict) -> bool:
 
     mean = report.get("mean_fit_passed")
     stages, copies = report.get("stages"), facts.get("stages")
+    d6_ran = summary.get("d6_ran") is True
+    expected = {"D1", "D6"} if d6_ran else {"D1"}
     if (report.get("schema") != "w1_smallset_fit_f_report_v1"
             or report.get("complete_evidence") is not True
             or report.get("replay_passed") is not True or not isinstance(mean, bool)
@@ -250,7 +251,8 @@ def _stage_report_matches(stage: str, report: dict, summary: dict) -> bool:
                                     ("complete_evidence", "replay_passed",
                                      "mean_fit_passed", "verdict"))
             or not isinstance(stages, list) or not isinstance(copies, list)
-            or not stages or len(stages) != len(copies)):
+            or not stages or len(stages) != len(copies)
+            or {s.get("stage") for s in stages if isinstance(s, dict)} != expected):
         return False
     for entry, copy in zip(stages, copies):
         if (not isinstance(entry, dict) or not isinstance(copy, dict)
@@ -299,23 +301,43 @@ def _candidate_problems(doc: dict, launch_id: str, t0: float,
     d1, d6, handoff, f = (doc.get(k) for k in ("d1", "d6", "d1_handoff", "f"))
     if not all(isinstance(v, dict) for v in (d1, d6, handoff, f)):
         return problems + ["stage_facts_invalid"]
+    if not isinstance(doc.get("authorized_includes"), list) or \
+            not doc.get("authorized_includes"):
+        return problems + ["authorized_includes_missing"]
+    if doc.get("d6_ran") not in (True, False):
+        return problems + ["d6_ran_flag_missing"]
+    d6_ran = doc.get("d6_ran") is True
     if (d1.get("local_complete_evidence") is not True
             or d1.get("return_coverage") is not True
             or d1.get("call_matrix_problems") != []
-            or handoff.get("handoff_ready") is not True
-            or handoff.get("problems") != []
-            or d6.get("local_complete_evidence") is not True
-            or d6.get("return_coverage") is not True
-            or d6.get("call_matrix_problems") != []
             or f.get("complete_evidence") is not True
             or f.get("replay_passed") is not True
             or f.get("return_coverage") is not True):
         problems.append("stage_facts_incomplete")
+    # D6 runs only when D1's mean gate passed, the handoff resolved and the
+    # authorization includes D6 (plan §7.2/§7.4 item 3); any other D6 state
+    # must be one of the recorded skip reasons.
+    if d6_ran:
+        if (d1.get("local_mean_fit_passed") is not True
+                or handoff.get("handoff_ready") is not True
+                or handoff.get("problems") != []
+                or d6.get("local_complete_evidence") is not True
+                or d6.get("return_coverage") is not True
+                or d6.get("call_matrix_problems") != []):
+            problems.append("stage_facts_incomplete")
+    elif d6.get("skipped_reason") not in (
+            "d1_incomplete", "d1_mean_fit_gate_not_passed",
+            "d6_not_authorized", "handoff_not_ready"):
+        problems.append("d6_state_invalid")
+    if not d6_ran and d6.get("skipped_reason") == "d1_mean_fit_gate_not_passed" \
+            and d1.get("local_mean_fit_passed") is not False:
+        problems.append("d6_state_invalid")
     stages = f.get("stages")
-    if (not isinstance(stages, list) or len(stages) != 2
+    expected = {"D1", "D6"} if d6_ran else {"D1"}
+    if (not isinstance(stages, list) or len(stages) != (2 if d6_ran else 1)
             or any(not isinstance(s, dict) for s in stages)
             or any(not isinstance(s.get("stage"), str) for s in stages)
-            or {s.get("stage") for s in stages} != {"D1", "D6"}
+            or {s.get("stage") for s in stages} != expected
             or any(s.get("replay_passed") is not True for s in stages)):
         problems.append("fresh_replay_incomplete")
     return problems
@@ -423,9 +445,12 @@ def run(args, *, t0: float = _OUTER_T0) -> int:
         problems.append("actual_wait_not_covered")
     stage_artifacts = {}
     if args.mode == "chain":
-        for subdir, filename in (("d1", "stage_report.json"),
-                                 ("d6", "stage_report.json"),
-                                 ("f", "f_report.json")):
+        d6_ran = summary.get("d6_ran") is True
+        stage_dirs = [("d1", "stage_report.json"),
+                      ("f", "f_report.json")]
+        if d6_ran:
+            stage_dirs.insert(1, ("d6", "stage_report.json"))
+        for subdir, filename in stage_dirs:
             try:
                 stage_problems, stage_doc, stage_proof, stage_binding = \
                     _proof_problems(out_dir / subdir / filename,
