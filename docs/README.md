@@ -1,9 +1,10 @@
 # 文档索引
 
-最后更新：2026-11-16。**数值缺口有限收口与受控拟合诊断：N0/N1 已完成；I 阶段当前实现的完整纯合成验收 `attempt_019` 通过，含 D1→D6→F、115 项反例及实际返回成本覆盖。R/真实 D1/D6/F 未实施、未授权、未运行。** 已结束阶段集中转入历史导航，冻结原文及实验产物保持原路径、原字节。
+最后更新：2026-11-17。**数值缺口有限收口与受控拟合诊断：N0/N1 与 I 合成验收已完成，缓存迁移及 R 准入通过。一次性真实链 D1 完整但拟合不足、D6 合法跳过、F 重放通过；该次外层因链预算字段缺失裁决 incomplete。预算序列化修复见方案 §43，后续真实链须重新冻结 R 并另获一次性授权。** 已结束阶段集中转入历史导航，冻结原文及实验产物保持原路径、原字节。
 
 ## 当前状态
 
+- **2026-11-17 真实拟合负结果与外层预算修复**：`derived/experiments/omniretarget_first/attempt_001` 的 D1 1000 步/101 probes 完整，旋转与 FK 平均门未过，F 逐位重放后为 `fit_insufficient`；监督器以 `budget_binding_mismatch` 裁决 incomplete。修复只补顶层完整预算，已消费阶段及旧工件保持原样，见验证记录 §32–§33。
 - **2026-11-16 I 当前实现合成验收通过**：`attempt_019` 的微型 D1→D6→F 与 **115/115** 反例通过；监督器实际返回后的外层采样文件写盘 **1393.687296s ≤ 登记 1396.483622s ≤ 3300s**（以更早的观察器 t0 计）。
 - **2026-11-16 撤回成本复审修复**：`77938bf` 对撤回和失败成本证明写盘做有界重算；原封口成本单列，尚未获外层返回证明时不冒称覆盖已证明，详见验证记录 §27。
 - **2026-11-16 I 阶段审阅修复**：阶段名、阶段报告正文与哈希绑定、stdout flush 计费问题分别修复；`attempt_018` 的 D1→D6→F 数值链和 **115/115** 反例事实保留，但其 **1454.429s** 观察早于最终 stdout flush，严格完整验收不能由该次证明。
@@ -19,7 +20,7 @@
 
 | 文档 | 用途与状态 |
 | --- | --- |
-| [I 阶段小集拟合诊断器验证记录](verification/omniretarget_w1_smallset_fit_diagnostic.md) | **合成验收通过（§28）＋R 准入已实施（§29）**：`attempt_019` 的 D1→D6→F、115 项反例和外层实际返回成本覆盖已核对；R 元数据准入已实现并运行，真实准入 fail-closed 于登记缓存的条件代码键绑定（`r_admission/attempt_002`，处理选项待裁决）；真实 D1/D6/F 未授权 |
+| [I 阶段小集拟合诊断器验证记录](verification/omniretarget_w1_smallset_fit_diagnostic.md) | **合成验收通过（§28）、缓存迁移与 R 通过（§31）、一次性真实链及预算修复（§32–§33）**：D1/F 为 `fit_insufficient`，D6 合法跳过；旧链外层 incomplete 保留，后续真实执行须新冻结与明确授权 |
 | [N1 最小合成验证与有限数值收口说明](verification/omniretarget_w1_n1_synthetic_closure.md) | **N1已收口（2026-11-07，五轮复阅修订后 attempt_006）**：C1 audited vs 独立节点图逐位对照、C5 三例门失败全区间内、C6 八偏差全经N0检测器检出；六类47用例全过，go=no_go→go_for_conditional_fit_diagnostics_review。封口=登记成本同盘覆盖+写后核验；返回核验先读盘后采样、return_observation.json SHA绑定证明且所有退出路径核验；撤回走覆盖成本循环 |
 | [N0 坐标级数值缺口分析记录](verification/omniretarget_w1_n0_coordinate_analysis.md) | **N0已收口（2026-11-07，五轮复阅修订后 attempt_006）**：uint32存在性/单侧可辨识位（4行）；same_input公式门+delta_measured一致性；分侧写界；roster精确集合；来源闭链（journal逐级SHA+registration三阶段严格校验+F重放双锚）；旧629全三类交付（381/223/25）；封口=登记成本覆盖封口与返回+终态时序；返回核验先读盘后采样+SHA绑定观察文件+撤回覆盖成本循环。结论=350 precision_limited+189 cross_path_sensitive+0 implementation_issue_candidate |
 | [数值缺口有限收口与受控拟合诊断方案](plans/omniretarget_w1_numerics_closure_fit_diagnostic_plan.md) | **v0.4+§14–§41修订与运行记录**：N0/N1、I 合成验收与 R 准入实现已完成；§41 缓存迁移与绑定修订（双来源绑定+迁移证明硬门+重建范围/预算冻结，待授权执行）；真实拟合须新冻结及明确授权 |

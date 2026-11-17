@@ -561,3 +561,13 @@
 阶段事实和内部成本均成立，但**严格外层验收未闭合**：`acceptance_verdict.json` 为 `incomplete`，唯一问题 `budget_binding_mismatch`。原因是 `run_real_chain()` 把完整链预算写在 `chain_budget`（`t0=108592.003335`、`wall_cap=6120s`、登记 `702.023437s`），却没有复制到监督器消费的顶层 `budget`；顶层只有 `measured_wall_s_at_summary`，所以监督器 `_proof_problems()` fail-closed。独立只读核对确认候选事实为空、D1/F 报告与证明 SHA 一致、worker 实际 wait `699.128939s`、进程内返回证明 `698.024949s` 均在 `702.023437s` 登记与 `6120s` 上限内；但由于监督器没有发出成功裁决和 `outer_stdout_observation.json`，不能将该 attempt 宣称为严格 `candidate_complete`。
 
 本次不改写任何封口/返回文件，不把合法的 `fit_insufficient` 转成通过，也不重跑已消费的 D1/D6/F。该结果证明当前真实一窗在冻结门下拟合不足；要得到严格成功的外层验收，需要修复链预算序列化后重新冻结 R/授权并另行获得新的一次性运行授权。
+
+## 33. 真实链顶层预算序列化修复（2026-11-17）
+
+按用户要求修复 §32 的 `budget_binding_mismatch`：`run_real_chain` 在成功和异常收口的公共路径中，从同一次 `StageBudget.facts()` 采样填入标准顶层 `budget`，`chain_budget` 保留为该次采样的兼容快照。封口器继续向顶层预算补 `measured_wall_s_at_summary`，监督器的起点/上限/覆盖成本/返回证明核验完全保持；不接受从旧 `chain_budget` 回退补齐不完整报告。
+
+新增 4 项回归：①实际 worker CLI→真实链编排→阶段及链封口→监督器贯通，数值阶段本体和物化器以合成替身执行完整 D1 负结果、合法跳过 D6、单阶段 F `fit_insufficient`；修复前重现 worker=0、监督器=3/`budget_binding_mismatch`，修复后监督器 `candidate_complete`，科学裁决仍为负结果；②删除预算 t0；③改错上限，两者均重签证明 SHA 后仍以唯一 `budget_binding_mismatch` 裁决 incomplete；④授权拒绝的异常路径也落完整预算、没有进入 D1。
+
+相关合并回归：`uv run --locked pytest -q tests/test_w1_smallset_fit_r_admission.py tests/test_w1_smallset_fit_diagnostic.py tests/test_w1_i_outer_return.py --tb=short` **113 passed（212.70s）**，其中 R/迁移/链模块 58 项、I 17 项、外层 38 项。日志：`derived/audit/w1_smallset_fit_diagnostic/budget_serialization_fix_20261117/regression.log`。未运行全项目套件或新的真实训练/FK/重放。
+
+本轮事前为旧真实 `attempt_001`、R `attempt_004`、已消费授权、新迁移缓存及 SOURCE 登记缓存建立 245 文件 SHA 清单（`budget_serialization_fix_20261117/protected_sha256_before.json`），相关工件只读保留。修复实现本地提交后执行一次 R 元数据重新冻结，授权草案另存且保持未授权；结果后续追加，不将旧链改判为严格完整验收，不恢复其执行权限。

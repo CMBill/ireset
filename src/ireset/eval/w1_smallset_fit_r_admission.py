@@ -1576,7 +1576,10 @@ def run_real_chain(*, admission_path: Path, authorization_path: Path,
         "cli_entry_perf_counter": time.perf_counter(),
         "supervisor_declared": False}
     facts["label_verdict"] = "pending_outer_return"
-    facts["chain_budget"] = chain_budget.facts()
+    # The seal and supervisor consume the top-level budget.  Keep the
+    # historical chain_budget snapshot from the SAME clock sample.
+    facts["budget"] = chain_budget.facts()
+    facts["chain_budget"] = dict(facts["budget"])
     outputs = write_acceptance_outputs(run_root, facts, chain_budget,
                                        withdraw=dict(CHAIN_WITHDRAW_ON_EXCEED))
     outputs["facts"] = facts

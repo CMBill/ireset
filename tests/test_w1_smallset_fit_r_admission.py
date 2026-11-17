@@ -1374,6 +1374,167 @@ def test_chain_candidate_semantics(tmp_path, mutation, expected):
     else:
         assert expected in problems
 
+@pytest.mark.parametrize("mutation", [None, "missing_t0", "wrong_cap"])
+def test_real_chain_serialized_budget_reaches_supervisor(
+        admission, fixture, tmp_path, monkeypatch, capsys, mutation):
+    """Exercise the actual chain/worker/seal/supervisor boundary on a
+    complete negative D1 result.  Only the numerical stage bodies and
+    materializers are stubs; no summary or budget is assembled by the test.
+    Re-signed budget drift must still fail at the supervisor's proof gate.
+    """
+    supervisor = _load_supervisor()
+    ticks = {"now": 101.0}
+    clock = lambda: ticks["now"]
+    monkeypatch.setattr(supervisor.time, "perf_counter", clock)
+    calls = []
+    registration = radm.FitRegistration(
+        "D1", (radm.WindowKey(PILOT6[0], 0, 60),), ("train",))
+    world = SimpleNamespace(
+        facts={"counters": {}}, loss_fn=None, decoder=None,
+        registration_for=lambda stage: registration,
+        view_for=lambda stage: {"registration": registration,
+                                "probe_batch": {},
+                                "ds": SimpleNamespace(
+                                    window_keys=registration.windows)},
+        build_trainer=lambda *args, **kwargs: SimpleNamespace())
+
+    def materialize(**kwargs):
+        assert kwargs["stage"] == "D1"
+        calls.append("D1_materialize")
+        return world
+
+    class Driver:
+        def __init__(self, **kwargs):
+            assert kwargs["plan"].stage == "D1"
+            self.budget = kwargs["budget"]
+            self.identity = kwargs["identity"]
+            kwargs["stage_dir"].mkdir(parents=True)
+
+        def run(self):
+            calls.append("D1_fit")
+            ticks["now"] += 1.0
+            return {"schema": "w1_smallset_fit_diagnostic_v1", "stage": "D1",
+                    "local_complete_evidence": True,
+                    "local_mean_fit_passed": False,
+                    "local_conclusion": "fit_insufficient",
+                    "final_verification_status": "pending_F",
+                    "call_matrix": {"expected": {}, "actual": {},
+                                    "problems": []},
+                    "identity": self.identity, "problems": [], "failure": None,
+                    "budget": self.budget.facts()}
+
+    def verify_f(**kwargs):
+        assert [s["plan"].stage for s in kwargs["stage_specs"]] == ["D1"]
+        calls.append("F_replay")
+        ticks["now"] += 1.0
+        budget = kwargs["budget"]
+        path = kwargs["out_dir"] / "f_report.json"
+        path.parent.mkdir(parents=True)
+        doc = _chain_f_report(["D1"], {"D1": False})
+        doc["budget"] = budget.facts()
+        radm._write_summary_sealed(path, doc, budget, clock=clock)
+        coverage = radm.verify_return_coverage(path, budget, clock=clock)
+        return {"summary_doc": coverage["final_doc"]}
+
+    def refuse_handoff(*args, **kwargs):
+        pytest.fail("D6 must not start after a complete negative D1 result")
+
+    monkeypatch.setattr(radm, "admission_recheck_problems",
+                        lambda *args, **kwargs: [])
+    monkeypatch.setattr(radm, "materialize_real_world", materialize)
+    monkeypatch.setattr(radm, "materialize_fit_apparatus", lambda **kwargs:
+                        SimpleNamespace(facts=lambda: {"counters": {}}))
+    monkeypatch.setattr(radm, "FitDriver", Driver)
+    monkeypatch.setattr(radm, "run_f_verification", verify_f)
+    monkeypatch.setattr(radm, "resolve_handoff", refuse_handoff)
+    real_chain = radm.run_real_chain
+
+    def run_chain(**kwargs):
+        return real_chain(**kwargs, clock=clock, project_root=fixture["proj"])
+
+    monkeypatch.setattr(radm, "run_real_chain", run_chain)
+    authorization = _authorize(fixture, admission["path"], tmp_path)
+    worker_results = []
+
+    class Child:
+        pid = 1234
+
+        def __init__(self, command, **kwargs):
+            assert command[:4] == ["uv", "run", "--locked", "python"]
+            spec = importlib.util.spec_from_file_location(
+                "w1_budget_serialization_worker", supervisor.WORKER)
+            worker = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(worker)
+            with monkeypatch.context() as cli_patch:
+                cli_patch.setattr(sys, "argv", command[4:])
+                worker_results.append(worker.main())
+            if mutation is not None:
+                out = Path(command[command.index("--output-dir") + 1])
+                summary_path = out / "acceptance_summary.json"
+                doc = json.loads(summary_path.read_text())
+                if mutation == "missing_t0":
+                    del doc["budget"]["t0_perf_counter"]
+                else:
+                    doc["budget"]["wall_cap_s"] += 1.0
+                summary_path.write_text(json.dumps(doc))
+                proof_path = out / "return_observation.json"
+                proof = json.loads(proof_path.read_text())
+                proof["summary_sha256"] = radm.sha256_file(summary_path)
+                proof_path.write_text(json.dumps(proof))
+
+        def wait(self, timeout=None):
+            ticks["now"] += 0.125
+            return worker_results[-1]
+
+    monkeypatch.setattr(supervisor.subprocess, "Popen", Child)
+    args = SimpleNamespace(
+        mode="chain", output_root=tmp_path / "chain_runs",
+        wall_cap_s=6120.0, reserve_s=120.0,
+        admission=str(admission["path"]), authorization=str(authorization),
+        impl_sha=None, fixture=True, cache_root=None)
+    rc = supervisor.run(args, t0=100.0)
+    out = Path(args.output_root) / "attempt_001"
+    doc = json.loads((out / "acceptance_summary.json").read_text())
+    verdict = json.loads((out / "acceptance_verdict.json").read_text())
+    assert calls == ["D1_materialize", "D1_fit", "F_replay"]
+    assert worker_results == [0]
+    assert doc["d6"] == {"skipped_reason": "d1_mean_fit_gate_not_passed"}
+    assert not (out / "d6").exists()
+    assert doc["f"]["verdict"] == "fit_insufficient"
+    if mutation is None:
+        assert rc == 0 and verdict["verdict"] == "candidate_complete"
+        assert verdict["problems"] == []
+        budget = doc["budget"]
+        assert budget["t0_perf_counter"] == 100.0
+        assert budget["wall_cap_s"] == 6120.0
+        assert budget["reserve_s"] == 60.0
+        assert budget["measured_wall_s_at_summary"] == \
+            doc["seal"]["measured_wall_s_at_summary"]
+        assert {k: budget[k] for k in doc["chain_budget"]} == doc["chain_budget"]
+        assert (out / "outer_stdout_observation.json").is_file()
+    else:
+        assert rc == 3 and verdict["verdict"] == "incomplete"
+        assert verdict["problems"] == ["budget_binding_mismatch"]
+
+
+def test_refused_real_chain_still_serializes_complete_budget(
+        admission, tmp_path):
+    """A refusal is costed and sealed without entering any numerical stage."""
+    authorization = tmp_path / "unauthorized.json"
+    authorization.write_text(json.dumps(
+        {"schema": radm.AUTHORIZATION_SCHEMA, "authorized": False}))
+    result = radm.run_real_chain(
+        admission_path=admission["path"], authorization_path=authorization,
+        run_root=tmp_path / "refused", chain_t0=100.0, clock=lambda: 101.0,
+        device="cpu", fixture=True)
+    doc = result["summary_doc"]
+    assert any("authorization_not_authorized" in p for p in doc["problems"])
+    assert "d1" not in doc
+    assert doc["budget"]["t0_perf_counter"] == doc["seal"]["t0_perf_counter"]
+    assert doc["budget"]["wall_cap_s"] == doc["seal"]["wall_cap_s"] == 6120.0
+    assert doc["budget"]["budget_exceeded"] is False
+
+
 _supervisor_spec = importlib.util.spec_from_file_location(
     "w1_real_fit_supervisor",
     ROOT / "scripts/run_w1_smallset_fit_real_supervisor.py")

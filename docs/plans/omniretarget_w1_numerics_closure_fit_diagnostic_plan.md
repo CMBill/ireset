@@ -549,3 +549,11 @@ R 权威运行 `r_admission/attempt_002`（§40）确认登记缓存对当前代
 用户批准 `authorization_draft/attempt_001` 后，授权固定 `plan_sha256=2fda3476…`（方案版本提交 `84a1b06`）；`f9b101f` 仅追加执行记录，不改变该方案身份。监督器按 `D1 1800s → 条件 D6 3600s → F 600s` 各执行一次，失败不重试。真实结果和严格外层裁决见验证记录 §32：D1 完整但平均门未通过，D6 按 §7.2 合法跳过，F 完成逐位重放并给出 `fit_insufficient`。
 
 本次阶段内部证据和实际返回时间均在预算内，但链摘要顶层 `budget` 漏写 `StageBudget.facts()`，监督器因此以 `budget_binding_mismatch` fail-closed，未发布 `candidate_complete`。该 attempt 不得被宣称为严格完整验收；封口、返回证明和成本文件保持原样。后续若修复预算序列化，必须重新冻结受影响的 R/实现身份并取得新的单次授权，不能复用本次已消费阶段。
+
+## 43. 真实链预算序列化修复与重新冻结（2026-11-17）
+
+`run_real_chain` 在封口前将同一次 `chain_budget.facts()` 采样写入顶层 `budget`，并保留 `chain_budget` 为该采样的兼容快照。封口器继续只向标准顶层预算写入覆盖成本；监督器仍严格核验 `budget`、`seal`、返回证明与启动 t0/上限，不回退消费旧的 `chain_budget`，不放宽任何预算或数值门。
+
+新增合成编排回归通过实际 worker、`run_real_chain`、阶段封口、链封口和监督器，数值阶段本体与物化器使用替身：完整 D1 负结果→合法跳过 D6→单阶段 F 负结果应发布 `candidate_complete`，科学裁决仍为 `fit_insufficient`；删除顶层预算 t0 或改错上限并重签证明后均应保持 `budget_binding_mismatch`/incomplete，授权拒绝分支也须完整登记链预算。
+
+修复通过相关回归后立即提交本地实现，再以相同迁移缓存执行一次元数据 R（120s/15s）重新绑定实现身份，并另存 `authorized=false`、六项 checklist 待确认的授权草案。新草案须引用 §42 的已消费运行及其原始裁决，明确不得复用、重签或补写旧阶段；新真实链仅在另获一次性明确授权后执行。此修复不改变已观察的一窗拟合不足、不重跑 D1/D6/F，也不恢复旧授权。
