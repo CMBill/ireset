@@ -6,6 +6,8 @@
 
 **当前状态注记（2026-11-17）：**R 元数据准入与真实诊断入口已实现并通过反例回归（§40）；真实 R 准入已在监督器下运行一次，因登记缓存的条件代码键绑定对当前树 fail-closed（唯一条件文件差异为 `largebox_static_frame` 的可选插桩参数，`f4724f7`），权威结果 `r_admission/attempt_002` `admission_passed=false`。用户裁决选 (b)：本节新增 §41 缓存迁移与绑定修订——双来源绑定、替代缓存迁移证明硬门、重建范围/预算/调用/停止规则冻结（待授权执行）；c102ae1 复阅修复 §7.4 第 3 项顺序与合法负结果误判。真实 D1/D6/F 仍未实施、未授权、未运行。
 
+**当前状态注记（2026-11-17，授权后）：**缓存重建与 `r_admission/attempt_004` 已通过，用户正式授权固定使用 `84a1b06` 方案版本的 `plan_sha256`；`f9b101f` 及后续文档只记录执行事实。一次真实 chain 已执行：D1 完整但平均门未通过，D6 按 §7.2 合法跳过，F 逐位重放后为 `fit_insufficient`。阶段内部证据在预算内，但外层监督器因顶层链预算字段缺失以 `budget_binding_mismatch` fail-closed，详见 §42；不自动重试，严格完整验收尚未闭合。
+
 ## 1. 目标与当前基线
 
 下一阶段从“重复全链审计”转向两个可区分的问题：
@@ -541,3 +543,9 @@ R 权威运行 `r_admission/attempt_002`（§40）确认登记缓存对当前代
 ### 41.3 c102ae1 定向复阅修订（2026-11-17）
 
 复阅 c102ae1 的真实入口/监督器/链编排，发现并修复两处：①**§7.4 第 3 项顺序违反**——D6 曾先物化六窗再消费 D1 收据；现改为 D6 计费区间内先物化验证装置（handoff 复核所需的最小 apparatus），`resolve_handoff` 通过后才物化训练窗（apparatus 以参数传入复用，不重复构造）；②**合法负结果误判 incomplete**——D1 完整但平均门未过时按 §7.2 跳过 D6 属完整链，worker CLI/监督器现按 `authorized_includes`/`d6_ran`/`d6.skipped_reason` 条件验收（`d1_incomplete`/`d1_mean_fit_gate_not_passed`/`d6_not_authorized`/`handoff_not_ready` 四种合法跳过；D1 负结果 + F 单阶段验证 = candidate_complete，最终裁决 fit_insufficient 由 F 报告承载）；监督器对 d6 磁盘报告/证明的核验相应条件化。链摘要新增 `authorized_includes`/`d6_ran` 字段。相关回归：拟合链 106 passed（含新迁移/绑定/链语义 13 项），W1 缓存阶段既有回归 40 passed。**快速核对修复（2026-11-17）**：①缓存选择贯通——监督器/worker 新增 `--cache-root` 并校验准入包 `cache_binding.path` 与请求目录严格相等（否则 `cache_binding_mismatch`），chain 模式拒绝 CLI 覆盖；②迁移门落实 55/55 集合覆盖——`per_demo` 必须与登记集合严格相等（缺项/额外项/替换项/非 true 分别拒绝，另核对参照 identity 的 `schedule_rows` 集合）；真实 55 项只读核对 1/55→missing:54/55、55/55→[]、56/55→extra:1。验证记录 §30.1，合并回归 108 passed。
+
+## 42. §8.3 一次性真实链授权与结果（2026-11-17）
+
+用户批准 `authorization_draft/attempt_001` 后，授权固定 `plan_sha256=2fda3476…`（方案版本提交 `84a1b06`）；`f9b101f` 仅追加执行记录，不改变该方案身份。监督器按 `D1 1800s → 条件 D6 3600s → F 600s` 各执行一次，失败不重试。真实结果和严格外层裁决见验证记录 §32：D1 完整但平均门未通过，D6 按 §7.2 合法跳过，F 完成逐位重放并给出 `fit_insufficient`。
+
+本次阶段内部证据和实际返回时间均在预算内，但链摘要顶层 `budget` 漏写 `StageBudget.facts()`，监督器因此以 `budget_binding_mismatch` fail-closed，未发布 `candidate_complete`。该 attempt 不得被宣称为严格完整验收；封口、返回证明和成本文件保持原样。后续若修复预算序列化，必须重新冻结受影响的 R/实现身份并取得新的单次授权，不能复用本次已消费阶段。

@@ -2,9 +2,11 @@
 
 日期：2026-11-07。方案：[数值缺口有限收口与受控拟合诊断方案 v0.4](../plans/omniretarget_w1_numerics_closure_fit_diagnostic_plan.md) §6/§7（I 阶段交付）。
 
-**性质：纯合成实现与验证交付。本记录不含任何真实数据读取、真实 checkpoint、真实模型/优化器构造、真实 forward/backward/FK/AdamW 或真实训练更新；全部模块与测试在合成世界（合成 tokenizer/关节限位/教师窗/15-site FK 替身）上离线运行，不声称与生产 CUDA/foreach 等价。** 真实 R 冻结与真实 D1/D6/F 执行仍须方案 §8.3 的新冻结材料与新明确授权，本交付不创建真实 cohort/attempt/授权，不恢复旧 T6 一次性授权。
+**性质：§1–§31 为纯合成实现与验证交付；§32 另记录一次经明确授权的真实 CUDA 链运行。** 合成部分不含真实数据读取、真实 checkpoint、真实模型/优化器构造或生产等价声明；真实运行的阶段证据、外层成本与限制单独按 §32 记录，不恢复旧 T6 一次性授权。
 
 **2026-11-16 当前状态：**审阅 `b4d5729` 后修复 2 P1+1 P2（§26），复审 `eba46de` 的撤回成本 1 P2 已修复（§27）；当前实现 `77938bf` 的完整纯合成验收 `attempt_019` 通过，见 §28。`attempt_018` 的数值链和 uv wait 事实保留，但其最终 stdout flush 缺成本覆盖证明；`attempt_017` 也缺外层返回证明。不把合成结果当作真实拟合证据。
+
+**2026-11-17 授权后状态：**真实 R/缓存迁移与 `r_admission/attempt_004` 已通过；用户按方案版本 `84a1b06` 明确批准 §8.3 授权。一次真实 chain 已执行并在 `attempt_001` 封存：D1 完整但平均门未过，D6 合法跳过，F `fit_insufficient`；阶段内部证据成立，但外层监督器因链摘要顶层预算字段漏写而 `budget_binding_mismatch` fail-closed，详见 §32。不得将该 attempt 宣称为严格完整验收或自动重试。
 
 ## 1. 交付物
 
@@ -545,3 +547,17 @@
 `derived/audit/w1_smallset_fit_diagnostic/authorization_draft/attempt_001/authorization_draft.json`（SHA `595e97cd…`，`authorized=false`/`template_only=true`）：绑定 attempt_004 封口准入包 SHA、cohort `w1_patched_smallset_fit_v1`、includes 提案 ["D1","D6","F"]、预算 caps、调用矩阵 SHA、实现身份 SHA、方案文档 SHA、缓存迁移三项（绑定路径/绑定 identity SHA/参照 identity SHA/55）；六项 checklist 全 null 并附逐项语义说明与执行契约（每阶段一次/不重试/未知历史停止/D1→D6 条件）。自检：以当前 `authorization_problems` 核验该草案，仅剩预期门项（`authorization_not_authorized`+六项 checklist），其余绑定全部成立——用户复阅后将 checklist 置 true、`authorized=true` 即构成 §8.3 明确授权；授权前不执行任何 D1/D6/F 数值单元。
 
 **边界：缓存重建与 R 验收已完成；§8.3 草案仅为模板，真实 D1/D6/F 未实施、未授权、未运行；T6 `audit_incomplete`/539 gaps、cohort 34 次更新/1347.195507s、一次性授权已消费、`partial/null/false/not_ready/不接入` 保持；本轮未运行全项目套件（仅本交付 54 passed）。**
+
+## 32. §8.3 授权后的真实链运行（2026-11-17）
+
+用户明确批准 `authorization_draft/attempt_001` 后，正式授权文件保留 `plan_sha256=2fda3476…`，并新增 `plan_revision=84a1b06` 与版本说明：该哈希对应 `84a1b06` 中的方案正文，`f9b101f` 只追加执行记录。授权文件 SHA 为 `43402257…`；R 准入包仍为 `r_admission/attempt_004`，SHA 为 `c42a03ad…`，绑定迁移缓存 identity SHA 为 `da4bb292…`。授权 checklist 六项均为 `true`，`authorized=true`、`template_only=false`。
+
+监督器按用户指定的单次链命令执行真实 CUDA chain：`D1(1800s) → 条件 D6(3600s) → F(600s)`，未使用 fixture，输出为 `derived/experiments/omniretarget_first/attempt_001/`。worker 正常返回 0，未自动重试。
+
+- **D1**：真实一窗 `sub10_largebox_097:0:60`，1000 更新、101/101 probe，调用矩阵 expected=actual 且无问题；阶段返回证明 `695.593606≤699.589345≤1800s`。四门中 root position/joint 通过，rotation `0.02378091rad` 与 teacher FK `0.01676196m` 未通过，故 `local_complete_evidence=true`、`local_mean_fit_passed=false`、`local_conclusion=fit_insufficient`。
+- **D6**：按 §7.2 合法跳过，原因 `d1_mean_fit_gate_not_passed`；没有物化六窗或启动 D6 训练。
+- **F**：对 D1 的 initial/last 做 fresh bitwise replay，`complete_evidence=true`、`replay_passed=true`、`verdict=fit_insufficient`；返回证明 `2.427848≤6.425550≤600s`。
+
+阶段事实和内部成本均成立，但**严格外层验收未闭合**：`acceptance_verdict.json` 为 `incomplete`，唯一问题 `budget_binding_mismatch`。原因是 `run_real_chain()` 把完整链预算写在 `chain_budget`（`t0=108592.003335`、`wall_cap=6120s`、登记 `702.023437s`），却没有复制到监督器消费的顶层 `budget`；顶层只有 `measured_wall_s_at_summary`，所以监督器 `_proof_problems()` fail-closed。独立只读核对确认候选事实为空、D1/F 报告与证明 SHA 一致、worker 实际 wait `699.128939s`、进程内返回证明 `698.024949s` 均在 `702.023437s` 登记与 `6120s` 上限内；但由于监督器没有发出成功裁决和 `outer_stdout_observation.json`，不能将该 attempt 宣称为严格 `candidate_complete`。
+
+本次不改写任何封口/返回文件，不把合法的 `fit_insufficient` 转成通过，也不重跑已消费的 D1/D6/F。该结果证明当前真实一窗在冻结门下拟合不足；要得到严格成功的外层验收，需要修复链预算序列化后重新冻结 R/授权并另行获得新的一次性运行授权。
