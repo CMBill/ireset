@@ -1219,7 +1219,8 @@ def _optimizer_state_problems(opt, expected_step: int) -> list[str]:
     return problems
 
 
-def _optimizer_binding_problems(trainer, plan: FitPlan) -> list[str]:
+def _optimizer_binding_problems(trainer, plan: FitPlan, *,
+                                effective_lr: float | None = None) -> list[str]:
     """P1 (round-12/13): the ACTUAL AdamW parameter groups are the update
     arithmetic — ``trainer.cfg`` being correct is not enough.  Every group's
     lr/weight_decay/betas/eps/maximize/amsgrad must equal the frozen
@@ -1237,7 +1238,7 @@ def _optimizer_binding_problems(trainer, plan: FitPlan) -> list[str]:
         if not isinstance(group, dict):
             problems.append(f"optimizer_group_not_a_mapping:{idx}")
             continue
-        for key, want in (("lr", plan.lr),
+        for key, want in (("lr", plan.lr if effective_lr is None else effective_lr),
                           ("weight_decay", plan.weight_decay),
                           ("betas", ADAMW_BETAS),
                           ("eps", ADAMW_EPS),
@@ -1855,6 +1856,8 @@ class FitDriver:
             self._phase = f"step_{step}"
             self.budget.check(f"step_{step}_start")
             self.runtime_guard.check_unit(f"step_{step}_start")
+            self._before_update(step)
+            self.budget.check(f"step_{step}_after_update_admission")
             trainer.begin_update()
             parts_acc: dict[str, float] = {}
             n_micro, n_samples = 0, 0
@@ -1927,6 +1930,8 @@ class FitDriver:
             # P1 (round-13): same boundary before the actual AdamW step.
             self.budget.check(f"step_{step}_step_binding_read")
             self._phase = f"step_{step}_optimizer_update"
+            self._optimizer_step_entry(step)
+            self.budget.check(f"step_{step}_after_step_admission")
             self.counters["adamw_step_calls"] += 1
             trainer.step_optimizer()
             # P1 (round-15): one executed native step advances the frozen
@@ -1935,16 +1940,25 @@ class FitDriver:
             self._completed_steps += 1
             self._check_optimizer_state()
             trainer._check_params()
-            self.history.append({"step": step, "n_micro": n_micro,
-                                 "n_samples": n_samples,
-                                 **{k: float(v) for k, v in parts_acc.items()},
-                                 "gnorm": float(gnorm)})
+            row = {"step": step, "n_micro": n_micro, "n_samples": n_samples,
+                   **{k: float(v) for k, v in parts_acc.items()},
+                   "gnorm": float(gnorm)}
+            self._record_update(row)
             self.budget.check(f"step_{step}_complete")
             if step % plan.probe_every == 0:
                 self._phase = f"probe_step{step}"
                 self._run_probe(step, step // plan.probe_every)
         self._phase = "save_last"
         self._save_checkpoint("last.pt", plan.steps)
+
+    def _before_update(self, step: int) -> None:
+        """Extension admission only; the constant-LR path remains a no-op."""
+
+    def _optimizer_step_entry(self, step: int) -> None:
+        """Read-only extension evidence immediately before the native step."""
+
+    def _record_update(self, row: dict) -> None:
+        self.history.append(row)
 
     def _check_clip_coverage_pre(self) -> None:
         """Every trainable parameter must have a gradient for the joint clip."""
@@ -2613,6 +2627,7 @@ def verify_stage_local(stage_dir: Path, plan: FitPlan,
     problems += _checkpoint_binding_problems(
         stage_dir, plan, decoder, budget=budget,
         expected_identity=identity_to_bind,
+        counters=counters,
         # P1 (round-15): an already-refused identity skips the reference
         # construction (it is a real, budgeted numeric unit).
         skip_state_contract=identity_failed)
@@ -2686,7 +2701,8 @@ def _checkpoint_identity_problems(ck: dict, name: str,
 _STATE_CONTRACT_CACHE: dict[tuple, dict[str, dict[str, tuple]]] = {}
 
 
-def _plan_fresh_modules(plan: FitPlan, budget: StageBudget | None = None):
+def _plan_fresh_modules(plan: FitPlan, budget: StageBudget | None = None,
+                        counters: dict | None = None):
     """P1 (round-14): fresh modules for the FROZEN plan's architecture, from
     the same constructors ``Trainer`` uses — never trained, never forwarded.
 
@@ -2700,15 +2716,22 @@ def _plan_fresh_modules(plan: FitPlan, budget: StageBudget | None = None):
     else:
         from ireset.model.deterministic import DeterministicG1
         model = DeterministicG1(**_backbone_kwargs(plan))
+    if counters is not None:
+        counters["reference_model_constructions"] = counters.get(
+            "reference_model_constructions", 0) + 1
     check("saved_state_contract_model")
     from ireset.model.conditioner import ConditionEncoder
     conditioner = ConditionEncoder(plan.d_model)
+    if counters is not None:
+        counters["reference_conditioner_constructions"] = counters.get(
+            "reference_conditioner_constructions", 0) + 1
     check("saved_state_contract_conditioner")
     return model, conditioner
 
 
 def _plan_state_contract(plan: FitPlan,
-                         budget: StageBudget | None = None
+                         budget: StageBudget | None = None,
+                         counters: dict | None = None
                          ) -> dict[str, dict[str, tuple[tuple[int, ...], str]]]:
     """P1 (round-14): two checkpoints agreeing with EACH OTHER is not
     architecture legality — both can drop the same key, reshape a tensor or
@@ -2720,12 +2743,15 @@ def _plan_state_contract(plan: FitPlan,
            plan.ffn_mult, plan.time_window)
     cached = _STATE_CONTRACT_CACHE.get(key)
     if cached is not None:
+        if counters is not None:
+            counters["reference_contract_cache_hits"] = counters.get(
+                "reference_contract_cache_hits", 0) + 1
         return cached
     if budget is not None:
         budget.check("saved_state_contract_build")
     rng_state = torch.random.get_rng_state()
     try:
-        model, conditioner = _plan_fresh_modules(plan, budget)
+        model, conditioner = _plan_fresh_modules(plan, budget, counters)
         contract = {
             "model": {name: (tuple(t.shape), str(t.dtype))
                       for name, t in model.state_dict().items()},
@@ -2818,7 +2844,8 @@ def _checkpoint_binding_problems(stage_dir: Path, plan: FitPlan,
                                  decoder: MetricDecoder,
                                  budget: StageBudget | None = None,
                                  expected_identity: dict | None = None,
-                                 skip_state_contract: bool = False) -> list[str]:
+                                 skip_state_contract: bool = False,
+                                 counters: dict | None = None) -> list[str]:
     """Checkpoint role/step/root-stats/config/identity binding; when
     ``budget`` is given, every checkpoint read is guarded (P1 round-7: a
     reduction returning past the work deadline refuses the checkpoint
@@ -2833,6 +2860,9 @@ def _checkpoint_binding_problems(stage_dir: Path, plan: FitPlan,
             problems.append(f"checkpoint_missing:{name}")
             continue
         check(f"saved_checkpoint_read_{name}")
+        if counters is not None:
+            counters["checkpoint_inspection_reads"] = counters.get(
+                "checkpoint_inspection_reads", 0) + 1
         try:
             ck = torch.load(path, map_location="cpu", weights_only=False)
         except Exception as exc:  # noqa: BLE001
@@ -2872,7 +2902,7 @@ def _checkpoint_binding_problems(stage_dir: Path, plan: FitPlan,
     identity_failed = skip_state_contract or any(
         "identity" in p for p in problems)
     if loaded and not identity_failed:
-        contract = _plan_state_contract(plan, budget)
+        contract = _plan_state_contract(plan, budget, counters)
         for name, ck in loaded:
             problems += _checkpoint_architecture_problems(ck, name, contract)
     return problems
@@ -3124,20 +3154,27 @@ def _checkpoint_tensor_problems(ck: dict, model, conditioner) -> list[str]:
 
 
 def _load_state_dicts_checked(path: Path, model, conditioner,
-                              budget: StageBudget | None = None) -> list[str]:
+                              budget: StageBudget | None = None,
+                              counters: dict | None = None) -> list[str]:
     """Verify the saved tensor contract FIRST; only a clean checkpoint is
     copied into the live modules.  When ``budget`` is given, the read→load
     and model→conditioner boundaries are guarded (P1 round-8: each strict
     load is an independent unit)."""
     check = budget.check if budget is not None else (lambda _point: None)
+    if counters is not None:
+        counters["checkpoint_loads"] = counters.get("checkpoint_loads", 0) + 1
     ck = torch.load(path, map_location="cpu", weights_only=False)
     check(f"f_strict_load_{Path(path).stem}_pre")
     problems = _checkpoint_tensor_problems(ck, model, conditioner)
     if problems:
         return problems
     check(f"f_strict_load_{Path(path).stem}_model")
+    if counters is not None:
+        counters["strict_module_loads"] = counters.get("strict_module_loads", 0) + 1
     model.load_state_dict(ck["model"], strict=True)
     check(f"f_strict_load_{Path(path).stem}_conditioner")
+    if counters is not None:
+        counters["strict_module_loads"] = counters.get("strict_module_loads", 0) + 1
     conditioner.load_state_dict(ck["conditioner"], strict=True)
     return []
 
@@ -3145,7 +3182,8 @@ def _load_state_dicts_checked(path: Path, model, conditioner,
 def _f_identity_problems(stage_dir: Path, plan: FitPlan,
                          decoder: MetricDecoder, index: dict,
                          budget: StageBudget | None = None,
-                         expected_identity: dict | None = None) -> list[str]:
+                         expected_identity: dict | None = None,
+                         counters: dict | None = None) -> list[str]:
     """P1 (round-9/11): the identity helper's checkpoint reads are units too —
     each read is guarded, the embedded configuration is reconciled against
     the frozen plan FIELD BY FIELD and the embedded stage identity against
@@ -3160,6 +3198,9 @@ def _f_identity_problems(stage_dir: Path, plan: FitPlan,
             problems.append(f"checkpoint_missing:{name}")
             continue
         check(f"f_identity_checkpoint_read_{name}")
+        if counters is not None:
+            counters["checkpoint_inspection_reads"] = counters.get(
+                "checkpoint_inspection_reads", 0) + 1
         try:
             ck = torch.load(path, map_location="cpu", weights_only=False)
         except Exception as exc:  # noqa: BLE001
@@ -3261,7 +3302,8 @@ def _teacher_reference_checked(stage_dir: Path, decoder: MetricDecoder,
 
 def run_f_verification(*, stage_specs: list[dict], out_dir: Path,
                        budget: StageBudget, runtime_guard, build_modules,
-                       authorization: dict | None) -> dict:
+                       authorization: dict | None,
+                       finalize_evidence: Callable[[dict], None] | None = None) -> dict:
     """One F window: per stage re-run items 1-3, then fresh bitwise replay of
     the initial/last endpoints (exactly 2 fresh probes per stage).  Any
     mismatch is recorded as ``replay_mismatch`` and fails the final verdict —
@@ -3338,6 +3380,18 @@ def run_f_verification(*, stage_specs: list[dict], out_dir: Path,
         f_verify_counters: dict = {"production_decode_calls": 0,
                                    "metric_decode_calls": 0}
         try:
+            extension_verifier = spec.get("verify_extension")
+            if extension_verifier is not None:
+                budget.check("f_extension_precheck")
+                extension_problems = extension_verifier(budget)
+                budget.check("f_extension_precheck_complete")
+                if extension_problems:
+                    res.update(replay_enabled=False, replay_passed=None,
+                               skip_reason="extension_evidence_invalid",
+                               extension_problems=extension_problems[:20])
+                    stages_out.append(res)
+                    evidence_all_ok = False
+                    continue
             verification = verify_stage_local(
                 stage_dir, plan, registration, decoder,
                 production_decoder=loss_fn, counters=f_verify_counters,
@@ -3379,7 +3433,7 @@ def run_f_verification(*, stage_specs: list[dict], out_dir: Path,
             try:
                 identity_problems = _f_identity_problems(
                     stage_dir, plan, decoder, index_doc, budget=budget,
-                    expected_identity=expected_identity)
+                    expected_identity=expected_identity, counters=f_verify_counters)
             except BudgetExceeded as exc:
                 res.update({"replay_enabled": False, "replay_passed": None,
                             "skip_reason": "stage_deadline_stop",
@@ -3387,6 +3441,7 @@ def run_f_verification(*, stage_specs: list[dict], out_dir: Path,
                 stages_out.append(res)
                 evidence_all_ok = False
                 break
+        res["verification_counters"] = dict(f_verify_counters)
         if identity_problems:
             res.update({"replay_enabled": False, "replay_passed": None,
                         "skip_reason": "f_identity_problems",
@@ -3425,7 +3480,7 @@ def run_f_verification(*, stage_specs: list[dict], out_dir: Path,
                 budget.check(f"f_probe_{role}")
                 load_problems = _load_state_dicts_checked(
                     stage_dir / f"{role}.pt", model, conditioner,
-                    budget=budget)
+                    budget=budget, counters=f_counters)
                 if load_problems:
                     # refuse BEFORE any copy: a strict load would silently
                     # down-cast mistyped tensors (P1: dtype tamper)
@@ -3624,6 +3679,16 @@ def run_f_verification(*, stage_specs: list[dict], out_dir: Path,
                             else "fit_insufficient")
     else:
         final["verdict"] = "incomplete"
+    # Optional, versioned diagnostics attach their CPU/file-only comparison
+    # BEFORE F's seal. A slow/failed comparison cannot buy a late fit claim.
+    if finalize_evidence is not None:
+        try:
+            budget.check("f_extension_evidence")
+            finalize_evidence(final)
+            budget.check("f_extension_evidence_complete")
+        except (FitDiagnosticError, OSError, ValueError, TypeError, KeyError) as exc:
+            final.update(complete_evidence=False, mean_fit_passed=None,
+                         verdict="incomplete", extension_error=str(exc)[:500])
     path = out_dir / "f_report.json"
     # P1 (round-4): F covers its OWN final report re-read with a return-
     # coverage verification — the outer acceptance budget alone must not be

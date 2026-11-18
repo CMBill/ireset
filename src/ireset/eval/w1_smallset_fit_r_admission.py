@@ -408,6 +408,8 @@ def run_r_admission(*, out_dir: Path, budget: StageBudget,
                     git_identity: Callable[[Path], dict] | None = None,
                     cache_root: Path | None = None,
                     outer_launch: dict | None = None,
+                    extend_package: Callable[[dict, StageBudget], list[str]] | None = None,
+                    cohort_id: str = COHORT_ID,
                     ) -> dict:
     """One R window: metadata admission under the §8.1 R budget (120s/15s).
 
@@ -434,10 +436,10 @@ def run_r_admission(*, out_dir: Path, budget: StageBudget,
         if (out_dir / name).exists():
             raise FitDiagnosticError(f"r_output_reserved_unavailable:{name}")
     facts: dict = {"schema": R_ADMISSION_SCHEMA, "kind": "r_admission",
-                   "cohort_id": COHORT_ID, "stage": "R",
+                   "cohort_id": cohort_id, "stage": "R",
                    "source_root": path_for_record(source_root)}
     problems: list[str] = []
-    package: dict = {"schema": ADMISSION_PACKAGE_SCHEMA, "cohort_id": COHORT_ID}
+    package: dict = {"schema": ADMISSION_PACKAGE_SCHEMA, "cohort_id": cohort_id}
     try:
         budget.check("r_entry")
 
@@ -653,6 +655,13 @@ def run_r_admission(*, out_dir: Path, budget: StageBudget,
         problems.append(f"r_refused:{exc}")
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
         problems.append(f"r_error:{type(exc).__name__}:{str(exc)[:200]}")
+    if extend_package is not None:
+        try:
+            budget.check("r_extension")
+            problems += extend_package(package, budget)
+            budget.check("r_extension_complete")
+        except (FitDiagnosticError, OSError, ValueError, KeyError, TypeError) as exc:
+            problems.append(f"r_extension_refused:{type(exc).__name__}:{str(exc)[:300]}")
     facts["package"] = package
     facts["problems"] = problems
     facts["admission_passed"] = not problems
@@ -954,6 +963,7 @@ def materialize_fit_apparatus(*, admission: dict, budget: StageBudget,
                               teacher_npz_dir: Path | None = None,
                               omomo_pt_dir: Path | None = None,
                               runtime_probe: Callable[[], dict] | None = None,
+                              binding_validator=None,
                               ) -> FitApparatus:
     """Root statistics, joint range, tokenizer, metric decoder and the
     production loss/FK -- each a guarded unit of the CURRENT billed window."""
@@ -961,7 +971,7 @@ def materialize_fit_apparatus(*, admission: dict, budget: StageBudget,
     root = Path(project_root or PROJECT_ROOT)
     counters: dict = {}
     budget.check("materialize_apparatus_entry")
-    problems = admission_recheck_problems(
+    problems = (binding_validator or admission_recheck_problems)(
         admission, project_root=root, source_root=source_root,
         teacher_npz_dir=teacher_npz_dir, omomo_pt_dir=omomo_pt_dir,
         runtime_probe=runtime_probe)
@@ -1167,7 +1177,8 @@ def materialize_real_world(*, admission: dict, stage: str,
                            teacher_npz_dir: Path | None = None,
                            omomo_pt_dir: Path | None = None,
                            d1_probe_inputs: Path | None = None,
-                           apparatus: FitApparatus | None = None,
+                            apparatus: FitApparatus | None = None,
+                            binding_validator=None,
                            ) -> RealFitWorld:
     """Materialize the registered windows inside the CURRENT billed window.
 
@@ -1186,8 +1197,8 @@ def materialize_real_world(*, admission: dict, stage: str,
         apparatus = materialize_fit_apparatus(
             admission=admission, budget=budget, device=device, fixture=fixture,
             fk=fk, static_frame=static_frame, project_root=root,
-            source_root=source_root, teacher_npz_dir=teacher_npz_dir,
-            omomo_pt_dir=omomo_pt_dir)
+             source_root=source_root, teacher_npz_dir=teacher_npz_dir,
+            omomo_pt_dir=omomo_pt_dir, binding_validator=binding_validator)
     counters = apparatus.counters
     package = admission["package"]
     d1_registration, d6_registration = registrations_from_package(package)
