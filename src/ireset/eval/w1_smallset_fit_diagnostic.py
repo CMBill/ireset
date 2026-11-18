@@ -2004,17 +2004,18 @@ class FitDriver:
 
     # -- artifacts ------------------------------------------------------------
 
-    def _write_stage_artifacts(self) -> None:
+    def _write_stage_artifacts(self, *, arrays_already_persisted: bool = False) -> None:
         self._phase = "write_artifacts"
         self.budget.check("write_artifacts")
         probes_dir = self.stage_dir / "probes"
         probes_dir.mkdir(parents=True, exist_ok=True)
-        write_npz_records(self.stage_dir / "teacher_reference.npz",
-                          self.teacher_arrays)
-        write_npz_records(self.stage_dir / "probe_inputs.npz", {
-            f"w{b}__{k}": self.probe_batch[k].detach().cpu().numpy()[b]
-            for b in range(self.probe_batch["x0"].shape[0])
-            for k in ("x0", *COND_KEYS)})
+        if not arrays_already_persisted:
+            write_npz_records(self.stage_dir / "teacher_reference.npz",
+                              self.teacher_arrays)
+            write_npz_records(self.stage_dir / "probe_inputs.npz", {
+                f"w{b}__{k}": self.probe_batch[k].detach().cpu().numpy()[b]
+                for b in range(self.probe_batch["x0"].shape[0])
+                for k in ("x0", *COND_KEYS)})
         probe_index = {"schema": PROBE_INDEX_SCHEMA,
                        "plan": self.plan.as_dict(),
                        "window_ids": list(self.registration.window_ids),
@@ -2026,10 +2027,11 @@ class FitDriver:
                        "history_unrounded": self.history}
         (self.stage_dir / "probe_index.json").write_text(
             json.dumps(probe_index, indent=1, allow_nan=False))
-        for idx, arrays in self.probe_arrays_by_idx.items():
-            step = self.probes[idx]["step"]
-            write_npz_records(
-                probes_dir / f"probe_{idx:04d}_step_{step:06d}.npz", arrays)
+        if not arrays_already_persisted:
+            for idx, arrays in self.probe_arrays_by_idx.items():
+                step = self.probes[idx]["step"]
+                write_npz_records(
+                    probes_dir / f"probe_{idx:04d}_step_{step:06d}.npz", arrays)
         index = build_artifacts_index(self.stage_dir)
         (self.stage_dir / "artifacts_index.json").write_text(
             json.dumps(index, indent=1, allow_nan=False))

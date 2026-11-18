@@ -2,7 +2,7 @@
 
 日期：2026-11-18。对应[方案 v0.1＋§7](../plans/omniretarget_w1_d1_lr_schedule_diagnostic_plan.md)。
 
-**当前交付：I′ 实现、45 项新增合成测试及独立监督的缩比 A/B→F→比较验收通过。真实 R′ 未执行，真实候选 B 未授权、未运行。** 合成夹具的 `fit_insufficient`/`no_prespecified_improvement` 不构成真实学习率效果的结论。
+**当前交付：首轮复阅发现的 3 项 P1、3 项 P2 已修复，新合成验收和只读复审见 §6。真实 R′ 未执行，B 未授权、未运行。** §1–§5 为初版 `d1cca09` 的历史验收记录；合成夹具不构成真实学习率效果证据。
 
 ## 1. 范围、身份与不变项
 
@@ -138,3 +138,36 @@ uv run --locked pytest tests/test_w1_n0_coordinate_flags.py tests/test_w1_n1_syn
 已有的 `docs/README.md` 修改在本轮开始前就存在，未覆盖、未夹带入本轮提交。旧冻结主方案、运行、缓存及授权不改写；旧 `attempt_001` 的 incomplete、A 的 `fit_insufficient`、T6 `audit_incomplete`/539 gaps 和一次性授权消耗均保持。`partial/null/false/not_ready/production_integration=false` 保持，不宣称碰撞安全、持续抓握、泛化或 RL/真机资格。
 
 **后续必须依次：复阅本 I′ 交付→明确安排一次只读元数据 R′→复阅新冻结准入包与未签草案→绑定最终 SHA 的新 §8.3 一次性明确授权→一次真实 B 的 D1′/F′。** 新授权范围必须恰为 `[D1,F]`；未获授权不运行，任一失败/未知不自动重试、不改倍率、不补跑 A、不追加 D6。
+
+## 6. 复阅修复与复审（2026-11-18）
+
+首轮复阅对 `d1cca09` 的裁决为不通过；六项反例记录保留在 `/tmp/opencode/w1_lr_review_20261118_002/review.md`。本节是修订后证据，不把原 `acceptance_001` 追认成修订版验收。
+
+1. **硬截止与进程回收（P1）**：统一受管进程组，最外层负责终止与回收，worker 在工作前核对实际组。子进程夹具覆盖不响应 TERM 的 worker 和内层先退出留下的 worker；两条路径均无残留进程或僵尸。旧监督器文件未改。
+2. **R′ 实际返回（P1）**：单独的 R 父进程等待观察器实际返回，并绑定 launch ID、PID、封口 R 摘要和两份观察文件。只有该次实际退出及成本覆盖成立才发布草案；正式 v2 授权还需绑定返回收据的 SHA，并记录该次 R 最外层由调用方实际观察的 exit 0。慢写观察文件的协议夹具保留完整候选文件但实际退出 3，不能发布实际返回收据，消费端拒绝。没有运行真实 R′；成功支对照仅使用合成协议文件。
+3. **比较实际工件消费（P1）**：检查 A/B 文件字节、准入与授权、阶段报告/台账/返回证明。仅删除 B 的 probe、LR 历史、F 返回证明或 A 教师文件均返回空比较值；单字节翻转在只读复审另用隔离副本验证。
+4. **合成根隔离（P2）**：默认输出为 `derived/audit/w1_d1_lr_half_after_500_v1/synthetic/acceptance_default`，不能指向真实根及其子目录、别名或其他项目内历史目录；仍允许独立临时目录。每个根只预留 `attempt_001`。
+5. **阶段成本同步撤回（P2）**：报告、台账、证明由同一覆盖循环对账，计入最后一次证明写盘；慢台账/慢证明导致 D1′/F′ 同步撤回、成本只增，持续慢写则标记 `cost_unproven`。F′ 的起点绑定 D1′ 完成覆盖的采样。
+6. **坏索引收口（P2）**：`files=[]` 现在落 F `incomplete` 报告与返回证明，零 fresh 构造/预测。前缀另补持久化边界：NPZ 写后同步，收口不重写；盘上 LR 历史与内存逐字段不一致时，首个变更后的 micro 前停止。
+
+### 6.1 测试与新合成验收
+
+```bash
+uv run --locked pytest tests/test_w1_d1_lr_schedule.py tests/test_w1_d1_lr_review_regressions.py -q --basetemp /tmp/opencode/w1_lr_retest_suite_001
+uv run --locked pytest tests/test_w1_smallset_fit_diagnostic.py tests/test_w1_smallset_fit_review16.py tests/test_w1_i_outer_return.py -q --basetemp /tmp/opencode/w1_lr_retest_legacy_001
+uv run --locked pytest tests/test_w1_smallset_fit_r_admission.py -q --basetemp /tmp/opencode/w1_lr_retest_admission_001
+uv run --locked pytest tests/test_w1_n0_coordinate_flags.py tests/test_w1_n1_synthetic_numerics.py -q --basetemp /tmp/opencode/w1_lr_retest_n0n1_001
+```
+
+LR 与复阅反例 **59 passed / 162.39s**（初版 45 项加 14 项）；旧诊断/review16/外层 **80 passed / 262.47s**；准入 **58 passed / 8.68s**，N0/N1 **33 passed / 16.77s**。四组分进程执行，合计 230 项通过，未跑全项目套件。
+
+新权威合成根：`derived/audit/w1_d1_lr_half_after_500_v1/synthetic/acceptance_002/`。执行 `/usr/bin/python3 /tmp/opencode/run_w1_lr_review_acceptance_20261118.py`，父进程启动 `scripts/run_w1_d1_lr_schedule_supervisor.py --synthetic --output-root <该根>` 并观察实际 `wait()` 返回 **0**：
+
+- 实际外层返回耗时 **31.759001s ≤ 登记 34.567427s ≤ 2400s**；内层等候结束 31.729380s，completion 文件写后样本 31.737369s。实际外层返回覆盖了后续观察文件的写入；外部存档本身是合成验收的单列只读复审证据。
+- B 4 更新/5 probes、有效 LR `[.002,.002,.001,.001]`，5 份前缀数值工件逐字节相等，F initial/last 逐位重放通过；`fit_insufficient` / `no_prespecified_improvement` 为夹具结果。未执行 D6。
+- 33 文件实现身份 `7bddd5ee1f1281c605fa91b86f8afa65e00c6c22f2437f2a6632cc5944cb8d95`；方案 SHA `2b5a0a491ea076703612c3d5e334fe2fadbd8bca6b448d09c6c5a787eede0c09`。相对 A 旧实现清单仅两份原白名单模块变化；原生 Trainer/模型/目标/数据/配置不变。
+- 新 completion SHA `bacfcd327c5a4ef002810dc10cffa8704e495820643695640238c069cfd72c4f`；comparison SHA `7ff6d59833698c605a6ccf582c540840655fa9fe077995f8e9bd3bdc1d91b29c`。
+
+### 6.2 只读复审结论
+
+上一轮六项反例均有相应回归，修订后用独立读盘脚本 `uv run --locked python /tmp/opencode/verify_w1_lr_postfix_20261118.py` 对账两阶段的成本、交接、实际返回、实现与比较绑定，并在隔离副本上以 probe 单字节翻转确认不可消费。本次范围内未发现新的阻塞项。只读核对 **393 个历史保护文件、52 个旧合成文件均零漂移**；脚本结果与实际等待记录在 `/tmp/opencode/w1_lr_postfix_20261118/`。两真实根均未创建；没有读取真实数组数值或加载真实 checkpoint。**复审通过仅限工程与合成证据。下一步仍须明确安排仅元数据的 R′；真实 B 须另获绑定最终材料的严格 `[D1,F]` 一次性授权，不含 D6。**

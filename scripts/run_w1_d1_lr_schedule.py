@@ -11,11 +11,13 @@ _T0 = time.perf_counter()
 import argparse
 import json
 import math
+import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from ireset.eval import w1_d1_lr_schedule as lr
+from ireset.eval import w1_d1_lr_protocol as protocol
 from ireset.eval import w1_d1_lr_workflow as flow
 from ireset.eval import w1_smallset_fit_diagnostic as fit
 
@@ -39,25 +41,32 @@ def main():
             or args.wall_cap_s != cap or args.reserve_s != reserve):
         parser.error("frozen clock/cap/reserve mismatch")
     output = Path(args.output_dir).resolve()
-    if not args.fixture:
+    if args.fixture:
+        if not protocol.fixture_output_allowed(output, flow.PROJECT_ROOT):
+            parser.error("synthetic output must be isolated from reserved real and historical roots")
+    else:
         expected = Path(flow.PROJECT_ROOT) / (lr.RUN_ROOT if args.mode == "chain"
                                              else lr.AUDIT_ROOT + "/r_admission")
         if output.parent != expected:
             parser.error("fixed cohort root required")
     launch = {"launch_id": args.launch_id, "t0_perf_counter": t0,
-              "cli_entry_perf_counter": _T0, "supervisor_declared": True}
-    if not args.fixture:
-        flow.verify_launch_scope(output, launch, mode=args.mode)
+              "cli_entry_perf_counter": _T0, "supervisor_declared": True,
+              "worker_process_group": os.getpgrp()}
     budget = fit.StageBudget("R" if args.mode == "r-admit" else "chain", cap, reserve, t0=t0)
     try:
+        record = lr.read_object(output / "outer_launch.json")
+        if record.get("worker_process_group") != os.getpgrp():
+            raise fit.FitDiagnosticError("lr_worker_not_in_supervised_process_group")
+        if not args.fixture:
+            flow.verify_launch_scope(output, launch, mode=args.mode)
         if args.mode == "r-admit":
             if args.fixture:
                 parser.error("fixture acceptance uses chain mode only")
             out = flow.run_admission(out_dir=output, budget=budget,
                                      outer_launch=launch,
                                      cache_root=Path(args.cache_root) if args.cache_root else None)
-            # The unsigned draft binds the sealed admission bytes, but is not
-            # a signed authorization and cannot pass the execution gate.
+            # This is only a template. The collector makes the unsigned draft
+            # in the R root after it has observed the R observer return.
             doc = lr.read_object(Path(out["summary"]))
             if doc["admission_passed"]:
                 lr.write_json(output / "authorization_draft.json", flow.authorization_draft(

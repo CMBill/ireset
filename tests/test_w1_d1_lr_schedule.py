@@ -257,11 +257,30 @@ def test_supervisor_normal_fixture_chain(tmp_path):
     assert completion["supervisor_return_code"] == 0 and completion["comparison_candidate"] is True
     assert lr.consume_comparison(output / "attempt_001", observer_return_code=proc.returncode)["metrics"] is not None
     assert lr.consume_comparison(output / "attempt_001")["conclusion"] == "not_comparable"
-    comparison_path = output / "attempt_001/f/comparison.json"
+    run = output / "attempt_001"
+    admission = lr.read_object(run / "synthetic_materials/fixture_admission.json")
+    baseline_dir = Path(admission["package"]["baseline"]["root"]) / "d1"
+    for path, problem in (
+        (run / "d1" / lr.probe_name(0, 0), "lr_artifact_missing_or_invalid"),
+        (baseline_dir / "teacher_reference.npz", "baseline_unreadable"),
+        (run / "d1/lr_history.jsonl", "lr_artifact_missing_or_invalid"),
+        (run / "f/return_observation.json", "return_observation.json"),
+    ):
+        # No records or observed exit values are rewritten between the two calls.
+        saved = path.with_suffix(".held")
+        path.rename(saved)
+        try:
+            refused = lr.consume_comparison(run, observer_return_code=proc.returncode)
+            assert refused["conclusion"] == "not_comparable" and refused["metrics"] is None, path
+            assert any(problem in p for p in refused["problems"]), refused
+        finally:
+            saved.rename(path)
+    assert lr.consume_comparison(run, observer_return_code=proc.returncode)["metrics"] is not None
+    comparison_path = run / "f/comparison.json"
     modified = lr.read_object(comparison_path)
     modified["conclusion"] = "single_window_pass"
     lr.write_json(comparison_path, modified)
-    assert lr.consume_comparison(output / "attempt_001", observer_return_code=0)["metrics"] is None
+    assert lr.consume_comparison(run, observer_return_code=proc.returncode)["metrics"] is None
     assert completion["elapsed_after_actual_wait_s"] <= completion["registered_measured_s"] <= 2400
     p2 = subprocess.run([sys.executable, str(ROOT / "scripts/run_w1_d1_lr_schedule_supervisor.py"),
                          "--synthetic", "--output-root", str(output)], cwd=ROOT,
@@ -316,6 +335,43 @@ def test_mutation_after_prefix_receipt_stops_at_501_boundary(tmp_path, control):
     result = driver.run()
     assert result["counters"]["adamw_step_calls"] == plan.switch_after
     assert "baseline_prefix_mismatch:admission" in result["failure"]["message"]
+
+
+def test_recorded_lr_drift_stops_before_first_changed_micro(tmp_path, control):
+    _, world, plan, baseline, *_ = control
+    driver = driver_at(tmp_path / "B", world, plan, baseline)
+    original = driver._before_update
+
+    def before(u):
+        if u == plan.switch_after + 1:
+            path = driver.stage_dir / "lr_history.jsonl"
+            rows = [json.loads(line) for line in path.read_text().splitlines()]
+            rows[-1]["effective_lrs"] = [plan.lr_at(u)]
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        original(u)
+
+    driver._before_update = before
+    result = driver.run()
+    assert result["failure"]["message"] == "baseline_prefix_mismatch:durable_history"
+    assert result["counters"]["loss_calls"] == plan.switch_after * plan.grad_accum
+    assert result["counters"]["adamw_step_calls"] == plan.switch_after
+
+
+def test_stage_close_does_not_rewrite_a_changed_prefix(tmp_path, control):
+    _, world, plan, baseline, *_ = control
+    driver = driver_at(tmp_path / "B", world, plan, baseline)
+    original = driver._write_stage_artifacts
+    path = driver.stage_dir / lr.probe_name(0, 0)
+
+    def before_close():
+        path.write_bytes(path.read_bytes() + b"drift")
+        original()
+
+    driver._write_stage_artifacts = before_close
+    result = driver.run()
+    assert result["local_complete_evidence"] is False
+    assert "baseline_prefix_mismatch:file:" in result["failure"]["message"]
+    assert path.read_bytes().endswith(b"drift")
 
 
 @pytest.mark.parametrize("value", [True, float("nan"), float("inf"), 10**400, "0.1", None])

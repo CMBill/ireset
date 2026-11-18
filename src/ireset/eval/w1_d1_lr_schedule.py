@@ -18,14 +18,14 @@ from pathlib import Path
 import torch
 
 from ireset.eval import w1_smallset_fit_diagnostic as fit
+from ireset.eval import w1_d1_lr_protocol as protocol
 from ireset.eval.w1_n0_coordinate_flags import npz_members, sha256_file
 from ireset.paths import PROJECT_ROOT
 
 SCHEDULE_ID = "d1_half_after_500_v1"
-COHORT = "w1_d1_lr_half_after_500_v1"
+COHORT, RUN_ROOT, AUDIT_ROOT = protocol.COHORT, protocol.RUN_ROOT, protocol.AUDIT_ROOT
 PLAN_PATH = "docs/plans/omniretarget_w1_d1_lr_schedule_diagnostic_plan.md"
-RUN_ROOT = "derived/experiments/omniretarget_first/" + COHORT
-AUDIT_ROOT = "derived/audit/" + COHORT
+LR_ARTIFACTS = ("lr_evidence.json", "lr_history.jsonl", "prefix_checks.json", "prefix_admission.json")
 BASELINE_ROOT = "derived/experiments/omniretarget_first/attempt_002"
 BASELINE_AUDIT = ("derived/audit/w1_smallset_fit_diagnostic/"
                   "real_chain_20261118_attempt_002")
@@ -75,11 +75,23 @@ def write_json(path: Path, doc: dict) -> None:
         out.flush()
         os.fsync(out.fileno())
     os.replace(tmp, path)
-    fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    _fsync_directory(path.parent)
+
+
+def _fsync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def _persist_npz(path, records):
+    """Preserve the baseline's byte format and sync it before issuing receipts."""
+    fit.write_npz_records(path, records)
+    with path.open("rb") as stream:
+        os.fsync(stream.fileno())
+    _fsync_directory(path.parent)
 
 
 def file_record(path: Path) -> dict:
@@ -240,7 +252,10 @@ def baseline_problems(binding: dict, budget: fit.StageBudget | None = None,
         digest = fit._canonical_sha256({k: v for k, v in binding.items() if k != "sha256"})
         if digest != binding["sha256"]:
             problems.append("baseline_binding_digest")
-        for path, rec in binding["files"].items():
+        files = binding["files"]
+        if not isinstance(files, dict) or not files or not isinstance(binding.get("artifact_files"), dict):
+            return problems + ["baseline_files_not_a_mapping"]
+        for path, rec in files.items():
             check("baseline_recheck:" + Path(path).name)
             if counters is not None:
                 counters["baseline_file_hashes"] = counters.get("baseline_file_hashes", 0) + 1
@@ -354,8 +369,11 @@ class ScheduleDriver(fit.FitDriver):
                 if file_record(self.stage_dir / rel) != self.baseline["artifact_files"][rel]:
                     raise fit.FitDiagnosticError(f"baseline_prefix_mismatch:admission:{rel}")
             self.budget.check("prefix_history_admission")
-            rows = [json.loads(line) for line in (self.stage_dir / "lr_history.jsonl").read_text().splitlines()]
-            if len(rows) != self.plan.switch_after or any(not fit._json_value_equal(
+            try:
+                rows = [json.loads(line) for line in (self.stage_dir / "lr_history.jsonl").read_text().splitlines()]
+            except (OSError, ValueError) as exc:
+                raise fit.FitDiagnosticError("baseline_prefix_mismatch:durable_history_unreadable") from exc
+            if not fit._json_value_equal(rows, self.history) or any(not fit._json_value_equal(
                     {k: v for k, v in row.items() if k not in LR_FIELDS}, want)
                     for row, want in zip(rows, self.baseline_index["history_unrounded"])):
                 raise fit.FitDiagnosticError("baseline_prefix_mismatch:durable_history")
@@ -430,14 +448,17 @@ class ScheduleDriver(fit.FitDriver):
         super()._run_probe(step, idx)
         self.budget.check("persist_probe")
         if step == 0:
-            fit.write_npz_records(self.stage_dir / "teacher_reference.npz", self.teacher_arrays)
+            _persist_npz(self.stage_dir / "teacher_reference.npz", self.teacher_arrays)
             self._check_prefix_file("teacher_reference.npz")
-            fit.write_npz_records(self.stage_dir / "probe_inputs.npz", {
+            _persist_npz(self.stage_dir / "probe_inputs.npz", {
                 f"w{b}__{k}": self.probe_batch[k].detach().cpu().numpy()[b]
                 for b in range(self.probe_batch["x0"].shape[0]) for k in ("x0", *fit.COND_KEYS)})
             self._check_prefix_file("probe_inputs.npz")
         rel = probe_name(idx, step)
-        fit.write_npz_records(self.stage_dir / rel, self.probe_arrays_by_idx[idx])
+        _persist_npz(self.stage_dir / rel, self.probe_arrays_by_idx[idx])
+        if step == 0:
+            # Persist the new probes directory entry as well as the file in it.
+            _fsync_directory(self.stage_dir)
         if step <= self.plan.switch_after:
             self._check_prefix_file(rel)
         self.budget.check("persist_probe_complete")
@@ -447,7 +468,7 @@ class ScheduleDriver(fit.FitDriver):
             "schema": "w1_d1_lr_evidence_v1", "schedule": self.plan.schedule(),
             "baseline_sha256": self.baseline["sha256"], "switches": self.switches,
             "counts": self.lr_counts})
-        super()._write_stage_artifacts()
+        super()._write_stage_artifacts(arrays_already_persisted=True)
         problems = verify_schedule_stage(self.stage_dir, self.plan, self.baseline, self.budget,
                                          counters=self.cpu_evidence_counts)
         if problems:
@@ -468,26 +489,44 @@ class ScheduleDriver(fit.FitDriver):
         super()._preflight()
 
 
+def _candidate_artifact_problems(stage_dir, plan, report, check=lambda _point: None, counters=None):
+    check("lr_saved_artifact_binding")
+    index, index_sha = protocol._object_and_sha(stage_dir / "artifacts_index.json")
+    files = index.get("files")
+    if index.get("schema") != fit.ARTIFACTS_INDEX_SCHEMA or not isinstance(files, dict):
+        return ["lr_artifact_index_files_or_schema_invalid"]
+    required = {*fit._required_stage_artifacts(plan), *LR_ARTIFACTS}
+    problems = [f"lr_artifact_required_missing:{rel}" for rel in sorted(required - files.keys())]
+    if report is not None and report.get("artifacts_index_sha256") != index_sha:
+        return problems + ["lr_artifact_index_report_mismatch"]
+    for rel, expected in files.items():
+        check("lr_artifact:" + rel)
+        path = stage_dir / rel
+        if not path.resolve().is_relative_to(stage_dir.resolve()):
+            problems.append(f"lr_artifact_outside_stage:{rel}")
+            continue
+        if not path.is_file() or not isinstance(expected, dict):
+            problems.append(f"lr_artifact_missing_or_invalid:{rel}")
+            continue
+        if counters is not None:
+            counters["candidate_artifact_hashes"] = counters.get("candidate_artifact_hashes", 0) + 1
+        if not fit._json_value_equal(file_record(path), expected):
+            problems.append(f"lr_artifact_drift:{rel}")
+    check("lr_saved_artifact_binding_complete")
+    return problems
+
+
 def verify_schedule_stage(stage_dir: Path, plan: SchedulePlan, baseline: dict,
                           budget: fit.StageBudget, *, counters: dict | None = None) -> list[str]:
     """F's independent sequence reconstruction, before any fresh model work."""
     problems = baseline_problems(baseline, budget, counters)
     try:
-        budget.check("lr_saved_artifact_binding")
-        index_path = stage_dir / "artifacts_index.json"
-        index = read_object(index_path)
-        for rel in (*fit._required_stage_artifacts(plan), "lr_evidence.json",
-                    "lr_history.jsonl", "prefix_checks.json", "prefix_admission.json"):
-            budget.check("lr_artifact:" + rel)
-            expected = index.get("files", {}).get(rel)
-            if counters is not None:
-                counters["candidate_artifact_hashes"] = counters.get("candidate_artifact_hashes", 0) + 1
-            if expected is None or file_record(stage_dir / rel) != expected:
-                problems.append(f"lr_artifact_drift:{rel}")
+        budget.check("lr_saved_stage_report")
         report_path = stage_dir / "stage_report.json"
-        if report_path.is_file() and read_object(report_path).get(
-                "artifacts_index_sha256") != sha256_file(index_path):
-            problems.append("lr_artifact_index_report_mismatch")
+        report = read_object(report_path) if report_path.is_file() else None
+        problems += _candidate_artifact_problems(stage_dir, plan, report, budget.check, counters)
+        if problems:
+            return problems
         budget.check("lr_saved_read")
         pidx = read_object(stage_dir / "probe_index.json")
         _validate_probe_index(pidx, plan)
@@ -655,36 +694,64 @@ def consume_comparison(run_dir: Path, *, observer_return_code: int | None = None
     try:
         if type(observer_return_code) is not int or observer_return_code != 0:
             raise fit.FitDiagnosticError("independent_actual_return_required")
-        completion = read_object(run_dir.parent / "completion_verification.json")
-        sample = read_object(run_dir.parent / "observer_write_observation.json")
-        required = {"acceptance_summary.json", "acceptance_verdict.json",
-                    "outer_return_observation.json", "outer_stdout_observation.json",
-                    "f/comparison.json", "f/f_report.json"}
-        if (not isinstance(completion.get("bindings"), dict)
-                or set(completion["bindings"]) != required
-                or completion.get("comparison_candidate") is not True):
-            raise fit.FitDiagnosticError("independent_return_required_bindings_missing")
-        if (sample.get("completion_sha256") != sha256_file(run_dir.parent / "completion_verification.json")
-                or sample.get("registered_measured_s") != completion.get("registered_measured_s")
-                or not sample["elapsed_after_completion_write_s"] <= completion["registered_measured_s"] <= completion["wall_cap_s"]
-                or completion.get("supervisor_return_code") != 0):
-            raise fit.FitDiagnosticError("independent_return_binding_invalid")
-        for rel, digest in completion["bindings"].items():
-            if sha256_file(run_dir / rel) != digest:
-                raise fit.FitDiagnosticError(f"comparison_outer_file_drift:{rel}")
-        f = read_object(run_dir / "f/f_report.json")
-        comparison = read_object(run_dir / "f/comparison.json")
-        verdict = read_object(run_dir / "acceptance_verdict.json")
-        summary = read_object(run_dir / "acceptance_summary.json")
-        if (verdict.get("verdict") != "candidate_complete" or verdict.get("problems") != []
+        completion, _, _, _, summary, receipt = protocol.verify_observer_files(run_dir, "chain")
+        protocol.verify_stage_ledger(run_dir, summary, receipt)
+        f, f_sha = protocol._object_and_sha(run_dir / "f/f_report.json")
+        cmp_path = run_dir / "f/comparison.json"
+        comparison, cmp_sha = protocol._object_and_sha(cmp_path)
+        stage_report, stage_sha = protocol._object_and_sha(run_dir / "d1/stage_report.json")
+        if (summary.get("authorized_includes") != ["D1", "F"] or summary.get("d6_ran") is not False
+                or (run_dir / "d6").exists()
                 or f.get("complete_evidence") is not True or f.get("replay_passed") is not True
+                or stage_report.get("local_complete_evidence") is not True
                 or f.get("comparison") != summary.get("comparison")
-                or f["comparison"]["sha256"] != sha256_file(run_dir / "f/comparison.json")
-                or comparison["B_stage_report"] != file_record(run_dir / "d1/stage_report.json")
-                or comparison.get("fit_verdict") != f.get("verdict")):
+                or f.get("comparison") != {"path": "comparison.json", "sha256": cmp_sha,
+                                           "bytes": cmp_path.stat().st_size, "conclusion": comparison.get("conclusion")}
+                or f_sha != completion["bindings"]["f/f_report.json"]
+                or cmp_sha != completion["bindings"]["f/comparison.json"]
+                or stage_sha != receipt["stage_artifacts"]["d1"]["report_sha256"]
+                or comparison["B_stage_report"] != {"sha256": stage_sha, "bytes": (run_dir / "d1/stage_report.json").stat().st_size}
+                or comparison.get("schema") != "w1_d1_lr_comparison_v1"
+                or comparison.get("state") != "pending_outer_return" or comparison.get("problems") != []
+                or comparison.get("conclusion") not in {"single_window_pass", "improved_but_insufficient", "no_prespecified_improvement"}
+                or not isinstance(comparison.get("metrics"), dict) or set(comparison["metrics"]) != set(GATES)
+                or comparison.get("fit_verdict") not in {"fit_pass", "fit_insufficient"}
+                or comparison["fit_verdict"] != f.get("verdict")):
             raise fit.FitDiagnosticError("comparison_not_bound_to_complete_chain")
+        admission_path = Path(summary["admission"]["path"])
+        admission, admission_sha = protocol._object_and_sha(admission_path)
+        if admission_sha != summary["admission"]["sha256"]:
+            raise fit.FitDiagnosticError("comparison_admission_drift")
+        auth_path = Path(summary["authorization"]["path"])
+        auth, auth_sha = protocol._object_and_sha(auth_path)
+        if (auth_sha != summary["authorization"]["sha256"] or auth.get("includes") != ["D1", "F"]
+                or auth.get("authorized") is not True or auth.get("admission_package_sha256") != admission_sha):
+            raise fit.FitDiagnosticError("comparison_authorization_drift")
+        package = admission["package"]
+        plan, baseline = SchedulePlan(**package["fit_plan"]), package["baseline"]
+        if (not isinstance(baseline, dict) or type(summary.get("fixture")) is not bool
+                or package.get("fixture") is not summary["fixture"] or plan.synthetic is not summary["fixture"]
+                or any(d.get("baseline_sha256") != baseline.get("sha256") for d in (summary, package, comparison, stage_report))
+                or any(not fit._json_value_equal(d.get("schedule"), plan.schedule()) for d in (summary, package, comparison))
+                or not fit._json_value_equal(stage_report.get("plan"), plan.as_dict())):
+            raise fit.FitDiagnosticError("comparison_plan_or_baseline_binding_invalid")
+        if not summary["fixture"]:
+            r_expected = PROJECT_ROOT / protocol.R_ROOT / "attempt_001/r_admission.json"
+            if admission_path.resolve() != r_expected:
+                raise fit.FitDiagnosticError("lr_r_fixed_admission_required")
+            protocol.verify_r_actual_return(admission_path.parent, auth.get("r_observer_actual_return"),
+                                            expected_admission_sha=admission_sha)
+        # Consume actual byte evidence on BOTH sides, not just the hash of a
+        # document that once pointed to those bytes. No arrays are decoded.
+        problems = baseline_problems(baseline) + _candidate_artifact_problems(run_dir / "d1", plan, stage_report)
+        if problems:
+            return _unavailable_comparison(problems)
         return {**comparison, "state": "consumable_after_verified_actual_return"}
-    except (fit.FitDiagnosticError, OSError, ValueError, TypeError, KeyError) as exc:
-        return {"schema": "w1_d1_lr_comparison_v1", "paired_probes": None,
-                "prefix": None, "tail": None, "final_spikes": None,
-                **classify({}, {}, [str(exc)])}
+    except (fit.FitDiagnosticError, OSError, ValueError, TypeError, KeyError, IndexError) as exc:
+        return _unavailable_comparison([str(exc)])
+
+
+def _unavailable_comparison(problems):
+    return {"schema": "w1_d1_lr_comparison_v1", "paired_probes": None,
+            "prefix": None, "tail": None, "final_spikes": None,
+            **classify({}, {}, problems)}

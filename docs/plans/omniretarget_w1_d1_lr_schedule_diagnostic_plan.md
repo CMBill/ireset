@@ -1,6 +1,6 @@
 # W1 固定单窗学习率日程对照方案
 
-版本：v0.1＋§7 实施记录（2026-11-18）。承接[主方案 §9、§44](omniretarget_w1_numerics_closure_fit_diagnostic_plan.md)和[真实单窗验证记录 §34](../verification/omniretarget_w1_smallset_fit_diagnostic.md#34-预算修复后的授权真实链2026-11-18)。**§1–§6 为原提案；I′ 已实施，合成验收与实现身份见[验证记录](../verification/omniretarget_w1_d1_lr_schedule_diagnostic.md)。真实 R′ 尚未执行，B 未授权、未运行。**
+版本：v0.1＋§7 实施及 §8 复阅修订（2026-11-18）。承接[主方案 §9、§44](omniretarget_w1_numerics_closure_fit_diagnostic_plan.md)和[真实单窗验证记录 §34](../verification/omniretarget_w1_smallset_fit_diagnostic.md#34-预算修复后的授权真实链2026-11-18)。**§1–§6 为原方案；真实 R′ 尚未执行，B 未授权、未运行。当前合成验收与实现身份见[验证记录](../verification/omniretarget_w1_d1_lr_schedule_diagnostic.md)。**
 
 ## 1. 要回答的问题
 
@@ -94,3 +94,13 @@
 测试命令、实际结果、当前合成工件及 SHA 见[独立验证记录](../verification/omniretarget_w1_d1_lr_schedule_diagnostic.md)。合成 A/B 是随机初始化微型模型和替身 FK，**不是历史真实 A 或真实 B 的拟合结论**。
 
 **下一停止点：复阅 I′ 实现及合成验收，然后明确安排一次 R′（仅元数据）→复阅冻结准入/未签草案→另获新的 §8.3 一次性授权→一次真实 B 的 D1′/F′。本轮不创建真实 R′/训练/cohort/授权记录，不追加 D6。**
+
+## 8. I′ 首轮复阅修订：仅工程边界（2026-11-18）
+
+- 监督器使用同一 Linux 进程组覆盖所有受管子进程，超时停止整个组并回收已收养的残余子进程；启动前确认 worker 属于登记组。合成默认在 `audit/<cohort>/synthetic/`，禁止把合成写入真实或历史目录。
+- R′ 由父进程实际 `wait()` 观察器。核验通过后才保存与该次启动、封口 R 文件和观察文件绑定的 `r_observer_actual_return.json`，并产出 R 根下的最终**未签** `authorization_draft.json`。attempt 内的预备草案没有实际返回绑定，不能消费。R′ 任务的最外层实际 exit0 还必须由调用方观察；之后复阅/签署 `w1_d1_lr_authorization_v2`，绑定该收据 SHA 并明确确认执行这次 R′ 的最外层实际返回码为 0，不能从候选文件推定。缺失、非零、旧协议或文件漂移均拒绝。没有隐式签署或真实 B 执行。
+- D1′/F′ 的报告、台账和返回证明共同覆盖尾部写盘。覆盖不足同步撤回，成本只增不减；无法证明为未知，不进入后续数值工作。交接以 D1′ 最后覆盖采样为 F′ 起点。
+- 比较消费必须同时复核外部实际返回、阶段成本/封口证明、准入/授权、A 的绑定文件以及 B 索引内的实际工件；无需再解码或重放，任何缺失/漂移一律 `not_comparable`。F 见到坏索引应正常落不完整报告，不启动 fresh 模型。
+- 共同前缀数值 NPZ 在原位置写入、同步并逐文件比对；D1′ 收口不再重写已写文件。切换前也核对盘上历史的 LR 与状态记录，不能依赖仅匹配去掉 LR 字段后的行。
+
+§1–§6 的数据、数值日程、阈值、预算和调用上限不变。旧合成工件原样留存。修订后通过复审也不代表已经安排 R′；真实 B 仍只允许冻结的 `[D1,F]`，不追加 D6。
