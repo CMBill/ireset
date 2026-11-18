@@ -18,6 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from ireset.eval import w1_d1_lr_schedule as lr
 from ireset.eval import w1_d1_lr_protocol as protocol
+from ireset.eval import w1_d1_lr_artifacts as artifacts
 from ireset.eval import w1_d1_lr_workflow as flow
 from ireset.eval import w1_smallset_fit_diagnostic as fit
 
@@ -72,23 +73,31 @@ def main():
                 lr.write_json(output / "authorization_draft.json", flow.authorization_draft(
                     doc["package"], flow.radm.sha256_file(Path(out["summary"]))))
         else:
+            claim = lr.read_object(output.parent / "cohort_launch_claim.json")
+            if (claim.get("observer_pid") != os.getpgrp()
+                    or claim.get("artifact_space") != artifacts.policy()):
+                raise fit.FitDiagnosticError("lr_worker_missing_supervised_artifact_policy")
+            space = artifacts.ArtifactSpace(output.parent, supervised=True)
+            budget.artifact_space = space
             if args.fixture:
                 # Fixture generation is charged from the supervisor's t0.
-                world, _, _, admission, authorization = flow.synthetic_materials(output)
+                world, _, _, admission, authorization = flow.synthetic_materials(output, space=space)
             else:
                 if not args.admission or not args.authorization or args.cache_root:
                     parser.error("chain requires admission/authorization, no cache override")
                 world, admission, authorization = None, Path(args.admission), Path(args.authorization)
             out = flow.run_candidate(run_root=output, admission_path=admission,
                                       authorization_path=authorization, chain_t0=t0,
-                                      outer_launch=launch, fixture=args.fixture, fixture_world=world)
+                                      outer_launch=launch, fixture=args.fixture, fixture_world=world,
+                                      supervised=True)
         path = Path(out["summary"])
         doc = lr.read_object(path)
         print(json.dumps({"state": "pending_outer_return", "output_dir": str(output),
                           "mode": args.mode, "problems": doc.get("problems"),
                           "comparison": doc.get("comparison")}), flush=True)
         cov = fit.verify_return_coverage(path, budget,
-                                         withdraw={"label_verdict": "budget_exceeded_after_seal"})
+                                         withdraw={"label_verdict": "budget_exceeded_after_seal"},
+                                         **budget.closure_write_options())
         if not cov["covered"]:
             return 3
         doc = cov["final_doc"]

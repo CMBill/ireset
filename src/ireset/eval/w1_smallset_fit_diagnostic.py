@@ -192,6 +192,12 @@ class StageBudget:
     clock: Callable[[], float] = time.perf_counter
     exceeded: bool = False
     stopped_at: str = ""
+    artifact_space: object | None = field(default=None, repr=False)
+
+    def closure_write_options(self) -> dict:
+        if self.artifact_space is None:
+            return {}
+        return {"write_json": self.artifact_space.write_closure_json}
 
     @property
     def work_deadline(self) -> float:
@@ -1735,9 +1741,17 @@ class FitDriver:
         self.runtime_guard.check_unit(f"checkpoint_{name}_start")
         self._check_runtime_bindings()
         self.budget.check(f"checkpoint_{name}_binding_read")
-        self.counters["checkpoint_saves"] = \
-            self.counters.get("checkpoint_saves", 0) + 1
-        self.trainer.save(name, step, {"step": step}, identity=self.identity)
+        def save():
+            self.counters["checkpoint_saves"] = self.counters.get("checkpoint_saves", 0) + 1
+            self.trainer.save(name, step, {"step": step}, identity=self.identity)
+
+        space = self.budget.artifact_space
+        if space is None:
+            save()
+        else:
+            with space.checkpoint(self.stage_dir / name, (self.trainer.model, self.trainer.conditioner),
+                                  check=self.budget.check):
+                save()
 
     # -- main flow ------------------------------------------------------------
 
@@ -1932,8 +1946,7 @@ class FitDriver:
             self._phase = f"step_{step}_optimizer_update"
             self._optimizer_step_entry(step)
             self.budget.check(f"step_{step}_after_step_admission")
-            self.counters["adamw_step_calls"] += 1
-            trainer.step_optimizer()
+            self._step_optimizer()
             # P1 (round-15): one executed native step advances the frozen
             # counter exactly once; the ACTUAL optimizer state must follow it
             # (a stale/preloaded step is a refusal, never a silent update).
@@ -1956,6 +1969,10 @@ class FitDriver:
 
     def _optimizer_step_entry(self, step: int) -> None:
         """Read-only extension evidence immediately before the native step."""
+
+    def _step_optimizer(self) -> None:
+        self.counters["adamw_step_calls"] += 1
+        self.trainer.step_optimizer()
 
     def _record_update(self, row: dict) -> None:
         self.history.append(row)
@@ -2004,15 +2021,29 @@ class FitDriver:
 
     # -- artifacts ------------------------------------------------------------
 
+    def _write_work_json(self, path, doc):
+        space = self.budget.artifact_space
+        if space is None:
+            path.write_text(json.dumps(doc, indent=1, allow_nan=False))
+        else:
+            space.write_json(path, doc, check=self.budget.check)
+
+    def _write_work_npz(self, path, records):
+        space = self.budget.artifact_space
+        if space is None:
+            write_npz_records(path, records)
+        else:
+            space.write_npz(path, records, check=self.budget.check)
+
     def _write_stage_artifacts(self, *, arrays_already_persisted: bool = False) -> None:
         self._phase = "write_artifacts"
         self.budget.check("write_artifacts")
         probes_dir = self.stage_dir / "probes"
         probes_dir.mkdir(parents=True, exist_ok=True)
         if not arrays_already_persisted:
-            write_npz_records(self.stage_dir / "teacher_reference.npz",
-                              self.teacher_arrays)
-            write_npz_records(self.stage_dir / "probe_inputs.npz", {
+            self._write_work_npz(self.stage_dir / "teacher_reference.npz",
+                                 self.teacher_arrays)
+            self._write_work_npz(self.stage_dir / "probe_inputs.npz", {
                 f"w{b}__{k}": self.probe_batch[k].detach().cpu().numpy()[b]
                 for b in range(self.probe_batch["x0"].shape[0])
                 for k in ("x0", *COND_KEYS)})
@@ -2025,16 +2056,14 @@ class FitDriver:
                        "teacher_reference": "teacher_reference.npz",
                        "probe_inputs": "probe_inputs.npz",
                        "history_unrounded": self.history}
-        (self.stage_dir / "probe_index.json").write_text(
-            json.dumps(probe_index, indent=1, allow_nan=False))
+        self._write_work_json(self.stage_dir / "probe_index.json", probe_index)
         if not arrays_already_persisted:
             for idx, arrays in self.probe_arrays_by_idx.items():
                 step = self.probes[idx]["step"]
-                write_npz_records(
+                self._write_work_npz(
                     probes_dir / f"probe_{idx:04d}_step_{step:06d}.npz", arrays)
         index = build_artifacts_index(self.stage_dir)
-        (self.stage_dir / "artifacts_index.json").write_text(
-            json.dumps(index, indent=1, allow_nan=False))
+        self._write_work_json(self.stage_dir / "artifacts_index.json", index)
 
 
 RETURN_OBSERVATION_SCHEMA = "n0_return_observation_v1"
@@ -2116,7 +2145,7 @@ def _return_proof_problems(stage_dir: Path) -> list[str]:
     return problems
 
 
-def write_handoff_candidate(stage_dir: Path, summary: dict) -> dict | None:
+def write_handoff_candidate(stage_dir: Path, summary: dict, *, write_json=None) -> dict | None:
     """Write the D1 receipt candidate AFTER the sealed report exists: it
     binds the report bytes but is NOT consumable alone (plan §7.4 item 3)."""
     stage_dir = Path(stage_dir)
@@ -2139,8 +2168,11 @@ def write_handoff_candidate(stage_dir: Path, summary: dict) -> dict | None:
         "note": "candidate_only; handoff_ready is resolved from disk facts "
                 "(seal + return observation + re-verification + authorization)",
     }
-    (stage_dir / "handoff_candidate.json").write_text(
-        json.dumps(candidate, indent=1, allow_nan=False))
+    path = stage_dir / "handoff_candidate.json"
+    if write_json is None:
+        path.write_text(json.dumps(candidate, indent=1, allow_nan=False))
+    else:
+        write_json(path, candidate)
     return candidate
 
 
@@ -2172,14 +2204,15 @@ def finish_stage(stage_dir: Path, summary: dict, budget: StageBudget) -> dict:
     summary = {**summary, "artifacts_index_sha256":
                sha256_file(index_path) if index_path.is_file() else None}
     path = stage_dir / "stage_report.json"
+    write_options = budget.closure_write_options()
     seal = _write_summary_sealed(path, summary, budget,
                                  withdraw=dict(I_WITHDRAW_ON_EXCEED),
-                                 clock=budget.clock)
-    candidate = write_handoff_candidate(stage_dir, summary)
+                                 clock=budget.clock, **write_options)
+    candidate = write_handoff_candidate(stage_dir, summary, **write_options)
     doc = json.loads(path.read_text())
     cov = verify_return_coverage(path, budget,
-                                 withdraw=dict(I_WITHDRAW_ON_EXCEED),
-                                 clock=budget.clock)
+                                  withdraw=dict(I_WITHDRAW_ON_EXCEED),
+                                  clock=budget.clock, **write_options)
     doc, seal_view = _coverage_return_view(cov)
     return {"stage_report": str(path), "seal": seal_view,
             "return_coverage": cov,
@@ -3697,12 +3730,12 @@ def run_f_verification(*, stage_specs: list[dict], out_dir: Path,
     # the only guard against a slow tail read; the necessary read happens
     # BEFORE the coverage sample and no I/O follows the passing sample.
     seal = _write_summary_sealed(path, final, budget,
-                                 withdraw=dict(F_WITHDRAW_ON_EXCEED),
-                                 clock=budget.clock)
+                                  withdraw=dict(F_WITHDRAW_ON_EXCEED),
+                                  clock=budget.clock, **budget.closure_write_options())
     doc = json.loads(path.read_text())
     cov = verify_return_coverage(path, budget,
-                                 withdraw=dict(F_WITHDRAW_ON_EXCEED),
-                                 clock=budget.clock)
+                                  withdraw=dict(F_WITHDRAW_ON_EXCEED),
+                                  clock=budget.clock, **budget.closure_write_options())
     doc, seal_view = _coverage_return_view(cov)
     return {"f_report": str(path), "seal": seal_view,
             "return_coverage": cov, "seal_loop": seal, "summary_doc": doc}
@@ -3880,8 +3913,8 @@ def write_acceptance_outputs(out_dir: Path, facts: dict, budget: StageBudget,
     out_dir = Path(out_dir)
     path = out_dir / "acceptance_summary.json"
     seal = _write_summary_sealed(path, facts, budget,
-                                 withdraw=dict(withdraw or {}),
-                                 clock=budget.clock)
+                                  withdraw=dict(withdraw or {}),
+                                  clock=budget.clock, **budget.closure_write_options())
     return {"summary": str(path), "seal": seal,
             "summary_doc": json.loads(path.read_text())}
 
@@ -3950,14 +3983,14 @@ def _observe_returned_report(path: Path, budget: StageBudget, withdraw: dict) ->
 def _mini_stage(tmp: Path, stage: str, *, n_windows: int = 6, steps: int = 2,
                 probe_every: int = 1, seed: int = 20261107, d_model: int = 16,
                 lr: float = 0.02, world: SyntheticWorld | None = None,
-                finish: bool = False):
+                finish: bool = False, artifact_space=None):
     """One miniature fit stage for the counterexamples."""
     world = world or make_synthetic_world(seed=seed, n_windows=n_windows,
                                           d_model=d_model)
     plan = FitPlan(stage, steps=steps, probe_every=probe_every, synthetic=True,
                    d_model=d_model, n_layers=1, n_heads=4, ffn_mult=2, lr=lr)
     sdir = Path(tmp) / stage.lower()
-    budget = StageBudget(stage=stage, wall_cap_s=600.0, reserve_s=10.0)
+    budget = StageBudget(stage=stage, wall_cap_s=600.0, reserve_s=10.0, artifact_space=artifact_space)
     view = world.view_for(stage)
     trainer = world.build_trainer(plan, sdir, budget_deadline=budget.work_deadline,
                                   train_ds=view["ds"])

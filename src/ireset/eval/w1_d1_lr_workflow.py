@@ -19,6 +19,7 @@ from ireset.eval import w1_smallset_fit_diagnostic as fit
 from ireset.eval import w1_smallset_fit_r_admission as radm
 from ireset.eval import w1_d1_lr_schedule as lr
 from ireset.eval import w1_d1_lr_protocol as protocol
+from ireset.eval import w1_d1_lr_artifacts as artifacts
 from ireset.paths import PROJECT_ROOT
 
 PACKAGE_SCHEMA = "w1_d1_lr_admission_package_v1"
@@ -28,6 +29,8 @@ CHECKLIST = (*radm.AUTHORIZATION_CHECKLIST, "baseline_prefix_schedule_and_compar
 EXTRA_FILES = (lr.PLAN_PATH, "src/ireset/eval/w1_d1_lr_schedule.py",
                "src/ireset/eval/w1_d1_lr_workflow.py",
                "src/ireset/eval/w1_d1_lr_protocol.py",
+               "src/ireset/eval/w1_d1_lr_artifacts.py",
+               "src/ireset/eval/w1_n0_coordinate_flags.py",
                "scripts/run_w1_d1_lr_schedule.py",
                "scripts/run_w1_d1_lr_schedule_supervisor.py",
                "tests/test_w1_d1_lr_schedule.py",
@@ -60,7 +63,8 @@ def frozen_matrix(plan: lr.SchedulePlan | None = None, baseline: dict | None = N
          "prefix_file_comparisons": p.switch_after // p.probe_every + 3,
          "prefix_admission_file_hashes": p.switch_after // p.probe_every + 3,
          "history_rows_compared": p.switch_after, "schedule_switches": 1,
-         "optimizer_state_digest_reads": 3 * p.steps + 2,
+          "optimizer_state_digest_reads": 3 * p.steps + 2,
+          "optimizer_step_contract_checks": p.steps + 1,
          "cpu_evidence_baseline_rechecks": 2,
          "cpu_evidence_schedule_rows_verified": p.steps,
          "cpu_evidence_prefix_file_comparisons": p.switch_after // p.probe_every + 3,
@@ -84,7 +88,9 @@ def frozen_matrix(plan: lr.SchedulePlan | None = None, baseline: dict | None = N
     f["cpu_evidence_schedule_rows_verified"] = 2 * p.steps
     # Decode classes are distinct: the top-level D1 counters exclude the
     # 8000 production decodes inside loss; the saved and fresh domains do not.
-    doc = {"schema": "w1_d1_lr_call_matrix_v1", "D1": d, "D6": {}, "F": f,
+    doc = {"schema": "w1_d1_lr_call_matrix_v2", "D1": d, "D6": {}, "F": f,
+           "optimizer_step_contract": lr.OPTIMIZER_STEP_CONTRACT,
+           "artifact_space": artifacts.policy(),
            "R": {"model_constructions": 0, "forward_calls": 0,
                  "array_value_reads": 0, "checkpoint_loads": 0},
            "bounds": {"D6_all_calls": 0, "conditioner_forward_calls": d["conditioner_forward_calls"] + 2,
@@ -296,12 +302,17 @@ def verify_launch_scope(run_root: Path, outer_launch: dict, *, mode="chain"):
 class StageLedger:
     """One durable row per stage; a partial/crashed attempt is never zero."""
 
-    def __init__(self, path):
+    def __init__(self, path, *, space=None):
         self.path = Path(path)
         self.rows = []
+        self.space = space
+
+    def write(self, path, doc):
+        write = lr.write_json if self.space is None else self.space.write_closure_json
+        write(path, doc)
 
     def _write(self):
-        lr.write_json(self.path, {"schema": protocol.LEDGER_SCHEMA, "rows": self.rows})
+        self.write(self.path, {"schema": protocol.LEDGER_SCHEMA, "rows": self.rows})
 
     def begin(self, budget):
         if any(row["stage"] == budget.stage for row in self.rows):
@@ -334,14 +345,14 @@ class StageLedger:
                             note="lr_stage_ledger_return_withdrawn")
                 report["budget"]["measured_wall_s_at_summary"] = registered
                 report.update(withdraw)
-                lr.write_json(report_path, report)
+                self.write(report_path, report)
                 report_sha = protocol.sha(report_path)
             row.update(status=("cost_unproven" if unproven else "sealed_candidate"
                                if not rejected and report.get(complete) is True else "incomplete"),
                        measured_wall_s=registered, report_seal=seal["status"])
             self._write()
             observed = budget.clock() - budget.t0
-            lr.write_json(proof_path, {"schema": fit.RETURN_OBSERVATION_SCHEMA, "covered": not rejected,
+            self.write(proof_path, {"schema": fit.RETURN_OBSERVATION_SCHEMA, "covered": not rejected,
                                        "summary_sha256": report_sha, "registered_measured_s": registered,
                                        "wall_cap_s": budget.wall_cap_s, "elapsed_s": observed,
                                        "cost_coverage_unproven": unproven, "stage_ledger_row": dict(row)})
@@ -373,7 +384,7 @@ def _matrix_problems(driver, report, f_doc=None, f_cpu=None):
     if driver.lr_counts["schedule_switches"] != 1:
         problems.append("schedule_switch_count")
     for key in ("history_rows_compared", "prefix_file_comparisons", "prefix_admission_file_hashes", "lr_group_reads",
-                "optimizer_state_digest_reads"):
+                "optimizer_state_digest_reads", "optimizer_step_contract_checks"):
         multiplier = len(driver.trainer.opt.param_groups) if key == "lr_group_reads" else 1
         if driver.lr_counts[key] != want["D1"][key] * multiplier:
             problems.append("D1:" + key)
@@ -415,19 +426,22 @@ def _matrix_problems(driver, report, f_doc=None, f_cpu=None):
 
 
 def run_candidate(*, run_root, admission_path, authorization_path, chain_t0,
-                  outer_launch, fixture=False, fixture_world=None, **world_kwargs):
+                   outer_launch, fixture=False, fixture_world=None, supervised=False, **world_kwargs):
     """One candidate; every refused/failed path remains incomplete, never retried."""
     root = Path(world_kwargs.get("project_root") or PROJECT_ROOT)
-    run_root = Path(run_root)
+    run_root = Path(run_root).resolve()
     if fixture:
         if not protocol.fixture_output_allowed(run_root, PROJECT_ROOT):
             raise fit.FitDiagnosticError("lr_fixture_output_not_isolated")
+        run_root.mkdir(parents=True, exist_ok=True)
     else:
         verify_launch_scope(run_root, outer_launch)
-        if world_kwargs or fixture_world is not None:
+        if world_kwargs or fixture_world is not None or not supervised:
             raise fit.FitDiagnosticError("real_world_override_forbidden")
-    chain = fit.StageBudget("chain", 2400.0, 60.0, t0=chain_t0)
-    d1_budget = fit.StageBudget("D1", 1800.0, 60.0, t0=chain_t0)
+    space = artifacts.ArtifactSpace(run_root.parent if supervised else run_root,
+                                    cap_bytes=radm.R_ARTIFACT_CAP_BYTES, supervised=supervised)
+    chain = fit.StageBudget("chain", 2400.0, 60.0, t0=chain_t0, artifact_space=space)
+    d1_budget = fit.StageBudget("D1", 1800.0, 60.0, t0=chain_t0, artifact_space=space)
     facts = {"kind": "lr_schedule_chain", "cohort_id": lr.COHORT, "fixture": fixture,
              "authorized_includes": ["D1", "F"], "d6_ran": False,
              "d6": {"skipped_reason": "d6_not_authorized"},
@@ -439,7 +453,7 @@ def run_candidate(*, run_root, admission_path, authorization_path, chain_t0,
                                    "legacy_incomplete_unchanged": True,
                                    "T6_mandatory_gaps": 539}
     problems = []
-    ledger = StageLedger(run_root / "costs.json")
+    ledger = StageLedger(run_root / "costs.json", space=space)
     active_budget = d1_budget
     try:
         ledger.begin(d1_budget)
@@ -457,12 +471,11 @@ def run_candidate(*, run_root, admission_path, authorization_path, chain_t0,
             raise fit.FitDiagnosticError(f"lr_authorization_refused:{errors}")
         # Persistent, exclusive claim precedes array/model work. The supervisor
         # also reserves the fixed root, so parallel/changed-path invocations fail.
-        with (run_root / "authorization_consumed.json").open("x") as out:
-            json.dump({"authorization_sha256": facts["authorization"]["sha256"],
-                       "admission_sha256": facts["admission"]["sha256"],
-                       "cohort": lr.COHORT, "state": "consumed", "t0": chain_t0}, out)
-            out.flush()
-            os.fsync(out.fileno())
+        space.write_json(run_root / "authorization_consumed.json", {
+            "authorization_sha256": facts["authorization"]["sha256"],
+            "admission_sha256": facts["admission"]["sha256"],
+            "cohort": lr.COHORT, "state": "consumed", "t0": chain_t0},
+            exclusive=True, check=d1_budget.check)
         plan = lr.SchedulePlan(**p["fit_plan"])
         if not fixture and plan.synthetic:
             raise fit.FitDiagnosticError("synthetic_plan_on_real_path")
@@ -527,12 +540,16 @@ def run_candidate(*, run_root, admission_path, authorization_path, chain_t0,
                              stage_closed_perf_counter=cov["end"],
                             call_matrix_problems=doc.get("call_matrix", {}).get("problems"),
                             seal=doc.get("seal", {}).get("status"))
-        f_budget = fit.StageBudget("F", 600.0, 60.0, t0=f_start)
+        f_budget = fit.StageBudget("F", 600.0, 60.0, t0=f_start, artifact_space=space)
         active_budget = f_budget
         ledger.begin(f_budget)
         f_specs = []
         f_cpu_counts = {}
         if facts["d1"]["local_complete_evidence"] is True and cov["covered"]:
+            # Leave room for a comparison before constructing the F apparatus.
+            # The exact serialized byte count is checked again at publication.
+            space.require(run_root / "f/comparison.json.tmp", 4096 * (plan.n_probes + 1))
+            f_budget.check("lr_f_artifact_reservation")
             apparatus = (radm.materialize_fit_apparatus(
                 admission=admission, budget=f_budget,
                 device="cpu" if fixture else "cuda", fixture=fixture,
@@ -561,9 +578,10 @@ def run_candidate(*, run_root, admission_path, authorization_path, chain_t0,
             return model, conditioner
 
         def comparison(final):
-            comparison_doc = lr.build_comparison(stage_dir=d1_dir, baseline=p["baseline"],
-                                                  plan=plan, f_candidate=final, budget=f_budget,
-                                                  counters=f_cpu_counts)
+            comparison_doc = (lr.build_comparison(stage_dir=d1_dir, baseline=p["baseline"],
+                                                   plan=plan, f_candidate=final, budget=f_budget,
+                                                   counters=f_cpu_counts) if f_specs else
+                              lr._unavailable_comparison(["d1_incomplete_or_uncovered"]))
             matrix_errors = _matrix_problems(driver, summary, final, f_cpu_counts) if final.get("complete_evidence") else []
             if matrix_errors:
                 comparison_doc.update(lr.classify({}, {}, matrix_errors))
@@ -573,7 +591,10 @@ def run_candidate(*, run_root, admission_path, authorization_path, chain_t0,
                     comparison_doc[key] = None
                 final.update(complete_evidence=False, mean_fit_passed=None, verdict="incomplete")
             path = run_root / "f/comparison.json"
-            lr.write_json(path, comparison_doc)
+            if comparison_doc["conclusion"] == "not_comparable":
+                space.write_closure_json(path, comparison_doc)
+            else:
+                space.write_json(path, comparison_doc, check=f_budget.check)
             final["comparison"] = {"path": "comparison.json", **lr.file_record(path),
                                    "conclusion": comparison_doc["conclusion"]}
             final["construction_counts"] = build_counts
@@ -597,9 +618,9 @@ def run_candidate(*, run_root, admission_path, authorization_path, chain_t0,
         ledger.failed(active_budget, str(exc)[:500])
     facts["stage_ledger"] = {"rows": ledger.rows,
                               "sha256": radm.sha256_file(ledger.path) if ledger.path.is_file() else None}
-    size = sum(p.stat().st_size for p in run_root.rglob("*") if p.is_file())
+    size = space.used_bytes()
     facts["artifacts_bytes_before_chain_seal"] = size
-    if size > radm.R_ARTIFACT_CAP_BYTES:
+    if size > space.cap_bytes:
         problems.append("lr_artifact_cap_exceeded")
     facts["problems"] = problems
     facts["budget"] = chain.facts()
@@ -608,7 +629,7 @@ def run_candidate(*, run_root, admission_path, authorization_path, chain_t0,
                                         withdraw={"label_verdict": "budget_exceeded_after_seal"})
 
 
-def synthetic_materials(out_dir: Path, *, steps=4, switch_after=2):
+def synthetic_materials(out_dir: Path, *, steps=4, switch_after=2, space=None):
     """Offline A/B control, labelled fixture; cannot be used by the real entry."""
     if not protocol.fixture_output_allowed(out_dir, PROJECT_ROOT):
         raise fit.FitDiagnosticError("lr_fixture_output_not_isolated")
@@ -616,7 +637,7 @@ def synthetic_materials(out_dir: Path, *, steps=4, switch_after=2):
     parent = Path(out_dir) / "synthetic_materials"
     world, constant, _, summary, stage_dir, _, _ = fit._mini_stage(
         parent / "A", "D1", n_windows=1, steps=steps, probe_every=1,
-        d_model=16, lr=0.002, finish=True)
+        d_model=16, lr=0.002, finish=True, artifact_space=space)
     if summary["local_complete_evidence"] is not True:
         raise fit.FitDiagnosticError("synthetic_A_incomplete")
     plan = lr.SchedulePlan(**constant.as_dict(), switch_after=switch_after)
@@ -632,12 +653,13 @@ def synthetic_materials(out_dir: Path, *, steps=4, switch_after=2):
                "budget": {"caps": {k: {"wall_cap_s": v[0], "reserve_s": v[1]} for k, v in CAPS.items()},
                           "chain_cap_s": 2400.0, "total_with_r_s": 2520.0}}
     admission_path = parent / "fixture_admission.json"
-    lr.write_json(admission_path, {"admission_passed": True, "problems": [],
+    write = lr.write_json if space is None else space.write_json
+    write(admission_path, {"admission_passed": True, "problems": [],
                                   "seal": {"status": "sealed_within_budget"},
                                   "package": package})
     auth = authorization_draft(package, radm.sha256_file(admission_path))
     auth.update(authorized=True, template_only=False, checklist={k: True for k in CHECKLIST},
                 synthetic_only=True)
     auth_path = parent / "fixture_authorization.json"
-    lr.write_json(auth_path, auth)
+    write(auth_path, auth)
     return world, plan, baseline, admission_path, auth_path

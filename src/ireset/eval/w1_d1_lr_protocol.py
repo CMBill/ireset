@@ -5,6 +5,8 @@ import json
 import math
 from pathlib import Path
 
+from ireset.eval import w1_d1_lr_artifacts as artifacts
+
 COHORT = "w1_d1_lr_half_after_500_v1"
 RUN_ROOT = "derived/experiments/omniretarget_first/" + COHORT
 AUDIT_ROOT = "derived/audit/" + COHORT
@@ -18,6 +20,11 @@ CAPS = {"r-admit": (120.0, 15.0), "chain": (2400.0, 60.0)}
 STAGE_REPORTS = {"D1": ("d1/stage_report.json", 1800.0), "F": ("f/f_report.json", 600.0)}
 COMPLETION_NAME = "completion_verification.json"
 SAMPLE_NAME = "observer_write_observation.json"
+CHAIN_WAIT_NAME = "chain_observer_actual_wait.json"
+CHAIN_ARCHIVE_NAME = "chain_wait_archive_observation.json"
+CHAIN_CAPTURE_FAILURE = "chain_capture_failure.json"
+CHAIN_WAIT_SCHEMA = "w1_d1_lr_chain_observer_actual_wait_v1"
+CHAIN_ARCHIVE_SCHEMA = "w1_d1_lr_chain_wait_archive_v1"
 
 
 def sha(path):
@@ -162,6 +169,58 @@ def verify_r_actual_return(attempt, binding, *, expected_admission_sha=None):
             or summary.get("admission_passed") is not True):
         raise ValueError("lr_r_actual_observer_return_invalid")
     return summary
+
+
+def chain_wait_binding(attempt, packet):
+    """The parent and consumer bind the same attempt and observer, not just a code."""
+    completion, completion_sha, _, sample_sha, summary, _ = packet
+    root = attempt.parent
+    claim, claim_sha = _object_and_sha(root / "cohort_launch_claim.json")
+    pid, collector_pid = claim.get("observer_pid"), claim.get("collector_pid")
+    if (attempt.name != "attempt_001" or {p.name for p in root.glob("attempt_*")} != {"attempt_001"}
+            or claim.get("cohort") != COHORT or claim.get("mode") != "chain"
+            or claim.get("state") != "running" or type(claim.get("max_attempts")) is not int or claim["max_attempts"] != 1
+            or type(claim.get("synthetic")) is not bool or claim["synthetic"] is not summary.get("fixture")
+            or claim.get("t0_perf_counter") != completion["t0_perf_counter"]
+            or type(pid) is not int or pid <= 0 or pid != summary["outer_launch"]["worker_process_group"]
+            or type(collector_pid) is not int or collector_pid <= 0 or pid == collector_pid
+            or claim.get("artifact_space") != artifacts.policy()):
+        raise ValueError("lr_chain_capture_claim_invalid")
+    return {"launch_id": completion["launch_id"], "observer_pid": pid, "collector_pid": collector_pid,
+            "t0_perf_counter": completion["t0_perf_counter"],
+            "registered_measured_s": completion["registered_measured_s"], "wall_cap_s": CAPS["chain"][0],
+            "completion_sha256": completion_sha, "observer_write_observation_sha256": sample_sha,
+            "cohort_launch_claim_sha256": claim_sha}
+
+
+def verify_chain_actual_return(attempt, *, collector_return_code):
+    """Verify the independent wait, its fsync observation, and the collector outcome."""
+    attempt = Path(attempt)
+    root = attempt.parent
+    if type(collector_return_code) is not int or collector_return_code != 0:
+        raise ValueError("lr_independent_capture_exit_required")
+    if any((root / name).exists() for name in (CHAIN_CAPTURE_FAILURE, "supervisor_failure.json")):
+        raise ValueError("lr_chain_capture_failed")
+    packet = verify_observer_files(attempt, "chain")
+    bound = chain_wait_binding(attempt, packet)
+    wait, wait_sha = _object_and_sha(root / CHAIN_WAIT_NAME)
+    archived, _ = _object_and_sha(root / CHAIN_ARCHIVE_NAME)
+    t0, reg = bound["t0_perf_counter"], bound["registered_measured_s"]
+    returned, synced = wait.get("observer_return_perf_counter"), archived.get("archive_synced_perf_counter")
+    rc = wait.get("observer_actual_return_code")
+    if (wait.get("schema") != CHAIN_WAIT_SCHEMA or any(wait.get(k) != v for k, v in bound.items())
+            or any(type(wait.get(k)) is not int for k in ("observer_pid", "collector_pid"))
+            or type(rc) is not int or rc != 0 or wait.get("group_reaped_cleanly") is not True
+            or archived.get("schema") != CHAIN_ARCHIVE_SCHEMA or archived.get("wait_sha256") != wait_sha
+            or archived.get("launch_id") != bound["launch_id"]
+            or not all(number(v) for v in (returned, synced, wait.get("elapsed_s"), archived.get("elapsed_s")))
+            or returned - t0 != wait["elapsed_s"] or synced - t0 != archived["elapsed_s"]
+            or not packet[2]["elapsed_after_completion_write_s"] <= returned - t0 <= synced - t0 <= reg <= bound["wall_cap_s"]):
+        raise ValueError("lr_chain_actual_return_or_archive_not_covered")
+    space = artifacts.ArtifactSpace(root, supervised=True)
+    if space.used_bytes() > space.cap_bytes or any(root.rglob("*.tmp")):
+        raise ValueError("lr_chain_artifact_closure_invalid")
+    return packet
 
 
 def verify_stage_ledger(attempt, summary, receipt=None):

@@ -1,7 +1,7 @@
-"""D1-only supervisor policy adapter plus independent actual-return observer.
+"""D1-only supervisor with an independent parent that waits and archives.
 
 The audited legacy supervisor is loaded as a private module, not modified.
-Every comparison remains a candidate until this outer observer returns zero.
+Every comparison stays provisional until the external wait and archive are verified.
 One fixed root/attempt is allowed for R′ and B independently; no retries.
 """
 
@@ -14,15 +14,18 @@ import importlib.util
 import json
 import math
 import os
+import shutil
 import signal
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 from ireset.eval import w1_d1_lr_protocol as protocol
+from ireset.eval import w1_d1_lr_artifacts as artifacts
 
 COHORT = protocol.COHORT
 
@@ -30,13 +33,38 @@ COHORT = protocol.COHORT
 class InheritedGroupWorker(subprocess.Popen):
     """Only the outer observer owns the hard deadline and process group."""
 
-    def __init__(self, *args, start_new_session=False, **kwargs):
+    def __init__(self, *args, start_new_session=False, limit_logs=False, **kwargs):
+        logs = {key: kwargs[key] for key in ("stdout", "stderr")} if limit_logs else {}
+        kwargs.update(dict.fromkeys(logs, subprocess.PIPE))
         super().__init__(*args, start_new_session=False, **kwargs)
+        self._log_errors = []
+        self._drains = []
+        for key, out in logs.items():
+            thread = threading.Thread(target=self._drain_log, args=(getattr(self, key), out), daemon=True)
+            thread.start()
+            self._drains.append(thread)
+
+    def _drain_log(self, stream, out):
+        remaining = artifacts.LOG_BYTES
+        try:
+            with stream:
+                while chunk := stream.read1(64 << 10):
+                    out.write(chunk[:remaining])
+                    if len(chunk) > remaining:
+                        raise artifacts.ArtifactLimit("lr_artifact_log_slot_exceeded")
+                    remaining -= len(chunk)
+        except (OSError, ValueError) as exc:
+            self._log_errors.append(str(exc))
 
     def wait(self, timeout=None):
         # The legacy supervisor's private TERM/grace/KILL loop must not race
         # its parent or create another session. The parent kills this group.
-        return super().wait()
+        rc = super().wait()
+        for thread in self._drains:
+            thread.join(timeout=1.0)
+        if self._log_errors or any(t.is_alive() for t in self._drains):
+            raise artifacts.ArtifactLimit(f"lr_bounded_log_capture_incomplete:{self._log_errors}")
+        return rc
 
 
 def _adopt_orphans():
@@ -180,7 +208,7 @@ def _single_attempt(root):
 def _inner(args, output):
     t0 = float.fromhex(args.inner_t0_hex)
     claim = json.loads((output / "cohort_launch_claim.json").read_bytes())
-    expected_group = os.getppid() if args.mode == "r-admit" else os.getpid()
+    expected_group = os.getppid()
     if (not math.isfinite(t0) or not 0 < t0 <= _T0
             or os.getpgrp() != expected_group or claim.get("observer_pid") != os.getppid()
             or claim.get("t0_perf_counter") != t0 or claim.get("cohort") != COHORT
@@ -193,14 +221,20 @@ def _inner(args, output):
         args.admission = str(fixture / "fixture_admission.json")
         args.authorization = str(fixture / "fixture_authorization.json")
     mod = load_core()
-    mod.subprocess = SimpleNamespace(Popen=InheritedGroupWorker, TimeoutExpired=subprocess.TimeoutExpired)
+    space = artifacts.ArtifactSpace(output, supervised=True) if args.mode == "chain" else None
+    mod.subprocess = SimpleNamespace(
+        Popen=lambda *a, **kw: InheritedGroupWorker(*a, limit_logs=space is not None, **kw),
+        TimeoutExpired=subprocess.TimeoutExpired)
     mod._attempt_dir = _single_attempt
     write = mod._write_json
 
     def write_with_group(path, doc):
         if path.name == "outer_launch.json":
             doc = {**doc, "worker_process_group": expected_group}
-        write(path, doc)
+        if space is None:
+            write(path, doc)
+        else:
+            space.write_json(path, doc, closing=path.name != "outer_launch.json")
 
     mod._write_json = write_with_group
     return mod.run(args, t0=t0)
@@ -208,28 +242,28 @@ def _inner(args, output):
 
 def _observe(args, output, t0):
     mod = load_core()
+    space = artifacts.ArtifactSpace(output, supervised=True) if args.mode == "chain" else None
+    write_closure = mod._write_json if space is None else space.write_closure_json
     output.mkdir(parents=True, exist_ok=True)
     # O_EXCL reservation plus nonempty-root refusal closes parallel launches,
     # failed/crashed/unknown histories and all attempt-renaming retry paths.
     if any(output.iterdir()):
         raise ValueError("once-only attempt consumed or history unknown")
     claim = output / "cohort_launch_claim.json"
-    with claim.open("x") as out:
-        json.dump({"cohort": COHORT, "mode": args.mode, "state": "running",
-                   "t0_perf_counter": t0, "synthetic": args.synthetic, "observer_pid": os.getpid(),
-                   "max_attempts": 1,
-                   "parent_consumption": {
-                       "cohort": "w1_patched_smallset_fit_v1",
-                       "run": "derived/experiments/omniretarget_first/attempt_002",
-                       "authorization_consumed": True,
-                       "old_incomplete_not_reclassified": True}}, out)
-        out.flush()
-        os.fsync(out.fileno())
-    fd = os.open(output, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    doc = {"cohort": COHORT, "mode": args.mode, "state": "running", "t0_perf_counter": t0,
+           "synthetic": args.synthetic, "observer_pid": os.getpid(), "max_attempts": 1,
+           "parent_consumption": {"cohort": "w1_patched_smallset_fit_v1",
+                                  "run": "derived/experiments/omniretarget_first/attempt_002",
+                                  "authorization_consumed": True, "old_incomplete_not_reclassified": True}}
+    if space is None:
+        with claim.open("x") as out:
+            json.dump(doc, out)
+            out.flush()
+            os.fsync(out.fileno())
+        artifacts.sync_directory(output)
+    else:
+        space.write_json(claim, {**doc, "collector_pid": os.getppid(), "artifact_space": artifacts.policy()},
+                         exclusive=True)
     command = _base_command(args, output) + ["--inner-t0-hex", t0.hex()]
     with (output / "supervisor_stdout.log").open("xb") as stdout, (output / "supervisor_stderr.log").open("xb") as stderr:
         if time.perf_counter() >= t0 + args.wall_cap_s - args.reserve_s:
@@ -240,14 +274,21 @@ def _observe(args, output, t0):
             rc = subprocess.run(command, cwd=ROOT, stdout=stdout, stderr=stderr).returncode
             unclean = False
         else:
-            rc, unclean, _ = wait_in_owned_group(command, deadline=t0 + args.wall_cap_s, cwd=ROOT,
-                                                 stdout=stdout, stderr=stderr)
+            # One process group is owned by the collector, including uv and
+            # the numerical worker. The observer must not create a nested group.
+            inner = InheritedGroupWorker(command, limit_logs=True, cwd=ROOT, stdout=stdout, stderr=stderr)
+            rc, unclean = inner.wait(), False
         returned = time.perf_counter()
         stdout.flush()
         stderr.flush()
         os.fsync(stdout.fileno())
         os.fsync(stderr.fileno())
     if rc != 0 or unclean or returned - t0 > args.wall_cap_s:
+        if space is not None:
+            write_closure(output / "supervisor_failure.json", {
+                "state": "incomplete", "inner_return_code": rc, "elapsed_s_lower_bound": returned - t0,
+                "problems": ["lr_supervisor_group_or_return_incomplete"]})
+            return 3
         mod._write_incomplete_costed(output / "supervisor_failure.json", {
             "schema": "w1_d1_lr_observer_failure_v1", "mode": args.mode,
             "supervisor_return_code": rc, "process_group_unclean": unclean,
@@ -258,8 +299,9 @@ def _observe(args, output, t0):
         return 3
     attempt = output / "attempt_001"
     try:
-        artifact_bytes = sum(p.stat().st_size for p in output.rglob("*") if p.is_file())
-        if artifact_bytes > 2 * (1 << 30):
+        artifact_bytes = (sum(p.stat().st_size for p in output.rglob("*") if p.is_file())
+                          if space is None else space.used_bytes())
+        if artifact_bytes > artifacts.CAP_BYTES:
             return 3
         verdict = json.loads((attempt / "acceptance_verdict.json").read_bytes())
         registered = verdict["registered_measured_s"]
@@ -275,9 +317,9 @@ def _observe(args, output, t0):
                   "artifacts_bytes_at_return": artifact_bytes,
                    "bindings": {rel: mod._sha(attempt / rel) for rel in protocol.attempt_bindings(args.mode)}}
         path = output / protocol.COMPLETION_NAME
-        mod._write_json(path, record)
+        write_closure(path, record)
         after_record = time.perf_counter() - t0
-        mod._write_json(output / protocol.SAMPLE_NAME, {
+        write_closure(output / protocol.SAMPLE_NAME, {
             "completion_sha256": mod._sha(path), "elapsed_after_completion_write_s": after_record,
             "registered_measured_s": registered, "wall_cap_s": args.wall_cap_s})
         # No output or I/O after the passing final sample. Exit=0 is required
@@ -338,6 +380,55 @@ def _capture_r_return(args, output):
     return 3 if unclean else _record_r_return(output, rc=rc, pid=pid, returned=returned, t0=_T0)
 
 
+def _record_chain_return(output, *, rc, unclean, pid, returned, t0):
+    """Publish only this parent's actual wait and the post-fsync observation."""
+    attempt = output / "attempt_001"
+    space = artifacts.ArtifactSpace(output, supervised=True)
+    if type(rc) is not int or rc != 0 or unclean:
+        return 3  # no success receipt, and no write to a root another launcher might own
+    owned = False
+    try:
+        packet = protocol.verify_observer_files(attempt, "chain")
+        bound = protocol.chain_wait_binding(attempt, packet)
+        if (bound["collector_pid"] != os.getpid() or bound["observer_pid"] != pid
+                or bound["t0_perf_counter"] != t0):
+            return 3
+        owned = True
+        reg = bound["registered_measured_s"]
+        if not packet[2]["elapsed_after_completion_write_s"] <= returned - t0 <= reg:
+            raise ValueError("lr_chain_actual_observer_wait_not_covered")
+        path = output / protocol.CHAIN_WAIT_NAME
+        space.write_json(path, {"schema": protocol.CHAIN_WAIT_SCHEMA, **bound,
+                                "observer_actual_return_code": rc, "group_reaped_cleanly": True,
+                                "observer_return_perf_counter": returned, "elapsed_s": returned - t0},
+                         closing=True, exclusive=True)
+        wait_sha = protocol.sha(path)
+        synced = time.perf_counter()
+        if not returned - t0 <= synced - t0 <= reg:
+            raise ValueError("lr_chain_wait_archive_not_covered")
+        space.write_json(output / protocol.CHAIN_ARCHIVE_NAME, {
+            "schema": protocol.CHAIN_ARCHIVE_SCHEMA, "launch_id": bound["launch_id"], "wait_sha256": wait_sha,
+            "archive_synced_perf_counter": synced, "elapsed_s": synced - t0}, closing=True, exclusive=True)
+        if time.perf_counter() - t0 <= reg:
+            return 0
+        raise ValueError("lr_chain_archive_observation_write_not_covered")
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        # Only publish a failure for a launch this collector owns, including
+        # failures after both tentative records are present.
+        if owned:
+            space.write_failure(output / protocol.CHAIN_CAPTURE_FAILURE, exc)
+        return 3
+
+
+def _capture_chain_return(args, output):
+    if not args.synthetic and shutil.disk_usage(ROOT).free < 7 * (1 << 30):
+        raise ValueError("lr_disk_margin")
+    command = _base_command(args, output) + ["--chain-observer-t0-hex", _T0.hex()]
+    rc, unclean, pid = wait_in_owned_group(command, deadline=_T0 + args.wall_cap_s, cwd=ROOT)
+    return _record_chain_return(output, rc=rc, unclean=unclean, pid=pid,
+                                returned=time.perf_counter(), t0=_T0)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--mode", choices=("r-admit", "chain"), default="chain")
@@ -349,6 +440,7 @@ def main(argv=None):
     private = ap.add_mutually_exclusive_group()
     private.add_argument("--inner-t0-hex", help=argparse.SUPPRESS)
     private.add_argument("--r-observer-t0-hex", help=argparse.SUPPRESS)
+    private.add_argument("--chain-observer-t0-hex", help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
     args.fixture, args.impl_sha = args.synthetic, None
     args.wall_cap_s, args.reserve_s = protocol.CAPS[args.mode]
@@ -366,17 +458,19 @@ def main(argv=None):
     try:
         if args.inner_t0_hex:
             return _inner(args, output)
-        if args.r_observer_t0_hex:
-            t0 = float.fromhex(args.r_observer_t0_hex)
-            if (args.mode != "r-admit" or os.getpgrp() != os.getpid()
+        observer_t0 = args.r_observer_t0_hex or args.chain_observer_t0_hex
+        if observer_t0:
+            t0 = float.fromhex(observer_t0)
+            mode = "r-admit" if args.r_observer_t0_hex else "chain"
+            if (args.mode != mode or os.getpgrp() != os.getpid()
                     or not math.isfinite(t0) or not 0 < t0 <= _T0):
-                raise ValueError("invalid R observer launch")
+                raise ValueError("invalid observer launch")
             return _observe(args, output, t0)
         if output.exists() and any(output.iterdir()):
             ap.error("once-only attempt consumed or history unknown")
         if args.mode == "r-admit":
             return _capture_r_return(args, output)
-        return _observe(args, output, _T0)
+        return _capture_chain_return(args, output)
     except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
         print(f"LR supervisor refused: {exc}", file=sys.stderr, flush=True)
         return 3

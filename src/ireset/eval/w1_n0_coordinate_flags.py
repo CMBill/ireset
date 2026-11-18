@@ -1214,7 +1214,7 @@ def _write_json_fsync(path: Path, doc: dict) -> None:
 
 
 def _write_summary_sealed(summary_path: Path, summary: dict, budget: N0Budget,
-                          withdraw: dict | None = None, clock=None) -> dict:
+                          withdraw: dict | None = None, clock=None, *, write_json=None) -> dict:
     """Publish-then-verify summary seal with covering cost registration.
 
     Plan §8.2: a completion claim may only be published once the sealing AND
@@ -1239,6 +1239,7 @@ def _write_summary_sealed(summary_path: Path, summary: dict, budget: N0Budget,
     facts are authoritative; callers must not trust pre-write state.
     """
     now = clock if clock is not None else time.perf_counter
+    write = _write_json_fsync if write_json is None else write_json
     cap = float(budget.wall_cap_s)
     samples: list[float] = []
     stage = "publish"
@@ -1270,7 +1271,7 @@ def _write_summary_sealed(summary_path: Path, summary: dict, budget: N0Budget,
                                               "budget_exceeded_after_seal")}
         if status == "budget_exceeded_after_seal" and withdraw:
             doc.update(withdraw)
-        _write_json_fsync(summary_path, doc)
+        write(summary_path, doc)
         post = now() - budget.t0
         samples.append(post)
         observed_write_latency = max(observed_write_latency, post - pre)
@@ -1312,7 +1313,7 @@ def _write_summary_sealed(summary_path: Path, summary: dict, budget: N0Budget,
                    "measured_wall_s_at_summary": final_cost}
     if withdraw:
         doc.update(withdraw)
-    _write_json_fsync(summary_path, doc)
+    write(summary_path, doc)
     return {"status": "budget_exceeded_after_seal",
             "measured_wall_s": now() - budget.t0,
             "rounds": 3 * SEAL_VERIFY_ROUNDS + 1, "samples": samples,
@@ -1320,7 +1321,7 @@ def _write_summary_sealed(summary_path: Path, summary: dict, budget: N0Budget,
 
 
 def verify_return_coverage(summary_path: Path, budget: N0Budget,
-                           withdraw: dict | None = None, clock=None) -> dict:
+                           withdraw: dict | None = None, clock=None, *, write_json=None) -> dict:
     """Independent post-output return-coverage proof (plan §8.2).
 
     The necessary disk read AND the CLI output (flushed by the caller before
@@ -1345,6 +1346,7 @@ def verify_return_coverage(summary_path: Path, budget: N0Budget,
     callers never have to reconstruct the withdrawal semantics themselves.
     """
     now = clock if clock is not None else time.perf_counter
+    write = _write_json_fsync if write_json is None else write_json
     summary_path = Path(summary_path)
     # necessary disk read happens BEFORE the coverage sample
     doc = json.loads(summary_path.read_text())
@@ -1368,7 +1370,7 @@ def verify_return_coverage(summary_path: Path, budget: N0Budget,
                  "seal_tail_reserve_s": seal.get("seal_tail_reserve_s"),
                  "wall_cap_s": cap, "checked_after_output_flush": True,
                  "summary_sha256": sha256_file(summary_path)}
-        _write_json_fsync(obs_path, proof)
+        write(obs_path, proof)
         post = now() - budget.t0
         if post <= float(measured) and post <= cap:
             return {"covered": True, "elapsed_s": elapsed,
@@ -1403,8 +1405,8 @@ def verify_return_coverage(summary_path: Path, budget: N0Budget,
         withdrawn_doc["seal"]["seal_tail_reserve_s"] = reserve
         withdrawn_doc["budget"] = {**doc.get("budget", {}),
                                    "measured_wall_s_at_summary": new_measured}
-        _write_json_fsync(summary_path, withdrawn_doc)
-        _write_json_fsync(obs_path, {
+        write(summary_path, withdrawn_doc)
+        write(obs_path, {
             "schema": "n0_return_observation_v1", "covered": False,
             "elapsed_s": elapsed, "registered_measured_s": new_measured,
             "wall_cap_s": cap, "note": "return_coverage_withdrawn",
@@ -1428,8 +1430,8 @@ def verify_return_coverage(summary_path: Path, budget: N0Budget,
     withdrawn_doc["seal"]["cost_coverage_unproven"] = True
     withdrawn_doc["budget"] = {**doc.get("budget", {}),
                                "measured_wall_s_at_summary": elapsed}
-    _write_json_fsync(summary_path, withdrawn_doc)
-    _write_json_fsync(obs_path, {
+    write(summary_path, withdrawn_doc)
+    write(obs_path, {
         "schema": "n0_return_observation_v1", "covered": False,
         "elapsed_s": elapsed, "registered_measured_s": elapsed,
         "wall_cap_s": cap, "note": "cost_coverage_unproven"})

@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from ireset.eval import w1_d1_lr_schedule as lr
 from ireset.eval import w1_d1_lr_workflow as flow
+from ireset.eval import w1_d1_lr_artifacts as artifacts
 from ireset.eval import w1_smallset_fit_diagnostic as fit
 
 @pytest.fixture(scope="module")
@@ -133,6 +134,95 @@ def test_actual_optimizer_mutations_refused(tmp_path, control, mutation):
     assert result["counters"]["adamw_step_calls"] < plan.steps
     if mutation in ("late", "one_group", "reset", "data_reset", "new_optimizer"):
         assert result["counters"]["adamw_step_calls"] == plan.switch_after
+
+
+@pytest.mark.parametrize("scope", ["instance", "global"])
+@pytest.mark.parametrize("when", ["pre", "post"])
+def test_late_optimizer_step_hooks_refused(tmp_path, control, scope, when):
+    _, world, plan, baseline, *_ = control
+    driver = driver_at(tmp_path / "B", world, plan, baseline)
+    original = driver._optimizer_step_entry
+    handles, called = [], []
+
+    def alter_lr(opt, *_):
+        called.append(True)
+        opt.param_groups[0]["lr"] = plan.lr
+
+    def bind(u):
+        original(u)
+        if u == plan.switch_after + 1:
+            register = (getattr(driver.trainer.opt, f"register_step_{when}_hook") if scope == "instance"
+                        else getattr(lr.torch_optimizer, f"register_optimizer_step_{when}_hook"))
+            handles.append(register(alter_lr))
+
+    driver._optimizer_step_entry = bind
+    try:
+        report = driver.run()
+    finally:
+        for handle in handles:
+            handle.remove()
+    assert handles and called == []
+    assert report["local_complete_evidence"] is False
+    assert report["failure"]["message"] == "lr_optimizer_step_hooks_forbidden"
+    assert report["counters"]["adamw_step_calls"] == plan.switch_after
+    assert len((driver.stage_dir / "lr_history.jsonl").read_text().splitlines()) == plan.switch_after
+    assert not (driver.stage_dir / "last.pt").exists()
+
+
+def test_prefix_receipt_write_cannot_admit_late_state_read(tmp_path, control, monkeypatch):
+    _, world, plan, baseline, *_ = control
+    driver = driver_at(tmp_path / "B", world, plan, baseline)
+    clock = fit._FakeClock(0.)
+    driver.budget.t0, driver.budget.clock = 0., clock
+    write, digest = lr.write_json, driver._read_state_digest
+    late_reads = []
+
+    def slow(path, doc):
+        write(path, doc)
+        if path.name == "prefix_admission.json":
+            clock.t = driver.budget.work_deadline
+
+    def state():
+        if clock.t >= driver.budget.work_deadline:
+            late_reads.append(clock.t)
+        return digest()
+
+    monkeypatch.setattr(lr, "write_json", slow)
+    monkeypatch.setattr(driver, "_read_state_digest", state)
+    report = driver.run()
+    assert (driver.stage_dir / "prefix_admission.json").is_file()
+    assert late_reads == [] and report["budget"]["stopped_at"] == "prefix_admission_written"
+    assert report["counters"]["loss_calls"] == plan.switch_after * plan.grad_accum
+    assert report["counters"]["adamw_step_calls"] == plan.switch_after
+
+
+@pytest.mark.parametrize("stopping_file", ["teacher_reference.npz", lr.probe_name(0, 0), "initial.pt"])
+def test_artifact_cap_refuses_before_write_and_prevents_f(tmp_path, control, monkeypatch, stopping_file):
+    _, world, _, baseline, admission, authorization = control
+    seq = ("teacher_reference.npz", "probe_inputs.npz", lr.probe_name(0, 0), "initial.pt")
+    preceding = seq[:seq.index(stopping_file)]
+    work_bytes = (sum(baseline["artifact_files"][rel]["bytes"] for rel in preceding) + 8192
+                  if preceding else 1500)
+    cap = artifacts.CLOSURE_RESERVE_BYTES + work_bytes
+    monkeypatch.setattr(flow.radm, "R_ARTIFACT_CAP_BYTES", cap)
+
+    def forbidden(*_a, **_kw):
+        pytest.fail("F entered fresh replay after artifact admission failed")
+
+    monkeypatch.setattr(fit, "_fresh_probe", forbidden)
+    run = tmp_path / "B"
+    result = flow.run_candidate(run_root=run, admission_path=admission, authorization_path=authorization,
+                                chain_t0=time.perf_counter(), outer_launch={}, fixture=True, fixture_world=world)
+    d = lr.read_object(run / "d1/stage_report.json")
+    assert not d["local_complete_evidence"] and d["counters"]["adamw_step_calls"] == 0
+    assert d["counters"].get("checkpoint_saves", 0) == 0
+    assert "lr_artifact_cap_exceeded" in d["failure"]["message"] and stopping_file in d["failure"]["message"]
+    assert not any((run / "d1" / rel).exists() for rel in (stopping_file, stopping_file + ".tmp"))
+    assert all((run / "d1" / rel).is_file() for rel in preceding)
+    assert result["summary_doc"]["f"]["complete_evidence"] is False
+    cmp = lr.read_object(run / "f/comparison.json")
+    assert cmp["conclusion"] == "not_comparable" and cmp["metrics"] is None
+    assert artifacts.ArtifactSpace(run, cap_bytes=cap).used_bytes() <= cap
 
 
 @pytest.mark.parametrize("kind", ["byte", "missing_probe", "history", "fake_lr", "state_counter", "endpoint"])
@@ -255,7 +345,8 @@ def test_supervisor_normal_fixture_chain(tmp_path):
     assert proc.returncode == 0, (proc.stdout, proc.stderr, logs, worker.read_text() if worker.exists() else "")
     completion = lr.read_object(output / "completion_verification.json")
     assert completion["supervisor_return_code"] == 0 and completion["comparison_candidate"] is True
-    assert lr.consume_comparison(output / "attempt_001", observer_return_code=proc.returncode)["metrics"] is not None
+    assert lr.consume_comparison(output / "attempt_001", collector_return_code=proc.returncode)["metrics"] is not None
+    assert lr.consume_comparison(output / "attempt_001", observer_return_code=0)["metrics"] is None
     assert lr.consume_comparison(output / "attempt_001")["conclusion"] == "not_comparable"
     run = output / "attempt_001"
     admission = lr.read_object(run / "synthetic_materials/fixture_admission.json")
@@ -265,22 +356,47 @@ def test_supervisor_normal_fixture_chain(tmp_path):
         (baseline_dir / "teacher_reference.npz", "baseline_unreadable"),
         (run / "d1/lr_history.jsonl", "lr_artifact_missing_or_invalid"),
         (run / "f/return_observation.json", "return_observation.json"),
+        (output / lr.protocol.CHAIN_WAIT_NAME, lr.protocol.CHAIN_WAIT_NAME),
+        (output / lr.protocol.CHAIN_ARCHIVE_NAME, lr.protocol.CHAIN_ARCHIVE_NAME),
     ):
         # No records or observed exit values are rewritten between the two calls.
         saved = path.with_suffix(".held")
         path.rename(saved)
         try:
-            refused = lr.consume_comparison(run, observer_return_code=proc.returncode)
+            refused = lr.consume_comparison(run, collector_return_code=proc.returncode)
             assert refused["conclusion"] == "not_comparable" and refused["metrics"] is None, path
             assert any(problem in p for p in refused["problems"]), refused
         finally:
             saved.rename(path)
-    assert lr.consume_comparison(run, observer_return_code=proc.returncode)["metrics"] is not None
+    assert lr.consume_comparison(run, collector_return_code=proc.returncode)["metrics"] is not None
+    wait_path = output / lr.protocol.CHAIN_WAIT_NAME
+    archive_path = output / lr.protocol.CHAIN_ARCHIVE_NAME
+    wait_raw, archive_raw = wait_path.read_bytes(), archive_path.read_bytes()
+    for tamper in ("wrong_launch", "late_wait", "late_archive"):
+        wait, archive = json.loads(wait_raw), json.loads(archive_raw)
+        if tamper == "wrong_launch":
+            wait["launch_id"] += "-other"
+        elif tamper == "late_wait":
+            wait["observer_return_perf_counter"] = wait["t0_perf_counter"] + wait["registered_measured_s"] + 1
+            wait["elapsed_s"] = wait["observer_return_perf_counter"] - wait["t0_perf_counter"]
+        else:
+            archive["archive_synced_perf_counter"] = wait["t0_perf_counter"] + wait["registered_measured_s"] + 1
+            archive["elapsed_s"] = archive["archive_synced_perf_counter"] - wait["t0_perf_counter"]
+        try:
+            lr.write_json(wait_path, wait)
+            archive["wait_sha256"] = lr.protocol.sha(wait_path)
+            lr.write_json(archive_path, archive)
+            refused = lr.consume_comparison(run, collector_return_code=0)
+            assert refused["conclusion"] == "not_comparable" and refused["metrics"] is None
+            assert "lr_chain_actual_return_or_archive_not_covered" in refused["problems"]
+        finally:
+            wait_path.write_bytes(wait_raw)
+            archive_path.write_bytes(archive_raw)
     comparison_path = run / "f/comparison.json"
     modified = lr.read_object(comparison_path)
     modified["conclusion"] = "single_window_pass"
     lr.write_json(comparison_path, modified)
-    assert lr.consume_comparison(run, observer_return_code=proc.returncode)["metrics"] is None
+    assert lr.consume_comparison(run, collector_return_code=proc.returncode)["metrics"] is None
     assert completion["elapsed_after_actual_wait_s"] <= completion["registered_measured_s"] <= 2400
     p2 = subprocess.run([sys.executable, str(ROOT / "scripts/run_w1_d1_lr_schedule_supervisor.py"),
                          "--synthetic", "--output-root", str(output)], cwd=ROOT,

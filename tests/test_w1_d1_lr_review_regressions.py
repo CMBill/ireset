@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SUPERVISOR = ROOT / "scripts/run_w1_d1_lr_schedule_supervisor.py"
 sys.path.insert(0, str(ROOT / "src"))
 from ireset.eval import w1_d1_lr_protocol as protocol
+from ireset.eval import w1_d1_lr_artifacts as artifacts
 
 
 def _supervisor():
@@ -55,7 +56,7 @@ def test_synthetic_scope_default_and_reserved_paths(tmp_path, monkeypatch):
     sup = _supervisor()
     monkeypatch.setattr(sup, "ROOT", tmp_path)
     seen = []
-    monkeypatch.setattr(sup, "_observe", lambda args, path, t0: seen.append(path) or 0)
+    monkeypatch.setattr(sup, "_capture_chain_return", lambda args, path: seen.append(path) or 0)
     assert sup.main(["--synthetic"]) == 0
     assert seen == [tmp_path / protocol.AUDIT_ROOT / "synthetic/acceptance_default"]
     candidate = tmp_path / protocol.RUN_ROOT
@@ -63,7 +64,7 @@ def test_synthetic_scope_default_and_reserved_paths(tmp_path, monkeypatch):
     alias = tmp_path / "alias"
     alias.symlink_to(candidate)
     for forbidden in (candidate, admission, candidate / "child", alias, tmp_path / "derived/experiments"):
-        for inner in ([], ["--inner-t0-hex", sup._T0.hex()]):
+        for inner in ([], ["--inner-t0-hex", sup._T0.hex()], ["--chain-observer-t0-hex", sup._T0.hex()]):
             with pytest.raises(SystemExit) as exc:
                 sup.main(["--synthetic", "--output-root", str(forbidden), *inner])
             assert exc.value.code == 2
@@ -239,6 +240,69 @@ def test_r_observer_requires_actual_wait_and_bound_receipt(tmp_path, monkeypatch
         sample.write_bytes(sample.read_bytes() + b"\n")
         with pytest.raises(fit.FitDiagnosticError, match="actual_observer_return_invalid"):
             flow.verify_admission_return(admission, binding, root=tmp_path)
+
+
+@pytest.mark.parametrize("late", ["wait", "receipt", "archive", None])
+def test_capture_closes_external_wait_and_both_writes(tmp_path, monkeypatch, late):
+    sup = _supervisor()
+    t0, registered, pid = 100.0, 20.0, os.getpid() + 1
+    attempt = tmp_path / "attempt_001"
+    attempt.mkdir()
+    binding = {"launch_id": "test", "t0_perf_counter": t0, "registered_measured_s": registered}
+    packet = (binding, "a" * 64, {"elapsed_after_completion_write_s": 15.0}, "b" * 64,
+              {"fixture": True, "outer_launch": {"worker_process_group": pid}}, {})
+    space = artifacts.ArtifactSpace(tmp_path)
+    space.write_json(tmp_path / "cohort_launch_claim.json", {
+        "cohort": protocol.COHORT, "mode": "chain", "state": "running", "max_attempts": 1,
+        "synthetic": True, "t0_perf_counter": t0, "observer_pid": pid, "collector_pid": os.getpid(),
+        "artifact_space": artifacts.policy()})
+    monkeypatch.setattr(protocol, "verify_observer_files", lambda *a: packet)
+    returned = 121.0 if late == "wait" else 116.0
+    clock = SimpleNamespace(t=returned)
+    monkeypatch.setattr(sup, "time", SimpleNamespace(perf_counter=lambda: clock.t))
+    original = artifacts.ArtifactSpace.write_json
+
+    def write(space, path, doc, **kwargs):
+        original(space, path, doc, **kwargs)
+        if ((late == "receipt" and path.name == protocol.CHAIN_WAIT_NAME)
+                or (late == "archive" and path.name == protocol.CHAIN_ARCHIVE_NAME)):
+            clock.t = 121.0
+
+    monkeypatch.setattr(artifacts.ArtifactSpace, "write_json", write)
+    rc = sup._record_chain_return(tmp_path, rc=0, unclean=False, pid=pid, returned=returned, t0=t0)
+    if late is None:
+        assert rc == 0
+        assert protocol.verify_chain_actual_return(attempt, collector_return_code=rc) == packet
+    else:
+        assert rc == 3 and (tmp_path / protocol.CHAIN_CAPTURE_FAILURE).is_file()
+        with pytest.raises(ValueError, match="lr_chain_capture_failed"):
+            protocol.verify_chain_actual_return(attempt, collector_return_code=0)
+        assert (tmp_path / protocol.CHAIN_WAIT_NAME).exists() == (late != "wait")
+        assert (tmp_path / protocol.CHAIN_ARCHIVE_NAME).exists() == (late == "archive")
+
+
+def test_artifact_replacement_counts_old_and_temporary_bytes(tmp_path):
+    space = artifacts.ArtifactSpace(tmp_path, cap_bytes=artifacts.CLOSURE_RESERVE_BYTES + 100)
+    path = tmp_path / "artifact.json"
+    space.write_bytes(path, b"a" * 60)
+    with pytest.raises(artifacts.ArtifactLimit, match="need=41:available=40"):
+        space.write_bytes(path, b"b" * 41)
+    assert path.read_bytes() == b"a" * 60 and not (tmp_path / "artifact.json.tmp").exists()
+    space.write_bytes(path, b"b" * 40)
+    assert space.used_bytes() == 40
+
+
+def test_supervised_logs_cannot_outgrow_reserved_slots(tmp_path):
+    sup = _supervisor()
+    path = tmp_path / "worker_stdout.log"
+    err = tmp_path / "worker_stderr.log"
+    with path.open("xb") as stdout, err.open("xb") as stderr:
+        child = sup.InheritedGroupWorker([sys.executable, "-c",
+            f"import os; os.write(1, b'x' * {artifacts.LOG_BYTES + 1})"],
+            stdout=stdout, stderr=stderr, limit_logs=True)
+        with pytest.raises(artifacts.ArtifactLimit, match="log_slot_exceeded"):
+            child.wait()
+    assert path.stat().st_size == artifacts.LOG_BYTES
 
 
 if __name__ == "__main__":

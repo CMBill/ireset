@@ -16,6 +16,7 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 
 import torch
+from torch.optim import optimizer as torch_optimizer
 
 from ireset.eval import w1_smallset_fit_diagnostic as fit
 from ireset.eval import w1_d1_lr_protocol as protocol
@@ -26,6 +27,7 @@ SCHEDULE_ID = "d1_half_after_500_v1"
 COHORT, RUN_ROOT, AUDIT_ROOT = protocol.COHORT, protocol.RUN_ROOT, protocol.AUDIT_ROOT
 PLAN_PATH = "docs/plans/omniretarget_w1_d1_lr_schedule_diagnostic_plan.md"
 LR_ARTIFACTS = ("lr_evidence.json", "lr_history.jsonl", "prefix_checks.json", "prefix_admission.json")
+OPTIMIZER_STEP_CONTRACT = "native_adamw_no_optimizer_step_hooks_v1"
 BASELINE_ROOT = "derived/experiments/omniretarget_first/attempt_002"
 BASELINE_AUDIT = ("derived/audit/w1_smallset_fit_diagnostic/"
                   "real_chain_20261118_attempt_002")
@@ -315,6 +317,8 @@ class ScheduleDriver(fit.FitDriver):
         identity.update(lr_schedule=plan.schedule(), baseline_sha256=baseline["sha256"])
         kwargs["identity"] = identity
         super().__init__(**kwargs)
+        self.native_optimizer = self.trainer.opt
+        self.native_step = torch.optim.AdamW.step
         self.group_roster = tuple(tuple(id(p) for p in g["params"])
                                   for g in self.trainer.opt.param_groups)
         decode = self._real_decode_clip
@@ -347,6 +351,33 @@ class ScheduleDriver(fit.FitDriver):
             "optimizer_state_digest_reads", 0) + 1
         return _state_digest(self.trainer.opt)
 
+    def _require_unhooked_step(self):
+        opt = self.trainer.opt
+        step, trainer_step = opt.step, self.trainer.step_optimizer
+        if (opt is not self.native_optimizer or type(opt) is not torch.optim.AdamW
+                or getattr(step, "__self__", None) is not opt
+                or getattr(step, "__func__", None) is not self.native_step
+                or getattr(trainer_step, "__self__", None) is not self.trainer
+                or getattr(trainer_step, "__func__", None) is not fit.Trainer.step_optimizer):
+            raise fit.FitDiagnosticError("lr_native_optimizer_dispatch_required")
+        # PyTorch's native wrapper runs global AND instance hooks inside
+        # opt.step(), after our LR sample. Neither kind is admitted here.
+        registries = (getattr(opt, "_optimizer_step_pre_hooks", None),
+                      getattr(opt, "_optimizer_step_post_hooks", None),
+                      getattr(torch_optimizer, "_global_optimizer_pre_hooks", None),
+                      getattr(torch_optimizer, "_global_optimizer_post_hooks", None))
+        if any(not isinstance(hooks, dict) or hooks for hooks in registries):
+            raise fit.FitDiagnosticError("lr_optimizer_step_hooks_forbidden")
+        key = "optimizer_step_contract_checks"
+        self.lr_counts[key] = self.lr_counts.get(key, 0) + 1
+
+    def _write_schedule_json(self, path, doc):
+        space = self.budget.artifact_space
+        if space is None:
+            write_json(path, doc)
+        else:
+            space.write_json(path, doc, check=self.budget.check)
+
     def _before_update(self, step):
         self.budget.check("lr_before_update")
         self._check_runtime_bindings()
@@ -377,9 +408,10 @@ class ScheduleDriver(fit.FitDriver):
                     {k: v for k, v in row.items() if k not in LR_FIELDS}, want)
                     for row, want in zip(rows, self.baseline_index["history_unrounded"])):
                 raise fit.FitDiagnosticError("baseline_prefix_mismatch:durable_history")
-            write_json(self.stage_dir / "prefix_admission.json", {
+            self._write_schedule_json(self.stage_dir / "prefix_admission.json", {
                 "before_update": step, "prefix_probe_files": len(expected) - 2,
                 "history_rows": len(rows), "baseline_sha256": self.baseline["sha256"]})
+            self.budget.check("prefix_admission_written")
             before = _state_signature(self.trainer.opt)
             state_before = self._read_state_digest()
             self.budget.check("lr_switch")
@@ -405,13 +437,21 @@ class ScheduleDriver(fit.FitDriver):
         if (self.current_lr != self.plan.lr_at(step)
                 or self._read_state_digest() != self.last_state_digest):
             raise fit.FitDiagnosticError("lr_or_momentum_changed_inside_update")
+    def _step_optimizer(self):
+        self.budget.check("lr_native_step")
+        self._require_unhooked_step()
+        lrs = [g["lr"] for g in self.trainer.opt.param_groups]
+        step = self._completed_steps + 1
+        if not lrs or any(not fit._json_value_equal(lr, self.plan.lr_at(step)) for lr in lrs):
+            raise fit.FitDiagnosticError("lr_native_step_group_mismatch")
         self.lr_entry = {"optimizer_update": step, "lr_schedule_id": SCHEDULE_ID,
-                         "effective_lrs": [g["lr"] for g in self.trainer.opt.param_groups],
+                         "effective_lrs": lrs,
                          "state_step_before": self._completed_steps,
                          "state_step_after": step,
                          "optimizer_state_sha256_before": self.last_state_digest}
         # The native step is the only allowed writer until _record_update.
         self.state_signature = None
+        super()._step_optimizer()
 
     def _record_update(self, row):
         self.state_signature = _state_signature(self.trainer.opt)
@@ -426,10 +466,16 @@ class ScheduleDriver(fit.FitDriver):
             self.lr_counts["history_rows_compared"] += 1
         super()._record_update(row)
         self.budget.check("lr_history_write")
-        with (self.stage_dir / "lr_history.jsonl").open("a") as out:
-            out.write(json.dumps(row, allow_nan=False) + "\n")
-            out.flush()
-            os.fsync(out.fileno())
+        path = self.stage_dir / "lr_history.jsonl"
+        line = (json.dumps(row, allow_nan=False) + "\n").encode()
+        space = self.budget.artifact_space
+        if space is None:
+            with path.open("ab") as out:
+                out.write(line)
+                out.flush()
+                os.fsync(out.fileno())
+        else:
+            space.write_bytes(path, line, append=True, check=self.budget.check)
         self.budget.check("lr_history_written")
 
     def _check_prefix_file(self, rel):
@@ -439,7 +485,7 @@ class ScheduleDriver(fit.FitDriver):
         self.lr_counts["prefix_file_comparisons"] += 1
         row = {"file": rel, "A": expected, "B": actual, "equal": actual == expected}
         self.prefix_files.append(row)
-        write_json(self.stage_dir / "prefix_checks.json", {"files": self.prefix_files})
+        self._write_schedule_json(self.stage_dir / "prefix_checks.json", {"files": self.prefix_files})
         self.budget.check("baseline_prefix_written:" + rel)
         if actual != expected:
             raise fit.FitDiagnosticError(f"baseline_prefix_mismatch:file:{rel}")
@@ -447,15 +493,23 @@ class ScheduleDriver(fit.FitDriver):
     def _run_probe(self, step, idx):
         super()._run_probe(step, idx)
         self.budget.check("persist_probe")
+        space = self.budget.artifact_space
+
+        def persist(path, records):
+            if space is None:
+                _persist_npz(path, records)
+            else:
+                space.write_npz(path, records, check=self.budget.check)
+
         if step == 0:
-            _persist_npz(self.stage_dir / "teacher_reference.npz", self.teacher_arrays)
+            persist(self.stage_dir / "teacher_reference.npz", self.teacher_arrays)
             self._check_prefix_file("teacher_reference.npz")
-            _persist_npz(self.stage_dir / "probe_inputs.npz", {
+            persist(self.stage_dir / "probe_inputs.npz", {
                 f"w{b}__{k}": self.probe_batch[k].detach().cpu().numpy()[b]
                 for b in range(self.probe_batch["x0"].shape[0]) for k in ("x0", *fit.COND_KEYS)})
             self._check_prefix_file("probe_inputs.npz")
         rel = probe_name(idx, step)
-        _persist_npz(self.stage_dir / rel, self.probe_arrays_by_idx[idx])
+        persist(self.stage_dir / rel, self.probe_arrays_by_idx[idx])
         if step == 0:
             # Persist the new probes directory entry as well as the file in it.
             _fsync_directory(self.stage_dir)
@@ -464,10 +518,10 @@ class ScheduleDriver(fit.FitDriver):
         self.budget.check("persist_probe_complete")
 
     def _write_stage_artifacts(self):
-        write_json(self.stage_dir / "lr_evidence.json", {
-            "schema": "w1_d1_lr_evidence_v1", "schedule": self.plan.schedule(),
+        self._write_schedule_json(self.stage_dir / "lr_evidence.json", {
+            "schema": "w1_d1_lr_evidence_v2", "schedule": self.plan.schedule(),
             "baseline_sha256": self.baseline["sha256"], "switches": self.switches,
-            "counts": self.lr_counts})
+            "optimizer_step_contract": OPTIMIZER_STEP_CONTRACT, "counts": self.lr_counts})
         super()._write_stage_artifacts(arrays_already_persisted=True)
         problems = verify_schedule_stage(self.stage_dir, self.plan, self.baseline, self.budget,
                                          counters=self.cpu_evidence_counts)
@@ -483,6 +537,8 @@ class ScheduleDriver(fit.FitDriver):
         return out
 
     def _preflight(self):
+        self.budget.check("lr_optimizer_preflight")
+        self._require_unhooked_step()
         problems = baseline_problems(self.baseline, self.budget, self.cpu_evidence_counts)
         if problems:
             raise fit.FitDiagnosticError(f"baseline_prefix_mismatch:{problems[:3]}")
@@ -533,6 +589,12 @@ def verify_schedule_stage(stage_dir: Path, plan: SchedulePlan, baseline: dict,
         if not fit._json_value_equal(pidx.get("plan"), plan.as_dict()):
             problems.append("lr_saved_plan_mismatch")
         evidence = read_object(stage_dir / "lr_evidence.json")
+        counts = evidence.get("counts")
+        if (evidence.get("schema") != "w1_d1_lr_evidence_v2"
+                or evidence.get("optimizer_step_contract") != OPTIMIZER_STEP_CONTRACT
+                or not isinstance(counts, dict)
+                or not fit._json_value_equal(counts.get("optimizer_step_contract_checks"), plan.steps + 1)):
+            problems.append("lr_native_step_contract_evidence_missing")
         if read_object(stage_dir / "prefix_admission.json") != {
                 "before_update": plan.switch_after + 1,
                 "prefix_probe_files": plan.switch_after // plan.probe_every + 1,
@@ -684,17 +746,20 @@ def build_comparison(*, stage_dir: Path, baseline: dict, plan: SchedulePlan,
     return out
 
 
-def consume_comparison(run_dir: Path, *, observer_return_code: int | None = None) -> dict:
+def consume_comparison(run_dir: Path, *, collector_return_code: int | None = None,
+                       observer_return_code: int | None = None) -> dict:
     """A standalone comparison is NOT evidence of successful return.
 
-    Require the independent observer's *actual*, externally observed exit code
-    in addition to every disk binding. Any unknown/failure yields null metrics.
+    The caller observes the archival collector's exit. Its receipt binds the
+    observer's actual exit and archive duration; observer_return_code alone is
+    no longer proof. Any unknown/failure yields null metrics.
     """
     run_dir = Path(run_dir)
     try:
-        if type(observer_return_code) is not int or observer_return_code != 0:
-            raise fit.FitDiagnosticError("independent_actual_return_required")
-        completion, _, _, _, summary, receipt = protocol.verify_observer_files(run_dir, "chain")
+        if observer_return_code is not None:
+            raise fit.FitDiagnosticError("lr_bare_observer_exit_not_accepted")
+        completion, _, _, _, summary, receipt = protocol.verify_chain_actual_return(
+            run_dir, collector_return_code=collector_return_code)
         protocol.verify_stage_ledger(run_dir, summary, receipt)
         f, f_sha = protocol._object_and_sha(run_dir / "f/f_report.json")
         cmp_path = run_dir / "f/comparison.json"
@@ -729,11 +794,16 @@ def consume_comparison(run_dir: Path, *, observer_return_code: int | None = None
             raise fit.FitDiagnosticError("comparison_authorization_drift")
         package = admission["package"]
         plan, baseline = SchedulePlan(**package["fit_plan"]), package["baseline"]
+        matrix = package["call_matrix"]
+        lr_fact = read_object(run_dir / "d1/lr_evidence.json")
         if (not isinstance(baseline, dict) or type(summary.get("fixture")) is not bool
                 or package.get("fixture") is not summary["fixture"] or plan.synthetic is not summary["fixture"]
                 or any(d.get("baseline_sha256") != baseline.get("sha256") for d in (summary, package, comparison, stage_report))
                 or any(not fit._json_value_equal(d.get("schedule"), plan.schedule()) for d in (summary, package, comparison))
-                or not fit._json_value_equal(stage_report.get("plan"), plan.as_dict())):
+                or not fit._json_value_equal(stage_report.get("plan"), plan.as_dict())
+                or not isinstance(matrix, dict) or matrix.get("optimizer_step_contract") != OPTIMIZER_STEP_CONTRACT
+                or lr_fact.get("optimizer_step_contract") != OPTIMIZER_STEP_CONTRACT
+                or lr_fact.get("schema") != "w1_d1_lr_evidence_v2"):
             raise fit.FitDiagnosticError("comparison_plan_or_baseline_binding_invalid")
         if not summary["fixture"]:
             r_expected = PROJECT_ROOT / protocol.R_ROOT / "attempt_001/r_admission.json"
