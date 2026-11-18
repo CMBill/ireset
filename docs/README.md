@@ -1,9 +1,10 @@
 # 文档索引
 
-最后更新：2026-11-17。**数值缺口有限收口与受控拟合诊断：N0/N1 与 I 合成验收已完成，缓存迁移及 R 准入通过。一次性真实链 D1 完整但拟合不足、D6 合法跳过、F 重放通过；该次外层因链预算字段缺失裁决 incomplete。预算序列化修复 `0c4572d` 经 113 项回归通过，新 R `attempt_005` 通过，授权草案 `attempt_002` 未授权；后续真实链须另获一次性授权（方案 §43）。** 已结束阶段集中转入历史导航，冻结原文及实验产物保持原路径、原字节。
+最后更新：2026-11-18。**数值缺口有限收口与受控拟合诊断：N0/N1、I 合成验收、缓存迁移与 R 准入已完成。预算修复后重新授权的真实 `attempt_002` 证据验收通过（外层 candidate_complete）：D1 1000 步/101 probes 完整但拟合不足，D6 合法跳过，F 逐位重放后为 fit_insufficient；独立外层采样文件写盘 701.024471s≤登记703.799003s≤6120s。下一交付为 §9 固定同窗的一因素诊断方案，当前一次性授权已消费。** 已结束阶段集中转入历史导航，冻结原文及实验产物保持原路径、原字节。
 
 ## 当前状态
 
+- **2026-11-18 新授权真实链验收与保存曲线分析**：`attempt_002` worker/监督器均 exit0，外层 `candidate_complete`/problems=[]，F `fit_insufficient`；根旋转 0.023780910989rad、FK 0.016761962649m 未过门。新旧 101/101 probe NPZ 逐字节相同，无四门同时通过的 probe；278 保护文件零漂移。见验证记录 §34、方案 §44。后续先冻结单因素优化/目标诊断方案，学习率日程仅为候选，不自动启动新训练。
 - **2026-11-17 真实拟合负结果与外层预算修复**：`derived/experiments/omniretarget_first/attempt_001` 的 D1 1000 步/101 probes 完整，旋转与 FK 平均门未过，F 逐位重放后为 `fit_insufficient`；监督器以 `budget_binding_mismatch` 裁决 incomplete。修复只补顶层完整预算，已消费阶段及旧工件保持原样，见验证记录 §32–§33。
 - **2026-11-16 I 当前实现合成验收通过**：`attempt_019` 的微型 D1→D6→F 与 **115/115** 反例通过；监督器实际返回后的外层采样文件写盘 **1393.687296s ≤ 登记 1396.483622s ≤ 3300s**（以更早的观察器 t0 计）。
 - **2026-11-16 撤回成本复审修复**：`77938bf` 对撤回和失败成本证明写盘做有界重算；原封口成本单列，尚未获外层返回证明时不冒称覆盖已证明，详见验证记录 §27。
@@ -20,15 +21,17 @@
 
 | 文档 | 用途与状态 |
 | --- | --- |
-| [I 阶段小集拟合诊断器验证记录](verification/omniretarget_w1_smallset_fit_diagnostic.md) | **合成验收通过（§28）、缓存迁移与 R 通过（§31）、一次性真实链及预算修复（§32–§33）**：D1/F 为 `fit_insufficient`，D6 合法跳过；旧链外层 incomplete 保留，后续真实执行须新冻结与明确授权 |
+| [I 阶段小集拟合诊断器验证记录](verification/omniretarget_w1_smallset_fit_diagnostic.md) | **合成验收、缓存迁移与 R 通过；预算修复后的新授权真实链见 §34**：外层 candidate_complete，D1/F 为 fit_insufficient，D6 合法跳过；保存曲线分析支持进入固定同窗单因素诊断方案阶段 |
 | [N1 最小合成验证与有限数值收口说明](verification/omniretarget_w1_n1_synthetic_closure.md) | **N1已收口（2026-11-07，五轮复阅修订后 attempt_006）**：C1 audited vs 独立节点图逐位对照、C5 三例门失败全区间内、C6 八偏差全经N0检测器检出；六类47用例全过，go=no_go→go_for_conditional_fit_diagnostics_review。封口=登记成本同盘覆盖+写后核验；返回核验先读盘后采样、return_observation.json SHA绑定证明且所有退出路径核验；撤回走覆盖成本循环 |
 | [N0 坐标级数值缺口分析记录](verification/omniretarget_w1_n0_coordinate_analysis.md) | **N0已收口（2026-11-07，五轮复阅修订后 attempt_006）**：uint32存在性/单侧可辨识位（4行）；same_input公式门+delta_measured一致性；分侧写界；roster精确集合；来源闭链（journal逐级SHA+registration三阶段严格校验+F重放双锚）；旧629全三类交付（381/223/25）；封口=登记成本覆盖封口与返回+终态时序；返回核验先读盘后采样+SHA绑定观察文件+撤回覆盖成本循环。结论=350 precision_limited+189 cross_path_sensitive+0 implementation_issue_candidate |
-| [数值缺口有限收口与受控拟合诊断方案](plans/omniretarget_w1_numerics_closure_fit_diagnostic_plan.md) | **v0.4+§14–§41修订与运行记录**：N0/N1、I 合成验收与 R 准入实现已完成；§41 缓存迁移与绑定修订（双来源绑定+迁移证明硬门+重建范围/预算冻结，待授权执行）；真实拟合须新冻结及明确授权 |
+| [数值缺口有限收口与受控拟合诊断方案](plans/omniretarget_w1_numerics_closure_fit_diagnostic_plan.md) | **v0.4+§14–§44 修订与运行记录**：N0/N1、I、缓存迁移、R 和授权真实链证据验收已完成；§44 为真实 fit_insufficient 及后续 §9 一因素诊断方案分支，未授权新运行 |
 | [最新T6执行报告](verification/omniretarget_w1_gradient_numerics_retest_report.md) | **已执行的基线，不是待执行任务**：329 failures清零，539 gaps保留；一次性授权已消费，完整目标与交互质量不通过 |
 | [项目整体实现方案](plans/interaction_retarget_impl_plan.md) | 总体目标、坐标/资产约定和最终质量/端到端加速标准；其历史完成快照不能覆盖最新裁决 |
 | [已完成阶段归档](archive/omniretarget_completed_20261106/README.md) | A2、W1训练/归因/融合、合成/真实目标与FK审计、更新审计/迁移、数值修复/T6的分组导航、实际结论和边界 |
 
 ## 下一步的范围
+
+真实 `attempt_002` 已完成当前冻结配置的单窗拟合验收，结果为 `fit_insufficient`。下一交付按方案 §9 冻结**固定同窗的一因素优化/目标诊断方案**；可以优先评估学习率日程，明确唯一改变量、预算/调用及比较规则，另获授权后执行。当前曲线只证明两次运行复现一致及本预算未过门，不直接证明学习率、损失冲突或容量是原因。
 
 先用已有保存量区分不可辨识、相消敏感和实现问题，不机械追求539项全部改判通过。拟合诊断先回答新实现能否拟合固定训练窗，不直接续训旧checkpoint、扩数据、改变损失或重启旧修复路线。
 

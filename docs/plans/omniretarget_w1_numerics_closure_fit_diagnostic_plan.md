@@ -559,3 +559,11 @@ R 权威运行 `r_admission/attempt_002`（§40）确认登记缓存对当前代
 修复通过相关回归后立即提交本地实现，再以相同迁移缓存执行一次元数据 R（120s/15s）重新绑定实现身份，并另存 `authorized=false`、六项 checklist 待确认的授权草案。新草案须引用 §42 的已消费运行及其原始裁决，明确不得复用、重签或补写旧阶段；新真实链仅在另获一次性明确授权后执行。此修复不改变已观察的一窗拟合不足、不重跑 D1/D6/F，也不恢复旧授权。
 
 **执行记录：**修复提交 `0c4572d`，相关合并回归 113 passed/212.70s；新 R `r_admission/attempt_005` 准入与监督器 `candidate_complete` 均通过（观察器写后 6.211709s≤登记9.198464s≤120s）。新草案 `authorization_draft/attempt_002` 保持未授权，固定方案版本为 `0c4572d`，绑定新 R/实现并引用旧已消费运行；本行不改变该冻结版本。保护旧证据 245 文件无漂移，未执行新的真实链，详见验证记录 §33.1。
+
+## 44. 重新授权后的真实链验收与 §9 分支（2026-11-18）
+
+用户明确批准下一步后，`authorization_draft/attempt_002` 六项 checklist 置 true，`authorized=true`/`template_only=false`，授权 SHA=`aaee87a9…`；原未签草案另存原字节。冻结方案版本仍为 `0c4572d`、方案正文 SHA=`f555be49…`，本节仅追加执行记录。监督器在新 `derived/experiments/omniretarget_first/attempt_002/` 执行一次真实 CUDA 链，worker/监督器均返回 0，无自动重试。
+
+**证据验收通过，拟合裁决为负：**外层 `candidate_complete`、problems=[]；D1 1000 更新/101 probes/各 4101 conditioner 与 backbone forward 完整，root position 与 joint 平均门通过，rotation **0.023780910989rad**、FK **0.016761962649m** 未通过；D6 因 `d1_mean_fit_gate_not_passed` 合法跳过；F 对 D1 initial/last 逐位重放通过，最终 `fit_insufficient`。预算序列化修复在真实链上闭合：D1/F 分别在 1800s/600s 内封口并返回；较早独立观察器起点计的监督器返回后采样文件写盘 **701.024471s ≤ 登记 703.799003s ≤ 6120s**。278 文件保护清单零漂移，旧真实 attempt001 的 incomplete 不改判。详见[验证记录 §34](../verification/omniretarget_w1_smallset_fit_diagnostic.md)。
+
+保存量分析没有新增模型/解码/FK 调用：两次真实链 101/101 probe NPZ 逐字节相同；旋转曾有 11 个 probe 过门但最终回升，FK 的 101 个 probe 全部未过门，且没有四门同时通过的 probe。结果落入 §9“完整 D1 未达平均目标”分支。**后续交付是固定同窗的一因素优化/目标诊断方案**；学习率日程可作为首要候选因素，需先冻结唯一改变量、预算/调用与比较规则并另获执行授权，不能据曲线直接判定学习率、容量或损失冲突为原因。当前授权已消费，不自动续训、重试、扩数据或启动新诊断；T6 与既有生产边界保持。

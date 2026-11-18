@@ -579,3 +579,44 @@
 新草案独占写入 **`authorization_draft/attempt_002/authorization_draft.json`**（SHA=`77a39abb…`），`authorized=false`、`template_only=true`、六项 checklist 均为 null；绑定 R `attempt_005`、最终实现/调用矩阵/预算/迁移缓存，方案固定为 **`plan_revision=0c4572d`**、该提交正文 SHA=`f555be49…`（本段仅为事后执行记录）。`prior_consumption` 绑定旧真实链摘要/裁决/D1/F 报告及已消费授权 SHA，保留 1000 更新/101 probes、D6 合法跳过、F `fit_insufficient` 和外层 incomplete；旧封口登记成本与撤回覆盖预留分列，不将预留当作实测成本，也不重置历史。
 
 以当前 `authorization_problems` 自检新草案仅有预期 7 项（未授权+六项 checklist 未确认）；旧已消费授权对新 R 则因准入包 SHA 与实现身份 SHA 不符被拒。自检存于 `budget_serialization_fix_20261117/authorization_refreeze_check.json`。最终 245 文件保护清单复核零漂移。新真实链尚未获授权、未启动；旧真实运行仍为 §32 的严格外层 incomplete，未事后补写或重签。
+
+## 34. 预算修复后的授权真实链（2026-11-18）
+
+用户明确回复“授权开始进行下一步工作”后，按已复阅的 `authorization_draft/attempt_002` 冻结范围执行一次真实 CUDA 链。授权六项 checklist 全置 `true`，`authorized=true`、`template_only=false`；批准后的 SHA 为 `aaee87a98fee221de1ef0acab16d7aa739b60374d8c71eb6dd089ab3d4c98302`。原未签草案按原字节另存 `real_chain_20261118_attempt_002/authorization_unsigned.json`，SHA 仍为 `77a39abb…`。授权继续固定 `plan_revision=0c4572d78d3c1430866b22b45a6029ff55094c11`、方案正文 SHA=`f555be49…`、R `attempt_005` SHA=`aeee97d1…`、实现身份 SHA=`b8ebf5e2…` 和迁移缓存 SHA=`da4bb292…`；本节是事后执行记录，不追溯改变冻结版本。
+
+启动时 HEAD 为 `4dbfe36`、工作树干净；没有改动受绑定的实现、配置、运行时要求或缓存。标准库独立观察器先采样，再启动系统 Python 监督器；监督器通过 `uv run --locked python scripts/run_w1_smallset_fit_real.py --mode chain` 执行真实路径，未使用 fixture。新目录为 `derived/experiments/omniretarget_first/attempt_002/`，每阶段至多一次，未重试。
+
+### 34.1 最终事实、调用与成本覆盖
+
+worker 和监督器均返回 **0**；外层 **`candidate_complete` / problems=[]**，F 的科学裁决为 **`fit_insufficient`**。本次完成了证据与计费验收，拟合平均目标仍未达到。
+
+- **D1**：唯一训练窗 `sub10_largebox_097:0:60`，完整 1000 次 AdamW 更新、4000 micro/backward/loss、4000 窗消费、101/101 probe、conditioner/backbone 各 4101 forward、2 次 checkpoint 保存；生产 FK batch 调用 8102，生产/度量解码各 102。调用矩阵逐项对账无问题，`local_complete_evidence=true`、`local_mean_fit_passed=false`。
+- **D6**：`d6_ran=false`，按 §7.2 以 `d1_mean_fit_gate_not_passed` 合法跳过；无 D6 物化、训练目录或调用。条件阶段未运行不恢复这次链授权。
+- **F**：仅验证已完成的 D1；全部保存 probe 复核，核验计数为生产/度量解码各 102。initial/last fresh bitwise replay 通过，fresh 计数为 conditioner/backbone 各 2 forward、生产 FK batch 2、生产解码 2、度量解码 4。`complete_evidence=true`、`replay_passed=true`、`verdict=fit_insufficient`，端点范围 `initial_last_only` 保持。
+
+| 最终 step1000 指标 | 实测值 | 冻结门 | 结果 |
+| --- | --- | --- | --- |
+| 根位置 RMSE | 0.002787434597 m | ≤0.01 m | 通过 |
+| 根旋转平均角 | 0.023780910989 rad | ≤π/180 rad | 未通过（门的 1.362546 倍） |
+| 关节 RMSE | 0.027638625284 rad | ≤0.05 rad | 通过 |
+| 教师 FK MPJPE | 0.016761962649 m | ≤0.01 m | 未通过（门的 1.676196 倍） |
+
+阶段返回证明：D1 **697.398145s ≤ 登记 701.396195s ≤ 1800s**；F **2.398910s ≤ 登记 6.396776s ≤ 600s**。链封口顶层 `budget` 与监督器 t0/6120s 上限、返回证明完全绑定，`chain_budget` 仍保留封口前同次采样快照；未出现 `budget_binding_mismatch`。
+
+独立观察器起点 `158622.812248318` 早于监督器起点 `158622.830711460`。按更早的观察器起点计，监督器实际 wait 返回 **701.013647s**，观察报告与后续采样文件 fsync 完成后 **701.024471s ≤ 登记 703.799003s ≤ 6120s**。stdout flush、收据/裁决/观察写盘、uv 与监督器实际返回均有覆盖；登记值包含预留，不能当作实际运行耗时。D1/F 使用各自时钟，阶段预留不相加替代整链实测。
+
+只读 `verify_evidence.py` 逐项核验阶段/链封口、实际返回、授权/准入 SHA、stdout 事件、工件索引哈希和精确调用矩阵，`completion_verification.json` 为 `passed=true`、problems=[]。旧真实链、旧授权、R004/R005、两套缓存及当前冻结实现等 **278 文件前后 SHA 零漂移**。原 `attempt_001` 的 incomplete、已消费事实和原始封口均保留；本次没有重新发布 R、重建缓存、改写旧证据或运行回归套件。
+
+主要 SHA：链摘要 `6bc647c1…`、外层裁决 `39d2bb6f…`、D1 报告 `47c42309…`、F 报告 `71e4e813…`。完整哈希与独立观察存于 `derived/audit/w1_smallset_fit_diagnostic/real_chain_20261118_attempt_002/` 下的 `chain_observer.json`、`observer_write_observation.json`、`execution_finished.json`、`completion_verification.json` 和保护清单。观察器与只读分析脚本也保存在同目录。
+
+### 34.2 保存曲线分析与 §9 分支
+
+只读分析入口 `uv run --locked python derived/audit/w1_smallset_fit_diagnostic/real_chain_20261118_attempt_002/analyze_saved_metrics.py` 只消费已保存 JSON/NPZ；没有追加模型、解码、FK 或训练调用。输出 `saved_probe_analysis.json` 和 `d1_saved_convergence.png/.pdf`，不改动任何封口工件。
+
+新旧真实运行的 **101/101 份 probe NPZ 逐字节相同**，所有对应指标完全相同，`probe_index.json` SHA 均为 `20e2baad…`。这仅是两次固定输入/配置执行的复现事实，不证明任意运行的确定性，也不把旧外层裁决改为 complete。
+
+- 根旋转曾在 **11/101** 个 probe 通过均值门；最低为 step510 的 **0.009971368248 rad**，但最后为 **0.023780910989 rad**。step800–1000 范围 **0.023780910989–0.034253931367 rad**，全部高于门。
+- FK 在 **0/101** 个 probe 通过；最低为 step680 的 **0.016122775268 m**，仍高于 0.01m。**没有任一 probe 同时通过四门**，挑选中间 checkpoint 不能消除本次负结果。
+- 最终保存峰值：根旋转 **0.037709345273 rad@frame0**；关节绝对误差 **0.295979567290 rad@(frame0,joint9)**；FK 距离 **0.060052104180 m@(frame1,site11)**。索引为冻结顺序的零基坐标。这里只展示已保存误差，`spike_gate_status=not_evaluated` 保持。
+
+据 §9，下一交付应为**固定同窗的一因素优化/目标诊断方案**。可以优先评估学习率日程这个单一候选因素，以区分当前预算内的后段旋转回升和 FK 残差；曲线本身不能归因于学习率、损失冲突或模型容量。方案须先冻结唯一改变量、预算/调用、端点与比较规则，再按新身份/授权执行；本轮未选择已获执行资格的因素，未改变损失、扩数据、续训、运行 DDIM/val/test 或接入生产。T6 `audit_incomplete`/539 gaps 与 `partial/null/false/not_ready/不接入` 保持，本次一次性授权已消费。
