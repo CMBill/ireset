@@ -1859,6 +1859,9 @@ class FitDriver:
     def _admit_collated(self, batch: dict, step: int, micro: int) -> None:
         """Extension gate on the exact collated object, before consumption."""
 
+    def _count_collated_windows(self, n_windows: int) -> None:
+        self.counters["window_consumptions_total"] += n_windows
+
     def _train_and_probe(self) -> None:
         plan, trainer = self.plan, self.trainer
         data_iter = iter(trainer.train_loader)
@@ -1896,9 +1899,9 @@ class FitDriver:
                     batch = next(data_iter)
                 ever_yielded = True
                 self._admit_collated(batch, step, micro + 1)
-                n_samples += int(batch["x0"].shape[0])
-                self.counters["window_consumptions_total"] += \
-                    int(batch["x0"].shape[0])
+                n_windows = int(batch["x0"].shape[0])
+                n_samples += n_windows
+                self._count_collated_windows(n_windows)
                 self.budget.check(f"step_{step}_micro_{micro + 1}_loaded")
                 batch = self._to_device(batch)
 

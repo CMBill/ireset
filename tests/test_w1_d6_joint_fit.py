@@ -141,6 +141,56 @@ def test_bad_training_collate_has_zero_micro_forwards(tmp_path, monkeypatch, cpu
     assert not (root / 'd6/history.jsonl').exists()
 
 
+def test_whole_transfer_permutation_refused_before_native_micro(tmp_path, monkeypatch, cpu_runtime):
+    root = tmp_path / 'work'
+    launch, rec, budget = materials(root)
+    transfer = fit.FitDriver._to_device
+    orders = []
+
+    def permute(driver, batch):
+        result = transfer(driver, batch)
+        if driver._phase == 'step_1_micro_1':
+            result = {name: value.roll(1, dims=0) for name, value in result.items()}
+            orders.append((batch['clip_idx'].tolist(), result['clip_idx'].tolist()))
+        return result
+
+    monkeypatch.setattr(fit.FitDriver, '_to_device', permute)
+    monkeypatch.setattr(fit.Trainer, 'accumulate_micro', forbid)
+    out = job.run_d6(root, launch, rec, budget)
+    assert len(orders) == 1 and orders[0][0] != orders[0][1]
+    assert out['failure']['message'] == 'train_transfer_slot_order'
+    assert out['micros_current_update'] == out['counts']['admission']['micro_entries'] == 0
+    train = out['counts']['train']
+    assert train['window_consumptions_total'] == train['loss_calls'] == train['adamw_step_calls'] == 0
+    assert train['conditioner_forward_calls'] == train['backbone_forward_calls'] == 1  # initial only
+
+
+def test_history_order_matches_native_micro_inputs(tmp_path, monkeypatch, cpu_runtime):
+    root = tmp_path / 'work'
+    launch, rec, budget = materials(root)
+    original_micro, record = fit.Trainer.accumulate_micro, job.JointDriver._record_update
+    orders = []
+
+    def observe(trainer, batch, **kwargs):
+        orders.append(batch['clip_idx'].tolist())
+        return original_micro(trainer, batch, **kwargs)
+
+    def stop_after_first(driver, row):
+        record(driver, row)
+        raise p.Refused('test_first_update_observed')
+
+    monkeypatch.setattr(fit.Trainer, 'accumulate_micro', observe)
+    monkeypatch.setattr(job.JointDriver, '_record_update', stop_after_first)
+    out = job.run_d6(root, launch, rec, budget)
+    assert out['failure']['message'] == 'test_first_update_observed' and out['completed_updates'] == 1
+    row, = ev.json_lines(p.snapshot(root, 'd6/history.jsonl'), 1)
+    manifest, _ = p.document(root, 'd6/payload.json')
+    assert len(orders) == 4 and len({tuple(order) for order in orders}) > 1
+    assert row['micros'] == [ev.consumption(manifest, order, kind='train', step=1, micro=m,
+                                           event=row['begin_event'] + m) for m, order in enumerate(orders, 1)]
+    assert out['counts']['train']['window_consumptions_total'] == 24
+
+
 def test_source_snapshot_and_condition_independence(tmp_path, monkeypatch, cpu_runtime):
     root = tmp_path / 'work'
     launch, rec, budget = materials(root)
@@ -218,8 +268,9 @@ def test_exact_real_switch_numbering_without_training(tmp_path):
     assert driver.audit.counts['switches'] == 1
 
 
-@pytest.mark.parametrize('fault', ['same-count-probe', 'missing-probe', 'same-count-history',
-                                  'slow-hash', 'slow-sync', 'slow-state', 'slow-roster', 'state-bytes'])
+@pytest.mark.parametrize('fault', ['same-count-probe', 'missing-probe', 'extra-probe', 'nonregular-probe',
+                                  'same-count-history', 'slow-probe-roster', 'slow-hash', 'slow-sync',
+                                  'slow-state', 'slow-roster', 'state-bytes'])
 def test_prefix_is_a_hard_admission_boundary(tmp_path, monkeypatch, fault):
     root, driver, opt, _ = controller_at_500(tmp_path)
     driver._completed_steps = 500
@@ -229,6 +280,23 @@ def test_prefix_is_a_hard_admission_boundary(tmp_path, monkeypatch, fault):
         j.write_bytes(j.read_bytes().replace(b'"idx":0', b'"idx":1', 1))
     elif fault == 'missing-probe':
         (root / ev.probe_path(50, 500)).unlink()
+    elif fault == 'extra-probe':
+        shutil.copyfile(root / ev.probe_path(0, 0), root / ev.probe_path(51, 0))
+    elif fault == 'nonregular-probe':
+        path = root / ev.probe_path(50, 500)
+        path.unlink()
+        path.mkdir()
+    elif fault == 'slow-probe-roster':
+        iterdir = Path.iterdir
+
+        def slow(path):
+            entries = list(iterdir(path))
+            if path == root / 'd6/probes':
+                clock.t = driver.budget.work_deadline
+            return iter(entries)
+
+        monkeypatch.setattr(Path, 'iterdir', slow)
+        monkeypatch.setattr(p, 'snapshot', forbid)
     elif fault == 'same-count-history':
         path = root / 'd6/history.jsonl'
         path.write_bytes(path.read_bytes().replace(b'"step":500', b'"step":499'))
@@ -264,12 +332,16 @@ def test_prefix_is_a_hard_admission_boundary(tmp_path, monkeypatch, fault):
         driver._check_optimizer_binding = lambda: setattr(clock, 't', driver.budget.work_deadline)
     else:
         next(iter(opt.state.values()))['exp_avg'].data.fill_(0.)
-    with pytest.raises((p.Refused, FileNotFoundError)):
+    match = {'extra-probe': 'prefix_probe_file_set', 'nonregular-probe': 'prefix_probe_directory_nonregular',
+             'slow-probe-roster': 'prefix_probe_roster_checks:returned'}.get(fault)
+    with pytest.raises(p.Refused, match=match):
         driver._before_update(501)
     assert driver.audit.counts['state_digest_reads'] == (1 if fault in ('slow-state', 'state-bytes') else 0)
     assert [g['lr'] for g in opt.param_groups] == [.0001] * 2
     assert driver.audit.counts['switches'] == driver.audit.counts['begin_updates'] == driver.audit.counts['micro_entries'] == 0
     assert not (root / 'd6/switch.json').exists()
+    if fault in ('extra-probe', 'nonregular-probe', 'slow-probe-roster'):
+        assert driver.audit.counts['prefix_snapshots'] == 0 and not (root / 'd6/prefix_receipt.json').exists()
 
 
 @pytest.mark.parametrize('scope', ['instance', 'global', 'replace', 'late-group', 'state-reset'])
@@ -408,22 +480,82 @@ def test_f_metadata_hard_gate(accepted, tmp_path, monkeypatch, fault):
     assert result['counts']['build'] == result['counts']['replay'] == {}
 
 
-def test_slow_f_metadata_read_has_no_following_hash_or_numeric_unit(accepted, tmp_path, monkeypatch):
+@pytest.mark.parametrize('rel, n_artifacts', [('fixture_admission.json', 0), ('d6/worker.json', 0),
+                                             ('d6.stdout.log', 0), ('d6/artifacts_index.json', 1)])
+def test_slow_f_metadata_read_has_no_following_hash_or_numeric_unit(accepted, tmp_path, monkeypatch, rel, n_artifacts):
     args = clone_for_f(accepted, tmp_path)
     _, _, _, _, _, budget = args
-    read = p.snapshot
+    read, hashed = p.snapshot, p.record
+    late = []
 
-    def slow(root, rel):
-        data = read(root, rel)
-        if rel == 'd6/artifacts_index.json':
-            budget.clock.t = budget.work_deadline
+    def slow(root, path):
+        assert not late, path
+        data = read(root, path)
+        if path == rel:
+            budget.clock.t = budget.work_deadline + .1
+            late.append(path)
         return data
 
+    def checked_record(raw):
+        assert not late, 'hash after late read'
+        return hashed(raw)
+
     monkeypatch.setattr(p, 'snapshot', slow)
+    monkeypatch.setattr(p, 'record', checked_record)
     monkeypatch.setattr(job, 'apparatus', forbid)
     result = job.run_f(*args)
-    assert result['counts']['saved'] == {'artifact_snapshots': 1}
-    assert 'budget_exceeded:F:artifact_read:d6/artifacts_index.json:returned' in result['failure']['message']
+    assert late == [rel] and result['counts']['build'] == result['counts']['replay'] == {}
+    assert result['counts']['saved'].get('artifact_snapshots', 0) == n_artifacts
+    assert result['counts']['saved'].get('artifact_hashes', 0) == 0
+    point = 'artifact_read' if n_artifacts else 'read'
+    assert result['failure']['message'] == f'budget_exceeded:F:{point}:{rel}:returned'
+    assert result['budget']['budget_exceeded'] and result['local_replay_passed'] is None
+
+
+@pytest.mark.parametrize('fault, entered', [('autocast', 1), ('slow-runtime', 0), ('slow-decode', 1)])
+def test_f_saved_decode_runtime_and_return_hard_gate(accepted, tmp_path, monkeypatch, cpu_runtime, fault, entered):
+    args = clone_for_f(accepted, tmp_path)
+    budget = args[-1]
+    decode, verify = fit.LossAssembler.decode_clip, job.FixtureRuntime.check_unit
+    seen = []
+
+    def drift(assembler, *a, **kw):
+        seen.append(torch.is_autocast_enabled('cpu'))
+        result = decode(assembler, *a, **kw)
+        if fault == 'autocast' and len(seen) <= 2:
+            # Baseline accepted the whole chain if autocast was transient.
+            torch.set_autocast_enabled('cpu', len(seen) == 1)
+        elif fault == 'slow-decode':
+            budget.clock.t = budget.work_deadline
+        return result
+
+    def slow_runtime(runtime, point):
+        verify(runtime, point)
+        if fault == 'slow-runtime' and point == 'teacher_w0_production_decode:pre':
+            budget.clock.t = budget.work_deadline
+
+    assemble = ev.by_slot
+
+    def no_late_record(*a):
+        assert not seen, 'parsed successor probe after refusing the first saved decode'
+        return assemble(*a)
+
+    monkeypatch.setattr(fit.LossAssembler, 'decode_clip', drift)
+    monkeypatch.setattr(job.FixtureRuntime, 'check_unit', slow_runtime)
+    monkeypatch.setattr(ev, 'by_slot', no_late_record)
+    monkeypatch.setattr(job, 'replay', forbid)
+    enabled = torch.is_autocast_enabled('cpu')
+    try:
+        result = job.run_f(*args)
+    finally:
+        torch.set_autocast_enabled('cpu', enabled)
+    assert seen == [False] * entered and result['counts']['saved'].get('production_decode_calls', 0) == entered
+    assert result['counts']['saved']['metric_decode_calls'] == 1 and result['counts']['replay'] == {}
+    failure = {'autocast': 'i6_runtime_drift:teacher_w0_production_decode:post',
+               'slow-runtime': 'budget_exceeded:F:teacher_w0_production_decode:pre_runtime:returned',
+               'slow-decode': 'budget_exceeded:F:production_decode_calls:returned'}
+    assert result['failure']['message'] == failure[fault]
+    assert result['local_replay_passed'] is None and not result['local_evidence_complete']
 
 
 @pytest.mark.parametrize('fault', ['paired-x0', 'input-missing', 'input-order', 'last-role', 'last-dtype', 'last-nan'])
@@ -458,8 +590,8 @@ def test_preflight_failures_never_build_or_load_fresh(accepted, tmp_path, monkey
     assert f['counts']['saved'].get('checkpoint_preflight_reads', 0) == (2 if fault.startswith('last-') else 0)
 
 
-@pytest.mark.parametrize('fault', ['snapshot-replaced', 'fresh-bit-drift'])
-def test_f_uses_one_frozen_snapshot_and_rejects_bit_drift(accepted, tmp_path, monkeypatch, cpu_runtime, fault):
+@pytest.mark.parametrize('fault', ['snapshot-replaced', 'fresh-bit-drift', 'fresh-shape', 'fresh-dtype', 'fresh-metric'])
+def test_f_uses_one_frozen_snapshot_and_classifies_mismatches(accepted, tmp_path, monkeypatch, cpu_runtime, fault):
     args = clone_for_f(accepted, tmp_path)
     root = args[0]
     original = fit._fresh_probe
@@ -474,8 +606,20 @@ def test_f_uses_one_frozen_snapshot_and_rejects_bit_drift(accepted, tmp_path, mo
         raw, prod = original(*a, **kw)
         if fault == 'fresh-bit-drift':
             raw[0, 2, 0] = np.nextafter(raw[0, 2, 0], np.float32(np.inf))
+        elif fault == 'fresh-shape':
+            raw = raw[:, :-1, :]
+        elif fault == 'fresh-dtype':
+            raw = raw.astype(np.float64)
         return raw, prod
 
+    reduce = fit.compute_window_metrics
+
+    def reduce_fresh(*a, **kw):
+        result = reduce(*a, **kw)
+        return {**result, 'root_position_rmse_m': 1.} if live else result
+
+    if fault == 'fresh-metric':
+        monkeypatch.setattr(fit, 'compute_window_metrics', reduce_fresh)
     monkeypatch.setattr(fit, '_fresh_probe', run)
     f = job.run_f(*args)
     if fault == 'snapshot-replaced':
@@ -484,7 +628,57 @@ def test_f_uses_one_frozen_snapshot_and_rejects_bit_drift(accepted, tmp_path, mo
             cli.verify_archived_d6_bytes(root, cli.tree_records(p.Space(root)), f['d6_index'])
     else:
         assert f['local_replay_passed'] is False and not f['local_evidence_complete']
-        assert f['failure']['type'] == 'ReplayMismatch' and f['counts']['replay']['strict_loads'] == 2 and len(live) == 1
+        replay = f['counts']['replay']
+        assert f['failure']['type'] == 'ReplayMismatch' and replay['strict_loads'] == 2 and len(live) == 1
+        assert replay['backbone_forward_calls'] == 1 and replay['production_fk_batch_calls'] == 6
+        assert replay.get('metric_reductions', 0) == (1 if fault == 'fresh-metric' else 0)
+
+
+def test_f_fresh_fk_runtime_drift_blocks_the_next_window_decode(accepted, tmp_path, monkeypatch, cpu_runtime):
+    args = clone_for_f(accepted, tmp_path)
+    fk, decode = fit.SyntheticFK.site_world_positions, fit.LossAssembler.decode_clip
+    seen = []
+
+    def drift(*a, **kw):
+        out = fk(*a, **kw)
+        assert not seen
+        seen.append(torch.is_autocast_enabled('cpu'))
+        torch.set_autocast_enabled('cpu', True)
+        return out
+
+    def observe(*a, **kw):
+        assert not seen, 'a fresh decode ran after FK drift'
+        return decode(*a, **kw)
+
+    monkeypatch.setattr(fit.SyntheticFK, 'site_world_positions', drift)
+    monkeypatch.setattr(fit.LossAssembler, 'decode_clip', observe)
+    enabled = torch.is_autocast_enabled('cpu')
+    try:
+        result = job.run_f(*args)
+    finally:
+        torch.set_autocast_enabled('cpu', enabled)
+    replay = result['counts']['replay']
+    assert seen == [False] and replay['production_fk_batch_calls'] == replay['production_decode_calls'] == 1
+    assert replay['strict_loads'] == 2 and result['local_replay_passed'] is None
+    assert result['failure']['message'] == 'i6_runtime_drift:fresh_numeric_entry:production_decode_calls'
+
+
+def test_worker_startup_slow_launch_read_stops_before_hash_or_observer(tmp_path, monkeypatch):
+    root = tmp_path / 'work'
+    launch, rec, budget = materials(root)
+    read = p.snapshot
+    monkeypatch.setattr(cli.time, 'perf_counter', budget.clock)
+
+    def slow(root, rel):
+        assert rel == 'launch.json'
+        raw = read(root, rel)
+        budget.clock.t = budget.work_deadline + .1
+        return raw
+
+    monkeypatch.setattr(p, 'snapshot', slow)
+    monkeypatch.setattr(p, 'record', forbid)
+    with pytest.raises(p.Refused, match='budget_exceeded:D6:startup:read:launch.json:returned'):
+        cli._worker(root, rec['sha256'], 'f' * 64, 'D6', budget.work_deadline)
 
 
 @pytest.mark.parametrize('stage,closed_offset,work_end,hard_end', [('D6', 0, 3480, 3600),
@@ -513,26 +707,42 @@ def test_wait_and_stage_receipts_share_effective_cap(tmp_path, monkeypatch, faul
     report = {'registered_s': wanted, 'seal_sampled_at': start + 30}
     packet = (report, rec, {'pid': 7}, rec)
     monkeypatch.setattr(p, 'report_packet', lambda *a, **kw: packet)
-    monkeypatch.setattr(p, 'stage_logs', lambda *a: {})
+    monkeypatch.setattr(p, 'stage_logs', lambda *a, **kw: {})
     returned = start + (36 if fault == 'late_wait' else 31)
     clock = fit._FakeClock(returned + .1)
     actual = cli.Wait(6, 0, returned, clock(), True)
-    write = p.Space.publish
+    write, read = p.Space.publish, p.snapshot
+    written = []
+    reread = []
 
     def timed(space, name, doc, **kw):
+        assert clock() < start + wanted
+        written.append(name)
         write(space, name, doc, **kw)
         if fault == 'slow_wait_receipt' and name.endswith('/actual_wait.json'):
             clock.t = start + wanted + .1
-        if fault in ('slow_stage_sync', 'chain_reserve') and name.endswith('/post_sync.json'):
+        if fault == 'slow_stage_sync' and name.endswith('/post_sync.json'):
             clock.t = start + wanted + .1
+        if fault == 'chain_reserve' and name.endswith('/actual_wait.json'):
+            clock.t = hard + .1
+
+    def checked_read(root, path):
+        assert clock() < start + wanted, 'readback admitted after return from a late write'
+        reread.append(path)
+        return read(root, path)
 
     monkeypatch.setattr(p.Space, 'publish', timed)
+    monkeypatch.setattr(p, 'snapshot', checked_read)
     if fault == 'none':
         result, _ = cli.close_stage(space, launch, stage, ledger, rec, actual, 2, clock=clock)
         assert result['closed_at'] == clock()
     else:
         with pytest.raises(p.Refused, match='F_.*_not_covered'):
             cli.close_stage(space, launch, stage, ledger, rec, actual, 2, clock=clock)
+        if fault in ('chain_reserve', 'slow_wait_receipt'):
+            assert written == ['f/actual_wait.json'] and reread == []
+        if fault == 'slow_stage_sync':
+            assert reread == ['f/actual_wait.json']
         if fault == 'chain_reserve':
             assert 4140 < clock() - 100. < 4200 and clock() - start < 600
 
@@ -544,21 +754,29 @@ def test_outer_archive_covers_its_last_write(tmp_path, monkeypatch, late_file):
     rec = {'bytes': 160, 'sha256': 'f' * 64}
     launch = {'t0': 100., 'collector_pid': 8}
     comp = {'registered_s': 14., 'sampled_at': 110., 'closed': {'D6': {}, 'F': {}}, 'problem': None}
-    monkeypatch.setattr(cli, '_chain_packet', lambda *a: (comp, rec, rec))
-    write = p.Space.publish
+    monkeypatch.setattr(cli, '_chain_packet', lambda *a, **kw: (comp, rec, rec))
+    write, read = p.Space.publish, p.snapshot
+    reread = []
 
     def timed(space, name, doc, **kw):
         write(space, name, doc, **kw)
         if name == late_file:
             clock.t = 114.01
 
+    def checked_read(root, path):
+        assert clock() < 114., 'archive readback after late write'
+        reread.append(path)
+        return read(root, path)
+
     monkeypatch.setattr(p.Space, 'publish', timed)
+    monkeypatch.setattr(p, 'snapshot', checked_read)
     actual = cli.Wait(9, 0, 111., 111.5, True)
     if late_file is None:
         assert cli.archive_return(space, launch, rec, actual, clock=clock) == 0
     else:
         with pytest.raises(p.Refused, match='chain_.*_not_covered'):
             cli.archive_return(space, launch, rec, actual, clock=clock)
+        assert reread == ([] if late_file == cli.ARCHIVE else [cli.ARCHIVE])
 
 
 def test_actual_delayed_subprocess_exit_zero_is_not_covered(tmp_path, monkeypatch):
@@ -566,10 +784,56 @@ def test_actual_delayed_subprocess_exit_zero_is_not_covered(tmp_path, monkeypatc
     actual = cli.wait_owned([sys.executable, '-c', 'import time; time.sleep(.25)'], t0 + 5.)
     assert actual.clean and actual.rc == 0 and actual.waited_at - t0 > .125
     rec = {'bytes': 160, 'sha256': 'f' * 64}
-    monkeypatch.setattr(cli, '_chain_packet', lambda *a: ({'registered_s': .125, 'sampled_at': t0}, rec, rec))
+    monkeypatch.setattr(cli, '_chain_packet', lambda *a, **kw: ({'registered_s': .125, 'sampled_at': t0}, rec, rec))
     with pytest.raises(p.Refused, match='chain_actual_wait_not_covered'):
         cli.archive_return(p.Space(tmp_path), {'t0': t0, 'collector_pid': 2}, rec, actual)
     assert not (tmp_path / cli.ARCHIVE).exists()
+
+
+def test_actual_failed_stage_wait_is_retained_but_never_covers_stage(tmp_path, monkeypatch):
+    root = tmp_path / 'actual-stage-failure'
+    # Only the stage command is replaced: the collector, observer, wait,
+    # log capture and archive still use their real process ownership paths.
+    observer = r'''
+import sys
+from pathlib import Path
+import run_w1_d6_joint_fit as c
+def command(root, rec, ledger, stage, deadline):
+    assert stage == 'D6'
+    return [sys.executable, '-c', 'import os, sys; print(os.getpid(), flush=True); sys.exit(7)']
+c._stage_command = command
+sys.exit(c.coordinate(Path(sys.argv[1]), sys.argv[2], float.fromhex(sys.argv[3])))
+'''
+    collector = r'''
+import sys
+from pathlib import Path
+import run_w1_d6_joint_fit as c
+def launch_observer(command, deadline, **kwargs):
+    assert kwargs['scope'] == 'collector_session'
+    observer = [sys.executable, '-c', sys.argv[1], command[3], command[7], command[9]]
+    return wait(observer, deadline, **kwargs)
+wait, c.wait_owned = c.wait_owned, launch_observer
+sys.exit(c.collect(Path(sys.argv[2]), 'fit-pass', float.fromhex(sys.argv[3]), sys.argv[4]))
+'''
+    monkeypatch.setenv('PYTHONPATH', str(ROOT / 'scripts'))
+    t0, token = time.perf_counter(), 'e' * 64
+    actual = cli.wait_owned([sys.executable, '-c', collector, observer, str(root), t0.hex(), token],
+                            t0 + 20., scope='new_session')
+    assert actual.rc == 3 and actual.clean
+    packet, _ = p.document(root, cli.COMPLETION)
+    failure = packet['failed_stage_wait']
+    wait = failure['actual']
+    assert failure['coverage_proven'] is False and failure['stage'] == 'D6' and packet['closed'] == {}
+    assert wait['pid'] == int(p.snapshot(root, 'd6.stdout.log')) and wait['rc'] == 7 and wait['clean'] is True
+    assert t0 <= wait['waited_at'] <= wait['cleaned_at'] <= packet['sampled_at'] <= actual.waited_at
+    assert failure['cost_lower_bound_s'] == wait['cleaned_at'] - t0
+    _, ledger_rec = p.document(root, 'd6/ledger.json')
+    assert failure['ledger'] == ledger_rec and not (root / 'f').exists()
+    assert not (root / 'd6/actual_wait.json').exists() and not (root / 'd6/post_sync.json').exists()
+    _, sync_rec = p.document(root, cli.LAST_SYNC)
+    out = cli.consume(root, cli.CollectorReturn(actual, token, t0, str(root), sync_rec))
+    assert out['failed_stage_wait'] == failure and out['mean_fit_passed'] is out['replay_passed'] is None
+    assert out['verdict'] == 'incomplete' and out['complete_evidence'] is False
 
 
 def test_consumer_refuses_bare_exit_late_and_foreign_observation(accepted):

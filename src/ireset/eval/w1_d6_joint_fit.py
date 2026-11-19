@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass
 import functools
 import hashlib
 import io
+import stat
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -54,7 +55,7 @@ class Apparatus:
 def apparatus(root, adm, meter, runtime):
     runtime_unit(meter.budget, runtime, 'apparatus_entry')
     name = 'source/root_stats.json'
-    doc, rec = meter.unit('root_stats_reads', p.document, root, name, adm['sources'][name])
+    doc, rec = meter.unit('root_stats_reads', p.document, root, name, adm['sources'][name], unit=meter.budget.unit)
     mean, std = np.array(doc['mean'], dtype=np.float32), np.array(doc['std'], dtype=np.float32)
     joint_range = np.stack([-2. + .02 * np.arange(fit.J_JOINTS), 2. - .02 * np.arange(fit.J_JOINTS)], axis=1)
     tokenizer = meter.unit('tokenizer_constructions', fit.StateTokenizer, joint_range, fit.RootStats(mean=mean, std=std))
@@ -104,9 +105,10 @@ def build_windows(root, adm, app, meter, payload_meter, identity):
     rows, items = [], []
     for slot, key in enumerate(adm['registration']['windows']):
         _, source_path, schedule_path = ev.source_paths(slot)
-        source, source_rec = meter.unit('source_snapshot_reads', p.document, root, source_path, adm['sources'][source_path])
+        source, source_rec = meter.unit('source_snapshot_reads', p.document, root, source_path, adm['sources'][source_path],
+                                        unit=meter.budget.unit)
         schedule_doc, sched_rec = meter.unit('source_snapshot_reads', p.document, root, schedule_path,
-                                           adm['sources'][schedule_path])
+                                            adm['sources'][schedule_path], unit=meter.budget.unit)
         p.require(source['demo'] == key['demo'], 'source_window_key')
         clip = meter.unit('window_materializations', materialize_fixture, source, schedule_doc, app.tokenizer, slot)
         item = meter.unit('x0_encodes', _window_item, clip, app.tokenizer, key['start'], slot)
@@ -205,8 +207,18 @@ class Journal:
         return {'bytes': n, 'sha256': h.hexdigest()}
 
     def verify_prefix(self, plan, identity, optimizer_post):
-        receipt = ev.prefix_receipt(plan, identity, self.refs, self.stream_record('d6/history.jsonl'),
-                                    self.stream_record('d6/probe_index.jsonl'), optimizer_post)
+        receipt = self.budget.unit('prefix_expected_receipt', ev.prefix_receipt, plan, identity, self.refs,
+                                   self.stream_record('d6/history.jsonl'),
+                                   self.stream_record('d6/probe_index.jsonl'), optimizer_post)
+        probe_dir = self.space.root / 'd6' / 'probes'
+        expected = {Path(path).name for path in receipt['files'] if Path(path).parent == Path('d6/probes')}
+        p.require(stat.S_ISDIR(self.budget.unit('prefix_probe_directory', probe_dir.lstat).st_mode),
+                  'prefix_probe_directory_not_owned')
+        children = self.meter.unit('prefix_probe_roster_checks', lambda: list(probe_dir.iterdir()))
+        p.require({child.name for child in children} == expected, 'prefix_probe_file_set')
+        for child in children:
+            observed = self.budget.unit('prefix_probe_directory_entry', child.lstat)
+            p.require(stat.S_ISREG(observed.st_mode) and observed.st_nlink == 1, 'prefix_probe_directory_nonregular')
         paths = {**receipt['files'], 'd6/history.jsonl': receipt['history'],
                  'd6/probe_index.jsonl': receipt['probe_journal']}
         snapshots = {}
@@ -248,6 +260,7 @@ class JointDriver(fit.FitDriver):
         self.last_state = ev.empty_state(self.roster)
         self.switch_after = ev.schedule(self.plan)['switch_after']
         self.pending_micros = []
+        self._pending_collate = None
         self.orders = ev.shuffle_orders(self.plan)
         self.live_batch = None
         self.live_versions = None
@@ -356,27 +369,47 @@ class JointDriver(fit.FitDriver):
         self.audit.unit('begin_updates', self._original_begin, point='begin_native_update')
         self.start_event = ev.event_base(self.plan, self._step) + 1
         self.pending_micros = []
+        self._pending_collate = None
 
     def _micro(self, batch, *, pre_backward, post_backward):
+        self.budget.check('live_micro_entry')
+        self._assert_batch(batch)
+        step, micro, positions = self._pending_collate
+        self._pending_collate = None
+        row = self.budget.unit('live_micro_record', ev.consumption, self.manifest, positions,
+                               kind='train', step=step, micro=micro, event=self.start_event + micro)
+
         def enter_backward():
             pre_backward()
             self.audit.enter('backward_entries')
 
-        return self.audit.unit('micro_entries', self._original_micro, batch, pre_backward=enter_backward,
-                               post_backward=post_backward)
+        self.audit.enter('micro_entries')
+        self.pending_micros.append(row)
+        self.counters['window_consumptions_total'] += len(positions)
+        out = self._original_micro(batch, pre_backward=enter_backward, post_backward=post_backward)
+        self.budget.check('micro_entries:returned')
+        return out
 
     def _admit_collated(self, batch, step, micro):
         self.audit.enter('train_batches')
         pos = ev.check_batch(batch, self.manifest, self.audit, device='cpu')
         p.equal(pos, self.budget.unit('expected_trainer_shuffle', next, self.orders))
-        p.require(micro == len(self.pending_micros) + 1, 'micro_sequence')
-        self.pending_micros.append(ev.consumption(self.manifest, pos, kind='train', step=step, micro=micro,
-                                                  event=self.start_event + micro))
+        p.require(self._pending_collate is None and micro == len(self.pending_micros) + 1, 'micro_sequence')
+        self._pending_collate = (step, micro, pos)
         self.budget.check('collate_admitted')
 
+    def _count_collated_windows(self, n_windows):
+        # A loaded batch has not been consumed until its transferred bytes are
+        # verified and the native micro is actually dispatched.
+        pass
+
     def _to_device(self, batch):
+        step, micro, positions = self._pending_collate
         device_batch = self.budget.unit('train_device_transfer', super()._to_device, batch)
-        ev.check_batch(device_batch, self.manifest, self.audit, device=self.trainer.cfg.device)
+        device_positions = ev.check_batch(device_batch, self.manifest, self.audit,
+                                          device=self.trainer.cfg.device)
+        p.require(device_positions == positions, 'train_transfer_slot_order')
+        self._pending_collate = (step, micro, device_positions)
         self._bind_live_batch(device_batch)
         return device_batch
 
@@ -491,7 +524,8 @@ class JointDriver(fit.FitDriver):
         saved = ev.read_saved(self.root, self.plan, self.identity, self.admission, meter, index_rec=self.index_rec)
         _, teacher = ev.verified_inputs(saved, meter)
         validate_endpoints(saved, self.plan, self.identity, self.app, meter, self.runtime_guard)
-        final, _ = ev.saved_metrics(saved, self.plan, self.app, meter, teacher)
+        final, _ = ev.saved_metrics(saved, self.plan, self.app, meter, teacher,
+                                    runtime_guard=self.runtime_guard)
         meter.complete()
         return {'problems': [], 'local_mean_fit_passed': not final['failed_gates'], 'final': final,
                 'expected_windows': self.plan.n_probes * p.N, 'artifacts_index': self.index_rec, **ev.STATUS}
@@ -573,18 +607,21 @@ class ReplayMismatch(p.Refused):
 
 
 def _fresh_check(raw, prod, records, teacher, saved_probe, app, meter, step):
-    p.require(raw.shape == (p.N, 60, 38) and raw.dtype == np.float32 and len(prod) == p.N, 'fresh_probe_shape')
+    if (not isinstance(raw, np.ndarray) or raw.shape != (p.N, 60, 38) or raw.dtype != np.float32
+            or not isinstance(prod, list) or len(prod) != p.N):
+        raise ReplayMismatch(f'fresh_probe_shape_or_dtype:step{step}')
     for b in range(p.N):
         want = ev.by_slot(records, b)
         meter.budget.check('fresh_bitwise_check')
-        if (set(prod[b]) != {'prod_pos', 'prod_quat', 'prod_q', 'fk_pred'}
+        if (not isinstance(prod[b], dict) or set(prod[b]) != {'prod_pos', 'prod_quat', 'prod_q', 'fk_pred'}
                 or not ev.bitwise(raw[b], want['raw_x0_pred'])
-                or not all(ev.bitwise(v, want[k]) for k, v in prod[b].items())):
+                or not all(isinstance(v, np.ndarray) and ev.bitwise(v, want[k]) for k, v in prod[b].items())):
             raise ReplayMismatch(f'endpoint_bitwise_mismatch:step{step}:slot{b}')
         pred = meter.unit('metric_decode_calls', app.decoder.decode, raw[b])
         tgt = meter.unit('metric_decode_calls', app.decoder.decode, teacher[b]['raw_x0_tgt'])
         metrics = meter.unit('metric_reductions', fit.compute_window_metrics, pred, tgt, prod[b]['fk_pred'], teacher[b]['fk_tgt'])
-        p.require(not fit._metrics_equal(saved_probe['windows'][b]['metrics'], metrics), 'fresh_endpoint_metric_drift')
+        if fit._metrics_equal(saved_probe['windows'][b]['metrics'], metrics):
+            raise ReplayMismatch(f'endpoint_metric_mismatch:step{step}:slot{b}')
 
 
 def replay(root, saved, batch, teacher, records, checkpoints, plan, app, meter, runtime):
@@ -596,7 +633,7 @@ def replay(root, saved, batch, teacher, records, checkpoints, plan, app, meter, 
     live = {k: budget.unit('fresh_transfer:' + k, v.to, 'cpu', copy=True) for k, v in batch.items()}
     ev.check_batch(live, saved.manifest, meter, device='cpu', canonical=True)
     versions = {k: (id(v), v._version) for k, v in live.items()}
-    fresh_counts = ev.NumericCounts(meter.limits, {}, budget)
+    fresh_counts = ev.NumericCounts(meter.limits, {}, budget, runtime)
     model = meter.unit('fresh_model_constructions', DeterministicG1, **fit._backbone_kwargs(plan))
     conditioner = meter.unit('fresh_conditioner_constructions', ConditionEncoder, plan.d_model)
     conditioner.forward = condition_only(conditioner.forward)
@@ -615,6 +652,7 @@ def replay(root, saved, batch, teacher, records, checkpoints, plan, app, meter, 
         finally:
             for key, value in fresh_counts.items():
                 meter.counts[key] = value
+        runtime_unit(budget, runtime, 'endpoint_probe_returned')
         p.require({k: (id(v), v._version) for k, v in live.items()} == versions, 'fresh_snapshot_mutated')
         _fresh_check(raw, prod, records[step], teacher, saved.probes[idx], app, meter, step)
     meter.complete()
@@ -623,7 +661,8 @@ def replay(root, saved, batch, teacher, records, checkpoints, plan, app, meter, 
 def metrics_and_replay(root, saved, plan, identity, app, saved_meter, replay_meter, runtime, fact):
     batch, teacher = ev.verified_inputs(saved, saved_meter)
     checkpoints = validate_endpoints(saved, plan, identity, app, saved_meter, runtime)
-    final, records = ev.saved_metrics(saved, plan, app, saved_meter, teacher)
+    final, records = ev.saved_metrics(saved, plan, app, saved_meter, teacher,
+                                      runtime_guard=runtime)
     saved_meter.complete()
     p.equal(final, fact)
     replay(root, saved, batch, teacher, records, checkpoints, plan, app, replay_meter, runtime)
@@ -637,7 +676,7 @@ def run_d6(root, launch, launch_rec, budget):
     counts = {k: meter.counts for k, meter in meters.items()}
     out = {'local_complete_evidence': False, 'local_mean_fit_passed': None, 'counts': counts, **ev.STATUS}
     try:
-        adm, permit = budget.unit('d6_materials', p.verify_materials, root, launch)
+        adm, permit = p.verify_materials(root, launch, unit=budget.unit)
         identity = ev.identity_for(plan, reg, launch, launch_rec, adm, permit)
         out['identity'] = identity
         runtime = admitted_runtime(budget)
@@ -664,6 +703,7 @@ def run_d6(root, launch, launch_rec, budget):
             out['local_mean_fit_passed'] = None
     except Exception as exc:
         out['failure'] = {'type': type(exc).__name__, 'message': str(exc)[:500]}
+        out['budget'] = budget.facts()
     return out
 
 
@@ -674,7 +714,7 @@ def run_f(root, launch, launch_rec, ledger, obs_pid, budget):
     out = {'local_replay_passed': None, 'local_evidence_complete': False,
            'counts': {k: meter.counts for k, meter in meters.items()}, **ev.STATUS}
     try:
-        adm, permit = budget.unit('f_materials', p.verify_materials, root, launch)
+        adm, permit = p.verify_materials(root, launch, unit=budget.unit)
         identity = ev.identity_for(plan, reg, launch, launch_rec, adm, permit)
         out['identity'] = identity
         d6 = p.verify_closed_stage(root, launch, launch_rec, 'D6', ledger['d6_closed'], obs_pid, unit=budget.unit)
@@ -690,10 +730,12 @@ def run_f(root, launch, launch_rec, ledger, obs_pid, budget):
         app = apparatus(root, adm, meters['build'], runtime)
         meters['build'].complete()
         final = metrics_and_replay(root, saved, plan, identity, app, meters['saved'], meters['replay'], runtime, d6['final'])
+        out['local_replay_passed'] = True
         budget.check('f_candidate_before_work_deadline')
-        out.update(local_replay_passed=True, local_evidence_complete=True, final=final, failure=None)
+        out.update(local_evidence_complete=True, final=final, failure=None)
     except Exception as exc:
         if isinstance(exc, ReplayMismatch):
             out['local_replay_passed'] = False
         out['failure'] = {'type': type(exc).__name__, 'message': str(exc)[:500]}
+    out['budget'] = budget.facts()
     return out

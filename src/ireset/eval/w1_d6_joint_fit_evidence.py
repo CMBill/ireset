@@ -80,13 +80,17 @@ class Meter:
 class NumericCounts(dict):
     """Cap counters at the entry points used by the inherited numeric units."""
 
-    def __init__(self, limits, initial, budget):
+    def __init__(self, limits, initial, budget, runtime_guard):
         super().__init__(initial)
         self.limits = limits
         self.budget = budget
+        self.runtime_guard = runtime_guard
 
     def __setitem__(self, key, value):
-        self.budget.check('count_numeric_entry:' + key)
+        point = 'fresh_numeric_entry:' + key
+        # In particular, recheck after the preceding window's FK, which
+        # could leave autocast enabled before the next production decode.
+        self.budget.unit(point, self.runtime_guard.check_unit, point)
         p.require(type(value) is int and value <= self.limits[key], f'call_cap:{key}')
         super().__setitem__(key, value)
 
@@ -384,18 +388,20 @@ def read_saved(root, plan, identity, admission, meter, *, index_rec):
     p.require(set(index['files']) == set(layout(plan)), 'artifact_index_coverage')
     # Reject unregistered files under D6, including a half-written checkpoint.
     allowed = {*layout(plan), 'd6/artifacts_index.json', *p.stage_files('D6')}
-    p.require(all(str(f.relative_to(root)) in allowed for f in (root / 'd6').rglob('*') if not f.is_dir()),
-              'unexpected_d6_artifact')
+    entries = meter.budget.unit('d6_artifact_roster', lambda: list((root / 'd6').rglob('*')))
+    for path in entries:
+        if not meter.budget.unit('d6_artifact_is_directory', path.is_dir):
+            p.require(str(path.relative_to(root)) in allowed, 'unexpected_d6_artifact')
     blobs, refs = {}, {}
     for rel in layout(plan):
         raw = read(rel)
         rec = hashed(raw)
         p.require(rec == index['files'][rel]['record'], f'artifact_changed:{rel}')
         blobs[rel], refs[rel] = raw, rec
-    manifest = p.decode(blobs['d6/payload.json'])
+    manifest = meter.budget.unit('source_manifest_decode', p.decode, blobs['d6/payload.json'])
     meter.budget.unit('validate_source_manifest', validate_manifest, manifest, identity, admission)
     p.equal(index, artifacts_index(plan, manifest, refs, identity))
-    roster = p.decode(blobs['d6/optimizer_roster.json'])['groups']
+    roster = meter.budget.unit('optimizer_roster_decode', p.decode, blobs['d6/optimizer_roster.json'])['groups']
     meter.budget.unit('verify_optimizer_roster', validate_roster, roster)
     hist, journal = blobs['d6/history.jsonl'], blobs['d6/probe_index.jsonl']
     history_rows = meter.budget.unit('history_decode', json_lines, hist, plan.steps)
@@ -403,13 +409,14 @@ def read_saved(root, plan, identity, admission, meter, *, index_rec):
     verify_history(history_rows, plan, manifest, roster, meter)
     verify_probes(probes, plan, manifest, refs, meter)
     switch_after = schedule(plan)['switch_after']
-    prefix = p.decode(blobs['d6/prefix_receipt.json'])
+    prefix = meter.budget.unit('prefix_receipt_decode', p.decode, blobs['d6/prefix_receipt.json'])
     prefix_hist = meter.unit('prefix_hashes', prefix_record, hist, switch_after, point='prefix_history_sha256')
     prefix_probes = meter.unit('prefix_hashes', prefix_record, journal,
                             sum(s <= switch_after for s in plan.probe_steps), point='prefix_probes_sha256')
     state = history_rows[switch_after - 1]['state_after']
     p.equal(prefix, prefix_receipt(plan, identity, refs, prefix_hist, prefix_probes, state))
-    p.equal(p.decode(blobs['d6/switch.json']), switch_record(plan, refs['d6/prefix_receipt.json'], state, roster))
+    switch = meter.budget.unit('switch_receipt_decode', p.decode, blobs['d6/switch.json'])
+    p.equal(switch, switch_record(plan, refs['d6/prefix_receipt.json'], state, roster))
     meter.budget.check('metadata_verified')
     return Saved(index_rec, blobs, manifest, probes, roster)
 
@@ -441,17 +448,21 @@ def verified_inputs(saved, meter):
     return batch, [by_slot(teachers, b) for b in range(p.N)]
 
 
-def checked_decodes(recs, raw, apparatus, meter):
+def checked_decodes(recs, raw, apparatus, meter, *, runtime_guard, label):
     meter.budget.check('saved_x0_domain')
     p.require(not apparatus.decoder.verify_x0(raw) and not fit.verify_rotation_matrix(recs['md_R']), 'saved_x0_domain')
     md = meter.unit('metric_decode_calls', apparatus.decoder.decode, raw)
     for key in ('pos', 'R', 'q'):
         p.require(bitwise(md[key], recs['md_' + key]), f'saved_metric_decode_drift:{key}')
     prod = apparatus.loss_fn
-    x = meter.budget.unit('saved_prod_transfer', torch.from_numpy, raw.copy())
+    cpu_raw = meter.budget.unit('saved_prod_copy', raw.copy)
+    x = meter.budget.unit('saved_prod_transfer', torch.from_numpy, cpu_raw)
     x = meter.budget.unit('saved_prod_device', x.to, prod.mean.device)
+    point = f'{label}_production_decode'
+    meter.budget.unit(point + ':pre_runtime', runtime_guard.check_unit, point + ':pre')
     with torch.no_grad():
         decoded = meter.unit('production_decode_calls', prod.decode_clip, x[None])
+    meter.budget.unit(point + ':post_runtime', runtime_guard.check_unit, point + ':post')
     for key, value in zip(('prod_pos', 'prod_quat', 'prod_q'), decoded, strict=True):
         actual = meter.budget.unit('saved_prod_return', lambda: value[0].detach().cpu().numpy())
         p.require(bitwise(actual, recs[key]), f'saved_production_decode_drift:{key}')
@@ -489,8 +500,9 @@ def summarize(final_windows):
             'n_passing_windows': p.N - len({w['window_id'] for w in failed}), 'worst': worst}
 
 
-def saved_metrics(saved, plan, apparatus, meter, teacher):
-    teacher_md = [checked_decodes(t, t['raw_x0_tgt'], apparatus, meter) for t in teacher]
+def saved_metrics(saved, plan, apparatus, meter, teacher, *, runtime_guard):
+    teacher_md = [checked_decodes(t, t['raw_x0_tgt'], apparatus, meter, runtime_guard=runtime_guard,
+                                  label=f'teacher_w{b}') for b, t in enumerate(teacher)]
     endpoints = {}
     for idx, row in enumerate(saved.probes):
         step = row['step']
@@ -498,7 +510,8 @@ def saved_metrics(saved, plan, apparatus, meter, teacher):
         windows = []
         for b, w in enumerate(row['windows']):
             rec = by_slot(vals, b)
-            md = checked_decodes(rec, rec['raw_x0_pred'], apparatus, meter)
+            md = checked_decodes(rec, rec['raw_x0_pred'], apparatus, meter, runtime_guard=runtime_guard,
+                                 label=f'probe_{idx}_w{b}')
             metrics = meter.unit('metric_reductions', _verify_reduction, rec, teacher[b], md, teacher_md[b], w)
             windows.append({'window_id': w['window_id'], 'batch_pos': b, 'step': step, 'metrics': metrics})
         if step in (0, plan.steps):

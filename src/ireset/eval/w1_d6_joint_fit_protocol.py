@@ -157,12 +157,16 @@ def snapshot(root, rel):
     return raw
 
 
-def document(root, rel, binding=None):
-    raw = snapshot(root, rel)
-    rec = record(raw)
+def unmetered(_point, fn, /, *args, **kwargs):
+    return fn(*args, **kwargs)
+
+
+def document(root, rel, binding=None, *, unit=unmetered):
+    raw = unit(f'read:{rel}', snapshot, root, rel)
+    rec = unit(f'hash:{rel}', record, raw)
     if binding is not None:
         require(encode(rec) == encode(binding), f'byte_binding:{rel}')
-    return decode(raw), rec
+    return unit(f'decode:{rel}', decode, raw), rec
 
 
 def valid_output(path):
@@ -192,16 +196,21 @@ def window_registration(synthetic):
             for demo in (FIXTURE_DEMOS if synthetic else REAL_DEMOS)]}
 
 
-def implementation_identity():
+def implementation_identity(*, unit=unmetered):
     # Bind the local Python dependency closure conservatively, plus the exact
     # launchers, test contract, frozen plan, W1 config and locked environment.
-    paths = sorted(p for p in (PROJECT_ROOT / 'src/ireset').rglob('*.py') if p.is_file())
+    paths = unit('implementation_roster', lambda: sorted((PROJECT_ROOT / 'src/ireset').rglob('*.py')))
+    paths = [path for path in paths if unit('implementation_file_type', path.is_file)]
     paths += [PROJECT_ROOT / name for name in (
         PLAN_PATH, 'scripts/run_w1_d6_joint_fit.py', 'scripts/run_w1_d1_lr_schedule_supervisor.py',
         'tests/test_w1_d6_joint_fit.py', 'configs/train/omniretarget_motion.yaml',
         'pyproject.toml', 'uv.lock', '.python-version')]
-    files = {str(p.relative_to(PROJECT_ROOT)): record(p.read_bytes()) for p in paths}
-    return {'files': files, 'sha256': digest(files)}
+    files = {}
+    for path in paths:
+        rel = str(path.relative_to(PROJECT_ROOT))
+        raw = unit(f'implementation_read:{rel}', path.read_bytes)
+        files[rel] = unit(f'implementation_hash:{rel}', record, raw)
+    return {'files': files, 'sha256': unit('implementation_digest', digest, files)}
 
 
 def fixture_materials(launch):
@@ -218,8 +227,8 @@ def fixture_materials(launch):
     return admission, permit
 
 
-def verify_launch(root, pinned_sha):
-    launch, launch_rec = document(root, 'launch.json')
+def verify_launch(root, pinned_sha, *, unit=unmetered):
+    launch, launch_rec = document(root, 'launch.json', unit=unit)
     require(is_sha(pinned_sha) and launch_rec['sha256'] == pinned_sha, 'launch_external_binding')
     require(launch.get('schema') == SCHEMA and launch.get('root') == str(root)
             and launch.get('cohort') == COHORT and launch.get('synthetic') is True
@@ -229,10 +238,12 @@ def verify_launch(root, pinned_sha):
     return launch, launch_rec
 
 
-def verify_materials(root, launch):
-    adm, permit = fixture_materials(launch)
+def verify_materials(root, launch, *, unit=unmetered):
+    adm, permit = unit('fixture_materials_expected', fixture_materials, launch)
     for name, expected in (('fixture_admission.json', adm), ('fixture_permit.json', permit)):
-        require(record(snapshot(root, name)) == record(encode(expected)), f'fixture_material_binding:{name}')
+        raw = unit(f'read:{name}', snapshot, root, name)
+        rec = unit(f'hash:{name}', record, raw)
+        require(rec == record(encode(expected)), f'fixture_material_binding:{name}')
     return adm, permit
 
 
@@ -278,7 +289,8 @@ def call_matrix(synthetic):
             'admission': {'loss_production_decode_calls': 2 * micros, 'native_step_checks': steps + 1,
                           'micro_entries': micros, 'backward_entries': micros, 'begin_updates': steps,
                           'state_digest_reads': 3 * steps + 2, 'switches': 1,
-                          'prefix_snapshots': prefix_probes + 5, 'prefix_hashes': prefix_probes + 5, 'train_batches': micros,
+                          'prefix_snapshots': prefix_probes + 5, 'prefix_hashes': prefix_probes + 5,
+                          'prefix_probe_roster_checks': 1, 'train_batches': micros,
                           'probe_batches': probes, 'teacher_batches': 1,
                           'window_payload_hashes': 8 * N * (1 + 2 * micros + probes + 2),
                           'generation_artifact_hashes': probes + 10, 'history_appends': steps,
@@ -357,15 +369,15 @@ def worker_binding(launch_rec, ledger_rec, stage, pid, observer_pid, group):
             'ledger': ledger_rec, 'pid': pid, 'observer_pid': observer_pid, 'process_group': group}
 
 
-def report_packet(root, launch_rec, stage, ledger, ledger_rec, observer_pid, pid=None):
+def report_packet(root, launch_rec, stage, ledger, ledger_rec, observer_pid, *, pid=None, unit=unmetered):
     _, report_path, worker_path, _, _ = stage_files(stage)
-    worker, worker_rec = document(root, worker_path)
+    worker, worker_rec = document(root, worker_path, unit=unit)
     group = worker.get('process_group')
     require(type(group) is int and group > 0 and (pid is None or group == pid), 'stage_group_mismatch')
     require(type(worker.get('pid')) is int and worker['pid'] > 0 and worker['pid'] != observer_pid,
             'invalid_stage_worker')
     equal(worker, worker_binding(launch_rec, ledger_rec, stage, worker['pid'], observer_pid, group))
-    report, report_rec = document(root, report_path)
+    report, report_rec = document(root, report_path, unit=unit)
     require(report.get('schema') == SCHEMA + '/stage_report' and report.get('stage') == stage
             and report.get('ledger') == ledger_rec and report.get('worker') == worker_rec
             and report.get('launch') == launch_rec
@@ -388,8 +400,12 @@ def coverage(times, start, registered, hard, reason):
             and times[-1] - start <= registered <= hard - start, reason)
 
 
-def stage_logs(root, stage):
-    return {rel: record(snapshot(root, rel)) for rel in (f'{stage.lower()}.stdout.log', f'{stage.lower()}.stderr.log')}
+def stage_logs(root, stage, *, unit=unmetered):
+    result = {}
+    for rel in (f'{stage.lower()}.stdout.log', f'{stage.lower()}.stderr.log'):
+        raw = unit(f'read:{rel}', snapshot, root, rel)
+        result[rel] = unit(f'hash:{rel}', record, raw)
+    return result
 
 
 def stage_settlement(launch_rec, ledger_rec, packet, obs_pid, actual_pid, actual_rc, waited_at, cleaned_at, logs, stage):
@@ -399,17 +415,16 @@ def stage_settlement(launch_rec, ledger_rec, packet, obs_pid, actual_pid, actual
             'group_reaped': True, 'logs': logs, 'registered_s': packet[0]['registered_s']}
 
 
-def verify_closed_stage(root, launch, launch_rec, stage, closed, observer_pid, *, d6_closed=None, unit=None):
-    unit = unit or (lambda _name, fn, *args: fn(*args))
+def verify_closed_stage(root, launch, launch_rec, stage, closed, observer_pid, *, d6_closed=None, unit=unmetered):
     ld, _, _, wr, ar = stage_files(stage)
-    ledger, ledger_rec = unit('stage_ledger_read', document, root, ld)
+    ledger, ledger_rec = document(root, ld, unit=unit)
     start = launch['t0'] if stage == 'D6' else d6_closed['closed_at']
     equal(ledger, stage_ledger(launch, launch_rec, stage, start, d6_closed=d6_closed))
-    packet = unit('stage_report_packet', report_packet, root, launch_rec, stage, ledger, ledger_rec, observer_pid)
+    packet = report_packet(root, launch_rec, stage, ledger, ledger_rec, observer_pid, unit=unit)
     timing = ledger['timing']
-    wait, wait_rec = unit('stage_wait_read', document, root, wr)
-    archive, ar_rec = unit('stage_post_sync_read', document, root, ar)
-    logs = unit('stage_log_hashes', stage_logs, root, stage)
+    wait, wait_rec = document(root, wr, unit=unit)
+    archive, ar_rec = document(root, ar, unit=unit)
+    logs = stage_logs(root, stage, unit=unit)
     require(type(wait.get('process_pid')) is int and wait['process_pid'] == packet[2]['process_group']
             and wait['process_pid'] != observer_pid, 'stage_process_pid_invalid')
     equal(wait, stage_settlement(launch_rec, ledger_rec, packet, observer_pid, wait['process_pid'],
