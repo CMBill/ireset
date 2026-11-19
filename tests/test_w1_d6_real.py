@@ -8,7 +8,9 @@ from types import SimpleNamespace
 
 import mujoco
 import numpy as np
+import pytorch_kinematics as pk
 import pytest
+import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 import run_w1_d6_joint_fit_real as cli
@@ -18,10 +20,72 @@ from ireset.eval import w1_d6_joint_fit_evidence as ev
 from ireset.eval import w1_d6_joint_fit_protocol as p
 from ireset.eval import w1_d6_joint_fit_real as real
 from ireset.eval import w1_d6_r6 as r
+from ireset.eval import w1_d6_runtime as tensors
+from ireset.train import trainer as native
 
 
 def budget(tmp_path, stage='D6', *, clock=lambda: 10.):
     return p.Budget(p.stage_timing(stage, 10., 10.), p.Space(tmp_path), clock=clock)
+
+
+def forbid(*args, **kw):
+    pytest.fail('admitted a successor after a refused unit')
+
+
+def cpu_checks(b):
+    # Exercise the real metadata checker using CPU fixtures, no CUDA setup.
+    runtime = real.Runtime.__new__(real.Runtime)
+    runtime.checked = []
+    runtime.guards = SimpleNamespace(budget=b)
+    runtime.check_unit = b.check
+    return runtime
+
+
+@pytest.mark.parametrize('fault', [None, 'before', 'setup', 'endpoint', 'missing_check'])
+def test_audited_runtime_setup_and_endpoint_gate(tmp_path, monkeypatch, fault):
+    b, stage = budget(tmp_path, 'F'), 'F'
+    matrix = p.call_matrix(False)
+    build = real.meter_for(stage, 'build', b, matrix)
+    guards = real.meter_for(stage, 'guards', b, matrix)
+    flags = {k: v for k, v in r.REQ.items() if k != 'device'}
+    expected = {'identity': {'cpu_threads': 1}, 'gpu': {'uuid': 'fixture'},
+                'observed_before_setup': {**flags, 'cudnn_allow_tf32': True}}
+    helper = {'path': r.RUNTIME_HELPER, **p.record(b'fixture_helper')}
+    policy = {'schema': r.RUNTIME_REPORT, 'helper': helper, 'tensor_check_points': {stage: r.tensor_check_points(stage)}}
+    events = []
+    setup = {'schema': 'w1_real_fk_runtime_v1', 'requirements': {k: flags[k] for k in r.AUDITED_FLAGS},
+             'before': {k: expected['observed_before_setup'][k] for k in r.AUDITED_FLAGS},
+             'after': {k: flags[k] for k in r.AUDITED_FLAGS}, 'applied': fault != 'setup', 'problems': []}
+
+    def configure():
+        events.append('setup')
+        return setup
+
+    monkeypatch.setattr(r, 'runtime_identity', lambda *a, **kw: {} if fault == 'before' else expected)
+    monkeypatch.setattr(r, 'verify_fk_sources', lambda *a, **kw: None)
+    monkeypatch.setattr(r, 'runtime_flags', lambda _: flags.copy())
+    monkeypatch.setattr(real.audited, 'configure_production_runtime', configure)
+    monkeypatch.setattr(torch, 'get_num_threads', lambda: 1)
+    monkeypatch.setattr(torch.cuda, 'current_device', lambda: 0)
+    monkeypatch.setattr(torch.cuda, 'synchronize', lambda device: events.append(device))
+    if fault in ('before', 'setup'):
+        with pytest.raises(p.Refused, match='binding_mismatch|audited_runtime_setup_refused'):
+            real.Runtime(build, guards, expected, policy)
+        assert events == ([] if fault == 'before' else ['setup'])
+        return
+    runtime = real.Runtime(build, guards, expected, policy)
+    for point, dev in r.tensor_check_points(stage)[int(fault == 'missing_check'):]:
+        runtime.inspect(point, lambda _, device: {'device': device, 'float_dtype': 'torch.float32',
+                                                   'tensors': 1, 'float_tensors': 1}, None, dev)
+    if fault == 'endpoint':
+        flags = {**flags, 'cpu_autocast_enabled': True}
+    if fault:
+        with pytest.raises(p.Refused, match='production_runtime_drift|binding_mismatch'):
+            runtime.finish()
+    else:
+        runtime.finish()
+        assert runtime.facts()['endpoint'] == runtime.facts()['ready']
+        assert events == ['setup', 'cuda:0', 'cuda:0']
 
 
 def test_effective_real_config_and_native_schedule():
@@ -178,7 +242,8 @@ def test_late_plain_compile_refuses_scene_compile(tmp_path, monkeypatch):
     assert meter.counts['scene_plain_compiles'] == 1 and meter.counts['scene_compiles'] == 0 and real._SCENE is None
 
 
-def test_production_apparatus_snapshot_and_fk_construction_counts(tmp_path, monkeypatch):
+@pytest.mark.parametrize('fault', [None, 'build_dtype', 'transfer_dtype', 'index_dtype', 'loss_dtype'])
+def test_production_apparatus_snapshot_and_fk_construction_counts(tmp_path, monkeypatch, fault):
     monkeypatch.setattr(real, '_SCENE', None)
     monkeypatch.setattr(real, 'PROJECT_ROOT', tmp_path)
     monkeypatch.setattr(real, 'DEVICE', 'cpu')
@@ -199,21 +264,56 @@ def test_production_apparatus_snapshot_and_fk_construction_counts(tmp_path, monk
     bindings = {'production_assets': files, 'root_stats': {'file': rs, 'headers': r.STATS_HEADERS}, 'runtime': {}}
     # Same production setup functions as F, only bound to synthetic CPU assets.
     monkeypatch.setattr(real, 'BoundAssets', lambda binding, m, original=real.BoundAssets: original(binding, m, tmp_path))
-    app, spec = real.apparatus(bindings, meter, SimpleNamespace(check_unit=lambda _: None))
+    runtime = cpu_checks(meter.budget)
+    if fault == 'build_dtype':
+        build = pk.build_chain_from_urdf
+        def bad(*a, **kw):
+            chain = build(*a, **kw)
+            chain._static_offsets = chain._static_offsets.double()
+            return chain
+        monkeypatch.setattr(pk, 'build_chain_from_urdf', bad)
+        monkeypatch.setattr(pk.Chain, 'to', forbid)
+    elif fault in ('transfer_dtype', 'index_dtype'):
+        to = pk.Chain.to
+        def bad(self, *a, **kw):
+            chain = to(self, *a, **kw)
+            if fault == 'transfer_dtype':
+                chain.axes = chain.axes.double()
+            else:
+                chain._joint_indices_clamped = chain._joint_indices_clamped.int()
+            return chain
+        monkeypatch.setattr(pk.Chain, 'to', bad)
+    elif fault == 'loss_dtype':
+        assembler = real.fit.LossAssembler
+        def bad(*a, **kw):
+            loss = assembler(*a, **kw)
+            loss.std = loss.std.double()
+            return loss
+        monkeypatch.setattr(real.fit, 'LossAssembler', bad)
+    if fault:
+        with pytest.raises(p.Refused, match='real_tensor_contract'):
+            real.apparatus(bindings, meter, runtime)
+        assert meter.counts['fk_constructions'] == 1
+        assert meter.counts['fk_chain_transfers'] == int(fault != 'build_dtype')
+        assert meter.counts['loss_constructions'] == int(fault == 'loss_dtype')
+        assert meter.counts['scene_compiles'] == int(fault == 'loss_dtype')
+        return
+    app, spec = real.apparatus(bindings, meter, runtime)
     assert spec.joint_range.shape == (29, 2) and app.loss_fn.fk.n_joints == 29
     expected = {k: n for k, n in matrix['F']['build'].items() if not k.startswith('runtime_')}
     expected['asset_snapshot_reads'] = expected['asset_snapshot_hashes'] = 5  # our tiny locked closure
     expected.update(matrix['branches']['F']['build']['scene'][0])
     assert meter.counts == expected
+    assert [x['point'] for x in runtime.checked] == [k for k, _ in r.tensor_check_points('F')[:4]]
 
 
 @pytest.mark.parametrize('fault', ['draft', 'old_schema', 'd1', 'not_new', 'double'])
 def test_only_new_exact_authorization(tmp_path, fault):
-    auth = {'schema': cli.rcli.AUTH_SCHEMA, 'cohort': p.COHORT, 'authorized': True, 'template_only': False,
+    auth = {'schema': cli.review.AUTH_SCHEMA, 'cohort': p.COHORT, 'authorized': True, 'template_only': False,
             'root': str(r.REAL_ROOT), 'includes': ['D6', 'F'], 'max_per_stage': 1,
             'checklist': dict.fromkeys(r.CHECKLIST, True), 'approval_reference': 'fixture only'}
     cli._validate_permission(auth)
-    auth.update({'draft': {'authorized': False, 'template_only': True}, 'old_schema': {'schema': 'w1_d1_lr_authorization_v2'},
+    auth.update({'draft': {'authorized': False, 'template_only': True}, 'old_schema': {'schema': cli.rcli.AUTH_SCHEMA},
                  'd1': {'includes': ['D1', 'D6', 'F']}, 'not_new': {'approval_reference': ''}, 'double': {'max_per_stage': 2}}[fault])
     with pytest.raises(p.Refused):
         cli._validate_permission(auth)
@@ -231,3 +331,136 @@ def test_f_metadata_before_apparatus(tmp_path, monkeypatch):
     monkeypatch.setattr(real, 'apparatus', lambda *a: pytest.fail('apparatus reached'))
     f = real.run_f(stage, {'d6_closed': {}}, 1)
     assert not f['local_evidence_complete'] and f['local_replay_passed'] is None and not any(f['counts'].values())
+
+
+@pytest.mark.parametrize('fault', ['none', 'model_dtype', 'model_device', 'model_transfer', 'conditioner_dtype',
+                                   'conditioner_transfer', 'slow_check', 'slow_model'])
+def test_native_trainer_checks_before_the_next_independent_unit(tmp_path, monkeypatch, fault):
+    now = [10.]
+    b = budget(tmp_path, clock=lambda: now[0])
+    meter = real.meter_for('D6', 'build', b, p.call_matrix(False))
+    runtime = cpu_checks(b)
+    _, reg, cfg = real.plan_and_config({'contract': r.frozen_contract()})
+    cfg.device = 'cpu'
+    events = []
+
+    class Fixture(torch.nn.Linear):
+        def __init__(self, side):
+            super().__init__(1, 1)
+            self.side = side
+            self.register_buffer('constant', torch.ones(1, dtype=torch.float64 if fault == side + '_dtype' else torch.float32))
+            self.register_buffer('mask', torch.ones(1, dtype=torch.bool))
+            if fault == 'model_device' and side == 'model':
+                self.constant = self.constant.to('meta')
+            events.append(side)
+            if fault == 'slow_model' and side == 'model':
+                now[0] = b.work_deadline
+
+        def to(self, *a, **kw):
+            events.append(self.side + '_transfer')
+            out = super().to(*a, **kw)
+            if fault == self.side + '_transfer':
+                out.constant = out.constant.double()
+            return out
+
+    def check(module, device):
+        result = original(module, device)
+        if fault == 'slow_check':
+            now[0] = b.work_deadline
+        return result
+
+    original = tensors.module_facts
+    monkeypatch.setattr(tensors, 'module_facts', check)
+    monkeypatch.setattr(native, 'DeterministicG1', lambda **kw: Fixture('model'))
+    monkeypatch.setattr(native, 'ConditionEncoder', lambda *_: Fixture('conditioner'))
+    inputs = [{'fixture_only': torch.ones(1)} for _ in reg.windows]
+    invoke = lambda: real.build_trainer(cfg, SimpleNamespace(tokenizer=None, loss_fn=object()), inputs, reg, tmp_path, meter, runtime)
+    want = ['model', 'model_transfer', 'conditioner', 'conditioner_transfer']
+    if fault == 'none':
+        result, _ = invoke()
+        assert isinstance(result.opt, torch.optim.AdamW) and not result.opt.state
+        assert events == want
+        assert [d['point'] for d in runtime.checked] == ['trainer_' + k for k in want]
+    else:
+        with pytest.raises(p.Refused, match='^(real_tensor_contract|budget_exceeded)'):
+            invoke()
+        count = {'model_dtype': 1, 'model_device': 1, 'model_transfer': 2, 'conditioner_dtype': 3,
+                 'conditioner_transfer': 4, 'slow_check': 1, 'slow_model': 1}[fault]
+        assert events == want[:count]
+        assert meter.counts['model_constructions'] == 1 and meter.counts['optimizer_constructions'] == 0
+
+
+@pytest.mark.parametrize('fault', ['none', 'fresh_model_dtype', 'fresh_conditioner_transfer', 'load_destination_dtype',
+                                   'loaded_model_dtype', 'loaded_conditioner_device', 'loaded_mask_dtype', 'late_loaded_check'])
+def test_f_checks_each_fresh_construction_and_strict_load(tmp_path, monkeypatch, fault):
+    now = [10.]
+    b = budget(tmp_path, 'F', clock=lambda: now[0])
+    meter = real.meter_for('F', 'replay', b, p.call_matrix(False))
+    runtime = cpu_checks(b)
+    plan = ev.plan_for(False)
+    events = []
+
+    class Fixture(torch.nn.Linear):
+        def __init__(self, side):
+            super().__init__(1, 1)
+            self.side = side
+            self.register_buffer('mask', torch.ones(1, dtype=torch.bool))
+            events.append('fresh_' + side)
+            if fault == 'fresh_model_dtype' and side == 'model':
+                self.weight.data = self.weight.detach().double()
+
+        def to(self, *a, **kw):
+            events.append('transfer_' + self.side)
+            out = super().to(*a, **kw)
+            if fault == 'fresh_conditioner_transfer' and self.side == 'conditioner':
+                out.bias.data = out.bias.detach().double()
+            return out
+
+        def load_state_dict(self, state, strict=True):
+            assert strict is True
+            events.append('load_' + self.side)
+            ret = super().load_state_dict(state, strict=strict)
+            if fault == 'loaded_model_dtype' and self.side == 'model':
+                self.weight.data = self.weight.detach().double()
+            if fault == 'loaded_conditioner_device' and self.side == 'conditioner':
+                self.mask = self.mask.to('meta')
+            if fault == 'loaded_mask_dtype' and self.side == 'model':
+                self.mask = self.mask.long()
+            return ret
+
+    original = tensors.module_facts
+    def check(module, device):
+        facts = original(module, device)
+        if fault == 'late_loaded_check' and events[-1] == 'load_model':
+            now[0] = b.work_deadline
+        return facts
+
+    def probe(model, conditioner, *a, **kw):
+        events.append('probe')
+        return None, None
+
+    monkeypatch.setattr(tensors, 'module_facts', check)
+    monkeypatch.setattr(joint, 'DeterministicG1', lambda **kw: Fixture('model'))
+    monkeypatch.setattr(joint, 'ConditionEncoder', lambda *_: Fixture('conditioner'))
+    monkeypatch.setattr(joint, 'config', lambda _: SimpleNamespace(device='cpu'))
+    monkeypatch.setattr(ev, 'check_batch', lambda *a, **kw: None)
+    monkeypatch.setattr(ev.Meter, 'complete', lambda _: None)  # replay-only test, numerical probe is a stub
+    monkeypatch.setattr(joint.fit, '_fresh_probe', probe)
+    monkeypatch.setattr(joint, '_fresh_check', lambda *a: None)
+    state = dict(weight=torch.zeros(1, 1), bias=torch.zeros(1), mask=torch.ones(1, dtype=torch.bool))
+    if fault == 'load_destination_dtype':
+        state['mask'] = state['mask'].long()
+    checkpoints = {step: {'model': state, 'conditioner': state} for step in (0, plan.steps)}
+    invoke = lambda: joint.replay(tmp_path, SimpleNamespace(manifest={}, probes=[None] * plan.n_probes), {'tiny': torch.ones(1)},
+                                  None, {0: None, plan.steps: None}, checkpoints, plan, SimpleNamespace(loss_fn=None), meter, runtime)
+    want = ['fresh_model', 'transfer_model', 'fresh_conditioner', 'transfer_conditioner'] + ['load_model', 'load_conditioner', 'probe'] * 2
+    if fault == 'none':
+        invoke()
+        assert events == want and meter.counts['strict_loads'] == 4
+    else:
+        with pytest.raises(p.Refused, match='^(real_tensor_contract|real_strict_destination_state_mismatch|budget_exceeded)'):
+            invoke()
+        count = {'fresh_model_dtype': 1, 'fresh_conditioner_transfer': 4, 'load_destination_dtype': 4,
+                 'loaded_model_dtype': 5, 'loaded_conditioner_device': 6, 'loaded_mask_dtype': 5, 'late_loaded_check': 5}[fault]
+        assert events == want[:count]
+        assert meter.counts['strict_loads'] == max(count - 4, 0) and not meter.counts['probe_calls']

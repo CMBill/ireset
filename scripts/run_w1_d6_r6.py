@@ -249,7 +249,7 @@ def launch_r6(impl_sha, *, start=T0):
     return ExternalReturn(str(root), start, token, impl_sha, actual, sync, time.perf_counter())
 
 
-def verify_archive(root, actual, *, unit=p.unmetered):
+def _verify_sealed_packet(root, actual, *, unit=p.unmetered):
     p.require(isinstance(actual, ExternalReturn) and isinstance(actual.wait, Wait) and actual.root == str(root)
               and p.is_sha(actual.implementation_sha256) and p.is_sha(actual.launch_id)
               and type(actual.wait.pid) is int and actual.wait.pid > 0, 'r6_external_wait_required')
@@ -282,13 +282,18 @@ def verify_archive(root, actual, *, unit=p.unmetered):
     p.require(report['metadata_passed'] is True and report['problem'] is None
               and report['budget']['budget_exceeded'] is False, 'r6_metadata_not_passed')
     pkg = report['package']
-    p.equal(pkg['contract'], unit('r6_frozen_contract', r6.frozen_contract))
     p.equal(pkg['forbidden_calls'], r6.ZEROS)
     p.require(min(pkg['disk_free_bytes'].values()) >= p.DISK_MIN and pkg['bindings']['migration_verified'] == 55,
               'r6_package_metadata')
     p.equal(pkg['implementation']['sha256'], actual.implementation_sha256)
-    p.equal(pkg['implementation'], r6.implementation(unit=unit))
     return pkg, {'launch': lr, 'admission': report_rec, 'worker_wait': wr, 'archive': ar, 'post_sync': sr}, report['registered_s']
+
+
+def verify_archive(root, actual, *, unit=p.unmetered):
+    pkg, proof, reg = _verify_sealed_packet(root, actual, unit=unit)
+    p.equal(pkg['contract'], unit('r6_frozen_contract', r6.frozen_contract))
+    p.equal(pkg['implementation'], r6.implementation(unit=unit))
+    return pkg, proof, reg
 
 
 def draft(package, bindings, actual, final_readback_at):

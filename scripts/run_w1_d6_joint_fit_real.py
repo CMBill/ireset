@@ -17,9 +17,10 @@ sys.path[:0] = [str(ROOT / 'src'), str(ROOT / 'scripts')]
 from ireset.eval import w1_d6_joint_fit_protocol as p, w1_d6_r6 as r6
 import run_w1_d6_joint_fit as own
 import run_w1_d6_r6 as rcli
+import review_w1_d6_joint_fit as review
 
 ENTRY = ROOT / r6.REAL_ENTRY
-AUTH = ROOT / r6.AUDIT / 'authorization.json'
+AUTH = review.AUTH
 CLAIM = 'authorization_consumed.json'
 LAUNCH = 'launch.json'
 SCHEMA = r6.REAL_LAUNCH_SCHEMA
@@ -66,7 +67,7 @@ def external_return(doc):
 
 
 def _validate_permission(auth):
-    p.require(auth.get('schema') == rcli.AUTH_SCHEMA and auth.get('cohort') == p.COHORT
+    p.require(auth.get('schema') == review.AUTH_SCHEMA and auth.get('cohort') == p.COHORT
               and auth.get('authorized') is True and auth.get('template_only') is False
               and auth.get('root') == str(r6.REAL_ROOT), 'new_section_8_3_authorization_required')
     p.equal(auth.get('includes'), ['D6', 'F'])
@@ -83,19 +84,10 @@ def materials(auth_pin, *, unit):
     p.require(rec['sha256'] == auth_pin, 'authorization_external_pin')
     auth = unit('authorization_json', p.decode, raw)
     _validate_permission(auth)
-    binding = auth['bindings']
-    actual = rcli.external_return(binding['r6_external_return'])
-    package, proof, reg = rcli.verify_archive(r6.R6_ROOT, actual, unit=unit)
-    when = binding['r6_final_readback_at']
-    p.coverage((actual.readback_at, when), actual.t0, reg, actual.t0 + p.CAPS['R6'][0], 'authorized_r6_final_readback_late')
-    draft = rcli.draft(package, proof, actual, when)
+    reviewed, reviewed_rec, package = review.load(auth['bindings']['review'], unit=unit)
+    draft = review.draft(reviewed, reviewed_rec)
     p.equal(auth, {**draft, 'authorized': True, 'template_only': False,
                    'checklist': dict.fromkeys(r6.CHECKLIST, True), 'approval_reference': auth['approval_reference']})
-    # Validate the named ancestry and actual consumed source/assets are then
-    # byte-verified again at their numeric entries from the R6 snapshot recipe.
-    reader = r6.Reader(ROOT, unit)
-    for key in ('b_consumed', 'source', 'cache', 't6', 'plan', 'config'):
-        reader.hashed(*r6.PINS[key])
     return auth, rec, package
 
 
@@ -118,7 +110,7 @@ def _collector_command(t0, pr, auth_sha):
 
 
 def _consumption(lr, authorization):
-    return {'schema': rcli.AUTH_SCHEMA + '/consumed', 'attempt': 1, 'launch': lr, 'authorization': authorization,
+    return {'schema': review.AUTH_SCHEMA + '/consumed', 'attempt': 1, 'launch': lr, 'authorization': authorization,
             'includes': list(p.STAGES), 'state': 'claimed_no_retry'}
 
 
@@ -168,7 +160,7 @@ def _worker(root, stage, t0, start, launch_pin, ledger_pin):
         if stage == 'F':
             # Require the actual D6 close before importing the numeric graph.
             report = p.verify_closed_stage(root, launch, lr, 'D6', prior, observer, unit=budget.unit)
-            _candidate('D6', report, package['contract']['call_matrix'])
+            budget.unit('d6_stage_candidate', _candidate, 'D6', report, package)
         budget.check('real_before_numeric_import')
         from ireset.eval import w1_d6_joint_fit_real as job
         budget.check('real_numeric_import_returned')
@@ -181,14 +173,16 @@ def _worker(root, stage, t0, start, launch_pin, ledger_pin):
     return 0  # candidate only; observer still requires actual coverage and complete evidence
 
 
-def _candidate(stage, report, matrix):
+def _candidate(stage, report, package):
     p.require(report.get('failure') is None and report['budget']['budget_exceeded'] is False, 'real_stage_failure:' + stage)
     if stage == 'D6':
         p.require(report['local_complete_evidence'] is True and type(report['local_mean_fit_passed']) is bool,
                   'real_d6_not_complete')
     else:
         p.require(report['local_evidence_complete'] is True and report['local_replay_passed'] is True, 'real_f_not_complete')
-    p.require(p.real_counts_ok(stage, report['counts'], matrix), 'real_stage_matrix:' + stage)
+    contract = package['contract']
+    p.require(p.real_counts_ok(stage, report['counts'], contract['call_matrix']), 'real_stage_matrix:' + stage)
+    r6.verify_runtime_report(stage, report.get('runtime'), package['bindings']['runtime'], contract['runtime_evidence'])
 
 
 def _observe(root, pin, t0):
@@ -200,7 +194,6 @@ def _observe(root, pin, t0):
     closed, problem, failed_wait = {}, None, None
     try:
         _, _, package = _verify_launch_materials(launch, unit=budget.unit)
-        matrix = package['contract']['call_matrix']
         rcli._write(space, own.OBSERVER, own.observer_binding(lr, observer, launch['collector_pid']), budget.unit, budget.check)
         for stage in p.STAGES:
             prior = None if stage == 'D6' else closed['D6']
@@ -218,7 +211,14 @@ def _observe(root, pin, t0):
                 failed_wait = {'stage': stage, 'actual': asdict(actual), 'ledger': ld, 'coverage_proven': False,
                                'cost_lower_bound_s': actual.cleaned_at - start}
                 raise
-            _candidate(stage, report, matrix)
+            # These metadata checks run after the stage has closed. F starts
+            # at that close; the final F candidate gate is within the outer cap.
+            if stage == 'D6':
+                next_budget = p.Budget(p.stage_timing('F', t0, closed[stage]['closed_at']), space)
+                next_budget.unit('d6_stage_candidate', _candidate, stage, report, package)
+            else:
+                _, unit = own._tail_guard(time.perf_counter, t0 + p.CHAIN_CAP, 'real_f_candidate_readback')
+                unit('f_stage_candidate', _candidate, stage, report, package)
     except Exception as exc:
         problem = f'{type(exc).__name__}:{exc}'[:500]
     sample, hard = time.perf_counter(), t0 + p.CHAIN_CAP
@@ -315,7 +315,7 @@ def _verify_inner(root, parent, pr, wait, comp_rec, out, *, unit):
                       'completion': cr, 'actual': w, 'files': files,
                       'sampled_at': archive['sampled_at'], 'registered_s': comp['registered_s']})
     for name, report in reports.items():
-        _candidate(name, report, package['contract']['call_matrix'])
+        unit(name + '_stage_candidate', _candidate, name, report, package)
     d6 = reports['D6']
     own.verify_archived_d6_bytes(root, archive['files'], d6['artifacts_index'], unit=unit)
     p.equal([f['identity'], f['d6_index'], f['final']], [d6['identity'], d6['artifacts_index'], d6['final']])
@@ -381,6 +381,7 @@ def launch_authorized(auth_sha, *, start):
         p.require(budget.unit('real_parent', root.parent.resolve, strict=True) == root.parent
                   and budget.unit('real_disk_floor', shutil.disk_usage, root.parent).free >= p.DISK_MIN, 'real_disk_or_path')
         p.require(not budget.unit('real_prior_claim', os.path.lexists, root), 'real_claim_already_consumed')
+        review.verify_sources(package['bindings']['files'], unit=budget.unit)
         space = budget.unit('real_artifact_space', Space, root)
         p.require(space.root == root, 'real_unsafe_artifact_root')
         budget.check('exclusive_real_claim')

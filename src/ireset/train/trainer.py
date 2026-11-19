@@ -162,7 +162,7 @@ class Trainer:
                  formal_eval=None, formal_eval_every: int | None = None,
                  budget_deadline: float | None = None,
                  *, loss_fn=None, build_optimizer: bool = True,
-                 construction_observer=None, construction_entry=None) -> None:
+                 construction_observer=None, construction_entry=None, construction_check=None) -> None:
         self.cfg, self.tokenizer = cfg, tokenizer
         self.train_ds, self.val_ds = train_ds, val_ds
         self.out_dir = Path(out_dir)
@@ -202,13 +202,21 @@ class Trainer:
             )
         else:
             self.model = DeterministicG1(**cfg.backbone_kwargs())
+        if construction_check is not None:
+            construction_check('model', self.model)
         enter('model_transfer')
         self.model = self.model.to(cfg.device)
+        if construction_check is not None:
+            construction_check('model_transfer', self.model)
         self._constructed("model")
         enter('conditioner')
         self.conditioner = ConditionEncoder(cfg.d_model)
+        if construction_check is not None:
+            construction_check('conditioner', self.conditioner)
         enter('conditioner_transfer')
         self.conditioner = self.conditioner.to(cfg.device)
+        if construction_check is not None:
+            construction_check('conditioner_transfer', self.conditioner)
         self._constructed("conditioner")
         # ``loss_fn`` is an audit-only injection (pure-synthetic FK/geometry);
         # ``build_optimizer=False`` lets the independent-reference stage reuse

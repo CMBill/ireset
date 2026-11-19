@@ -18,7 +18,14 @@ from ireset.eval import w1_d6_joint_fit_protocol as p
 
 AUTH = p.record(b'outer protocol fixture only')
 PIN = AUTH['sha256']
-PACKAGE = {'implementation': {'sha256': '1' * 64, 'files': {}}, 'contract': {'call_matrix': p.call_matrix(False)}}
+r = cli.r6
+FLAGS = {k: v for k, v in r.REQ.items() if k != 'device'}
+RUNTIME = {'identity': {'cpu_threads': 1}, 'gpu': {'uuid': 'fixture'},
+           'observed_before_setup': {**FLAGS, 'cudnn_allow_tf32': True}}
+RUNTIME_POLICY = {'schema': r.RUNTIME_REPORT, 'helper': p.record(b'fixture_helper'),
+                  'tensor_check_points': {stage: r.tensor_check_points(stage) for stage in p.STAGES}}
+PACKAGE = {'implementation': {'sha256': '1' * 64, 'files': {}}, 'bindings': {'files': {}, 'runtime': RUNTIME},
+           'contract': {'call_matrix': p.call_matrix(False), 'runtime_evidence': RUNTIME_POLICY}}
 FORBIDDEN = {'torch', 'numpy', 'mujoco', 'ireset.eval.w1_d6_joint_fit_real'}
 
 
@@ -40,7 +47,19 @@ def _fixture_job(fault):
         counts = {name: vals.copy() for name, vals in matrix[stage].items()}
         counts['build'].update(matrix['branches'][stage]['build']['scene'][0])
         counts['guards']['runtime_syncs'] = 1
-        return dict(counts=counts, identity={'fixture_only': True}, failure=None,
+        now = {'flags': FLAGS, 'current_device': r.REQ['device'], 'cpu_threads': 1}
+        before = RUNTIME['observed_before_setup']
+        setup = {'schema': 'w1_real_fk_runtime_v1', 'requirements': {k: FLAGS[k] for k in r.AUDITED_FLAGS},
+                 'before': {k: before[k] for k in r.AUDITED_FLAGS}, 'after': {k: FLAGS[k] for k in r.AUDITED_FLAGS},
+                 'applied': True, 'problems': []}
+        facts = {'schema': r.RUNTIME_REPORT, 'stage': stage, 'kind': 'production', 'device': r.REQ['device'],
+                 'source': RUNTIME_POLICY['helper'], 'identity': RUNTIME['identity'], 'gpu': RUNTIME['gpu'],
+                 'before': before, 'ready': now, 'setup': setup, 'endpoint': now,
+                 'tensor_checks': [{'point': k, 'device': device, 'float_dtype': 'torch.float32', 'float_tensors': 1, 'tensors': 1}
+                                   for k, device in r.tensor_check_points(stage)]}
+        if fault == 'd6_no_runtime' and stage == 'D6':
+            facts = None
+        return dict(counts=counts, identity={'fixture_only': True}, failure=None, runtime=facts,
                     final={'fixture_only': True, 'failed_gates': ['fixture_window_5'] if fault == 'one_window' else []})
 
     def run_d6(scope):
@@ -201,7 +220,8 @@ def test_complete_negative_uses_same_actual_proof(tmp_path):
     assert r['final']['failed_gates'] == ['fixture_window_5']
 
 
-@pytest.mark.parametrize('fault', ['after_collector_seal', 'log_overflow', 'log_fsync', 'leftover_group', 'replay_mismatch', 'd6_refused'])
+@pytest.mark.parametrize('fault', ['after_collector_seal', 'log_overflow', 'log_fsync', 'leftover_group',
+                                   'replay_mismatch', 'd6_refused', 'd6_no_runtime'])
 def test_actual_failure_is_not_completion(tmp_path, fault):
     root = tmp_path / fault
     run = _run(root, fault)
@@ -214,12 +234,13 @@ def test_actual_failure_is_not_completion(tmp_path, fault):
         _refused(out, 'real_actual_collector_return_uncovered')
         assert w['rc'] == 0 and w['clean'] is True and out['cost_lower_bound_s'] > out['registered_s']
         assert (root / cli.own.LAST_SYNC).exists()
-    elif fault in ('replay_mismatch', 'd6_refused'):
-        _refused(out, 'real_stage_failure:F' if fault == 'replay_mismatch' else 'real_stage_failure:D6')
+    elif fault in ('replay_mismatch', 'd6_refused', 'd6_no_runtime'):
+        _refused(out, {'replay_mismatch': 'real_stage_failure:F', 'd6_refused': 'real_stage_failure:D6',
+                       'd6_no_runtime': 'real_runtime_report_missing:D6'}[fault])
         assert w['rc'] == 3 and w['clean'] is True
         assert out['replay_passed'] is (False if fault == 'replay_mismatch' else None)
         assert out['local_replay_passed'] is out['replay_passed']
-        if fault == 'd6_refused':
+        if fault != 'replay_mismatch':
             assert not (root / 'f').exists()
     else:
         _refused(out, 'real_collector_cleanup_or_logs_uncovered')

@@ -34,6 +34,7 @@ R6_ROOT = PROJECT_ROOT / AUDIT / 'r6/attempt_001'
 REAL_ROOT = PROJECT_ROOT / EXPERIMENTS / p.COHORT
 R6_ENTRY = 'scripts/run_w1_d6_r6.py'
 REAL_ENTRY = 'scripts/run_w1_d6_joint_fit_real.py'
+REVIEW_ENTRY = 'scripts/review_w1_d6_joint_fit.py'
 REAL_LAUNCH_SCHEMA = p.COHORT + '/real_launch_v2'
 REAL_OUTER_LOGS = ('collector.stdout.log', 'collector.stderr.log')
 REPORT = 'r6_admission.json'
@@ -67,6 +68,47 @@ STATS_HEADERS = {'mean': {'shape': [3], 'dtype': '<f8'}, 'std': {'shape': [3], '
 REQ = dict(device='cuda:0', default_dtype='torch.float32', default_device='cpu',
            cuda_matmul_allow_tf32=False, cudnn_allow_tf32=False, float32_matmul_precision='highest',
            deterministic_algorithms=False, autocast_enabled=False, cpu_autocast_enabled=False)
+RUNTIME_HELPER = 'src/ireset/eval/w1_real_fk_audit.py'
+AUDITED_FLAGS = ('cuda_matmul_allow_tf32', 'cudnn_allow_tf32', 'float32_matmul_precision',
+                 'deterministic_algorithms', 'autocast_enabled')
+RUNTIME_REPORT = p.COHORT + '/section_6_3_runtime_v1'
+FK_BUFFER_SOURCES = ('pytorch_kinematics/chain.py', 'pytorch_kinematics/frame.py')
+
+
+def tensor_check_points(stage):
+    apparatus = [('fk_chain_built', 'cpu'), ('fk_chain_transferred', REQ['device']),
+                 ('fk_ready', REQ['device']), ('loss_ready', REQ['device'])]
+    saved = [(name, 'cpu') for name in ('checkpoint_initial', 'checkpoint_last', 'reference_model', 'reference_conditioner')]
+    models = [(side + suffix, device) for side in ('model', 'conditioner')
+              for suffix, device in (('', 'cpu'), ('_transfer', REQ['device']))]
+    p.require(stage in p.STAGES, 'real_runtime_report_stage')
+    if stage == 'D6':
+        return apparatus + [('trainer_' + point, device) for point, device in models] + saved
+    return (apparatus + saved + [('fresh_' + point, device) for point, device in models]
+            + [(f'loaded_{step}_{side}', REQ['device']) for step in (0, 1000) for side in ('model', 'conditioner')])
+
+
+def verify_runtime_report(stage, doc, expected, policy):
+    p.require(isinstance(doc, dict) and doc.get('schema') == policy['schema'] and doc.get('stage') == stage
+              and doc.get('kind') == 'production' and doc.get('device') == REQ['device'],
+              'real_runtime_report_missing:' + stage)
+    flags = {k: v for k, v in REQ.items() if k != 'device'}
+    p.equal(doc['source'], policy['helper'])
+    p.equal(doc['identity'], expected['identity'])
+    p.equal(doc['gpu'], expected['gpu'])
+    p.equal(doc['before'], expected['observed_before_setup'])
+    p.equal(doc['setup'], {'schema': 'w1_real_fk_runtime_v1', 'requirements': {k: flags[k] for k in AUDITED_FLAGS},
+                          'before': {k: doc['before'][k] for k in AUDITED_FLAGS}, 'after': {k: flags[k] for k in AUDITED_FLAGS},
+                          'applied': True, 'problems': []})
+    want = {'flags': flags, 'current_device': REQ['device'], 'cpu_threads': expected['identity']['cpu_threads']}
+    p.equal(doc['ready'], want)
+    p.equal(doc['endpoint'], want)
+    p.equal([[row['point'], row['device']] for row in doc['tensor_checks']], policy['tensor_check_points'][stage])
+    p.require(all(row['float_dtype'] == flags['default_dtype'] and type(row['float_tensors']) is int
+                  and type(row['tensors']) is int and 0 < row['float_tensors'] <= row['tensors']
+                  for row in doc['tensor_checks']), 'real_tensor_check_report:' + stage)
+
+
 RUNTIME_SOURCES = {
     'adamw_source_sha256': ('torch', ('torch.optim.adam', 'torch.optim.adamw')),
     'scheduler_source_sha256': ('diffusers', ('diffusers.schedulers.scheduling_ddpm', 'diffusers.schedulers.scheduling_ddim')),
@@ -173,6 +215,21 @@ def streaming_record(path, unit):
         after = unit('hash_stat_after:' + str(path), os.fstat, file.fileno())
     p.require(_stamp(before) == _stamp(after), f'file_changed_during_hash:{path}')
     return {'bytes': before.st_size, 'sha256': h.hexdigest()}
+
+
+def fk_sources(unit):
+    install = unit('installed_fk_distribution', importlib.metadata.distribution, 'pytorch-kinematics')
+    roster = unit('installed_fk_roster', lambda: set(map(str, install.files or ())))
+    out = {}
+    for rel in FK_BUFFER_SOURCES:
+        p.require(rel in roster, 'fk_inspected_source_missing:' + rel)
+        at = unit('fk_source_path:' + rel, install.locate_file(rel).resolve, strict=True)
+        out[rel] = {'path': str(at), **streaming_record(at, unit)}
+    return out
+
+
+def verify_fk_sources(policy, *, unit):
+    p.equal(fk_sources(unit), policy['fk_buffer_sources'])
 
 
 def npz_headers(raw, unit=p.unmetered):
@@ -443,7 +500,8 @@ def implementation(*, unit=p.unmetered):
     # The extra roster is explicit; previous I6 evidence remains bound to
     # the historical tree, not blessed retroactively by this hash.
     files = dict(p.implementation_identity(unit=unit)['files'])
-    for rel in (R6_ENTRY, REAL_ENTRY, 'tests/test_w1_d6_r6.py', 'tests/test_w1_d6_real.py', 'tests/test_w1_d6_real_outer.py'):
+    for rel in (R6_ENTRY, REAL_ENTRY, REVIEW_ENTRY, 'tests/test_w1_d6_r6.py', 'tests/test_w1_d6_real.py',
+                'tests/test_w1_d6_real_outer.py', 'tests/test_w1_d6_review.py'):
         raw = unit('implementation_read:' + rel, (PROJECT_ROOT / rel).read_bytes)
         files[rel] = unit('implementation_hash:' + rel, p.record, raw)
     return {'files': files, 'sha256': unit('r6_implementation_digest', p.digest, files)}

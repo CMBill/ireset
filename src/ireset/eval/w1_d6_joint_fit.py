@@ -14,6 +14,7 @@ from torch.utils.data import default_collate
 
 from ireset.eval import w1_d6_joint_fit_evidence as ev
 from ireset.eval import w1_d6_joint_fit_protocol as p
+from ireset.eval import w1_d6_runtime as tensors
 from ireset.eval import w1_d1_lr_schedule as lr
 from ireset.eval import w1_smallset_fit_diagnostic as fit
 from ireset.eval.w1_smallset_fit_r_admission import RegisteredWindowDataset, _window_item
@@ -580,10 +581,13 @@ def _load_checkpoint_snapshot(raw):
 def validate_endpoints(saved, plan, identity, app, meter, runtime):
     endpoints = {}
     want_cfg = asdict(config(plan))
-    for name, idx in (('initial.pt', 0), ('last.pt', plan.n_probes - 1)):
+    for role, idx in (('initial', 0), ('last', plan.n_probes - 1)):
+        name = role + '.pt'
         runtime_unit(meter.budget, runtime, 'before_checkpoint_inspection:' + name)
         ck = meter.unit('checkpoint_preflight_reads', _load_checkpoint_snapshot, saved.snapshots['d6/' + name])
         p.require(isinstance(ck, dict), 'checkpoint_object:' + name)
+        if not plan.synthetic:
+            runtime.inspect('checkpoint_' + role, tensors.checkpoint_facts, ck, 'cpu')
         step = plan.probe_steps[idx]
         p.equal(ck.get('step'), step)
         p.equal(ck.get('val'), {'step': step})
@@ -604,8 +608,15 @@ def validate_endpoints(saved, plan, identity, app, meter, runtime):
     # Independent of the two checkpoints; fresh construction is a separate
     # later operation. No reuse of a cross-stage global architecture cache.
     with torch.random.fork_rng(devices=[]):
+        if not plan.synthetic:
+            runtime_unit(meter.budget, runtime, 'reference_model_entry')
         ref_model = meter.unit('reference_model_constructions', DeterministicG1, **fit._backbone_kwargs(plan))
+        if not plan.synthetic:
+            runtime.inspect('reference_model', tensors.module_facts, ref_model, 'cpu')
+            runtime_unit(meter.budget, runtime, 'reference_conditioner_entry')
         ref_cond = meter.unit('reference_conditioner_constructions', ConditionEncoder, plan.d_model)
+        if not plan.synthetic:
+            runtime.inspect('reference_conditioner', tensors.module_facts, ref_cond, 'cpu')
     modules = {'model': ref_model, 'conditioner': ref_cond}
     contract = meter.budget.unit('reference_state_contract', lambda: {
         side: {k: (tuple(t.shape), str(t.dtype)) for k, t in model.state_dict().items()}
@@ -653,22 +664,36 @@ def replay(root, saved, batch, teacher, records, checkpoints, plan, app, meter, 
     ev.check_batch(live, saved.manifest, meter, device=device, canonical=True)
     versions = {k: (id(v), v._version) for k, v in live.items()}
     fresh_counts = ev.NumericCounts(meter.limits, {}, budget, runtime)
+    if not plan.synthetic:
+        runtime_unit(budget, runtime, 'fresh_model_entry')
     model = meter.unit('fresh_model_constructions', DeterministicG1, **fit._backbone_kwargs(plan))
     if not plan.synthetic:
+        runtime.inspect('fresh_model', tensors.module_facts, model, 'cpu')
         model = meter.unit('fresh_module_transfers', model.to, device)
+        runtime.inspect('fresh_model_transfer', tensors.module_facts, model, device)
         runtime_unit(budget, runtime, 'fresh_model_on_device')
     conditioner = meter.unit('fresh_conditioner_constructions', ConditionEncoder, plan.d_model)
     if not plan.synthetic:
+        runtime.inspect('fresh_conditioner', tensors.module_facts, conditioner, 'cpu')
         conditioner = meter.unit('fresh_module_transfers', conditioner.to, device)
+        runtime.inspect('fresh_conditioner_transfer', tensors.module_facts, conditioner, device)
         runtime_unit(budget, runtime, 'fresh_conditioner_on_device')
     conditioner.forward = condition_only(conditioner.forward)
     modules = {'model': model, 'conditioner': conditioner}
-    p.require(not fit.parameter_contract_problems(modules, torch.device(device).type, torch.float32), 'fresh_parameter_contract')
+    if plan.synthetic:
+        p.require(not fit.parameter_contract_problems(modules, 'cpu', torch.float32), 'fresh_parameter_contract')
     for step, idx in ((0, 0), (plan.steps, plan.n_probes - 1)):
         for side, module in modules.items():
             runtime_unit(budget, runtime, 'strict_load_runtime:' + side)
-            meter.unit('strict_loads', module.load_state_dict, checkpoints[step][side], strict=True)
-        p.require(not fit.parameter_contract_problems(modules, torch.device(device).type, torch.float32), 'fresh_loaded_parameter_contract')
+            state = checkpoints[step][side]
+            if not plan.synthetic:
+                tensors.check_state_destination(module, state, unit=budget.unit)
+            meter.unit('strict_loads', module.load_state_dict, state, strict=True)
+            if not plan.synthetic:
+                runtime.inspect(f'loaded_{step}_{side}', tensors.module_facts, module, device)
+                tensors.check_state_destination(module, state, unit=budget.unit)
+        if plan.synthetic:
+            p.require(not fit.parameter_contract_problems(modules, 'cpu', torch.float32), 'fresh_loaded_parameter_contract')
         p.require({k: (id(v), v._version) for k, v in live.items()} == versions, 'fresh_snapshot_mutated')
         meter.enter('probe_calls')
         try:

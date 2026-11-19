@@ -21,6 +21,8 @@ from ireset.eval import w1_d6_joint_fit as joint
 from ireset.eval import w1_d6_joint_fit_evidence as ev
 from ireset.eval import w1_d6_joint_fit_protocol as p
 from ireset.eval import w1_d6_r6 as r6
+from ireset.eval import w1_d6_runtime as tensors
+from ireset.eval import w1_real_fk_audit as audited
 from ireset.eval import w1_smallset_fit_diagnostic as fit
 from ireset.kinematics.torch_adapter import G1TorchFK
 from ireset.paths import PROJECT_ROOT
@@ -61,33 +63,47 @@ class Runtime:
     expected_device = 'cuda'  # fit.parameter_contract_problems compares .type
     expected_dtype = torch.float32
 
-    def __init__(self, build, guards, expected):
-        self.guards, self.expected = guards, expected
+    def __init__(self, build, guards, expected, policy):
+        self.guards, self.policy = guards, policy
+        self.stage = guards.budget.stage
+        self.checked, self.endpoint = [], None
         actual = build.unit('runtime_identity_checks', r6.runtime_identity, build.budget.unit,
                             dependency=lambda path: build.unit('runtime_dependency_hashes', r6.streaming_record, path, build.budget.unit),
                             binary=lambda path: build.unit('runtime_binary_hashes', r6.streaming_record, path, build.budget.unit))
         p.equal(actual, expected)
-        self.applied = build.unit('runtime_setups', self._apply)
-        self.check_unit('production_ready')
-
-    @staticmethod
-    def _apply():
-        torch.backends.cuda.matmul.allow_tf32 = False
-        torch.backends.cudnn.allow_tf32 = False
-        torch.set_float32_matmul_precision('highest')
-        return r6.runtime_flags(torch)
+        self.actual = actual
+        build.budget.unit('fk_runtime_sources', r6.verify_fk_sources, policy, unit=build.budget.unit)
+        p.equal(audited.RUNTIME_REQUIREMENTS, {k: r6.REQ[k] for k in r6.AUDITED_FLAGS})
+        self.applied = build.unit('runtime_setups', audited.configure_production_runtime)
+        p.require(self.applied['applied'] is True and self.applied['problems'] == [], 'audited_runtime_setup_refused')
+        self.ready = self.check_unit('production_ready')
 
     def check_unit(self, point):
         budget = self.guards.budget
-        flags = budget.unit('production_flags:' + point, r6.runtime_flags, torch)
-        p.require(flags == {k: v for k, v in r6.REQ.items() if k != 'device'}
-                  and torch.cuda.current_device() == 0
-                  and torch.get_num_threads() == self.expected['identity']['cpu_threads'], 'production_runtime_drift:' + point)
+        def observe():
+            flags = r6.runtime_flags(torch)
+            return {'flags': flags, 'current_device': f'cuda:{torch.cuda.current_device()}', 'cpu_threads': torch.get_num_threads()}
+
+        facts = budget.unit('production_runtime:' + point, observe)
+        p.require(facts == {'flags': {k: v for k, v in r6.REQ.items() if k != 'device'}, 'current_device': DEVICE,
+                            'cpu_threads': self.actual['identity']['cpu_threads']}, 'production_runtime_drift:' + point)
         self.guards.unit('runtime_syncs', torch.cuda.synchronize, DEVICE, point='cuda_sync:' + point)
+        return facts
+
+    def inspect(self, point, fn, obj, device):
+        budget = self.guards.budget
+        row = budget.unit('tensor_contract:' + point, fn, obj, device)
+        self.checked.append({'point': point, **row})
+
+    def finish(self):
+        self.endpoint = self.check_unit('real_stage_endpoint')
+        self.guards.budget.unit('runtime_endpoint_proof', r6.verify_runtime_report, self.stage, self.facts(), self.actual, self.policy)
 
     def facts(self):
-        return {'kind': 'production', 'device': DEVICE, 'setup': self.applied, 'identity': self.expected['identity'],
-                'gpu': self.expected['gpu']}
+        return {'schema': r6.RUNTIME_REPORT, 'stage': self.stage, 'kind': 'production', 'device': DEVICE,
+                'source': self.policy['helper'], 'before': self.actual['observed_before_setup'], 'setup': self.applied,
+                'identity': self.actual['identity'], 'gpu': self.actual['gpu'], 'ready': self.ready,
+                'endpoint': self.endpoint, 'tensor_checks': self.checked.copy()}
 
 
 def bound_snapshot(base, spec, meter, read_key, hash_key):
@@ -218,13 +234,24 @@ def apparatus(bindings, meter, runtime):
     tokenizer = meter.unit('tokenizer_constructions', fit.StateTokenizer, spec.joint_range, fit.RootStats(**stats))
     decoder = meter.unit('metric_decoder_constructions', fit.MetricDecoder, stats['mean'], stats['std'], tokenizer.lo, tokenizer.hi)
     runtime.check_unit('real_fk_construction')
-    fk = meter.unit('fk_constructions', G1TorchFK, DEVICE, torch.float32, bound_assets=(urdf, record), unit=meter.unit)
+
+    def guard_chain(name, fn, *args, **kw):
+        chain = meter.unit(name, fn, *args, **kw)
+        point, device = {'fk_chain_builds': ('fk_chain_built', 'cpu'),
+                         'fk_chain_transfers': ('fk_chain_transferred', DEVICE)}[name]
+        runtime.inspect(point, tensors.fk_chain_facts, chain, device)
+        return chain
+
+    fk = meter.unit('fk_constructions', G1TorchFK, DEVICE, torch.float32, bound_assets=(urdf, record), unit=guard_chain)
+    p.require(torch.device(fk.device) == torch.device(DEVICE) and fk.dtype is torch.float32, 'real_fk_declaration')
+    runtime.inspect('fk_ready', tensors.fk_chain_facts, fk.chain, DEVICE)
     p.equal(fk.chain.get_joint_parameter_names(), list(JOINT_NAMES))
     runtime.check_unit('real_fk_constructed')
     key = budget.unit('scene_bound_key', p.digest, [bindings['production_assets'], bindings['runtime']])
     frame = scene_frame(assets, key)
     loss = meter.unit('loss_constructions', fit.LossAssembler, tokenizer, fit.LossWeights(w_contact=0.), DEVICE,
                       use_fk=True, fk=fk, static_frame=frame)
+    runtime.inspect('loss_ready', tensors.loss_facts, loss, DEVICE)
     runtime.check_unit('real_loss_ready')
     return joint.Apparatus(tokenizer, decoder, loss, stat_rec), spec
 
@@ -289,8 +316,12 @@ def build_trainer(cfg, app, items, reg, path, meter, runtime):
         runtime.check_unit('real_trainer:' + key)
         meter.enter(keys[key])
 
+    def check(key, module):
+        runtime.inspect('trainer_' + key, tensors.module_facts, module, cfg.device if key.endswith('_transfer') else 'cpu')
+
     trainer = meter.budget.unit('trainer', fit.Trainer, cfg, app.tokenizer, ds, ds, path,
-                                budget_deadline=meter.budget.work_deadline, loss_fn=app.loss_fn, construction_entry=entry)
+                                budget_deadline=meter.budget.work_deadline, loss_fn=app.loss_fn,
+                                construction_entry=entry, construction_check=check)
     return trainer, probe
 
 
@@ -300,12 +331,13 @@ def run_d6(stage):
     meters = {k: meter_for('D6', k, budget, matrix) for k in ('build', 'admission', 'guards')}
     counts = {k: m.counts for k, m in meters.items()}
     out = {'local_complete_evidence': False, 'local_mean_fit_passed': None, 'counts': counts, **ev.STATUS}
+    runtime = None
     try:
         plan, reg, cfg = plan_and_config(stage.package)
         adm = evidence_admission(stage.package)
         identity = identity_for(stage, plan, reg, adm)
         out['identity'] = identity
-        runtime = Runtime(meters['build'], meters['guards'], stage.package['bindings']['runtime'])
+        runtime = Runtime(meters['build'], meters['guards'], stage.package['bindings']['runtime'], stage.package['contract']['runtime_evidence'])
         app, spec = apparatus(stage.package['bindings'], meters['build'], runtime)
         items, manifest = build_windows(stage.package, adm, app, spec, meters['build'], meters['admission'], identity)
         journal = joint.Journal(budget)
@@ -321,13 +353,15 @@ def run_d6(stage):
         d = driver.run()
         counts.update(train=d['counters'], saved=d['verification_counters'])
         out.update({k: d[k] for k in ('local_complete_evidence', 'local_mean_fit_passed', 'completed_updates',
-                                     'micros_current_update', 'failure', 'runtime')})
+                                     'micros_current_update', 'failure')})
         if d['local_complete_evidence']:
+            runtime.finish()
             p.require(p.real_counts_ok('D6', counts, matrix), 'real_d6_call_matrix')
             out.update(final=d['final'], artifacts_index=d['artifacts_index'], expected_windows=d['expected_windows'])
     except Exception as exc:
         out.update(local_complete_evidence=False, local_mean_fit_passed=None,
                    failure={'type': type(exc).__name__, 'message': str(exc)[:500]})
+    out['runtime'] = None if runtime is None else runtime.facts()
     out['budget'] = budget.facts()
     return out
 
@@ -338,6 +372,7 @@ def run_f(stage, ledger, obs_pid):
     meters = {k: meter_for('F', k, budget, matrix) for k in matrix['F']}
     out = {'local_evidence_complete': False, 'local_replay_passed': None,
            'counts': {k: m.counts for k, m in meters.items()}, **ev.STATUS}
+    runtime = None
     try:
         plan, reg, _ = plan_and_config(stage.package)
         adm = evidence_admission(stage.package)
@@ -350,13 +385,16 @@ def run_f(stage, ledger, obs_pid):
         p.equal({k: d6[k] for k in ev.STATUS}, ev.STATUS)
         p.equal(d6['expected_windows'], plan.n_probes * p.N)
         p.require(p.real_counts_ok('D6', d6['counts'], matrix), 'real_d6_call_matrix')
+        policy = stage.package['contract']['runtime_evidence']
+        budget.unit('d6_runtime_proof', r6.verify_runtime_report, 'D6', d6.get('runtime'), stage.package['bindings']['runtime'], policy)
         saved = ev.read_saved(root, plan, identity, adm, meters['saved'], index_rec=d6['artifacts_index'])
         out['d6_index'] = saved.index_rec
-        runtime = Runtime(meters['build'], meters['guards'], stage.package['bindings']['runtime'])
+        runtime = Runtime(meters['build'], meters['guards'], stage.package['bindings']['runtime'], policy)
         app, _ = apparatus(stage.package['bindings'], meters['build'], runtime)
         meters['build'].complete()
         final = joint.metrics_and_replay(root, saved, plan, identity, app, meters['saved'], meters['replay'], runtime, d6['final'])
         out['local_replay_passed'] = True
+        runtime.finish()
         p.require(p.real_counts_ok('F', out['counts'], matrix), 'real_f_call_matrix')
         budget.check('real_f_candidate')
         out.update(local_evidence_complete=True, final=final, failure=None)
@@ -364,5 +402,6 @@ def run_f(stage, ledger, obs_pid):
         if isinstance(exc, joint.ReplayMismatch):
             out['local_replay_passed'] = False
         out['failure'] = {'type': type(exc).__name__, 'message': str(exc)[:500]}
+    out['runtime'] = None if runtime is None else runtime.facts()
     out['budget'] = budget.facts()
     return out
