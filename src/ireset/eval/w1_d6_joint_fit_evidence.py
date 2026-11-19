@@ -57,14 +57,20 @@ def identity_for(plan, registration, launch, launch_rec, admission, permit):
 class Meter:
     """Count entered units, not nominal work; never admit above the matrix."""
 
-    def __init__(self, budget, limits, counters=None):
-        self.budget, self.limits = budget, limits
+    def __init__(self, budget, limits, counters=None, *, branches=None, bounded=None):
+        self.budget, self.exact = budget, limits
+        self.branches, self.bounded = branches or {}, bounded or {}
+        self.limits = {**limits, **self.bounded}
+        for alternatives in self.branches.values():
+            for arm in alternatives:
+                for key, cap in arm.items():
+                    self.limits[key] = max(cap, self.limits.get(key, 0))
         self.counts = Counter() if counters is None else counters
 
     def enter(self, key, point=None):
         self.budget.check(point or key)
         value = self.counts.get(key, 0) + 1
-        p.require(value <= self.limits[key], f'call_cap:{key}')
+        p.require(value <= self.limits.get(key, 0), f'call_cap:{key}')
         self.counts[key] = value
 
     def unit(self, key, fn, *args, point=None, **kwargs):
@@ -74,13 +80,20 @@ class Meter:
         return out
 
     def complete(self):
-        p.require(dict(self.counts) == self.limits, f'call_matrix_mismatch:{self.counts}:{self.limits}')
+        p.require(p.section_counts_ok(self.counts, self.exact, self.branches, self.bounded),
+                  f'call_matrix_mismatch:{self.counts}:{self.exact}')
+
+    def optional_unit(self, key, fn, *args, **kwargs):
+        # Real entries add sub-unit metering without altering I6's format.
+        if key in self.limits:
+            return self.unit(key, fn, *args, **kwargs)
+        return self.budget.unit(key, fn, *args, **kwargs)
 
 
 class NumericCounts(dict):
     """Cap counters at the entry points used by the inherited numeric units."""
 
-    def __init__(self, limits, initial, budget, runtime_guard):
+    def __init__(self, limits, initial, budget, runtime_guard=None):
         super().__init__(initial)
         self.limits = limits
         self.budget = budget
@@ -90,8 +103,11 @@ class NumericCounts(dict):
         point = 'fresh_numeric_entry:' + key
         # In particular, recheck after the preceding window's FK, which
         # could leave autocast enabled before the next production decode.
-        self.budget.unit(point, self.runtime_guard.check_unit, point)
-        p.require(type(value) is int and value <= self.limits[key], f'call_cap:{key}')
+        if self.runtime_guard is not None:
+            self.budget.unit(point, self.runtime_guard.check_unit, point)
+        else:
+            self.budget.check('train_counter_entry:' + key)
+        p.require(type(value) is int and 0 <= value <= self.limits[key], f'call_cap:{key}')
         super().__setitem__(key, value)
 
 
@@ -133,7 +149,8 @@ def validate_manifest(manifest, identity, admission):
         row = rows[slot]
         p.equal({k: v for k, v in row.items() if k != 'fields'}, {
             **expected, 'canonical_slot': slot, 'window_id': f"{expected['demo']}:0:60",
-            'sources': {k: admission['sources'][k] for k in source_paths(slot)}})
+            'sources': (admission['window_sources'][slot] if 'window_sources' in admission else
+                        {k: admission['sources'][k] for k in source_paths(slot)})})
         fields = row['fields']
         p.require(set(fields) == set(BATCH_KEYS), 'payload_manifest_key_set')
         for key, spec in fields.items():
@@ -163,13 +180,13 @@ def check_batch(batch, manifest, meter, *, device, canonical=False):
         v = batch[key]
         p.require(torch.is_tensor(v) and v.layout == torch.strided and v.device == torch.device(device)
                   and tuple(v.shape) == (p.N, *shape) and str(v.dtype) == 'torch.' + dtype, f'batch_contract:{key}')
-    positions = meter.budget.unit('batch_slot_reads', lambda: batch['clip_idx'].detach().cpu().tolist())
+    positions = meter.optional_unit('batch_index_snapshots', lambda: batch['clip_idx'].detach().cpu().tolist())
     p.require(sorted(positions) == list(range(p.N)) and (not canonical or positions == list(range(p.N))),
               'batch_window_order_or_multiset')
-    starts = meter.budget.unit('batch_start_reads', lambda: batch['start'].detach().cpu().tolist())
+    starts = meter.optional_unit('batch_index_snapshots', lambda: batch['start'].detach().cpu().tolist())
     p.equal(starts, [0] * p.N)
     for key in BATCH_KEYS:
-        arr = meter.budget.unit('batch_tensor_snapshot:' + key, lambda: batch[key].detach().cpu().numpy())
+        arr = meter.optional_unit('batch_tensor_snapshots', lambda: batch[key].detach().cpu().numpy())
         for b, slot in enumerate(positions):
             got = meter.unit('window_payload_hashes', array_record, arr[b])
             p.require(got == manifest['windows'][slot]['fields'][key], f'batch_payload:{key}:slot{b}')
@@ -443,7 +460,7 @@ def verified_inputs(saved, meter):
                       f'saved_input_payload:{b}:{k}')
         p.require(meter.unit('saved_payload_hashes', array_record, teachers[f'w{b}__raw_x0_tgt']) == row['fields']['x0'],
                   f'saved_teacher_payload:{b}')
-    batch = meter.budget.unit('saved_inputs_collate', lambda: {
+    batch = meter.optional_unit('saved_input_collates', lambda: {
         k: torch.from_numpy(np.stack([inputs[f'w{b}__{k}'] for b in range(p.N)])) for k in INPUT_TABLE})
     return batch, [by_slot(teachers, b) for b in range(p.N)]
 

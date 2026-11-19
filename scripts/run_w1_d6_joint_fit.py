@@ -32,8 +32,8 @@ ARCHIVE_TAIL = {ARCHIVE, LAST_SYNC, FAILURE}
 @dataclass(frozen=True)
 class Wait:
     pid: int
-    rc: int
-    waited_at: float
+    rc: int | None  # unknown only when even bounded cleanup could not wait
+    waited_at: float | None
     cleaned_at: float
     clean: bool
 
@@ -93,7 +93,8 @@ def _reap_leftovers(pgid, sid, excluded, deadline):
             time.sleep(.005)
 
 
-def wait_owned(command, deadline, *, space=None, logs=None, scope='group', start_deadline=None):
+def wait_owned(command, deadline, *, space=None, logs=None, scope='group', start_deadline=None,
+               strict=False, env=None):
     """Actually wait, then reap and fsync bounded logs. No nested sessions.
 
     The collector owns a session. The observer and each stage own distinct
@@ -144,9 +145,10 @@ def wait_owned(command, deadline, *, space=None, logs=None, scope='group', start
     try:
         new_session = scope == 'new_session'
         p.require(time.perf_counter() < start_limit, 'launch_deadline_already_exceeded')
-        proc = subprocess.Popen(command, cwd=ROOT,
-                                env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1', 'CUDA_VISIBLE_DEVICES': '',
-                                     'OMP_NUM_THREADS': '1', 'MKL_NUM_THREADS': '1', 'OPENBLAS_NUM_THREADS': '1'},
+        child_env = ({**os.environ, 'PYTHONDONTWRITEBYTECODE': '1', 'CUDA_VISIBLE_DEVICES': '',
+                      'OMP_NUM_THREADS': '1', 'MKL_NUM_THREADS': '1', 'OPENBLAS_NUM_THREADS': '1'}
+                     if env is None else env)
+        proc = subprocess.Popen(command, cwd=ROOT, env=child_env,
                                 start_new_session=new_session, process_group=-1 if new_session else 0,
                                 stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE if logs else subprocess.DEVNULL,
@@ -156,25 +158,36 @@ def wait_owned(command, deadline, *, space=None, logs=None, scope='group', start
         clean = True
         waited = None
         try:
+            if strict and time.perf_counter() >= start_limit:
+                raise InterruptedError('spawn_returned_after_start_deadline')
             if logs:
                 for stream, name in zip((proc.stdout, proc.stderr), logs, strict=True):
                     thread = Thread(target=drain, args=(stream, name), daemon=True)
                     thread.start()
                     threads.append(thread)
-            proc.wait(timeout=max(0., deadline - time.perf_counter()))
+            # Keep a small part of the same interval for actual kill/reap.
+            proc.wait(timeout=max(0., deadline - time.perf_counter() - (.20 if strict else 0.)))
             waited = time.perf_counter()
         except (subprocess.TimeoutExpired, InterruptedError, KeyboardInterrupt):
             clean = False
         finally:
             if proc.returncode is None:
                 _kill_group(proc.pid)
-                proc.wait()
-            if waited is None:
+                if strict:
+                    try:
+                        proc.wait(timeout=max(0., deadline - time.perf_counter()))
+                    except subprocess.TimeoutExpired:
+                        clean = False
+                else:
+                    proc.wait()
+            if waited is None and proc.returncode is not None:
                 waited = time.perf_counter()
-            clean &= _reap_leftovers(proc.pid, sid, os.getpid(), deadline + 1.)
+            clean &= _reap_leftovers(proc.pid, sid, os.getpid(), deadline + (0. if strict else 1.))
             for thread in threads:
                 thread.join(max(0., deadline - time.perf_counter()))
             clean &= not failures and not any(thread.is_alive() for thread in threads)
+            if strict:
+                clean &= time.perf_counter() <= deadline and waited is not None
         return Wait(proc.pid, proc.returncode, waited, time.perf_counter(), clean)
     finally:
         signal.signal(signal.SIGTERM, old)
@@ -538,11 +551,11 @@ def consume(root, actual=None):
     return out
 
 
-def verify_archived_d6_bytes(root, archived, sealed_index):
+def verify_archived_d6_bytes(root, archived, sealed_index, *, unit=p.unmetered):
     # A collector must not bless any replacements made after F took its
     # verified in-process snapshots. Match the final archive to D6's seal.
     rel = 'd6/artifacts_index.json'
-    index, _ = p.document(root, rel, sealed_index)
+    index, _ = p.document(root, rel, sealed_index, unit=unit)
     p.equal(archived[rel], sealed_index)
     p.require(set(index['files']) == {k for k in archived if k.startswith('d6/')
                                       and k not in {rel, *p.stage_files('D6')}}, 'archived_d6_roster')

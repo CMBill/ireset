@@ -1064,6 +1064,8 @@ def run_probe(*, trainer: Trainer, probe_batch: dict, plan: FitPlan, step: int,
         kp_p_np = kp_p.detach().cpu().numpy()
         kp_t_np = np.asarray(teacher["fk_tgt"][b])
         budget.check(f"{point}_w{b}_metrics")
+        if 'metric_reductions' in counters:
+            counters['metric_reductions'] += 1
         metrics = compute_window_metrics(dec_p, dec_t, kp_p_np, kp_t_np)
         err_fk_ts = np.linalg.norm(kp_p_np.astype(np.float64)
                                    - kp_t_np.astype(np.float64), axis=-1)
@@ -1386,7 +1388,8 @@ class FitDriver:
                  budget: StageBudget, runtime_guard, identity: dict,
                  stage_dir: Path, training_gen: torch.Generator | None = None,
                  authorization_includes_d6: bool = False,
-                 dataset_window_keys: Sequence[WindowKey] | None = None) -> None:
+                 dataset_window_keys: Sequence[WindowKey] | None = None,
+                 counters_factory=None) -> None:
         if registration.stage != plan.stage:
             raise FitDiagnosticError("registration_stage_mismatch")
         registration_problems = registration.problems()
@@ -1442,6 +1445,8 @@ class FitDriver:
                                "metric_decode_calls": 0,
                                "window_consumptions_total": 0,
                                "epochs_restarted": 0}
+        if counters_factory is not None:
+            self.counters = counters_factory(self.counters)
         # production-chain counting wrappers (audit-only; every call is
         # delegated unchanged so production numbers are untouched).  The FK
         # wrapper must sit on the INNER loss assembler because the loss
@@ -1743,7 +1748,7 @@ class FitDriver:
         self.budget.check(f"checkpoint_{name}_binding_read")
         def save():
             self.counters["checkpoint_saves"] = self.counters.get("checkpoint_saves", 0) + 1
-            self.trainer.save(name, step, {"step": step}, identity=self.identity)
+            self._persist_checkpoint(name, step)
 
         space = self.budget.artifact_space
         if space is None:
@@ -1752,6 +1757,9 @@ class FitDriver:
             with space.checkpoint(self.stage_dir / name, (self.trainer.model, self.trainer.conditioner),
                                   check=self.budget.check):
                 save()
+
+    def _persist_checkpoint(self, name, step):
+        self.trainer.save(name, step, {"step": step}, identity=self.identity)
 
     # -- main flow ------------------------------------------------------------
 
@@ -1946,6 +1954,7 @@ class FitDriver:
             self.budget.check(f"step_{step}_clip_binding_read")
             self.counters["clip_calls"] += 1
             gnorm = trainer.clip_gradients()
+            self.budget.check(f"step_{step}_clip_returned")
             self._check_clip_coverage_post()
             self.budget.check(f"step_{step}_pre_optimizer_step")
             self.runtime_guard.check_unit(f"step_{step}_pre_optimizer_step")
@@ -1960,6 +1969,7 @@ class FitDriver:
             # counter exactly once; the ACTUAL optimizer state must follow it
             # (a stale/preloaded step is a refusal, never a silent update).
             self._completed_steps += 1
+            self.budget.check(f"step_{step}_optimizer_returned")
             self._check_optimizer_state()
             trainer._check_params()
             row = {"step": step, "n_micro": n_micro, "n_samples": n_samples,

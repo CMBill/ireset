@@ -125,7 +125,7 @@ def build_windows(root, adm, app, meter, payload_meter, identity):
 
 def config(plan):
     return fit.TrainConfig(**{k: getattr(plan, k) for k in fit.CHECKPOINT_CONFIG_FIELDS},
-                           num_workers=0, device='cpu', loss=fit.LossWeights(w_contact=0.))
+                           num_workers=0, device='cpu' if plan.synthetic else 'cuda:0', loss=fit.LossWeights(w_contact=0.))
 
 
 def _initial_fixture_weights(model):
@@ -182,15 +182,15 @@ class Journal:
 
     def write(self, rel, raw):
         binding = self.meter.unit('generation_artifact_hashes', p.record, raw)
-        self.budget.unit('persist:' + rel, self.space.write_bytes, self.space.root / rel, raw,
-                         exclusive=True, check=self.budget.check)
+        self.meter.optional_unit('generation_artifact_writes', self.space.write_bytes, self.space.root / rel, raw,
+                                 exclusive=True, check=self.budget.check)
         self.refs[rel] = binding
         return binding
 
     def arrays(self, rel, data):
         self.space.require(self.space.root / rel, sum(a.nbytes for a in data.values()))
         with io.BytesIO() as buf:
-            self.budget.unit('serialize:' + rel, np.savez, buf, **data)
+            self.meter.optional_unit('generation_npz_serializations', np.savez, buf, **data)
             with buf.getbuffer() as raw:
                 return self.write(rel, raw)
 
@@ -244,8 +244,15 @@ class Journal:
 class JointDriver(fit.FitDriver):
     """Adds cohort-local evidence while reusing FitDriver's native update loop."""
 
-    def __init__(self, *, app, admission, manifest, journal, **kwargs):
-        p.require(kwargs['plan'].stage == 'D6' and kwargs['plan'].synthetic, 'i6_driver_requires_fixture_d6')
+    def __init__(self, *, app, admission, manifest, journal, real_stage=None, **kwargs):
+        plan = kwargs['plan']
+        p.require(plan.stage == 'D6' and (plan.synthetic == (real_stage is None)), 'joint_driver_scope')
+        self.matrix = p.call_matrix(True) if plan.synthetic else real_stage.require('D6', kwargs['budget'])
+        if not plan.synthetic:
+            def capped(initial):
+                exact = self.matrix['D6']['train']
+                return ev.NumericCounts(exact, {key: initial.get(key, 0) for key in exact}, kwargs['budget'])
+            kwargs['counters_factory'] = capped
         super().__init__(**kwargs)
         self.app, self.admission, self.manifest, self.journal = app, admission, manifest, journal
         self.audit = journal.meter
@@ -300,7 +307,7 @@ class JointDriver(fit.FitDriver):
         self._before_count('loss_calls')
 
     def _expected_call_matrix(self, plan):
-        return p.call_matrix(plan.synthetic)['D6']['train']
+        return self.matrix['D6']['train']
 
     def _roster_ids(self):
         return tuple(tuple(id(t) for t in group['params']) for group in self.trainer.opt.param_groups)
@@ -328,7 +335,7 @@ class JointDriver(fit.FitDriver):
         self._native_step_check()
         p.require(self._read_state() == self.last_state and not self.trainer.opt.state, 'nonempty_adamw_initial_state')
         self.journal.write('d6/optimizer_roster.json', p.encode({'groups': self.roster}))
-        self.probe_batch = self.budget.unit('canonical_probe_batch_transfer', super()._to_device, self.probe_batch)
+        self.probe_batch = self.audit.optional_unit('probe_batch_transfers', super()._to_device, self.probe_batch)
         ev.check_batch(self.probe_batch, self.manifest, self.audit, device=self.trainer.cfg.device, canonical=True)
 
     def _before_update(self, step):
@@ -346,6 +353,8 @@ class JointDriver(fit.FitDriver):
             self.budget.unit('before_lr_change_binding', self._check_optimizer_binding)
             old_lr = self.current_lr
             try:
+                if not self.plan.synthetic:
+                    self.audit.enter('switches')
                 self.current_lr = p.schedule_step(step, self.switch_after, self.plan.lr)
                 for group in self.trainer.opt.param_groups:
                     group['lr'] = self.current_lr
@@ -353,7 +362,8 @@ class JointDriver(fit.FitDriver):
                 p.require(after == before and lr._state_signature(self.trainer.opt) == self.signature,
                           'optimizer_state_changed_at_switch')
                 self.journal.write('d6/switch.json', p.encode(ev.switch_record(self.plan, receipt, after, self.roster)))
-                self.audit.enter('switches')
+                if self.plan.synthetic:
+                    self.audit.enter('switches')
             except Exception:
                 for group in self.trainer.opt.param_groups:
                     group['lr'] = old_lr
@@ -405,7 +415,7 @@ class JointDriver(fit.FitDriver):
 
     def _to_device(self, batch):
         step, micro, positions = self._pending_collate
-        device_batch = self.budget.unit('train_device_transfer', super()._to_device, batch)
+        device_batch = self.audit.optional_unit('train_device_batch_transfers', super()._to_device, batch)
         device_positions = ev.check_batch(device_batch, self.manifest, self.audit,
                                           device=self.trainer.cfg.device)
         p.require(device_positions == positions, 'train_transfer_slot_order')
@@ -487,9 +497,9 @@ class JointDriver(fit.FitDriver):
         self.endpoint_states[step] = state
         super()._run_probe(step, idx)
         if step == 0:
-            self.journal.arrays('d6/probe_inputs.npz', {
-                f'w{b}__{k}': tensor.detach().cpu().numpy()[b]
-                for k, tensor in self.probe_batch.items() for b in range(p.N)})
+            arrays = {k: self.audit.optional_unit('saved_probe_input_snapshots', lambda: tensor.detach().cpu().numpy())
+                      for k, tensor in self.probe_batch.items()}
+            self.journal.arrays('d6/probe_inputs.npz', {f'w{b}__{k}': a[b] for k, a in arrays.items() for b in range(p.N)})
             self.journal.arrays('d6/teacher_reference.npz', self.teacher_arrays)
         rec = self.journal.arrays(ev.probe_path(idx, step), self.probe_arrays_by_idx.pop(idx))
         self.journal.append('d6/probe_index.jsonl', {
@@ -506,6 +516,12 @@ class JointDriver(fit.FitDriver):
         raw = self.audit.unit('generation_checkpoint_reads', p.snapshot, self.root, rel)
         self.journal.refs[rel] = self.audit.unit('generation_artifact_hashes', p.record, raw)
 
+    def _persist_checkpoint(self, name, step):
+        if self.plan.synthetic:
+            super()._persist_checkpoint(name, step)
+        else:
+            self.trainer.save(name, step, {'step': step}, identity=self.identity, save_unit=self.audit.unit)
+
     def _write_stage_artifacts(self):
         self._phase = 'write_artifacts'
         for rel in self.journal.streams:
@@ -520,7 +536,7 @@ class JointDriver(fit.FitDriver):
         self.audit.complete()
 
     def _verify_saved_stage(self, counters):
-        meter = ev.Meter(self.budget, p.call_matrix(self.plan.synthetic)['D6']['saved'], counters)
+        meter = ev.Meter(self.budget, self.matrix['D6']['saved'], counters)
         saved = ev.read_saved(self.root, self.plan, self.identity, self.admission, meter, index_rec=self.index_rec)
         _, teacher = ev.verified_inputs(saved, meter)
         validate_endpoints(saved, self.plan, self.identity, self.app, meter, self.runtime_guard)
@@ -632,20 +648,27 @@ def replay(root, saved, batch, teacher, records, checkpoints, plan, app, meter, 
                       root / 'f/report.json', p.FILES['report.json'], closing=True)
     runtime_unit(budget, runtime, 'replay_inputs_ready')
     meter.enter('input_snapshot_transfers')
-    live = {k: budget.unit('fresh_transfer:' + k, v.to, 'cpu', copy=True) for k, v in batch.items()}
-    ev.check_batch(live, saved.manifest, meter, device='cpu', canonical=True)
+    device = config(plan).device
+    live = {k: budget.unit('fresh_transfer:' + k, v.to, device, copy=True) for k, v in batch.items()}
+    ev.check_batch(live, saved.manifest, meter, device=device, canonical=True)
     versions = {k: (id(v), v._version) for k, v in live.items()}
     fresh_counts = ev.NumericCounts(meter.limits, {}, budget, runtime)
     model = meter.unit('fresh_model_constructions', DeterministicG1, **fit._backbone_kwargs(plan))
+    if not plan.synthetic:
+        model = meter.unit('fresh_module_transfers', model.to, device)
+        runtime_unit(budget, runtime, 'fresh_model_on_device')
     conditioner = meter.unit('fresh_conditioner_constructions', ConditionEncoder, plan.d_model)
+    if not plan.synthetic:
+        conditioner = meter.unit('fresh_module_transfers', conditioner.to, device)
+        runtime_unit(budget, runtime, 'fresh_conditioner_on_device')
     conditioner.forward = condition_only(conditioner.forward)
     modules = {'model': model, 'conditioner': conditioner}
-    p.require(not fit.parameter_contract_problems(modules, 'cpu', torch.float32), 'fresh_parameter_contract')
+    p.require(not fit.parameter_contract_problems(modules, torch.device(device).type, torch.float32), 'fresh_parameter_contract')
     for step, idx in ((0, 0), (plan.steps, plan.n_probes - 1)):
         for side, module in modules.items():
             runtime_unit(budget, runtime, 'strict_load_runtime:' + side)
             meter.unit('strict_loads', module.load_state_dict, checkpoints[step][side], strict=True)
-        p.require(not fit.parameter_contract_problems(modules, 'cpu', torch.float32), 'fresh_loaded_parameter_contract')
+        p.require(not fit.parameter_contract_problems(modules, torch.device(device).type, torch.float32), 'fresh_loaded_parameter_contract')
         p.require({k: (id(v), v._version) for k, v in live.items()} == versions, 'fresh_snapshot_mutated')
         meter.enter('probe_calls')
         try:

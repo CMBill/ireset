@@ -1000,4 +1000,5 @@ def test_real_size_and_call_contracts_not_misrepresented_as_run():
     assert real['D6']['train']['backbone_forward_calls'] + real['F']['replay']['backbone_forward_calls'] == 4103
     assert real['D6']['train']['window_consumptions_total'] == 24000
     assert real['D6']['saved']['metric_reductions'] == real['F']['saved']['metric_reductions'] == 606
-    assert real['real_source_integration_frozen'] is False
+    assert real['real_source_integration_frozen'] is True
+    assert real['D6']['build']['source_snapshot_reads'] == 12

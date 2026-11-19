@@ -162,7 +162,7 @@ class Trainer:
                  formal_eval=None, formal_eval_every: int | None = None,
                  budget_deadline: float | None = None,
                  *, loss_fn=None, build_optimizer: bool = True,
-                 construction_observer=None) -> None:
+                 construction_observer=None, construction_entry=None) -> None:
         self.cfg, self.tokenizer = cfg, tokenizer
         self.train_ds, self.val_ds = train_ds, val_ds
         self.out_dir = Path(out_dir)
@@ -192,22 +192,31 @@ class Trainer:
         self._construction_observer = construction_observer
         torch.manual_seed(cfg.seed)
         np.random.seed(cfg.seed)
+        enter = construction_entry or (lambda _key: None)
+        enter('model')
         if cfg.model_type == "diffusion":
             self.model = DiffusionG1(
                 num_train_timesteps=cfg.num_train_timesteps,
                 beta_schedule=cfg.beta_schedule, beta_start=cfg.beta_start,
                 beta_end=cfg.beta_end, **cfg.backbone_kwargs(),
-            ).to(cfg.device)
+            )
         else:
-            self.model = DeterministicG1(**cfg.backbone_kwargs()).to(cfg.device)
+            self.model = DeterministicG1(**cfg.backbone_kwargs())
+        enter('model_transfer')
+        self.model = self.model.to(cfg.device)
         self._constructed("model")
-        self.conditioner = ConditionEncoder(cfg.d_model).to(cfg.device)
+        enter('conditioner')
+        self.conditioner = ConditionEncoder(cfg.d_model)
+        enter('conditioner_transfer')
+        self.conditioner = self.conditioner.to(cfg.device)
         self._constructed("conditioner")
         # ``loss_fn`` is an audit-only injection (pure-synthetic FK/geometry);
         # ``build_optimizer=False`` lets the independent-reference stage reuse
         # the shared forward without constructing a second native optimizer.
         self.loss_fn = (loss_fn if loss_fn is not None
                         else LossAssembler(tokenizer, cfg.loss, cfg.device))
+        if build_optimizer:
+            enter('optimizer')
         self.opt = (torch.optim.AdamW(
             [*self.model.parameters(), *self.conditioner.parameters()],
             lr=cfg.lr, weight_decay=cfg.weight_decay,
@@ -215,6 +224,7 @@ class Trainer:
         if self.opt is not None:
             self._constructed("optimizer")
         g = torch.Generator().manual_seed(cfg.seed)
+        enter('train_loader')
         self.train_loader = DataLoader(
             train_ds, batch_size=cfg.micro_batch, shuffle=True,
             num_workers=cfg.num_workers, generator=g, drop_last=True,
@@ -222,6 +232,7 @@ class Trainer:
             worker_init_fn=_worker_thread_limits,
         )
         g_val = torch.Generator().manual_seed(cfg.seed)
+        enter('val_loader')
         self.val_loader = DataLoader(
             val_ds, batch_size=cfg.micro_batch, shuffle=False,
             num_workers=0, drop_last=False, generator=g_val,
@@ -663,7 +674,7 @@ class Trainer:
         return self._last_validation_evidence
 
     def save(self, name: str, step: int, val: dict,
-             identity: dict | None = None, formal: dict | None = None) -> None:
+             identity: dict | None = None, formal: dict | None = None, *, save_unit=None) -> None:
         """Atomic checkpoint; a failed replacement preserves an earlier valid best.
 
         Shutdown evidence may use the reserved tail after the work deadline,
@@ -685,13 +696,14 @@ class Trainer:
         }
         path = self.out_dir / name
         tmp = path.with_name(path.name + ".tmp")
+        unit = save_unit or (lambda _key, fn, *args: fn(*args))
         try:
-            self._synchronize()
-            torch.save(payload, tmp)
-            self._synchronize()
+            unit('checkpoint_cuda_syncs', self._synchronize)
+            unit('checkpoint_serializations', torch.save, payload, tmp)
+            unit('checkpoint_cuda_syncs', self._synchronize)
             if not self._preserving_evidence:
                 self._check_deadline(f"save_{name}_serialized")
-            os.replace(tmp, path)
+            unit('checkpoint_renames', os.replace, tmp, path)
             self._checkpoint_records[name] = {
                 "name": name, "role": "best" if name == "best.pt" else "last",
                 "step": step, "parameters_finite": finite, "checkpoint_usable": usable,

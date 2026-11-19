@@ -1,7 +1,7 @@
-"""I6's stdlib-only launch, time, space and return contracts.
+"""Shared stdlib-only launch, time, space and call contracts.
 
 Nothing in this module admits a real run. Fixture permits are not §8.3
-authorizations. The R6/real data and permission entry points are not enabled.
+authorizations. R6 and the separately gated real workers have distinct entries.
 """
 
 from dataclasses import dataclass
@@ -44,6 +44,7 @@ FILES = {
     'report.json': 128 << 10, 'prefix_receipt.json': 16 << 10,
     'source': 16 << 10, 'launch.json': 128 << 10, 'archive.json': 256 << 10,
     'protocol': 64 << 10,
+    'r6_admission.json': 768 << 10,
 }
 
 
@@ -260,7 +261,7 @@ def schedule_step(step, switch_after=500, lr=1e-4):
 
 
 def call_matrix(synthetic):
-    """Complete path; real SOURCE/scene integration is still an R6 prerequisite."""
+    """One executable matrix per path. Branch ceilings are never exact counts."""
     steps, probes, prefix_probes = (4, 5, 3) if synthetic else (1000, 101, 51)
     micros = steps * 4
     rows, side_decodes = probes * N, (probes + 1) * N
@@ -274,14 +275,14 @@ def call_matrix(synthetic):
                  production_decode_calls=side_decodes, metric_reductions=rows,
                  reference_model_constructions=1, reference_conditioner_constructions=1,
                  checkpoint_root_stats_checks=2, checkpoint_tensor_checks=2, checkpoint_architecture_checks=2)
-    return {
+    matrix = {
         'version': SCHEMA + '/call_matrix', 'synthetic': synthetic,
         'D6': {
             'build': {'window_materializations': N, 'x0_encodes': N, 'root_stats_reads': 1,
                       'tokenizer_constructions': 1, 'metric_decoder_constructions': 1,
                       'loss_constructions': 1, 'fk_constructions': 1,
                       'model_constructions': 1, 'conditioner_constructions': 1,
-                      'optimizer_constructions': 1, 'source_snapshot_reads': 2 * N if synthetic else None},
+                       'optimizer_constructions': 1, 'source_snapshot_reads': 2 * N},
             'train': {'loss_calls': micros, 'backward_calls': micros, 'clip_calls': steps,
                       'adamw_step_calls': steps, 'conditioner_forward_calls': micros + probes,
                       'backbone_forward_calls': micros + probes, 'checkpoint_saves': 2,
@@ -311,10 +312,81 @@ def call_matrix(synthetic):
                          'metric_reductions': 2 * N, 'input_snapshot_transfers': 1,
                          'window_payload_hashes': 8 * N}},
         'R6_numerical_upper': 0, 'D1_upper': 0,
-        'F_extra_checkpoint_reads_upper': 0, 'production_scene_compile_or_cache_access_upper_each_stage': 1,
-        'fixture_scene_asset_compile_cache_access_upper': 0,
-        'real_source_integration_frozen': False,
+        'F_extra_checkpoint_reads_upper': 0,
+        'real_source_integration_frozen': not synthetic,
     }
+    if synthetic:
+        # Preserve the existing fixture permit/report contract.
+        matrix.update(production_scene_compile_or_cache_access_upper_each_stage=1,
+                      fixture_scene_asset_compile_cache_access_upper=0)
+        return matrix
+
+    matrix['version'] = COHORT + '/real_call_matrix_v1'
+    # Four locked files and 37 resolved mesh references. R6 verifies this
+    # exact closure before either production worker can consume the matrix.
+    real_setup = dict(runtime_identity_checks=1, runtime_dependency_hashes=5, runtime_setups=1,
+                      runtime_binary_hashes=1, asset_snapshot_reads=41, asset_snapshot_hashes=41,
+                      joint_specs=1, joint_plain_compiles=1, joint_xml_bindings=1,
+                      urdf_decodes=1, site_record_decodes=1, fk_chain_builds=1, fk_chain_transfers=1,
+                      scene_accesses=1, root_stats_hashes=1, root_stats_archives=1, root_stats_members=2)
+    matrix['D6']['build'].update(real_setup, source_snapshot_hashes=2 * N, source_archives=2 * N,
+                                 source_members=6 * N, registered_datasets=1, canonical_collates=1,
+                                 model_transfers=1, conditioner_transfers=1, train_loader_constructions=1,
+                                 val_loader_constructions=1)
+    matrix['F']['build'].update(real_setup)
+    matrix['D6']['admission'].update(train_device_batch_transfers=micros, probe_batch_transfers=1,
+                                     saved_probe_input_snapshots=10, generation_npz_serializations=probes + 2,
+                                     generation_artifact_writes=probes + 6,
+                                     checkpoint_serializations=2, checkpoint_renames=2, checkpoint_cuda_syncs=4,
+                                     batch_index_snapshots=2 * (2 * micros + probes + 2),
+                                     batch_tensor_snapshots=8 * (2 * micros + probes + 2))
+    matrix['F']['replay'].update(fresh_module_transfers=2, batch_index_snapshots=2, batch_tensor_snapshots=8)
+    matrix['D6']['train']['metric_reductions'] = rows
+    matrix['D6']['saved']['saved_input_collates'] = 1
+    # The saved verification map is intentionally shared by D6 and F.
+    # Zero is enforced by omission from the allowed entry keys and by the
+    # single stage route, not by reporting a synthetic zero in live counters.
+    matrix['prohibited'] = {'R6_numeric': 0, 'D1': 0, 'cache_rebuild': 0, 'schedule_inference': 0,
+                            'D6_checkpoint_restore': 0, 'F_source_window_materializations': 0,
+                            'F_optimizer': 0, 'DDIM': 0, 'formal_validation': 0}
+    cold = dict(scene_cache_misses=1, scene_specs=1, scene_plain_compiles=1, scene_plain_xml_bindings=1, scene_xml_bindings=1,
+                scene_compiles=1, scene_data_constructions=1, scene_resets=1, scene_mj_forwards=1)
+    hot = dict(scene_cache_hits=1)
+    matrix['branches'] = {stage: {'build': {'scene': [cold, hot]}} for stage in STAGES}
+    # Force completion at the CUDA guard boundaries, including paths that
+    # stop after an entered kernel. These are synchronization ceilings, not
+    # additional numerical probes. The numeric operations above are exact.
+    matrix['bounded'] = {'D6': {'guards': {'runtime_syncs': 32 * micros + 32 * side_decodes + 1024}},
+                         'F': {'guards': {'runtime_syncs': 8 * side_decodes + 1024}}}
+    for stage in STAGES:
+        matrix[stage]['guards'] = {}
+    matrix['derived_totals'] = {'probe_window_rows': rows, 'train_window_consumptions': micros * N,
+                                'conditioner_upper': micros + probes + 2, 'backbone_upper': micros + probes + 2,
+                                'production_fk_batch_upper': 2 * micros + side_decodes + 2 * N}
+    return matrix
+
+
+def real_counts_ok(stage, counts, matrix):
+    """Check exactly required units plus ONE complete alternative per branch."""
+    required = matrix[stage]
+    return set(counts) == set(required) and all(section_counts_ok(
+        counts[section], exact, matrix['branches'][stage].get(section, {}), matrix['bounded'][stage].get(section, {}))
+        for section, exact in required.items())
+
+
+def section_counts_ok(actual, exact, branches, bounded):
+    if not isinstance(actual, dict) or any(type(v) is not int or v < 0 for v in actual.values()) or any(
+            actual.get(k) != v for k, v in exact.items()):
+        return False
+    extra = {k: v for k, v in actual.items() if k not in exact}
+    for key, upper in bounded.items():
+        if not 0 < extra.pop(key, 0) <= upper:
+            return False
+    for alternatives in branches.values():
+        keys = set().union(*(set(arm) for arm in alternatives))
+        if {k: extra.pop(k) for k in keys if k in extra} not in alternatives:
+            return False
+    return not extra
 
 
 def stage_timing(stage, t0, start):
