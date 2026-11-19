@@ -1,8 +1,10 @@
-# W1 固定单窗学习率日程诊断：I′ 验证记录
+# W1 固定单窗学习率日程诊断：验证记录
 
-日期：2026-11-18。对应[方案 v0.1＋§7](../plans/omniretarget_w1_d1_lr_schedule_diagnostic_plan.md)。
+日期：2026-11-18。对应[方案 v0.1＋§7–§8](../plans/omniretarget_w1_d1_lr_schedule_diagnostic_plan.md)。
 
-**当前交付：首轮复阅发现的 3 项 P1、3 项 P2 已修复，新合成验收和只读复审见 §6。真实 R′ 未执行，B 未授权、未运行。** §1–§5 为初版 `d1cca09` 的历史验收记录；合成夹具不构成真实学习率效果证据。
+**当前交付：I′ 合成验收与复审（§6）、一次 R′（§7）、一次获授权的真实 D1′→F′ 与只读验收（§8）均已完成。真实 B 在第 1000 步四项平均指标全部达标，最终为 `fit_pass`／`single_window_pass`。** §1–§7 保留各阶段的历史快照；合成夹具不是学习率效果证据。
+
+2026-11-19 工程复阅发现并修复2 P1＋2 P2，见[单独修复记录](omniretarget_w1_d1_lr_review_hardening.md)。真实结果保持；修复后代码身份已经变化，旧绑定材料不授权新运行，原核验命令须在其冻结源码下执行。
 
 ## 1. 范围、身份与不变项
 
@@ -171,3 +173,104 @@ LR 与复阅反例 **59 passed / 162.39s**（初版 45 项加 14 项）；旧诊
 ### 6.2 只读复审结论
 
 上一轮六项反例均有相应回归，修订后用独立读盘脚本 `uv run --locked python /tmp/opencode/verify_w1_lr_postfix_20261118.py` 对账两阶段的成本、交接、实际返回、实现与比较绑定，并在隔离副本上以 probe 单字节翻转确认不可消费。本次范围内未发现新的阻塞项。只读核对 **393 个历史保护文件、52 个旧合成文件均零漂移**；脚本结果与实际等待记录在 `/tmp/opencode/w1_lr_postfix_20261118/`。两真实根均未创建；没有读取真实数组数值或加载真实 checkpoint。**复审通过仅限工程与合成证据。下一步仍须明确安排仅元数据的 R′；真实 B 须另获绑定最终材料的严格 `[D1,F]` 一次性授权，不含 D6。**
+
+## 7. 一次真实 R′ 准入通过，B 待新授权（2026-11-18）
+
+按整份方案推进的任务安排，在 `e96e0ad` 上只执行一次 `/usr/bin/python3 scripts/run_w1_d1_lr_schedule_supervisor.py --mode r-admit`，不覆盖缓存或输出根。固定根为 [`r_admission/`](../../derived/audit/w1_d1_lr_half_after_500_v1/r_admission/)，唯一尝试 `attempt_001`。`admission_passed=true`、`problems=[]`、`seal.status=sealed_within_budget` 且 `terminal=true`。本节仅追加验证记录，不改已绑定的方案、实现或先前验收字节。
+
+- `/tmp/opencode/run_w1_lr_r_admission_once_20261118.py` 的独立父进程 `wait()` 取得 R′ 最外层采集器实际 **exit 0**。观察器自身亦实际 exit 0，其返回耗时 **6.519662s**；采集器返回 **6.552050s**（相对监督器 `t0`）。从更早的启动前采样计至独立返回存档 `fsync` 后 **6.596295s ≤ 登记 9.580495s ≤ 120s**，内含 15s 收口预留。启动、封口、stdout、各级返回及 SHA 绑定一致。R′ 根最终 16 文件、103,998 bytes；准入时空闲 26,558,083,072 bytes，满足 7 GiB 下限。
+- 只读 JSON、字节哈希与数组头。保存报告的数组值读取、checkpoint 反序列化、模型/FK 构造、forward/backward、optimizer step 都为 **0**；没有重建缓存。从原 SOURCE 复核预注册/manifest、资产和窗位，复用 A 绑定的 `20261117_84a1b06_w1_smallset_fit_cache_rebuild/cache/attempt_001`（identity SHA `da4bb29235dcdc2401df3ad58ebc51c7502a8187ccc3d8dacdcb0a01e5f2f810`），复核 **55/55** 已登记逐位迁移证明与 train24 root_stats。唯一执行窗为 `sub10_largebox_097:0:60`；另外五窗是来源登记，不授权执行。运行时元数据与 T6 登记一致（Python 3.12.13、Torch 2.14.0+cu126、RTX 3090），数值 runtime 硬门将在 D1′/F′ 各自计费窗口重新应用和核验。
+- `PYTHONPATH="$PWD/src" uv run --locked python /tmp/opencode/verify_w1_lr_r_admission_20261118.py 191218.260867639` 从盘复核实际等待记录、终态封口、SOURCE/cache、固定窗、预约预算、冻结矩阵与 33 文件身份，重核 A 所绑定的 **125** 个文件（含 101 个 probe、旧 R005 及已消费授权），未解码数组。与 A 的旧实现清单仅两份白名单诊断/准入模块不同；393 个历史保护文件、52 个旧合成文件零漂移。未签草案经授权门实测拒绝，未调用 B 入口，B 根与正式授权目录均未创建。
+
+### 7.1 冻结材料与拟执行命令
+
+以下路径相对于 `derived/audit/w1_d1_lr_half_after_500_v1/`：
+
+| 文件 | SHA-256 |
+| --- | --- |
+| `r_admission/attempt_001/r_admission.json` | `56e0386f8f2784e124864f845dfa8d27eba817acaee203e55d90f8c2bb9aef02` |
+| `r_admission/authorization_draft.json`（未签） | `f101be40940f45428c5e48d8e796ac970699c1b1b63ca268465e0aa4d61613a1` |
+| `r_admission/r_observer_actual_return.json` | `26be090e223cb7ae933e8bc62df1d2244f0180ee574efaa2dc959bf377b7abab` |
+| `r_review/collector_actual_wait.json`（独立等待记录） | `cef2f282bcd13461ab889f8923e46f62e14cc0377707cfaa9a46ad79e775b8c4` |
+| `r_review/b_execution_proposal.json`（本表及命令的绑定入口） | `8ed68153c68bfe1c0b471b2121c2eaf88b7135f70100137dd96d09bde41e2fe5` |
+
+新矩阵 SHA `d89bcf4c5bbec9a4f5851a60e7029d0ed5875965070b9d7dfda111e34b4ce6fb`。最终包内还绑定方案、实现、基线及比较规则的各自摘要。根级草案为 `w1_d1_lr_authorization_v2`、`authorized=false`、`template_only=true`、七项 checklist 均为 `null`，绑定观察器收据 SHA，但 `capture_actual_return_code` 仍为 `null`；须由用户明确确认最外层实际返回码 0。不得用 attempt 内的预备草案或旧授权。以下命令已冻结但未执行，只能在取得新明确授权并复核材料、磁盘、固定根无历史之后启动：
+
+```text
+/usr/bin/python3 scripts/run_w1_d1_lr_schedule_supervisor.py --mode chain \
+  --admission derived/audit/w1_d1_lr_half_after_500_v1/r_admission/attempt_001/r_admission.json \
+  --authorization derived/audit/w1_d1_lr_half_after_500_v1/authorization/attempt_001/authorization.json
+```
+
+### 7.2 §8.3 一次性授权的复阅清单
+
+1. 新研究问题是同窗同起点下后 500 次更新减半 LR 的有限拟合对照；历史 A 只读，不重跑、续训或重用其已消费的授权。
+2. 旧 `attempt_001` incomplete、历史 A `fit_insufficient`、T6 `audit_incomplete`/539 gaps 及未覆盖范围均保留；拟合不能证明完整数值、碰撞、持续抓握、泛化或真机资格。
+3. 批准 §7.1 冻结材料绑定的实现、配置、资产、SOURCE/cache、窗位和 §6.3 runtime，及方案 §3/§5 的物理指标、唯一终点、probe 布局、解码核验与分域调用矩阵。D1′ 最多 1000 更新、4000 micro、101 probes；F′ 复核全部保存量，只 fresh 重放两端；D6 为零。
+4. 只允许固定 `w1_d1_lr_half_after_500_v1` 根一次，`includes` 恰为 `["D1","F"]`。预算 D1′ **1800s/60s**、F′ **600s/60s**，链 **2400s**，含已经执行的 R′ 合计上限 **2520s**；不互借。要求余盘 ≥7 GiB、新工件含临时文件 ≤2 GiB；失败或未知即停止，不更名、不重试。
+5. D1′ 保存 initial/last 各一份诊断 checkpoint；F′ 仅对 B 的这两份做 strict 加载与逐位重放。中间 FK 仅核保存点距离归约；尖峰只描述，不做门限验收。
+6. 不执行 DDIM、正式 val/test、D6 或生产接入；任何结果都不自动触发后续实验。
+7. 1–500 次更新用 `1e-4`；step500 probe 后、501 首个 micro 前所有组切 `5e-5`，不重置优化器或动量。先对账 51 个前缀 probe、输入/教师与 500 行历史；不符即 `baseline_prefix_mismatch`。按四原门和两项各 ≥10% 改善规则判 step1000；证据不足为 `not_comparable`、比较值 `null`。
+
+授权须明确引用 §7.1 提案 SHA，确认以上七项与本次 R′ 最外层采集器实际返回 0，并明确仅执行一次 B `["D1","F"]`。**截至本节：只有准入和未签材料，无真实 B 指标。** 获授权后仍需重核入口，由独立父进程记录 B 的实际退出；只在 F、两侧工件、各阶段成本/封口及外层返回全核验后才发布终点与配对曲线结论。
+
+## 8. 真实 B 执行与最终比较（2026-11-18）
+
+在固定窗 `sub10_largebox_097:0:60`、同一初始化与 1000 次更新下，第 501 步起将学习率减半的 B **在 step1000 通过四项既定平均门**。相对历史 A，根旋转平均误差下降 **82.6%**，教师 15-site FK MPJPE 下降 **77.7%**，根位置与关节也改善并保持达标。按预先冻结的优先顺序，最终是 **`fit_pass`／`single_window_pass`**，不是“改善但仍不足”。
+
+### 8.1 授权与实测执行
+
+- 用户明确复阅 §7.2、确认 R′ 采集器实际 exit 0，并引用 §7.1 提案 SHA `8ed68153c68bfe1c0b471b2121c2eaf88b7135f70100137dd96d09bde41e2fe5` 授权一次 `["D1","F"]`。复核冻结材料、运行时、绑定缓存和空运行根后，另写[正式 v2 授权](../../derived/audit/w1_d1_lr_half_after_500_v1/authorization/attempt_001/authorization.json)（SHA `1e60e045784dcd96fd4811a0946864bcdab4a7754a7b9b35efa2992bd8324dda`）；R′ 草案未改。监督器按 §7.1 的命令只执行一次，固定[运行根](../../derived/experiments/omniretarget_first/w1_d1_lr_half_after_500_v1/)仅有 `attempt_001`，`authorization_consumed.json` 状态 `consumed`、SHA `caa70d56f7c398bdce6cd8f570c96bb957affb4e31181c6fb7c4419f55a6614c`。不含 D6，没有重跑 A、R′ 或缓存，没有重试。
+- D1′：1000 次 AdamW 更新、4000 micro／窗消费、101 probes。前 500 步逐字段历史与 A 精确相等；51 份前缀 probe 加输入和教师，共 53 份 NPZ 与 A 逐字节相等。读取落盘 `prefix_admission.json` 和日程证据，确认在 step500 probe 之后、501 首个 micro 前准入，只切换一次：所有组（本次 1 组）实测更新 1–500 为 `1e-4`，501–1000 为 `5e-5`。全部 1000 行步序与状态摘要相接，切换两侧状态摘要相等，保留原优化器及动量。原生训练算术、窗、教师和已冻结实现不变。
+- F′：复核 B 全部保存量及实际日程，只 strict 加载并逐位重放 **B initial/last**。两次 fresh probe、两次 checkpoint 加载（各两个模块 strict load）；无训练更新。D1′ conditioner/backbone 各 4101 次 forward、生产 FK batch 8102；F′ fresh 的这三类调用各 2 次，全链分别合计 4103/4103/8104。两阶段调用矩阵与保存证据一致。
+- `wait4()` 实测外层观察器 exit **0**。从更早的父进程启动前采样，到独立等待收据及观察文件 `fsync` 后为 **962.240579s ≤ 登记 965.114975s ≤ 2400s**；相对监督器 `t0` 的实际退出为 962.195717s。D1′ 收口采样 **958.105482s ≤ 962.095717s ≤ 1800s**；F′ **3.006640s ≤ 7.002063s ≤ 600s**；各内含 60s 工作尾部预留，交接无空档。各阶段登记预留单独核验，链成本以链封口为准；加 R′ 登记合计 **974.695470s ≤ 2520s**。两阶段、链和返回证明的 SHA 均重核。
+- 入口空闲 26,542,993,408 bytes ≥7 GiB；B 终态 132 个文件、39,310,237 bytes。Linux `wait4` 的受管进程树文件写入计量（含临时和重复写入）为 44,109,824 bytes，远低于 2 GiB；无残留 `.tmp`。保护的 393 个历史文件与 52 个旧合成文件零漂移，33 个冻结实现/方案文件与 R′ 绑定一致。
+
+### 8.2 Step1000 主终点
+
+展示值舍入，裁决按绑定工件未舍入值。A 仍是历史 `fit_insufficient`，未重跑，不因 B 达标而改判。
+
+| 指标 | A | B | B−A | B/A | 原平均门（B） |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 根位置 RMSE（m） | 0.002787434597 | 0.001876769518 | −0.000910665079 | 0.673296 | ≤0.01，通过 |
+| 根旋转平均测地角（rad） | 0.023780910989 | 0.004131500103 | −0.019649410886 | 0.173732 | ≤π/180，通过 |
+| 关节角 RMSE（rad） | 0.027638625284 | 0.018747667508 | −0.008890957776 | 0.678314 | ≤0.05，通过 |
+| 教师 FK MPJPE（m） | 0.016761962649 | 0.003741488069 | −0.013020474580 | 0.223213 | ≤0.01，通过 |
+
+### 8.3 配对曲线与末次尖峰
+
+[比较工件](../../derived/experiments/omniretarget_first/w1_d1_lr_half_after_500_v1/attempt_001/f/comparison.json)保存同一步号配对的全部 **101 点**。step0–500 四项一致；切换后的 50 个配对点（step510–1000），B 四项分别在 **50/50** 点低于 A。B 从 step520 起剩余 **49** 个采样点四门同时通过（全曲线 49/101，A 为 0/101）；不等于对每个未采样更新也作了评估。step800–1000 的 21 点表明改善不只出现在末探：
+
+| 末段指标 | A 中位数 | B 中位数 | A 达标点 | B 达标点 |
+| --- | ---: | ---: | ---: | ---: |
+| 根旋转（rad） | 0.028872527084 | 0.004349221973 | 0/21 | 21/21 |
+| 教师 FK MPJPE（m） | 0.020529593721 | 0.004543669394 | 0/21 | 21/21 |
+
+Step1000 尖峰描述（坐标为窗内从 0 起算的帧、以及适用时的关节或 site 索引）：
+
+| 局部误差 | A p95 | A max（坐标） | B p95 | B max（坐标） |
+| --- | ---: | --- | ---: | --- |
+| 根位置（m） | 0.004335956275 | 0.007367336934 `[0]` | 0.003430901229 | 0.004762770905 `[0]` |
+| 根旋转（rad） | 0.028084010518 | 0.037709345273 `[0]` | 0.007857574776 | 0.018492568054 `[0]` |
+| 关节（rad） | 0.049284709928 | 0.295979567290 `[0,9]` | 0.033014093651 | 0.261446583986 `[0,9]` |
+| FK site（m） | 0.042028897785 | 0.060052104180 `[1,11]` | 0.008655371145 | 0.044133250931 `[0,4]` |
+
+`spike_gate_status=not_evaluated`；平均门不适用于局部最大值，也不证明没有尖峰。`fk_replay_scope=initial_last_only`；中间 FK 只核对保存点距离归约。本次结果只回答固定窗、固定 seed、固定预算的拟合问题，不能用于推断跨窗泛化、碰撞、持续抓握或生产/真机资格；也不单独分离 AdamW 随学习率改变的衰减量。旧 `attempt_001` 的 incomplete、历史 A 裁决和 T6 `audit_incomplete`／539 gaps 不变。**本方案收口，不自动追加 D6 或后续实验。**
+
+### 8.4 可复查的证据
+
+独立[核验摘要](../../derived/audit/w1_d1_lr_half_after_500_v1/b_review/verified_outcome.json)（SHA `b40117137c02f1f65278749c12861262d9ca774350afb2ba995851909b255ac5`）绑定外部实际等待、D1′/F′ 报告、台账、比较与完成验证。底层 `comparison.json` 按协议保留 `pending_outer_return`，不改原字节；独立核验用实际退出码消费比较，重哈希 A 的 125 份绑定文件和 B 的 110 份 D1 索引工件，独立复算 101 点及四项终点规则。省略外部实际退出码的对照返回 `not_comparable`／`metrics=null`。
+
+从项目根执行以下只读核验命令，不训练、不加载 checkpoint、不解码数组、不追加模型或 FK 调用。参数是这一次外部等待存档 `fsync` 后已观测的单调时钟值。执行和归档后核验均通过，本轮未重跑全项目套件。
+
+```bash
+uv run --locked python derived/audit/w1_d1_lr_half_after_500_v1/b_review/verify_saved_b.py 197765.26271136
+```
+
+| 关键文件 | SHA-256 |
+| --- | --- |
+| `b_review/observer_actual_wait.json` | `adee82812805ffbbd678cde4f3ed2d7cc8bc3f7a4358616a018c76bf0f3c2063` |
+| B `completion_verification.json` | `6b629bcf350fd3f176445f2bf64129c3d3f15dd208465b9cad9449d180c313b4` |
+| B `attempt_001/d1/stage_report.json` | `1744ae4061264705779e662fbf4559334753f48227859195991ce89855992949` |
+| B `attempt_001/f/f_report.json` | `9beb3c7643c3162a95ea761f82a13e19b6970dcb669946a198a2ab8a16c958bf` |
+| B `attempt_001/f/comparison.json` | `1c50c5974079d18a4141acbb8c608b5026839e54cf3e53523ed9430593d80fe7` |
