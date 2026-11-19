@@ -26,15 +26,21 @@ class ArtifactLimit(OSError):
     pass
 
 
-def sync_directory(path):
+def sync_directory(path, *, check=None):
     fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
+        if check is not None:
+            check('artifact_directory_fsync:' + path.name)
         os.fsync(fd)
     finally:
         os.close(fd)
 
 
 class ArtifactSpace:
+    # The independent D6 protocol opts in without changing the older
+    # protocol's checked-write boundaries or byte format.
+    stepwise_writes = False
+
     def __init__(self, root, *, cap_bytes=CAP_BYTES, supervised=False):
         if type(cap_bytes) is not int or not 0 < cap_bytes <= CAP_BYTES:
             raise ValueError("invalid LR artifact cap")
@@ -84,19 +90,39 @@ class ArtifactSpace:
         self.require(tmp, len(blob), closing=closing)
         if check is not None:
             check("lr_artifact_write:" + path.name)
+        guard = check if self.stepwise_writes else None
         path.parent.mkdir(parents=True, exist_ok=True)
-        with tmp.open("ab" if append else "xb") as out:
+        self._persist(path, tmp, blob, append=append, guard=guard)
+
+    def _persist(self, path, tmp, blob, *, append=False, guard=None):
+        if guard is not None:
+            guard('artifact_open:' + path.name)
+        # Avoid implicit buffered writes on close after a deadline refusal.
+        with tmp.open("ab" if append else "xb", buffering=0 if guard is not None else -1) as out:
             try:
-                out.write(blob)
-                out.flush()
+                if guard is not None:
+                    guard('artifact_write:' + path.name)
+                    if out.write(blob) != len(blob):
+                        raise ArtifactLimit('artifact_short_write:' + path.name)
+                    guard('artifact_file_fsync:' + path.name)
+                else:
+                    out.write(blob)
+                    out.flush()
                 os.fsync(out.fileno())
             except OSError:
-                if not append and not exclusive:
+                if tmp != path:
                     tmp.unlink()
                 raise
+        if guard is not None:
+            guard('artifact_file_fsync_returned:' + path.name)
         if tmp != path:
             os.replace(tmp, path)
-        sync_directory(path.parent)
+        if guard is None:
+            sync_directory(path.parent)
+        else:
+            guard('artifact_directory_open:' + path.name)
+            sync_directory(path.parent, check=guard)
+            guard('artifact_directory_fsync_returned:' + path.name)
 
     def write_json(self, path, doc, *, closing=False, exclusive=False, check=None):
         self.write_bytes(path, (json.dumps(doc, indent=1, allow_nan=False) + "\n").encode(),
@@ -105,7 +131,7 @@ class ArtifactSpace:
     def write_closure_json(self, path, doc):
         self.write_json(path, doc, closing=True)
 
-    def write_failure(self, path, reason):
+    def write_failure(self, path, reason, *, check=None):
         """Small exclusive fail-closed receipt, with its own reserved bytes."""
         path = Path(path)
         blob = (json.dumps({"state": "incomplete", "problem": str(reason)[:500]}) + "\n").encode()
@@ -113,11 +139,7 @@ class ArtifactSpace:
             raise ArtifactLimit("lr_artifact_failure_reserve_unavailable")
         if path.parent.resolve() != self.root:
             raise ArtifactLimit("lr_artifact_failure_outside_root")
-        with path.open("xb") as out:
-            out.write(blob)
-            out.flush()
-            os.fsync(out.fileno())
-        sync_directory(path.parent)
+        self._persist(path, path, blob, guard=check if self.stepwise_writes else None)
 
     def write_npz(self, path, records, *, check):
         import numpy as np

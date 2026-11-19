@@ -58,9 +58,9 @@
 5. **重放三态。** fresh 形状、dtype、逐位值或派生指标实测不符，记 `ReplayMismatch` / `local_replay_passed=false`，不运行另一端；未重放保持 `null`。本地重放通过而外层未覆盖不发布最终通过。
 6. **失败等待事实。** 真实 D6 子进程退出 7 的回归保留 PID、退出码、实际 wait、清理时点和已知成本下界。独立观测字段 `failed_stage_wait.coverage_proven=false`，无阶段通过收据、没有 F，消费端为 `incomplete`。
 
-## 修复后 I6 复阅通过
+## `4c38d2e` 六项修复的阶段性验收（历史）
 
-本轮仅对 I6 纯 CPU 机制给出通过。修复后实现身份（78 个文件）为 `77b0097bbb26f52fc399e4b221ce58b9878d51a07ade3a1d6b283d5a8a11588c`。两条独立 CLI 链从新 `/tmp` 根启动；用各自 `external_collector_wait` 在新进程只读消费，结果逐字段一致，不导入 Torch/NumPy 或追加数值调用，运行根内文件均未改变。
+六项原反例通过。此版实现身份（78 个文件）为 `77b0097bbb26f52fc399e4b221ce58b9878d51a07ade3a1d6b283d5a8a11588c`。两条独立 CLI 链从新 `/tmp` 根启动；用各自 `external_collector_wait` 在新进程只读消费，结果逐字段一致，不导入 Torch/NumPy 或追加数值调用，运行根内文件均未改变。继续复阅时，发现收据内部仍有慢 `fsync` 边界缺口；本节工件保留，不用于后续修复的身份验收。
 
 - 正控为 `fit_pass`（6/6），负控为 `fit_insufficient`（5/6），负控四项宏平均仍过门；两条链均 `complete_evidence=true`、`replay_passed=true`。每条 4 更新、16 micro/96 窗次、5 批 probe/30 窗行，D6 与 F 实际计数逐项对上矩阵。LR 仍为 `[1e-4,1e-4,5e-5,5e-5]`，切换前后 AdamW 状态摘要连续。F 从已验快照严格加载两端各自的状态（模型/conditioner 各载两次），重用一份输入，只重放初末端点。每条链的 5 份 probe NPZ、输入/教师 NPZ、训练历史及 probe 日志共 9 份与初版对应夹具逐字节一致。
 - 实测 F 起点精确等于 D6 关账时点。下表分别以阶段起点和整链起点计秒，均为实际耗时 ≤ 登记成本；实际等待、清理、写后回读及末次存档摘要都经复核。
@@ -74,6 +74,24 @@
 本轮 CLI 见证及独立只读摘要在 `/tmp/opencode/w1-i6-fix-acceptance.ev5AeO/`；`verified_acceptance.json` SHA-256 为 `ad2961320172eeb013439eb6aa3f532bae0a781c1f304b5eb04b5fad082ed61f`。正、负控各 52 文件，最终受管大小为 3,240,837 / 3,241,250 字节，不当作峰值实测。
 
 新 I6 套件 **86 passed**（142.04 s，`/tmp/opencode/w1-i6-fix-final-tests.dxpJJl/pytest.log`）。隔离的旧单窗 LR、旧拟合/外层、准入/N0/N1 分别 **73 / 80 / 91 passed**（`/tmp/opencode/w1-i6-fix-regressions.bFix3y/`）；未运行全项目套件。冻结计划及历史 **449** 项 SHA 一致，两处真实运行根仍不存在。
+
+## 收口内部同步的继续复阅
+
+在 `4c38d2e` 路径上对 F 收据的文件 `fsync` 单独注入延迟，复现 `T0+4140.1s` 仍启动目录 `fsync`；虽然最终拒收，后继同步不应进入。I6 现逐次守卫写入、文件同步、原子替换和目录同步；checkpoint 补充同步、日志和失败收据也使用相应截止。旧单窗写入器不启用这套额外边界，文件格式及空间规则未改。新增阶段收据、外层 archive、checkpoint 及原子替换四个反例：只执行已准入的文件 `fsync`，越线后不执行替换、目录同步或回读，不得发布后继收据。
+
+## 修复后 I6 复阅通过
+
+最终实现身份（78 个文件）：`a80f1e08d39110c1292060030d5c07b61cbc64353308d7d613787789b1b88381`。I6 **90 passed**（147.93 s，`/tmp/opencode/w1-i6-sync-verified.zBlG3k/pytest.log`），含上述证据边界反例和两个实际子进程对照。独立旧回归三组重跑 **73 / 80 / 91 passed**（`/tmp/opencode/w1-i6-sync-regressions.P9jSUr/`），未运行全项目套件。冻结计划及历史 449 项 SHA 不变，两处真实根仍不存在。
+
+该身份另用两条独立 CLI 链贯通，并以各自 `external_collector_wait` 在新进程只读核验。正控 `fit_pass`（6/6），负控 `fit_insufficient`（5/6，四项宏平均过门），两条链的证据均完整且 F 初末端点逐位重放成立。精确调用矩阵、四步日程、AdamW 状态连续性、两端预检及单输入快照复用均符合 I6 约定。每条链的 9 份数值工件与 `7b28bf6` 对应夹具逐字节一致；只读核验前后各 52 个文件字节不变，无数值库导入。
+
+| 实际耗时 ≤ 登记成本（秒） | `fit-pass` | `one-window-fails` |
+| --- | ---: | ---: |
+| D6 关账 | 43.774431 ≤ 47.700204 | 43.663236 ≤ 47.626369 |
+| F 关账，起点为 D6 实际关账 | 7.477005 ≤ 11.407529 | 7.425828 ≤ 11.387719 |
+| 采集器退出及清理，含最后存档同步、回读 | 51.536227 ≤ 56.276142 | 51.326224 ≤ 56.111535 |
+
+最终 CLI 见证和独立摘要位于 `/tmp/opencode/w1-i6-sync-acceptance.k41Mpw/`，`verified_acceptance.json` SHA-256 `b0f87380d8b5f6b1c158018f7bc011792c284dd96447ba9b0dd28208da7619b7`。本结论只覆盖 I6；未安排 R6 或授权/启动真实阶段。
 
 ## 复现命令
 

@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-- **2026-11-19 六窗 I6 修复及复阅**：初版六项问题已修复，86 项 I6 测试及旧回归三组通过。两条独立 CPU 链每条 4 次原生更新、5 次整批 probe、30 条窗行，F 两端逐位重放、实际返回及末次存档覆盖均经只读复核。正控 `fit_pass`（6/6），负控四项宏平均达标但一窗未过，裁决为 `fit_insufficient`（5/6）。详见[I6 验证记录](verification/omniretarget_w1_d6_joint_fit_i6.md)。
+- **2026-11-19 六窗 I6 修复及复阅**：初版六项问题及复阅发现的文件同步迟返问题均已修复，90 项 I6 测试通过。两条独立 CPU 链每条 4 次原生更新、5 次整批 probe、30 条窗行，F 两端逐位重放、实际返回及末次存档覆盖均经只读复核。正控 `fit_pass`（6/6），负控四项宏平均达标但一窗未过，裁决为 `fit_insufficient`（5/6）。详见[I6 验证记录](verification/omniretarget_w1_d6_joint_fit_i6.md)。
 - **2026-11-19 单窗LR工程复阅修复**：优化器钩子导致LR取样不实、实际观察器退出/存档覆盖、前缀收据写后截止、工件写前空间门四项已修复。定向73＋旧拟合80＋准入/N0/N1 91项通过；真实 B 的 `single_window_pass` 保留，旧材料/授权不复用，见[修复记录](verification/omniretarget_w1_d1_lr_review_hardening.md)。未重跑真实阶段或追加D6。
 - **2026-11-18 新授权真实链验收与保存曲线分析**：`attempt_002` worker/监督器均 exit0，外层 `candidate_complete`/problems=[]，F `fit_insufficient`；根旋转 0.023780910989rad、FK 0.016761962649m 未过门。新旧 101/101 probe NPZ 逐字节相同，无四门同时通过的 probe；278 保护文件零漂移。见验证记录 §34、方案 §44。后续先冻结单因素优化/目标诊断方案，学习率日程仅为候选，不自动启动新训练。
 - **2026-11-17 真实拟合负结果与外层预算修复**：`derived/experiments/omniretarget_first/attempt_001` 的 D1 1000 步/101 probes 完整，旋转与 FK 平均门未过，F 逐位重放后为 `fit_insufficient`；监督器以 `budget_binding_mismatch` 裁决 incomplete。修复只补顶层完整预算，已消费阶段及旧工件保持原样，见验证记录 §32–§33。

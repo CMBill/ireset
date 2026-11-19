@@ -501,7 +501,7 @@ class JointDriver(fit.FitDriver):
         self.budget.check('checkpoint_save_admission')
         super()._save_checkpoint(name, step)
         path = self.stage_dir / name
-        self.audit.unit('checkpoint_syncs', _sync_file, path)
+        self.audit.unit('checkpoint_syncs', _sync_file, path, check=self.budget.check)
         rel = str(path.relative_to(self.root))
         raw = self.audit.unit('generation_checkpoint_reads', p.snapshot, self.root, rel)
         self.journal.refs[rel] = self.audit.unit('generation_artifact_hashes', p.record, raw)
@@ -541,12 +541,14 @@ class JointDriver(fit.FitDriver):
             self.trainer.accumulate_micro = self._original_micro
 
 
-def _sync_file(path):
+def _sync_file(path, *, check):
     import os
 
     with path.open('rb') as f:
+        check('checkpoint_file_fsync:' + path.name)
         os.fsync(f.fileno())
-    p.sync_directory(path.parent)
+    check('checkpoint_file_fsync_returned:' + path.name)
+    p.sync_directory(path.parent, check=check)
 
 
 def _load_checkpoint_snapshot(raw):

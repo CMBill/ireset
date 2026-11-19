@@ -111,22 +111,33 @@ def wait_owned(command, deadline, *, space=None, logs=None, scope='group', start
         raise InterruptedError('i6_supervision_interrupted')
 
     failures = []
+    check_log, _ = _tail_guard(time.perf_counter, deadline, 'log_sync_not_covered')
 
     def drain(stream, name):
         try:
             left = p.LOG_BYTES
-            with stream, (space.root / name).open('xb') as out:
-                while chunk := stream.read1(65536):
-                    if len(chunk) > left:
-                        out.write(chunk[:left])
+            with stream:
+                check_log('open:' + name)
+                with (space.root / name).open('xb', buffering=0) as out:
+                    while True:
+                        check_log('read:' + name)
+                        chunk = stream.read1(65536)
+                        if not chunk:
+                            break
+                        check_log('write:' + name)
+                        bounded = chunk[:left]
+                        p.require(out.write(bounded) == len(bounded), 'log_short_write:' + name)
+                        if len(chunk) <= left:
+                            left -= len(chunk)
+                            continue
                         failures.append('bounded_log_overflow:' + name)
                         break
-                    out.write(chunk)
-                    left -= len(chunk)
-                out.flush()
-                os.fsync(out.fileno())
-            p.sync_directory(space.root)
-        except OSError as exc:
+                    check_log('file_fsync:' + name)
+                    os.fsync(out.fileno())
+            check_log('directory_open:' + name)
+            p.sync_directory(space.root, check=check_log)
+            check_log('directory_fsync_returned:' + name)
+        except (OSError, p.Refused) as exc:
             failures.append(str(exc))
 
     signal.signal(signal.SIGTERM, interrupted)
@@ -175,8 +186,9 @@ def _record_failure(space, t0, reason):
         elapsed = time.perf_counter() - t0
         if elapsed >= p.CHAIN_CAP:
             return
-        space.write_failure(space.root / FAILURE, f'{reason!s:.250}; cost_lower_bound_s={elapsed:.6f}')
-    except OSError:
+        check, _ = _tail_guard(time.perf_counter, t0 + p.CHAIN_CAP, 'failure_write_not_covered')
+        space.write_failure(space.root / FAILURE, f'{reason!s:.250}; cost_lower_bound_s={elapsed:.6f}', check=check)
+    except (OSError, p.Refused):
         pass
 
 

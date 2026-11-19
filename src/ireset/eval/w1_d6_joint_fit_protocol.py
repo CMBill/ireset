@@ -122,6 +122,8 @@ def space_policy():
 class Space(ArtifactSpace):
     """One non-log writer at a time; bounded concurrent streams own slots."""
 
+    stepwise_writes = True
+
     def __init__(self, root, *, cap_bytes=CAP_BYTES):
         super().__init__(root, cap_bytes=cap_bytes)
         self.logs = LOGS

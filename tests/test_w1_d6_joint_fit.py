@@ -21,6 +21,7 @@ import run_w1_d6_joint_fit as cli
 from ireset.eval import w1_d6_joint_fit as job
 from ireset.eval import w1_d6_joint_fit_evidence as ev
 from ireset.eval import w1_d6_joint_fit_protocol as p
+from ireset.eval import w1_d1_lr_artifacts as artifacts
 from ireset.eval import w1_smallset_fit_diagnostic as fit
 
 
@@ -777,6 +778,59 @@ def test_outer_archive_covers_its_last_write(tmp_path, monkeypatch, late_file):
         with pytest.raises(p.Refused, match='chain_.*_not_covered'):
             cli.archive_return(space, launch, rec, actual, clock=clock)
         assert reread == ([] if late_file == cli.ARCHIVE else [cli.ARCHIVE])
+
+
+@pytest.mark.parametrize('site', ['stage', 'archive', 'checkpoint', 'atomic_replace'])
+def test_late_file_fsync_cannot_enter_directory_sync_or_readback(tmp_path, monkeypatch, site):
+    space = p.Space(tmp_path)
+    timing = p.stage_timing('F', 100., 3700.)
+    stop = timing['hard_deadline'] if site == 'stage' else (
+        timing['work_deadline'] if site == 'checkpoint' else 4300.)
+    clock = fit._FakeClock(stop - .1)
+    rec = {'bytes': 10, 'sha256': 'e' * 64}
+    actual = cli.Wait(6, 0, stop - .3, stop - .2, True)
+    fsync = os.fsync
+    observed = []
+
+    def slow_file(fd):
+        assert not observed, 'a second fsync entered after the first returned late'
+        fsync(fd)
+        observed.append(fd)
+        clock.t = stop + .1
+
+    monkeypatch.setattr(os, 'fsync', slow_file)
+    monkeypatch.setattr(os, 'replace', forbid)
+    monkeypatch.setattr(artifacts, 'sync_directory', forbid)
+    monkeypatch.setattr(p, 'sync_directory', forbid)
+    monkeypatch.setattr(p, 'snapshot', forbid)
+    if site == 'stage':
+        report = {'seal_sampled_at': timing['work_deadline'] - .1, 'registered_s': stop - timing['t0']}
+        monkeypatch.setattr(p, 'report_packet', lambda *a, **kw: (report, rec, {'pid': 7}, rec))
+        monkeypatch.setattr(p, 'stage_logs', lambda *a, **kw: {})
+        with pytest.raises(p.Refused, match='F_settlement_not_covered:artifact_file_fsync_returned:actual_wait.json'):
+            cli.close_stage(space, rec, 'F', {'timing': timing}, rec, actual, 2, clock=clock)
+        assert clock() - 100. == pytest.approx(4140.1)
+        assert (tmp_path / 'f/actual_wait.json').exists() and not (tmp_path / 'f/post_sync.json').exists()
+    elif site == 'archive':
+        comp = {'registered_s': p.CHAIN_CAP, 'sampled_at': stop - .5, 'closed': {}, 'problem': None}
+        monkeypatch.setattr(cli, '_chain_packet', lambda *a, **kw: (comp, rec, rec))
+        with pytest.raises(p.Refused, match='chain_archive_not_covered:artifact_file_fsync_returned:archive.json'):
+            cli.archive_return(space, {'t0': 100., 'collector_pid': 8}, rec, actual, clock=clock)
+        assert (tmp_path / cli.ARCHIVE).exists() and not (tmp_path / cli.LAST_SYNC).exists()
+    elif site == 'checkpoint':
+        path = tmp_path / 'initial.pt'
+        path.write_bytes(b'checkpoint sync fixture')
+        budget = p.Budget(timing, space, clock=clock)
+        with pytest.raises(p.Refused, match='budget_exceeded:F:checkpoint_file_fsync_returned:initial.pt'):
+            job._sync_file(path, check=budget.check)
+    else:
+        check, _ = cli._tail_guard(clock, stop, 'atomic_write_not_covered')
+        path = tmp_path / 'artifact.json'
+        path.write_bytes(b'original')
+        with pytest.raises(p.Refused, match='atomic_write_not_covered:artifact_file_fsync_returned:artifact.json'):
+            space.write_bytes(path, b'new', check=check)
+        assert path.read_bytes() == b'original' and path.with_suffix('.json.tmp').exists()
+    assert len(observed) == 1
 
 
 def test_actual_delayed_subprocess_exit_zero_is_not_covered(tmp_path, monkeypatch):
