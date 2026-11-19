@@ -34,6 +34,8 @@ R6_ROOT = PROJECT_ROOT / AUDIT / 'r6/attempt_001'
 REAL_ROOT = PROJECT_ROOT / EXPERIMENTS / p.COHORT
 R6_ENTRY = 'scripts/run_w1_d6_r6.py'
 REAL_ENTRY = 'scripts/run_w1_d6_joint_fit_real.py'
+REAL_LAUNCH_SCHEMA = p.COHORT + '/real_launch_v2'
+REAL_OUTER_LOGS = ('collector.stdout.log', 'collector.stderr.log')
 REPORT = 'r6_admission.json'
 CONFIG = 'configs/train/omniretarget_motion.yaml'
 PINS = {
@@ -94,7 +96,9 @@ def commands():
         'cwd': str(PROJECT_ROOT),
         'R6': ['.venv/bin/python', '-I', '-B', R6_ENTRY, '--implementation-sha256', '<reviewed-implementation-sha256>',
                '--_t0', '<external-start-perf-counter-hex>'],
-        'D6_to_F': ['.venv/bin/python', '-I', '-B', REAL_ENTRY, '--authorization-sha256', '<new-section-8.3-sha256>'],
+        'D6_to_F': {'entrypoint': REAL_ENTRY + ':launch_authorized', 'interpreter': ['.venv/bin/python', '-I', '-B'],
+                    'mode': 'in_process_supervising_parent', 'auth_sha': '<new-section-8.3-sha256>',
+                    'start': '<perf-counter-before-entry-import>', 'retain_external_return': True},
         'worker_prefix': ['uv', 'run', '--locked', '--offline', '--no-sync', 'python', '-I', '-B'],
         'real_stage_roles': ['D6', 'F'], 'real_authorization_path': str(AUDIT / 'authorization.json'),
     }
@@ -110,9 +114,12 @@ def storage_policy():
             + files['teacher_reference.npz'] + files['probe_inputs.npz'] + files['payload.json']
             + files['artifacts_index.json'] + files['prefix_receipt.json'] + files['launch.json']
             + 4 * files['archive.json'] + 4 * files['report.json'] + 24 * files['protocol']
-            + len(p.LOGS) * p.LOG_BYTES + policy['closure_bytes'] + policy['failure_bytes'])
+            + 2 * files['protocol'] + (len(p.LOGS) + len(REAL_OUTER_LOGS)) * p.LOG_BYTES
+            + policy['closure_bytes'] + 2 * policy['failure_bytes'])
     p.require(peak <= policy['tree_cap_bytes'], 'real_tree_roster_over_cap')
-    return {**policy, 'real_roster_peak_upper_bytes': peak, 'R6_log_slots': ['r6.stdout.log', 'r6.stderr.log'],
+    return {**policy, 'real_roster_peak_upper_bytes': peak, 'real_outer_log_slots': list(REAL_OUTER_LOGS),
+            'real_outer_failure_bytes': policy['failure_bytes'],
+            'R6_log_slots': ['r6.stdout.log', 'r6.stderr.log'],
             'R6_roster_peak_upper_bytes': files[REPORT] + 8 * files['protocol'] + 2 * p.LOG_BYTES
             + policy['closure_bytes'] + policy['failure_bytes']}
 
@@ -126,7 +133,9 @@ def frozen_contract():
                          'step_contract': p.STEP_CONTRACT},
             'reports': {'D6': p.SCHEMA + '/stage_report:pending_F', 'F': p.SCHEMA + '/stage_report:pending_outer',
                         'R6': SCHEMA + '/candidate:pending_actual_wait', 'chain': p.SCHEMA + '/archive',
-                        'external_wait_required': True, 'r6_witness': SCHEMA + '/external_return'},
+                        'external_wait_required': True, 'r6_witness': SCHEMA + '/external_return',
+                         'real_parent_observation': REAL_LAUNCH_SCHEMA + '/outer_observation:pending_actual_readback',
+                         'real_witness': REAL_ENTRY + ':ExternalReturn'},
             'endpoint': {'step': 1000, 'probe_every': 10, 'window_rows': 606,
                          'thresholds': [.01, math.pi / 180, .05, .01], 'gate': 'all_four_on_all_six',
                          'fk_replay': 'initial_last_only', 'spike_gate': 'not_evaluated'},
@@ -434,7 +443,7 @@ def implementation(*, unit=p.unmetered):
     # The extra roster is explicit; previous I6 evidence remains bound to
     # the historical tree, not blessed retroactively by this hash.
     files = dict(p.implementation_identity(unit=unit)['files'])
-    for rel in (R6_ENTRY, REAL_ENTRY, 'tests/test_w1_d6_r6.py', 'tests/test_w1_d6_real.py'):
+    for rel in (R6_ENTRY, REAL_ENTRY, 'tests/test_w1_d6_r6.py', 'tests/test_w1_d6_real.py', 'tests/test_w1_d6_real_outer.py'):
         raw = unit('implementation_read:' + rel, (PROJECT_ROOT / rel).read_bytes)
         files[rel] = unit('implementation_hash:' + rel, p.record, raw)
     return {'files': files, 'sha256': unit('r6_implementation_digest', p.digest, files)}

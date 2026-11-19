@@ -393,14 +393,14 @@ def coordinate(root, pinned, t0):
     return 0 if problem is None else 3
 
 
-def tree_records(space, *, unit=p.unmetered):
+def tree_records(space, *, unit=p.unmetered, outer_only=()):
     p.require(unit('archive_tree_size', space.used_bytes) <= space.cap_bytes, 'archive_tree_size')
     files = {}
     for path in unit('archive_tree_roster', lambda: sorted(space.root.rglob('*'))):
         if unit('archive_tree_entry', path.is_dir):
             continue
         rel = str(path.relative_to(space.root))
-        if rel in ARCHIVE_TAIL:
+        if rel in ARCHIVE_TAIL or rel in outer_only:
             continue
         p.require(not rel.endswith('.tmp'), f'archive_contains_partial_file:{rel}')
         raw = unit(f'read:{rel}', p.snapshot, space.root, rel)
@@ -417,7 +417,7 @@ def _chain_packet(root, launch, launch_rec, pid, *, unit=p.unmetered):
     return comp, comp_rec, observer_rec
 
 
-def archive_return(space, launch, launch_rec, actual, *, clock=time.perf_counter):
+def archive_return(space, launch, launch_rec, actual, *, clock=time.perf_counter, outer_only=()):
     root, t0 = space.root, launch['t0']
     hard = t0 + p.CHAIN_CAP
     _, unit = _tail_guard(clock, hard, 'chain_packet_not_covered')
@@ -426,7 +426,7 @@ def archive_return(space, launch, launch_rec, actual, *, clock=time.perf_counter
     p.require(actual.clean, 'chain_group_unclean')
     p.coverage((sample, actual.waited_at, actual.cleaned_at, clock()), t0, reg, hard, 'chain_actual_wait_not_covered')
     check, unit = _tail_guard(clock, min(hard, t0 + reg), 'chain_archive_not_covered')
-    files = tree_records(space, unit=unit)
+    files = tree_records(space, unit=unit, outer_only=outer_only)
     sampled = clock()
     p.coverage((actual.cleaned_at, sampled), t0, reg, hard, 'chain_archive_before_write_not_covered')
     archive = {'schema': p.SCHEMA + '/archive', 'launch': launch_rec, 'observer': observer_rec,
