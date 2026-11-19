@@ -1780,11 +1780,7 @@ class FitDriver:
             # instead of finishing the verification first (the driver's
             # closure records the stage as incomplete).
             self._phase = "local_verification"
-            verification = verify_stage_local(
-                self.stage_dir, self.plan, self.registration, self.decoder,
-                production_decoder=self.loss_fn,
-                counters=verification_counters, budget=self.budget,
-                expected_identity=self.identity)
+            verification = self._verify_saved_stage(verification_counters)
             self.budget.check("local_verification_complete")
             summary.update(verification)
             summary["verification_counters"] = verification_counters
@@ -1854,6 +1850,15 @@ class FitDriver:
         if problems:
             raise FitDiagnosticError(f"parameter_contract:{problems}")
 
+    def _verify_saved_stage(self, counters: dict) -> dict:
+        return verify_stage_local(
+            self.stage_dir, self.plan, self.registration, self.decoder,
+            production_decoder=self.loss_fn, counters=counters,
+            budget=self.budget, expected_identity=self.identity)
+
+    def _admit_collated(self, batch: dict, step: int, micro: int) -> None:
+        """Extension gate on the exact collated object, before consumption."""
+
     def _train_and_probe(self) -> None:
         plan, trainer = self.plan, self.trainer
         data_iter = iter(trainer.train_loader)
@@ -1890,6 +1895,7 @@ class FitDriver:
                     data_iter = iter(trainer.train_loader)
                     batch = next(data_iter)
                 ever_yielded = True
+                self._admit_collated(batch, step, micro + 1)
                 n_samples += int(batch["x0"].shape[0])
                 self.counters["window_consumptions_total"] += \
                     int(batch["x0"].shape[0])
