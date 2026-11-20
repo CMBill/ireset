@@ -1,6 +1,6 @@
 # W1 固定六窗逐窗误差复盘方案
 
-**v0.2，按复阅意见修订，待复核。** 依据 2026-11-20 的[六窗真实结果](../verification/omniretarget_w1_d6_joint_fit_result.md)及[主方案 §9](omniretarget_w1_numerics_closure_fit_diagnostic_plan.md#9-f收口归因与后续分支)。本次核对了归档格式与历史源码；§6 的合成验收和真实归档复盘均未执行。
+**v0.3，按复阅意见修订，待复核。** 依据 2026-11-20 的[六窗真实结果](../verification/omniretarget_w1_d6_joint_fit_result.md)及[主方案 §9](omniretarget_w1_numerics_closure_fit_diagnostic_plan.md#9-f收口归因与后续分支)。本次核对了归档格式与历史源码；§6 的合成验收和真实归档复盘均未执行。
 
 ## 1. 要回答的问题
 
@@ -29,15 +29,22 @@
 
 **固定分母。** 沿用[原注册 §2.1](omniretarget_w1_d6_joint_fit_diagnostic_plan.md#21-注册来源与条件边界)的六个 `train` 首窗 `[0,60)`，固定顺序 `sub10_097、sub12_082、sub16_000、sub3_027、sub7_022、sub8_035`；连接键用完整 `window_id`。两侧步号必须恰为 `0,10,…,1000`、`idx=step/10`，逐步核对 `batch_pos` 与规范窗键。D6 恰 101 批、606 个唯一 `(step,window_id)`；B 每步仅共同窗 `sub10_largebox_097:0:60`、槽 0。禁止跳点、重复、插值或调换槽位。
 
-**历史源码白名单（只取字节，不导入）。** D6 从裁决的 `launch` 核验 [launch.json](../../derived/experiments/omniretarget_first/w1_d6_joint_fit_lr_half_v1/launch.json)，读取 `implementation.files`；B 从裁决的 `bindings.admission` 核验 [r_admission.json](../../derived/audit/w1_d1_lr_half_after_500_v1/r_admission/attempt_001/r_admission.json)，读取 `package.code_identity.implementation_files`。分别与阶段报告的实现摘要及 launch/准入引用对账。以 D6 `b138bb4`、B `e96e0ad` 定位历史源码，每个文件先匹配**本侧清单**的 SHA；提交号或当前工作树不代替字节核验。
+**历史源码白名单（只取字节，不导入）。** D6 从裁决的 `launch` 核验 [launch.json](../../derived/experiments/omniretarget_first/w1_d6_joint_fit_lr_half_v1/launch.json)，读取 `implementation.files`；B 从裁决的 `bindings.admission` 核验 [r_admission.json](../../derived/audit/w1_d1_lr_half_after_500_v1/r_admission/attempt_001/r_admission.json)，读取 `package.code_identity.implementation_files`。分别与阶段报告的实现摘要及 launch/准入引用对账。以 D6 `b138bb4`、B `e96e0ad` 定位历史源码，每个列入白名单的文件先匹配**本侧清单**的 SHA；提交号或当前工作树不代替字节核验。历史文件缺少本侧 SHA 时标为“未绑定”，不得用当前版本补证。
 
 | 白名单路径（相对 `src/ireset/`） | 要从两侧已绑定字节核对的内容 |
 | --- | --- |
-| `embodied/g1_spec.py`、`model/tokens.py`、`eval/w1_smallset_fit_diagnostic.py` | 按 `JOINT_NAMES` 原序取 29 关节，核对关节编码列 `9:38`、逐列解码和 `err_joint_tj` 轴序；按 `KPT_TO_SMPLH` 的**键插入序**取 15 个 site，不按名称排序。两侧名册文件 SHA 均为 `c4bf6946803c81025f1ea385d5345ac4c60f81a47921d9404a048e4c25ad7e8e`。 |
+| `embodied/g1_spec.py`、`model/tokens.py`、`eval/w1_smallset_fit_diagnostic.py` | 按 `JOINT_NAMES` 原序及锁定 G1 的 qpos 地址核对 29 个关节，核对关节编码列 `9:38`、逐列解码和 `err_joint_tj` 轴序；按 `KPT_TO_SMPLH` 的**键插入序**取 15 个 site，不按名称排序。两侧名册文件 SHA 均为 `c4bf6946803c81025f1ea385d5345ac4c60f81a47921d9404a048e4c25ad7e8e`。 |
 | `kinematics/torch_adapter.py`、`train/losses.py` 及上行度量模块 | 核对 probe/教师调用向 FK 传入 `list(KPT_TO_SMPLH)`、点按请求顺序堆叠；逐项对照四个门值、`compute_window_metrics` 及其角距、分位数和并列最大值规则。区分训练 `fk_m2` 和度量 MPJPE。 |
+| 两侧共同：`data/teacher.py`、`eval/w1_smallset_fit_r_admission.py` | 沿历史生成链核对 `convert_teacher_qpos` 保留关节 qpos 的 `[7:36]` 次序；核对场景切片得到的 `q` 原样送入 `_window_item`，再由 `StateTokenizer.encode` 写入 `x0[:,9:38]`。两文件在两侧清单中的 SHA 分别为 `531b958196fa8ea760e020da73e8bb5f1128c7b6eb14e71901a8bd0af8d9846b`、`0f967176769799cbfa235e120d1b0f96c5859b77b8e2fdbd7793c429865a75f1`。 |
+| D6：`data/schema.py`、`eval/w1_d6_joint_fit_real.py`；B：`data/w1_training.py`、`eval/w1_d1_lr_workflow.py` | D6 按 `clip_from_snapshots` 的 `scene[:,7:36]`、`InteractionClip.q` 到 `_window_item` 的实际调用核对；`data/schema.py` 仅 D6 清单绑定，SHA `465ef107bc669a938e62148e25b8b53e4d382cdfef50556fe4f85c5213207074`。B 核对 `load_w1_derived_clip`、`build_interaction_clip`、物化及实际 `ScheduleDriver` 路径；B 的 `data/schema.py` **不在** admission 实现清单中，因此不声称该文件有历史字节绑定。B 最终编码输入另由下述物化摘要与归档 x0 字节闭合；若该闭合失败，不作跨运行关节比较。D6 `eval/w1_d6_joint_fit_real.py` SHA `ec9cb6a8163f301eee14a900886ef7eaf04a5fe94d0817de9acb6657512e979f`；B `data/w1_training.py` SHA `355fef3c85fb55206bc235d02fc3b2029d7348dffa8f39aa2b44bf93a88225c6`；B `eval/w1_d1_lr_workflow.py` SHA `8ea525c30753a8aa359a57cb4876aabcb62b484d304f08157a7dc6ea46c24756`。 |
 | D6：`eval/w1_d6_joint_fit.py`、`eval/w1_d6_joint_fit_evidence.py`；B：`eval/w1_d1_lr_schedule.py` | 核对各自驱动实际采用的 probe 与归约、D6 末行投影和 B 比较列来源。两版度量模块的整文件 SHA 不同（D6 `af62b1df…`、B `19133e76…`）；核验各自身份后比较上述定义与调用，不要求两文件同 SHA。 |
 
-**共同载荷。** 先核对注册、步号、单位、两条有序名册、归约与门槛；再比较两侧 `w0` 的六个公共输入及八个教师成员（见 §2.1），逐键核对形状、dtype 和 C-order 字节。每侧 `x0` 必须等于本侧 `raw_x0_tgt`。D6 六个槽的公共输入及 `wfc/valid` 须匹配 `payload.json` 生成时登记的字段摘要；`clip_idx/start` 单独核对槽号与起帧。B 未保存这四个额外字段。两包不比容器字节。只有以上核对均通过才发布配对差；不可比时按 §5 分开处理。
+**共同载荷。** 先核对注册、步号、单位、两条有序名册、归约与门槛；再比较两侧 `w0` 的六个公共输入及八个教师成员（见 §2.1），逐键核对形状、dtype 和 C-order 字节。每侧 `x0` 必须等于本侧 `raw_x0_tgt`。
+
+- **D6 六槽。** 对每个槽 `b=0..5`，将 `probe_inputs.npz` 的 `w{b}__x0` 与 `teacher_reference.npz` 的 `w{b}__raw_x0_tgt` 分别按 §2.1 成员表核验，并要求二者的 `array_record` 均逐字段等于 `payload.json.windows[b].fields.x0`（shape、dtype、bytes、sha256）。六槽任何一项不符都使 D6 来源复核 `incomplete`，即使不涉及共同窗也不例外。六个槽的其他公共输入及 `wfc/valid` 也须匹配 payload 对应字段摘要；`clip_idx/start` 单独核对槽号与起帧。
+- **B 单槽。** 从 D1 阶段报告 `materialization.windows[0].x0_sha256` 取该次真实物化编码目标的摘要。要求它与 `probe_inputs.npz:w0__x0` 和 `teacher_reference.npz:w0__raw_x0_tgt` 各自 C-order 原始字节的 SHA-256 相等；B 的输入/教师任一文件与本侧摘要不一致，或两者彼此不一致，均令 `pair_status=not_comparable`，不影响已独立通过的 D6 描述。再要求 B/D6 共同窗两侧 `x0` 与 `raw_x0_tgt` 四数组逐位相等。已登记共同窗摘要为 `5a8a64a3e236ab7a53d6dd676c55c36e0c92ed0c3a671c27cce5dd93b3eec9f2`；执行时仍须从绑定文件重算，不以此常量代替核验。
+
+B 的 `data/schema.py` 没有历史身份绑定；因此不以它的当前或提交版源码推断 B 的关节列。关节语义只在已绑定的生产取列/编码路径、两侧同一 tokenizer 与 G1 名册，以及本侧物化摘要和归档 x0 字节全部闭合后使用。任一条不能闭合时，D6 的索引级描述仍可成立，但共同窗按 `not_comparable` 收口。B 未保存 D6 的 `wfc/valid/clip_idx/start`；这些字段只按 D6 本侧契约核对。两包不比容器字节。只有以上核对均通过才发布配对差；不可比时按 §5 分开处理。
 
 ## 3. 从保存误差复原原判门
 
@@ -87,11 +94,12 @@
 
 ## 6. 实施顺序与验收
 
-**第一步：复核 v0.2 后，在 CPU 合成夹具上验收。** 两种归档分别按 §2 写夹具，期望值可手算，不用分析器自身的输出作答案。专测字段或轴序错误时，同步更新夹具中的上游摘要，使反例确实到达所测检查；哈希漂移另测。
+**第一步：复核 v0.3 后，在 CPU 合成夹具上验收。** 两种归档分别按 §2 写夹具，期望值可手算，不用分析器自身的输出作答案。专测字段或轴序错误时，同步更新夹具中的上游摘要，使反例确实到达所测检查；哈希漂移另测。
 
 | 核验项 | 正控与反例的预期 |
 | --- | --- |
-| 读取、窗位与末行 | 合法的 B 旧格式（无索引长度声明、无 `role`/输入教师专表）可比；B 少键、错 dtype/字节序、身份未绑定、同名窗条件或教师不同、用 A 列代 B，均仅拒配对。D6 哈希漂移、总数不变却重复/缺窗或错槽均 `incomplete`；日志含额外字段的正确投影通过，保持总门数却互换两窗的 `metrics` 必须拒绝。 |
+| 读取、窗位与末行 | 合法的 B 旧格式（无索引长度声明、无 `role`/输入教师专表）可比；B 少键、错 dtype/字节序、身份未绑定、物化 x0 摘要与输入或教师原始目标不符、同名窗条件或教师不同、用 A 列代 B，均仅拒配对。D6 非共同槽的教师目标仅与其局部哈希同步篡改、但不匹配 payload 目标摘要时必须 `incomplete`；D6 哈希漂移、总数不变却重复/缺窗或错槽均 `incomplete`；日志含额外字段的正确投影通过，保持总门数却互换两窗的 `metrics` 必须拒绝。 |
+| 关节轴序路径 | 由绑定源码追踪两侧 `qpos[7:36] → clip.q → _window_item → tokenizer.encode`，并核对 `JOINT_NAMES`/`G1Spec.joint_range` 与 `x0[:,9:38]`。合成置入 29 个互异哨兵值，分别在 qpos 切片、clip 传递、编码列和反解码列置换一次，均须在来源/轴序检查处失败；若只改变 B 阶段物化摘要且同步重签归档，使最终 x0 与 D6 不同，则 `pair_status=not_comparable`，不能报告已对齐的关节名称或差距。 |
 | §3、§4A 原判门与趋势 | 常量、单点及并列峰值检验 RMS/线性归约与 C-order 首个最大值。四类趋势均须出现；`d=−0.10/+0.10` 分别下降/上升，非方向性且 `u=0.20` 为平坦、略高为波动。两窗变化的绝对值均恰为 0.05 时，同号/异号分别计同向/反向；只要一窗的绝对值低于 0.05 即计变化小。三类计数逐对核对，合计 20 不是充分条件。 |
 | §4B 固定组与成员 | 恰 4 窗同组、每窗 16/20 且含末点、命中点份额恰 50% 可提组级候选；改单一条件为 3 窗、15/20 或末点未达标即撤销。加零总和、并列入选、每步换组的反例；用 §5 的单点 60% 分布验证三个成员分别报告，不能把组通过记为三点分别通过。 |
 | §4C 最早差距 | 在完整步列中令 `Δr` 在 0、10 为 `+0.25`，20 为零；30–50 和 70–90 各连续三点为 `+0.25`，100–120 连续三点为 `−0.25`，其余为零。正向首段必须是 `[30,40,50]`，反向是 `[100,110,120]`；不能跨过 20 或挑后段。另验 step0 起即连续三点、只有两点后中断（该方向 `null`）；真实缺采样点按 §5 处理，不补零。 |
@@ -101,6 +109,7 @@
 **第三步：独立复核后发布。** 拟另存 `derived/audit/w1_d6_window_error_review_v1/attempt_001/`：输入与实现 SHA 清单、606 行逐窗曲线、窗内贡献及尾段计数、101 行共同窗配对表（不可比时记录原因）、机读结论；人读报告拟置 `docs/verification/omniretarget_w1_d6_window_error_review.md`。复核者从 §2 已验输入重算下列输出，不调用分析器的分类/选组/找段函数，不以产物中的分类、起点或候选标志为前提：
 
 - **§3、§4A：**重算 606 行完整度量和末次六行投影；从 24 条曲线重算 21 点统计、`a,b,s,d,u` 和四类趋势。从相邻采样点的有符号差重算每指标 15 对窗各 20 区间的同向、反向、变化小计数，分别与产物对账。
+- **§2 绑定：**重算六个 D6 槽各自输入与教师目标的 `array_record` 并分别对照 payload；重算 B 输入与教师原始目标摘要并分别对照绑定阶段报告的物化摘要。源身份缺项、B 摘要不符或两侧共同窗任一 x0 字节不同，都不得生成配对差。
 - **§4B：**从 step800 重新确定固定组；逐步复算贡献分子/分母、成员绝对点距与份额、命中点数、末点判定，再按索引集核对达到持续集中的窗数。
 - **§4C、§5：**先复核可比资格，可比才重算 101 对 SI 差与 `Δr`；对每指标从 step0 依步序分别找正、负方向首个连续三点，核对起点、三步及差值或 `null`。结合 §4B 重新判定是否提组级候选。合成验收中即使底层数值全对，单独改掉趋势标签、互换同反向计数或把首段换成后段，复核也必须报出具体差异。
 
