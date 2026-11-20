@@ -29,6 +29,7 @@
 | --- | --- |
 | [固定六窗联合拟合诊断方案](plans/omniretarget_w1_d6_joint_fit_diagnostic_plan.md) | **v0.2 冻结执行前快照**；完成情况以真实结果报告为准。 |
 | [固定六窗真实诊断结果](verification/omniretarget_w1_d6_joint_fit_result.md) | **已收口**：`fit_insufficient`，证据完整、端点重放通过；不自动续行。 |
+| [固定六窗逐窗误差复盘方案](plans/omniretarget_w1_d6_window_error_review_plan.md) | **v0.2 修订，待复核**：分开核验 D6/B 归档格式与有序名册，独立复核末段趋势、固定点组贡献和共同窗首次持续差距。 |
 | [固定六窗 I6 验证记录](verification/omniretarget_w1_d6_joint_fit_i6.md) | **纯 CPU 合成复阅通过**：载荷、日程、逐窗门、端点重放与实际退出覆盖。 |
 | [固定六窗 R6 与旧身份](verification/omniretarget_w1_d6_joint_fit_r6.md) | **唯一正式 R6 已消费**：历史封存和未签草案不变，不绑定修订后的代码。 |
 | [固定六窗外层计时修复](verification/omniretarget_w1_d6_joint_fit_outer.md) | **纯合成验收通过**：启动、返回、最后回读及独立见证；不放行真实运行。 |
@@ -45,6 +46,8 @@
 ## 下一步的范围
 
 **2026-11-20 六窗范围已结束：**唯一 `["D6","F"]` 授权已消费。保留负结果与保存曲线，不重跑 R6 或真实链，不追加 D1、六窗恒定学习率对照或其他实验。
+
+下一交付见[逐窗误差复盘方案](plans/omniretarget_w1_d6_window_error_review_plan.md)：先复核修订稿，再做可手算的 CPU 合成验收；通过后才按冻结范围复盘归档，判断是否值得另拟组级调权诊断。合成验收和归档复盘均未执行。
 
 学习率对照已按[冻结方案](plans/omniretarget_w1_d1_lr_schedule_diagnostic_plan.md)完成，前 500 步与 A 的共同前缀核验通过，B 在 step1000 四门达标。结论只覆盖固定窗和固定 seed，不代表泛化或生产资格；不自动追加 D6、续训或下一实验。
 
