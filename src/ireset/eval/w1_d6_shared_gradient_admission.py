@@ -146,17 +146,26 @@ def build_materials(project_root: Path) -> tuple[dict, dict]:
     implementation_paths = [
         "src/ireset/eval/w1_d6_shared_gradient.py",
         "src/ireset/eval/w1_d6_shared_gradient_admission.py",
+        "src/ireset/eval/w1_d6_shared_gradient_real.py",
+        "src/ireset/eval/w1_d6_joint_fit.py",
+        "src/ireset/eval/w1_d6_joint_fit_evidence.py",
+        "src/ireset/eval/w1_d6_joint_fit_protocol.py",
+        "src/ireset/eval/w1_d6_runtime.py",
         "docs/plans/omniretarget_w1_d6_shared_gradient_prereg_draft.md",
         "scripts/verify_w1_d6_shared_gradient.py",
         "scripts/prepare_w1_d6_shared_gradient_admission.py",
         "scripts/supervise_w1_d6_shared_gradient.py",
         "tests/test_w1_d6_shared_gradient.py",
         "tests/test_w1_d6_shared_gradient_admission.py",
+        "tests/test_w1_d6_shared_gradient_real.py",
         "src/ireset/train/trainer.py", "src/ireset/train/losses.py",
         "src/ireset/model/conditioner.py", "src/ireset/model/deterministic.py",
         "src/ireset/model/backbone.py", "src/ireset/model/tokens.py",
         "src/ireset/geometry/distance_adapter.py", "src/ireset/kinematics/rotation_adapter.py",
         "src/ireset/eval/w1_smallset_fit_r_admission.py", "src/ireset/embodied/g1_spec.py",
+        "src/ireset/eval/w1_smallset_fit_diagnostic.py", "src/ireset/kinematics/torch_adapter.py",
+        "src/ireset/eval/w1_real_fk_audit.py", "src/ireset/data/schema.py",
+        "src/ireset/data/teacher.py", "src/ireset/paths.py",
         "src/ireset/eval/w1_d6_joint_fit_real.py", "src/ireset/eval/w1_d6_r6.py",
         "scripts/run_w1_d6_joint_fit_real.py", "scripts/run_w1_d6_r6.py",
         "pyproject.toml", "uv.lock",
@@ -196,7 +205,8 @@ def build_materials(project_root: Path) -> tuple[dict, dict]:
                                    "read": 1, "hash": 1}
                                   for rel, rec in sorted(production_assets.items())],
         },
-        "future_outputs_proposed": {"npy": 20, "json": 9, "stdout_log_bytes_max": 256 << 10,
+        "future_outputs_proposed": {"worker_npy": 20, "worker_json": 5, "outer_json_max": 4,
+                                    "stdout_log_bytes_max": 256 << 10,
                                     "stderr_log_bytes_max": 256 << 10, "supervisor_receipt": 1,
                                     "retry": 0, "overwrite": 0},
         "closure_status": "proposed_only_not_runtime_verified",
@@ -204,15 +214,22 @@ def build_materials(project_root: Path) -> tuple[dict, dict]:
     # The current I/C matrix describes synthetic core work only. Real source,
     # asset, setup and outer-return counts remain proposed until worker review.
     package = {
-        "schema": SCHEMA, "state": "metadata_only_materials_drafted_worker_missing",
+        "schema": SCHEMA, "state": "metadata_only_materials_real_kernel_partial_supervision_pending",
         "executable": False, "authorized": False,
         "proposed_real_root": str(PROPOSED_REAL_ROOT),
         "historical": {"r6": meta_records["r6"], "verified_outcome": meta_records["outcome"],
                        "d6_artifacts_index": meta_records["d6_index"],
                        "synthetic_ic_acceptance": meta_records["ic_acceptance"]},
         "source": {"windows": WINDOWS, "selected_d6_files": _source_read_set(index),
+                   "d6_identity": index["identity"],
+                   "d6_config": pkg["contract"]["config"],
+                   "d6_contract": pkg["contract"],
+                   "d6_bindings": pkg["bindings"],
+                   "root_stats": {"file": pkg["bindings"]["root_stats"]["file"],
+                                  "headers": pkg["bindings"]["root_stats"]["headers"]},
+                   "production_assets": production_assets,
                    "r6_source_binding_sha256": _sha(json.dumps(pkg["bindings"], sort_keys=True,
-                                                                  separators=(",", ":")).encode()),
+                                                                   separators=(",", ":")).encode()),
                    "selected_payloads_opened": False},
         "implementation": {"files": implementation},
         "call_matrix_proposal": call_matrix,
@@ -221,7 +238,8 @@ def build_materials(project_root: Path) -> tuple[dict, dict]:
                     "attempts": 1, "parameter_updates": 0},
         "forbidden_calls": dict(ZERO_COUNTS),
         "status": {"fresh_source_hash_verification": "not_run",
-                   "checkpoint_and_batch_read": "not_run", "real_worker": "not_implemented",
+                   "checkpoint_and_batch_read": "not_run",
+                   "real_worker": "numerical_kernel_implemented_supervisor_integration_pending",
                    "external_authorization": "not_granted"},
     }
     package["metadata_sha256"] = _sha(json.dumps(package, sort_keys=True, separators=(",", ":")).encode())
@@ -251,8 +269,18 @@ def authorization_problems(auth: dict, package: dict) -> list[str]:
     bindings = auth.get("bindings")
     if type(bindings) is not dict or bindings.get("admission_metadata_sha256") != package.get("metadata_sha256"):
         problems.append("authorization_material_binding_mismatch")
-    if package.get("executable") is not True or package.get("status", {}).get("real_worker") != "implemented_and_reviewed":
-        problems.append("real_worker_not_frozen")
+    if type(bindings) is dict:
+        expected_bindings = {
+            "implementation_files": package.get("implementation", {}).get("files"),
+            "ic_acceptance": package.get("historical", {}).get("synthetic_ic_acceptance"),
+            "historical_d6_outcome": package.get("historical", {}).get("verified_outcome"),
+        }
+        for name, expected in expected_bindings.items():
+            if bindings.get(name) != expected:
+                problems.append("authorization_binding_mismatch:" + name)
+    if (package.get("executable") is not True or
+            package.get("status", {}).get("real_worker") != "implemented_and_reviewed_and_supervised"):
+        problems.append("real_worker_or_supervisor_not_frozen")
     if not isinstance(auth.get("approval_reference"), str) or not auth["approval_reference"].strip():
         problems.append("approval_reference_missing")
     return problems

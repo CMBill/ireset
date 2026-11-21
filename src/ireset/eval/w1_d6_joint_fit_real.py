@@ -161,10 +161,16 @@ def clip_from_snapshots(row, arrays, interval_table, joint_range):
 
 
 class BoundAssets:
-    def __init__(self, binding, meter, root=PROJECT_ROOT):
+    def __init__(self, binding, meter, root=PROJECT_ROOT, *, preloaded_raw=None):
         self.binding, self.meter = binding, meter
-        self.raw = {rel: bound_snapshot(root, spec, meter, 'asset_snapshot_reads', 'asset_snapshot_hashes')[0]
-                    for rel, spec in binding['files'].items()}
+        if preloaded_raw is None:
+            self.raw = {rel: bound_snapshot(root, spec, meter, 'asset_snapshot_reads', 'asset_snapshot_hashes')[0]
+                        for rel, spec in binding['files'].items()}
+        else:
+            p.require(type(preloaded_raw) is dict and set(preloaded_raw) == set(binding['files'])
+                      and all(type(raw) is bytes for raw in preloaded_raw.values()),
+                      'real_preloaded_asset_roster')
+            self.raw = dict(preloaded_raw)
 
     def xml(self, label):
         # MuJoCo VFS resolves assets by basename; bind a collision-free VFS
@@ -219,16 +225,27 @@ def scene_frame(assets, spec_key):
     return r, t
 
 
-def apparatus(bindings, meter, runtime):
+def apparatus(bindings, meter, runtime, *, preloaded_assets=None, preloaded_root_stats=None):
     budget = meter.budget
     runtime.check_unit('real_apparatus_entry')
-    assets = BoundAssets(bindings['production_assets'], meter)
+    if preloaded_assets is None:
+        assets = BoundAssets(bindings['production_assets'], meter)
+    else:
+        assets = BoundAssets(bindings['production_assets'], meter, preloaded_raw=preloaded_assets)
     # Seed-free apparatus; training initialization still occurs in Trainer.
     record = meter.unit('site_record_decodes', p.decode, assets.raw[r6.LOCKED['lock_record']])
     urdf = meter.unit('urdf_decodes', bytes.decode, assets.raw[r6.LOCKED['urdf']], 'utf-8')
     rs = bindings['root_stats']
-    raw, stat_rec = bound_snapshot(PROJECT_ROOT, rs['file'], meter, 'root_stats_reads', 'root_stats_hashes')
-    stats = snapshot_arrays(raw, ('mean', 'std'), rs['headers'], meter, 'root_stats_archives', 'root_stats_members')
+    if preloaded_root_stats is None:
+        raw, stat_rec = bound_snapshot(PROJECT_ROOT, rs['file'], meter, 'root_stats_reads', 'root_stats_hashes')
+        stats = snapshot_arrays(raw, ('mean', 'std'), rs['headers'], meter,
+                                'root_stats_archives', 'root_stats_members')
+    else:
+        stats, stat_rec = preloaded_root_stats
+        p.require(type(stats) is dict and set(stats) == {'mean', 'std'} and type(stat_rec) is dict
+                  and all(isinstance(stats[k], np.ndarray) and stats[k].dtype == np.float32
+                          and np.isfinite(stats[k]).all() for k in ('mean', 'std'))
+                  and (stats['std'] > 0).all(), 'real_preloaded_root_stats')
     p.require((stats['std'] > 0).all(), 'real_root_stats_std_domain')
     spec = assets.spec('joint')
     tokenizer = meter.unit('tokenizer_constructions', fit.StateTokenizer, spec.joint_range, fit.RootStats(**stats))

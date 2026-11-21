@@ -40,7 +40,7 @@ def test_metadata_package_binds_only_existing_records_and_source_roster(monkeypa
 def test_authorization_is_rejected_until_real_worker_is_frozen():
     package, draft = admission.build_materials(Path(__file__).resolve().parents[1])
     assert "authorization_not_signed" in admission.authorization_problems(draft, package)
-    assert "real_worker_not_frozen" in admission.authorization_problems(draft, package)
+    assert "real_worker_or_supervisor_not_frozen" in admission.authorization_problems(draft, package)
     forged = {**draft, "authorized": True, "template_only": False,
               "attempts": True, "checklist": dict.fromkeys(admission.CHECKLIST, True),
               "approval_reference": "review", "bindings": draft["bindings"]}

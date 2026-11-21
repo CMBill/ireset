@@ -1,8 +1,8 @@
-"""Fail-closed outer entry for the future one-shot real shared-gradient worker.
+"""Fail-closed outer entry for the one-shot real shared-gradient worker.
 
-This delivery freezes the launch boundary but does not provide or launch the
-numerical worker. A later revision must bind and review that worker before this
-command can be enabled.
+The numerical kernel is under implementation, but its production setup and
+outer wait/return evidence chain are not integrated or reviewed. This command
+therefore remains refusal-only.
 """
 
 import argparse
@@ -24,7 +24,7 @@ def main(argv=None):
     # Intentionally do not read the authorization path, worker inputs, or
     # output root in this implementation-only delivery.
     result = {"schema": admission.SCHEMA + "/supervisor_refusal",
-              "status": "refused", "reason": "real_worker_not_implemented_and_reviewed",
+              "status": "refused", "reason": "real_worker_supervisor_integration_not_reviewed",
               "authorization_path_opened": False, "worker_spawned": False,
               "checkpoint_or_batch_reads": 0, "parameter_updates": 0}
     print(json.dumps(result, sort_keys=True))
