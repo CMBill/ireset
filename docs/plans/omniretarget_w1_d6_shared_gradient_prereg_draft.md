@@ -114,4 +114,10 @@ I/C 纯合成实现已完成，验收细节见[验证记录](../verification/omn
 
 每例的精确运行计数、32 个同步点、工件读写/哈希矩阵、独立复核摘要和 16 文件实现闭包见验收 JSON；实现身份前后摘要为 `f65e074e2eea825933e0b6250674e368ae8bd35afdae0f2ea02e3b175e8feda3`。`attempt_001` 的槽位门失败及 `attempt_002`–`attempt_005` 的证据缺项均原样保留；只有 `attempt_006` 是当前权威。实现测试 18 passed；额外 Trainer/D6 相关回归结果见验证记录。
 
+## 11. 真实执行准入材料（2026-11-21；未授权）
+
+已增加 metadata-only 材料生成器、fail-closed supervisor 入口及反例测试。最新材料按独占递增 attempt 保存在 `derived/audit/w1_d6_shared_gradient_step0_v1/real_admission/`；早期尝试均原样保留，具体权威文件、SHA 与验证状态见[准入/监督验证记录](../verification/omniretarget_w1_d6_shared_gradient_admission.md)。该交付绑定既有 D6 `fit_insufficient` 独立裁决、固定 SHA 的历史 R6 metadata admission、D6 artifact index、I/C `attempt_006` 和当前 24 文件实现/方案闭包；只打开四份 JSON 元数据及实现/方案文本。D6 六个目标输入仅从既有 artifact index 消费登记的路径/字节数/SHA；不重新哈希或打开 checkpoint、NPZ、数据集或生产资产。R6 已登记的 41 项资产哈希作为历史元数据引用，不代表本轮重新验证资产。
+
+材料固定候选六窗、未来六份 D6 工件、root-stats 与 41 个生产资产读集合、单次执行上限 300s（240s 工作/60s 收口）、一次 attempt、更新 0，以及未来输出文件数量上限。当前 I/C 的 32 同步点与合成工件矩阵不能证明真实输入、资产构造、外层 `wait()`、进程组回收、同步回读与返回见证；这些在 admission JSON 中明确标为 `proposed_only_not_runtime_verified`。因此 admission state 是 `metadata_only_materials_drafted_worker_missing`、`executable=false`；草案 `authorized=false/template_only=true`，六项 checklist 均 null。supervisor 当前只做拒绝，不读授权、不启动进程，也不生成真实尝试根。**这不是可签发授权的材料包**：必须先实现真实 worker 与外层监督/返回证据链，再冻结完整精确矩阵并独立复核，生成绑定新实现闭包的材料后才可提交新的授权审阅。没有沿用 R6 或 D6/F 的任何授权。
+
 **边界：**这只验证合成目标、梯度归约、槽位/名册绑定、计数和有限存储/截止守卫。真实 archive/checkpoint/资产读取、真实 FK、真实七次 VJP、真实裁决均未运行，参数更新严格为 0。`--real` 入口在任何路径检查前拒绝；本记录不构成真实执行授权。真实阶段仍须新的冻结材料、完整外层 supervisor 与 I/O/runtime 矩阵、明确一次性授权；不得复用已消费的 D6/R6 授权。
