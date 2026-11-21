@@ -46,6 +46,7 @@ CHECKLIST = (
     "implementation_and_worker_closure_reviewed", "call_io_deadline_matrix_reviewed",
     "one_shot_300s_budget_and_zero_updates_reviewed", "independent_review_complete",
 )
+SUPERVISOR_GROUP_CLEANUP_CHECKS_MAX = 20
 
 
 class AdmissionError(RuntimeError):
@@ -155,6 +156,7 @@ def build_materials(project_root: Path) -> tuple[dict, dict]:
         "scripts/verify_w1_d6_shared_gradient.py",
         "scripts/prepare_w1_d6_shared_gradient_admission.py",
         "scripts/supervise_w1_d6_shared_gradient.py",
+        "tests/test_w1_d6_shared_gradient_supervisor.py",
         "tests/test_w1_d6_shared_gradient.py",
         "tests/test_w1_d6_shared_gradient_admission.py",
         "tests/test_w1_d6_shared_gradient_real.py",
@@ -183,7 +185,10 @@ def build_materials(project_root: Path) -> tuple[dict, dict]:
         "control": {"optimizer_construct": 0, "loader_iterations": 0, "contact_branch": 0,
                     "parameter_updates": 0},
         "supervisor": {"worker_launches": 1, "worker_retries": 0, "return_witnesses": 1,
-                       "pre_and_post_implementation_hash_passes": 2},
+                       "pre_and_post_implementation_hash_passes": 2,
+                       "process_group_created": 1, "actual_wait_calls": 1,
+                       "group_cleanup_checks_max": SUPERVISOR_GROUP_CLEANUP_CHECKS_MAX,
+                       "log_streams_drained": 2, "return_observation_write_readback": 1},
     }
     source_bindings = pkg["bindings"]
     production_assets = source_bindings["production_assets"]["files"]
@@ -239,7 +244,7 @@ def build_materials(project_root: Path) -> tuple[dict, dict]:
         "forbidden_calls": dict(ZERO_COUNTS),
         "status": {"fresh_source_hash_verification": "not_run",
                    "checkpoint_and_batch_read": "not_run",
-                   "real_worker": "numerical_kernel_implemented_supervisor_integration_pending",
+                   "real_worker": "kernel_and_supervisor_primitive_synthetic_reviewed_cli_refusal",
                    "external_authorization": "not_granted"},
     }
     package["metadata_sha256"] = _sha(json.dumps(package, sort_keys=True, separators=(",", ":")).encode())

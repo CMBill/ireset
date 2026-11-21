@@ -1,18 +1,337 @@
-"""Fail-closed outer entry for the one-shot real shared-gradient worker.
+"""Fail-closed outer entry and process supervisor for shared-gradient work.
 
-The numerical kernel is under implementation, but its production setup and
-outer wait/return evidence chain are not integrated or reviewed. This command
-therefore remains refusal-only.
+The process primitive is exercised only with synthetic children. The production
+CLI remains refusal-only until an exact worker packet and return contract are
+independently reviewed and frozen.
 """
 
 import argparse
+from dataclasses import dataclass
+import hashlib
 import json
+import os
 from pathlib import Path
+import secrets
+import signal
+import subprocess
 import sys
+import threading
+import time
+import stat
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 from ireset.eval import w1_d6_shared_gradient_admission as admission
+
+
+LOG_CAP = 256 << 10
+TERM_GRACE_S = 1.0
+GROUP_REAP_ROUNDS = 20
+GROUP_REAP_INTERVAL_S = 0.05
+
+
+@dataclass(frozen=True)
+class ExternalWaitWitness:
+    supervisor_pid: int
+    pid: int
+    process_group: int
+    return_code: int
+    started_at: float
+    waited_at: float
+    cleaned_at: float
+    group_reaped: bool
+    timed_out: bool
+    log_overflow: bool
+    logs: dict
+    _token: object
+
+
+@dataclass(frozen=True)
+class ExternalReturnWitness:
+    observation: dict
+    observation_sha256: str
+    final_sample: float
+    t0: float
+    registered_s: float
+    hard_deadline: float
+    _token: object
+
+
+_RETURN_TOKEN = object()
+_WAIT_TOKEN = object()
+
+
+def _hash_file(path: Path, expected_identity: tuple[int, int]) -> dict:
+    raw, identity = _read_regular(path, LOG_CAP, with_identity=True)
+    if identity != expected_identity:
+        raise ValueError("supervisor_file_identity_changed")
+    return {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+
+
+def _read_regular(path: Path, cap: int, *, with_identity=False):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > cap:
+            raise ValueError("supervisor_file_type_or_cap")
+        chunks, remaining = [], before.st_size
+        while remaining:
+            chunk = os.read(fd, min(remaining, 1 << 20))
+            if not chunk:
+                raise ValueError("supervisor_short_read")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(fd)
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != \
+                (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            raise ValueError("supervisor_file_changed_during_read")
+        raw = b"".join(chunks)
+        identity = (after.st_dev, after.st_ino)
+        return (raw, identity) if with_identity else raw
+    finally:
+        os.close(fd)
+
+
+def _real_directory(path: Path) -> Path:
+    supplied = Path(path).absolute()
+    resolved = supplied.resolve(strict=True)
+    if resolved != supplied or not resolved.is_dir():
+        raise ValueError("supervisor_directory_not_real")
+    return resolved
+
+
+def _group_exists(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _signal_group(pgid: int, sig: int) -> None:
+    try:
+        os.killpg(pgid, sig)
+    except ProcessLookupError:
+        pass
+
+
+def supervise_process(command: list[str], *, output_root: Path, t0: float,
+                      work_deadline: float, hard_deadline: float,
+                      clock=time.perf_counter, popen=subprocess.Popen,
+                      log_cap: int = LOG_CAP, term_grace_s: float = TERM_GRACE_S) -> ExternalWaitWitness:
+    """Wait for one process and prove process-group cleanup with bounded logs."""
+    root = _real_directory(output_root)
+    if (not isinstance(command, list) or not command or
+            not all(type(part) is str and part for part in command)):
+        raise ValueError("worker_command_invalid")
+    finite = lambda value: type(value) in (int, float) and value == value and abs(value) != float("inf")
+    if not (finite(t0) and finite(work_deadline) and finite(hard_deadline)
+            and finite(term_grace_s) and t0 <= work_deadline < hard_deadline
+            and clock() < work_deadline):
+        raise ValueError("worker_deadline_invalid")
+    if type(log_cap) is not int or log_cap <= 0 or term_grace_s < 0:
+        raise ValueError("worker_supervisor_limits_invalid")
+
+    log_paths = {"stdout": root / "worker.stdout.log", "stderr": root / "worker.stderr.log"}
+    streams, identities = {}, {}
+    for key, path in log_paths.items():
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        file_stat = os.fstat(fd)
+        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_nlink != 1:
+            os.close(fd)
+            raise ValueError("supervisor_log_not_regular")
+        identities[key] = (file_stat.st_dev, file_stat.st_ino)
+        streams[key] = os.fdopen(fd, "wb")
+    written = {key: 0 for key in streams}
+    overflow = {key: False for key in streams}
+
+    def drain(key, pipe):
+        try:
+            while True:
+                chunk = pipe.read(65536)
+                if not chunk:
+                    break
+                remaining = max(0, log_cap - written[key])
+                if remaining:
+                    streams[key].write(chunk[:remaining])
+                    written[key] += min(remaining, len(chunk))
+                if len(chunk) > remaining:
+                    overflow[key] = True
+        finally:
+            pipe.close()
+
+    process = None
+    threads = []
+    timed_out = False
+    launch_started_at = None
+    try:
+        launch_started_at = clock()
+        process = popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, start_new_session=True, close_fds=True)
+        pgid = process.pid
+        threads = [threading.Thread(target=drain, args=("stdout", process.stdout), daemon=True),
+                   threading.Thread(target=drain, args=("stderr", process.stderr), daemon=True)]
+        for thread in threads:
+            thread.start()
+        remaining = max(0., work_deadline - clock())
+        try:
+            return_code = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _signal_group(pgid, signal.SIGTERM)
+            try:
+                process.wait(timeout=term_grace_s)
+            except subprocess.TimeoutExpired:
+                pass
+            _signal_group(pgid, signal.SIGKILL)
+            return_code = process.wait()
+        waited_at = clock()
+
+        _signal_group(pgid, signal.SIGTERM)
+        for _ in range(GROUP_REAP_ROUNDS):
+            if not _group_exists(pgid):
+                break
+            if clock() >= hard_deadline:
+                break
+            time.sleep(min(GROUP_REAP_INTERVAL_S, max(0., hard_deadline - clock())))
+        if _group_exists(pgid):
+            _signal_group(pgid, signal.SIGKILL)
+        for thread in threads:
+            thread.join(timeout=max(0., hard_deadline - clock()))
+        group_reaped = not _group_exists(pgid) and all(not thread.is_alive() for thread in threads)
+        for stream in streams.values():
+            stream.flush()
+            os.fsync(stream.fileno())
+            stream.close()
+        cleaned_at = clock()
+        records = {key: _hash_file(path, identities[key]) for key, path in log_paths.items()}
+        return ExternalWaitWitness(os.getpid(), process.pid, pgid, return_code, launch_started_at,
+                                   waited_at, cleaned_at, group_reaped, timed_out,
+                                   any(overflow.values()), records, _WAIT_TOKEN)
+    except BaseException:
+        if process is not None:
+            _signal_group(process.pid, signal.SIGKILL)
+            try:
+                process.wait()
+            except Exception:
+                pass
+        raise
+    finally:
+        for pipe_name in ("stdout", "stderr"):
+            stream = streams.get(pipe_name)
+            if stream and not stream.closed:
+                stream.close()
+
+
+def return_witness(witness: ExternalWaitWitness, *, t0: float, registered_s: float,
+                   work_deadline: float, hard_deadline: float, final_sample: float) -> dict:
+    """Validate process return, cleanup, log caps, and end-to-end coverage."""
+    if not isinstance(witness, ExternalWaitWitness) or witness._token is not _WAIT_TOKEN:
+        raise ValueError("return_witness_wait_record_untrusted")
+    values = (t0, registered_s, work_deadline, hard_deadline, final_sample,
+              witness.started_at, witness.waited_at, witness.cleaned_at)
+    if not all(type(value) in (int, float) and value == value and abs(value) != float("inf")
+               for value in values):
+        raise ValueError("return_witness_nonfinite_time")
+    if not (t0 <= witness.started_at <= witness.waited_at <= witness.cleaned_at <= final_sample
+            <= t0 + registered_s <= hard_deadline and t0 <= work_deadline < hard_deadline
+            and registered_s >= 0 and witness.cleaned_at < work_deadline):
+        raise ValueError("return_witness_time_coverage")
+    if witness.pid != witness.process_group or witness.pid == witness.supervisor_pid \
+            or witness.return_code != 0 or witness.timed_out:
+        raise ValueError("return_witness_worker_not_successful")
+    if not witness.group_reaped or witness.log_overflow:
+        raise ValueError("return_witness_cleanup_or_log_failure")
+    if set(witness.logs) != {"stdout", "stderr"} or any(
+            type(rec) is not dict or type(rec.get("bytes")) is not int
+            or not 0 <= rec["bytes"] <= LOG_CAP
+            or not isinstance(rec.get("sha256"), str) or len(rec["sha256"]) != 64
+            or any(ch not in "0123456789abcdef" for ch in rec["sha256"])
+            for rec in witness.logs.values()):
+        raise ValueError("return_witness_log_contract")
+    return {"schema": admission.SCHEMA + "/external_return_witness_v1",
+            "supervisor_pid": witness.supervisor_pid, "pid": witness.pid,
+            "process_group": witness.process_group,
+            "return_code": witness.return_code, "started_at": witness.started_at,
+            "waited_at": witness.waited_at, "cleaned_at": witness.cleaned_at,
+            "final_sample": final_sample, "registered_s": registered_s,
+            "wall_cap_s": hard_deadline - t0, "group_reaped": True,
+            "timed_out": False, "log_overflow": False, "logs": witness.logs,
+            "coverage": "covered"}
+
+
+def seal_external_return(root: Path, wait: ExternalWaitWitness, *, t0: float,
+                         registered_s: float, work_deadline: float,
+                         hard_deadline: float, clock=time.perf_counter) -> ExternalReturnWitness:
+    """Publish/readback the pending proof, then take the final no-I/O sample."""
+    root = _real_directory(root)
+    candidate = return_witness(wait, t0=t0, registered_s=registered_s,
+                               work_deadline=work_deadline, hard_deadline=hard_deadline,
+                               final_sample=wait.cleaned_at)
+    observation = {key: value for key, value in candidate.items() if key != "final_sample"}
+    observation.update({"publication": "pending_actual_readback", "nonce": secrets.token_hex(16),
+                        "t0": t0, "work_deadline": work_deadline,
+                        "hard_deadline": hard_deadline, "receipt_pre_sample": clock()})
+    raw = (json.dumps(observation, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode()
+    path = Path(root) / "return_observation.json"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
+    receipt_stat = os.fstat(fd)
+    if not stat.S_ISREG(receipt_stat.st_mode) or receipt_stat.st_nlink != 1:
+        os.close(fd)
+        raise ValueError("return_observation_not_regular")
+    try:
+        with os.fdopen(fd, "wb", closefd=False) as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        os.close(fd)
+    directory_fd = os.open(Path(root), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    check, receipt_identity = _read_regular(path, 64 << 10, with_identity=True)
+    if receipt_identity != (receipt_stat.st_dev, receipt_stat.st_ino):
+        raise ValueError("return_observation_identity_changed")
+    if check != raw:
+        raise ValueError("return_observation_readback_mismatch")
+    rec = {"bytes": len(check), "sha256": hashlib.sha256(check).hexdigest()}
+    final_sample = clock()
+    finite_final = type(final_sample) in (int, float) and final_sample == final_sample \
+        and abs(final_sample) != float("inf")
+    if (not finite_final or final_sample - t0 > registered_s or final_sample > hard_deadline
+            or wait.cleaned_at >= work_deadline):
+        raise ValueError("return_observation_actual_coverage_failed")
+    return ExternalReturnWitness(observation, rec["sha256"], final_sample, t0,
+                                registered_s, hard_deadline, _RETURN_TOKEN)
+
+
+def verify_external_return(root: Path, witness: ExternalReturnWitness) -> dict:
+    """Consume only an unchanged disk receipt paired with this live witness."""
+    if not isinstance(witness, ExternalReturnWitness) or witness._token is not _RETURN_TOKEN:
+        raise ValueError("external_return_witness_missing")
+    path = _real_directory(root) / "return_observation.json"
+    raw = _read_regular(path, 64 << 10)
+    digest = hashlib.sha256(raw).hexdigest()
+    if digest != witness.observation_sha256:
+        raise ValueError("external_return_observation_drift")
+    observation = json.loads(raw)
+    receipt_pre_sample = observation.get("receipt_pre_sample")
+    if (observation != witness.observation or observation.get("publication") != "pending_actual_readback"
+            or observation.get("t0") != witness.t0
+            or observation.get("registered_s") != witness.registered_s
+            or observation.get("hard_deadline") != witness.hard_deadline
+            or type(receipt_pre_sample) not in (int, float)
+            or not witness.t0 <= receipt_pre_sample <= witness.final_sample
+            or witness.final_sample - witness.t0 > witness.registered_s
+            or witness.final_sample > witness.hard_deadline):
+        raise ValueError("external_return_observation_uncovered")
+    return {"coverage": "covered", "observation_sha256": digest,
+            "final_sample": witness.final_sample, "registered_s": witness.registered_s}
 
 
 def main(argv=None):

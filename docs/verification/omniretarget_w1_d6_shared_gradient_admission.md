@@ -1,6 +1,6 @@
 # W1 固定六窗共享梯度真实准入与监督材料
 
-**2026-11-21 · metadata-only 预准入材料生成；未读取 checkpoint/批次/资产 payload；无真实执行授权。**
+**2026-11-21 · metadata-only 预准入材料生成；worker 与 supervisor 进程原语合成复核；未读取 checkpoint/批次/资产 payload；无真实执行授权。**
 
 ## 结果
 
@@ -19,9 +19,17 @@ Admission 内部 canonical metadata SHA 为 `094413d6e2e87a046cdb040c8b34e25041a
 
 ## Fail-Closed 边界
 
-新增 `scripts/supervise_w1_d6_shared_gradient.py` 是明确拒绝的外层占位入口：当前无真实 worker，不打开授权路径、不创建运行根、不 spawn 子进程，退出码 3。真实入口要启用，需先实现并独立复核 numerical worker 与标准库 supervisor：启动前 t0、一次性 claim、完整实现闭包前后哈希、分阶段调用/运行时/同步/deadline 守卫、硬截止进程组终止和 wait/cleanup 收据、最后同步回读后的外部返回见证。不能把本稿的提议矩阵或旧 D6/R6 授权当作这些证明。
+`scripts/supervise_w1_d6_shared_gradient.py` 仍是明确拒绝的生产 CLI：不打开授权路径、不创建真实运行根、不 spawn 真实 worker，退出码 3。其合成可调用进程原语已实现并复核：独立 session/process group、stdout/stderr 并发排空及定额截断、真实 `Popen.wait()`、超时后的 TERM/KILL 和进程组回收检查、日志文件身份/哈希、pending return receipt 的 fsync 与同步回读。最后单调时钟样本只保存在私有内存 `ExternalReturnWitness` 中；盘上记录标记 `pending_actual_readback` 并保存回读前样本，避免把采样后的写盘时间伪称已覆盖。缺少该私有返回对象、工件漂移、迟返、超时、溢出或未回收均不能得到 `covered`。这些测试不构成真实 worker/授权消费证明。
 
-验证：新增 admission/supervisor 测试 3 passed，覆盖元数据读取范围、固定外部 SHA、R6/D6/I/C 交叉绑定、bool 冒充 attempt 计数拒绝、unsigned draft 与 supervisor 不读授权即拒绝。端到端运行只生成上述 metadata packet；checkpoint/archive payload、NPZ member、dataset、robot asset、模型、FK、autograd、更新和真实 supervisor wait 均 0。**当前交付完成的是预审材料骨架，不是可签署的真实准入包；不得据此授权运行。**
+验证：本轮共享梯度 worker、adapter、admission 与 supervisor 定向套件 **129 passed**。新增 8 项 supervisor 进程测试覆盖正常 `wait()`/日志/返回见证、超时回收、输出上限、存活后代进程组清理、预算迟返拒绝、receipt fsync/readback 与漂移拒绝、非有限 deadline 在 spawn 前拒绝；生产 CLI 的 refusal 回归仍通过。`compileall` 与 `git diff --check` 通过。测试只启动使用 Python `-I -c` 的合成子进程及临时目录；checkpoint/archive payload、NPZ member、dataset、robot asset、真实模型/FK/autograd/更新、真实 worker 和真实运行根均为 0。当前 `attempt_005` packet 是较早生成的历史 metadata-only 文件，未按本轮新增闭包重发；`executable=false`、`authorized=false`，不得据此授权运行。
+
+## Supervisor 合成复核（2026-11-21）
+
+`supervise_process()` 的启动边界、实际 `wait()` 返回、cleanup 完成和最后同步回读分开记录。Worker 在新 session 中启动，因此 PID 与 process-group ID 相等并与 supervisor PID 不同。父进程分别排空两个 pipe，日志最多保留登记上限字节但继续读取以避免 pipe deadlock；超量会使见证不可消费。截止超时会向整个 group 发送 SIGTERM，宽限后 SIGKILL，并实际 wait 主进程、检查 group 与排空线程是否消失。若 cleanup 不能被证明，见证拒绝。
+
+返回观察文件采用一次性创建、文件与目录 fsync、no-follow regular-file 回读和 inode/字节核验。回读后取得 final monotonic sample，不再写文件；因此落盘文件只能是 pending receipt，只有同进程返回的私有见证记录 final sample 并允许 `verify_external_return()` 消费。覆盖条件同时要求 worker 在工作 deadline 前清理完成，final sample 在登记墙钟与 hard deadline 内，exit code 为 0、未超时、group 已回收且日志未溢出。
+
+该单元尚未接到真实授权/claim/implementation-closure/worker launcher，也没有父级实际返回后的完整消费链。当前 CLI 继续拒绝运行；旧 D6/R6 授权不适用于此流程。
 
 ## 保留尝试
 
