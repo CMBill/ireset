@@ -121,7 +121,7 @@ def supervise_process(command: list[str], *, output_root: Path, t0: float,
                       work_deadline: float, hard_deadline: float,
                       clock=time.perf_counter, popen=subprocess.Popen,
                       log_cap: int = LOG_CAP, term_grace_s: float = TERM_GRACE_S,
-                      cwd: Path | None = None) -> ExternalWaitWitness:
+                      cwd: Path | None = None, env: dict[str, str] | None = None) -> ExternalWaitWitness:
     """Wait for one process and prove process-group cleanup with bounded logs."""
     root = _real_directory(output_root)
     if (not isinstance(command, list) or not command or
@@ -135,6 +135,10 @@ def supervise_process(command: list[str], *, output_root: Path, t0: float,
     if type(log_cap) is not int or log_cap <= 0 or term_grace_s < 0:
         raise ValueError("worker_supervisor_limits_invalid")
     working_directory = _real_directory(cwd) if cwd is not None else None
+    if env is not None and (type(env) is not dict or any(
+            type(key) is not str or not key or type(value) is not str or "\x00" in key + value
+            for key, value in env.items())):
+        raise ValueError("worker_environment_invalid")
 
     log_paths = {"stdout": root / "worker.stdout.log", "stderr": root / "worker.stderr.log"}
     streams, identities = {}, {}
@@ -172,7 +176,7 @@ def supervise_process(command: list[str], *, output_root: Path, t0: float,
         launch_started_at = clock()
         process = popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE, start_new_session=True, close_fds=True,
-                        cwd=working_directory)
+                        cwd=working_directory, env=env)
         pgid = process.pid
         threads = [threading.Thread(target=drain, args=("stdout", process.stdout), daemon=True),
                    threading.Thread(target=drain, args=("stderr", process.stderr), daemon=True)]
@@ -394,9 +398,275 @@ def _write_exclusive_json(root: Path, name: str, doc: dict) -> dict:
     return {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
 
 
+def _write_exclusive_bytes(root: Path, name: str, raw: bytes) -> dict:
+    if type(raw) is not bytes or not name or Path(name).name != name:
+        raise ValueError("supervisor_bytes_record_invalid")
+    path = root / name
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            raise ValueError("supervisor_bytes_not_regular")
+        with os.fdopen(fd, "wb", closefd=False) as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        os.close(fd)
+    dirfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(dirfd)
+    finally:
+        os.close(dirfd)
+    observed = _read_regular(path, len(raw) + 1)
+    if observed != raw:
+        raise ValueError("supervisor_bytes_readback_mismatch")
+    return {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+
+
+def consume_authorization_once(ledger_root: Path, *, authorization_sha256: str,
+                              launch_id: str, admission_sha256: str,
+                              implementation_sha256: str, t0: float) -> dict:
+    """Atomically consume one authorization digest; failures remain consumed."""
+    ledger_root = _real_directory(ledger_root)
+    is_sha = lambda value: isinstance(value, str) and len(value) == 64 and all(
+        char in "0123456789abcdef" for char in value)
+    if not all(is_sha(value) for value in (authorization_sha256, launch_id,
+                                            admission_sha256, implementation_sha256)):
+        raise ValueError("authorization_ledger_binding_invalid")
+    if type(t0) not in (int, float) or t0 != t0 or abs(t0) == float("inf"):
+        raise ValueError("authorization_ledger_time_invalid")
+    name = authorization_sha256
+    receipt = {"schema": admission.SCHEMA + "/authorization_consumption_v1",
+               "state": "consumed_before_worker_launch", "authorization_sha256": authorization_sha256,
+               "launch_id": launch_id, "admission_metadata_sha256": admission_sha256,
+               "implementation_closure_sha256": implementation_sha256, "t0": t0,
+               "attempts": 1, "retries": 0, "parameter_updates": 0}
+    directory = ledger_root / name
+    directory.mkdir(mode=0o700, exist_ok=False)
+    dirfd = os.open(ledger_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(dirfd)
+    finally:
+        os.close(dirfd)
+    record = _write_exclusive_json(directory, "consumed.json", receipt)
+    return {"path": name + "/consumed.json", "directory": name,
+            "record": receipt, **record}
+
+
+def _record_authorization_event(ledger_root: Path, ledger: dict, name: str, event: dict) -> dict:
+    if name not in {"launch_started.json", "candidate_validated.json", "return_candidate.json",
+                    "failed.json"}:
+        raise ValueError("authorization_ledger_event_name")
+    directory = _real_directory(Path(ledger_root) / ledger.get("directory", ""))
+    consumed = _read_regular(directory / "consumed.json", 64 << 10)
+    if hashlib.sha256(consumed).hexdigest() != ledger.get("sha256"):
+        raise ValueError("authorization_ledger_consumption_drift")
+    record = _write_exclusive_json(directory, name, event)
+    return {"path": ledger["directory"] + "/" + name, **record}
+
+
+def _read_authorization(authorization_path: Path, authorization_sha256: str) -> tuple[bytes, dict]:
+    raw = _read_bounded_regular(Path(authorization_path), 1 << 20)
+    if hashlib.sha256(raw).hexdigest() != authorization_sha256:
+        raise ValueError("authorization_sha256_mismatch")
+    try:
+        auth = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("authorization_json_invalid") from exc
+    if type(auth) is not dict:
+        raise ValueError("authorization_json_not_object")
+    return raw, auth
+
+
+def _approved_worker_argv(package: dict, launch_spec_path: Path,
+                          admission_path: Path, authorization_path: Path,
+                          authorization_sha256: str, project_root: Path) -> list[str]:
+    worker = package.get("worker_launch")
+    if type(worker) is not dict:
+        raise ValueError("authorized_worker_launcher_not_frozen")
+    template = worker.get("argv_template")
+    script_rel = worker.get("script_rel")
+    script = Path(script_rel) if isinstance(script_rel, str) else Path("/")
+    implementation_files = package.get("implementation", {}).get("files", {})
+    substitutions = {"{launch_spec}": str(launch_spec_path),
+                     "{admission_snapshot}": str(admission_path),
+                     "{authorization_snapshot}": str(authorization_path),
+                     "{authorization_sha256}": authorization_sha256}
+    if (worker.get("status") != "reviewed_executable" or worker.get("execution_mode") != "real_worker_v1"
+            or type(template) is not list or not template
+            or not all(type(part) is str and part for part in template)
+            or script.is_absolute() or ".." in script.parts or script_rel not in implementation_files
+            or len(template) < 3 or template[1] != "-I"
+            or template[2] != str(Path(project_root) / script)
+            or not Path(template[0]).is_absolute()
+            or any(template.count(token) != 1 for token in substitutions)):
+        raise ValueError("authorized_worker_launcher_not_frozen")
+    command = []
+    seen = set()
+    for part in template:
+        if part in substitutions:
+            seen.add(part)
+            command.append(substitutions[part])
+        elif "{" in part or "}" in part:
+            raise ValueError("authorized_worker_launcher_placeholder_invalid")
+        else:
+            command.append(part)
+    if seen != set(substitutions) or command[0] != package.get("worker_launch", {}).get("executable"):
+        raise ValueError("authorized_worker_launcher_binding_invalid")
+    return command
+
+
+def _approved_worker_environment(package: dict) -> dict[str, str]:
+    worker = package.get("worker_launch")
+    env = worker.get("env") if type(worker) is dict else None
+    if type(env) is not dict or any(type(key) is not str or not key or type(value) is not str
+                                    or "\x00" in key + value
+                                    for key, value in env.items()):
+        raise ValueError("authorized_worker_environment_not_frozen")
+    return dict(env)
+
+
+def run_authorized_attempt(*, authorization_path: Path, authorization_sha256: str,
+                           package: dict, project_root: Path,
+                           ledger_root: Path, clock=time.perf_counter,
+                           popen=subprocess.Popen) -> dict:
+    """Run only a separately approved, package-pinned worker exactly once."""
+    project_root = _real_directory(project_root)
+    if type(package) is not dict or package.get("schema") != admission.SCHEMA:
+        raise ValueError("real_admission_package_invalid")
+    package_body = {key: value for key, value in package.items() if key != "metadata_sha256"}
+    if (package.get("executable") is not True
+            or package.get("metadata_sha256") != _canonical_sha(package_body)
+            or package.get("status", {}).get("real_worker") != "implemented_and_reviewed_and_supervised"):
+        raise ValueError("real_admission_not_executable")
+    auth_raw, auth = _read_authorization(authorization_path, authorization_sha256)
+    problems = admission.authorization_problems(auth, package)
+    if problems:
+        raise ValueError("real_authorization_rejected:" + ",".join(problems))
+    launch_id = auth.get("launch_id")
+    if (not isinstance(launch_id, str) or len(launch_id) != 64
+            or any(ch not in "0123456789abcdef" for ch in launch_id)):
+        raise ValueError("real_authorization_launch_id_invalid")
+
+    proposed = Path(package.get("proposed_real_root", ""))
+    if (proposed.is_absolute() or ".." in proposed.parts or not proposed.parts
+            or str(project_root / proposed) != str(project_root / admission.PROPOSED_REAL_ROOT)):
+        raise ValueError("real_attempt_root_not_frozen")
+    attempt_root = project_root / proposed
+    parent = _real_directory(attempt_root.parent)
+    if parent != attempt_root.parent or attempt_root.exists():
+        raise ValueError("real_attempt_root_not_exclusive")
+    ledger_root = _real_directory(ledger_root)
+    ledger_rel = Path(package.get("authorization_consumption_ledger", ""))
+    if (ledger_rel.is_absolute() or ".." in ledger_rel.parts or not ledger_rel.parts
+            or ledger_root != project_root / ledger_rel):
+        raise ValueError("real_authorization_ledger_root_not_frozen")
+    pre = _implementation_closure(project_root, package.get("implementation", {}).get("files"))
+
+    t0 = clock()
+    budgets = package.get("budgets")
+    if (type(t0) not in (int, float) or t0 != t0 or abs(t0) == float("inf")
+            or type(budgets) is not dict
+            or type(budgets.get("work_cap_s")) is not int or budgets["work_cap_s"] != 240
+            or type(budgets.get("wall_cap_s")) is not int or budgets["wall_cap_s"] != 300
+            or type(budgets.get("attempts")) is not int or budgets["attempts"] != 1
+            or type(budgets.get("parameter_updates")) is not int or budgets["parameter_updates"] != 0):
+        raise ValueError("real_execution_budget_not_frozen")
+    work_deadline, hard_deadline = t0 + 240., t0 + 300.
+    ledger = consume_authorization_once(
+        ledger_root, authorization_sha256=authorization_sha256, launch_id=launch_id,
+        admission_sha256=package["metadata_sha256"], implementation_sha256=_canonical_sha(pre), t0=t0,
+    )
+    attempt_root.mkdir(mode=0o700, exist_ok=False)
+    attempt = _real_directory(attempt_root)
+    package_path = attempt / "admission_snapshot.json"
+    auth_path = attempt / "authorization_snapshot.json"
+    package_record = _write_exclusive_json(attempt, package_path.name, package)
+    auth_record = _write_exclusive_bytes(attempt, auth_path.name, auth_raw)
+    launch_spec = {"schema": admission.SCHEMA + "/worker_launch_spec_v1",
+                   "execution_mode": "real_worker_v1", "launch_id": launch_id,
+                   "authorization_sha256": authorization_sha256,
+                   "authorization_record": auth_record,
+                   "admission_metadata_sha256": package["metadata_sha256"],
+                   "admission_record": package_record,
+                   "implementation_pre": pre,
+                   "implementation_pre_sha256": _canonical_sha(pre),
+                   "authorization_ledger": {"path": ledger["path"], "sha256": ledger["sha256"]},
+                   "attempt_root": str(attempt), "t0": t0,
+                   "work_deadline": work_deadline, "hard_deadline": hard_deadline,
+                   "parameter_updates": 0}
+    launch_spec_record = _write_exclusive_json(attempt, "worker_launch.json", launch_spec)
+    command = _approved_worker_argv(package, attempt / "worker_launch.json", package_path,
+                                    auth_path, authorization_sha256, project_root)
+    worker_env = _approved_worker_environment(package)
+    launch_event = _record_authorization_event(
+        ledger_root, ledger, "launch_started.json",
+        {"schema": admission.SCHEMA + "/authorization_event_v1", "event": "launch_started",
+         "launch_id": launch_id, "attempt_root": str(attempt),
+         "launch_spec_sha256": launch_spec_record["sha256"], "parameter_updates": 0},
+    )
+    wait = supervise_process(command, output_root=attempt, t0=t0, work_deadline=work_deadline,
+                             hard_deadline=hard_deadline, clock=clock, popen=popen,
+                             cwd=project_root, env=worker_env)
+    if wait.return_code != 0 or wait.timed_out or not wait.group_reaped or wait.log_overflow:
+        raise ValueError("real_worker_failed_or_unclean")
+    result_raw = _read_regular(attempt / "worker_result.json", 2 << 20)
+    try:
+        worker_result = json.loads(result_raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("real_worker_result_invalid") from exc
+    if (type(worker_result) is not dict
+            or worker_result.get("schema") != "w1_d6_shared_gradient_real_worker_v1/worker_result"
+            or worker_result.get("status") != "candidate_pending_external_return"
+            or worker_result.get("launch_id") != launch_id
+            or worker_result.get("authorization_sha256") != authorization_sha256
+            or worker_result.get("admission_metadata_sha256") != package["metadata_sha256"]
+            or type(worker_result.get("parameter_updates")) is not int
+            or worker_result.get("parameter_updates") != 0
+            or type(worker_result.get("independent_review")) is not dict
+            or worker_result["independent_review"].get("passed") is not True):
+        raise ValueError("real_worker_result_binding_or_review")
+    post = _implementation_closure(project_root, package["implementation"]["files"])
+    if post != pre:
+        raise ValueError("implementation_closure_changed_during_worker")
+    result_record = {"bytes": len(result_raw), "sha256": hashlib.sha256(result_raw).hexdigest()}
+    candidate_event = _record_authorization_event(
+        ledger_root, ledger, "candidate_validated.json",
+        {"schema": admission.SCHEMA + "/authorization_event_v1", "event": "candidate_validated",
+         "launch_id": launch_id, "worker_result_sha256": result_record["sha256"],
+         "parameter_updates": 0},
+    )
+    wait_record = return_witness(wait, t0=t0, registered_s=300., work_deadline=work_deadline,
+                                 hard_deadline=hard_deadline, final_sample=wait.cleaned_at)
+    return_candidate_event = _record_authorization_event(
+        ledger_root, ledger, "return_candidate.json",
+        {"schema": admission.SCHEMA + "/authorization_event_v1", "event": "return_candidate",
+         "launch_id": launch_id, "implementation_closure_sha256": _canonical_sha(post),
+         "worker_result_sha256": result_record["sha256"], "parameter_updates": 0},
+    )
+    binding_facts = {"authorization_ledger": {"path": ledger["path"], "sha256": ledger["sha256"]},
+                     "authorization_ledger_events": [launch_event, candidate_event, return_candidate_event],
+                     "launch_spec": launch_spec_record, "worker_result": result_record,
+                     "implementation_pre_sha256": _canonical_sha(pre),
+                     "implementation_post_sha256": _canonical_sha(post),
+                     "wait_witness_sha256": _canonical_sha(wait_record), "parameter_updates": 0}
+    receipt = seal_external_return(attempt, wait, t0=t0, registered_s=300.,
+                                   work_deadline=work_deadline, hard_deadline=hard_deadline,
+                                   clock=clock, binding_facts=binding_facts)
+    consumed = verify_external_return(attempt, receipt)
+    if consumed.get("coverage") != "covered" or receipt.observation.get("binding_facts") != binding_facts:
+        raise ValueError("real_external_return_binding_failed")
+    return {"status": "candidate_complete", "attempt_root": str(attempt),
+            "authorization_ledger": ledger, "launch_spec": launch_spec,
+            "authorization_ledger_events": [launch_event, candidate_event, return_candidate_event],
+            "worker_result": worker_result, "wait": wait_record,
+            "return": consumed, "parameter_updates": 0}
+
+
 def run_synthetic_attempt(*, authorization_path: Path, authorization_sha256: str,
                           package: dict, project_root: Path, attempt_root: Path,
-                          command: list[str], work_cap_s: float = 5.0,
+                          ledger_root: Path, work_cap_s: float = 5.0,
                           hard_cap_s: float = 10.0, clock=time.perf_counter,
                           popen=subprocess.Popen) -> dict:
     """Exercise the complete outer contract with an explicitly synthetic packet."""
@@ -433,6 +703,19 @@ def run_synthetic_attempt(*, authorization_path: Path, authorization_sha256: str
     work_deadline = t0 + work_cap_s
     pre = _implementation_closure(project_root, package.get("implementation", {}).get("files"))
 
+    worker_launch = package.get("worker_launch")
+    command = worker_launch.get("argv") if type(worker_launch) is dict else None
+    worker_env = worker_launch.get("env") if type(worker_launch) is dict else None
+    if (type(command) is not list or not command or not all(type(part) is str and part for part in command)
+            or type(worker_env) is not dict or any(type(k) is not str or type(v) is not str
+                                                   for k, v in worker_env.items())
+            or worker_launch.get("shell") is not False or worker_launch.get("status") != "synthetic_test_only"):
+        raise ValueError("synthetic_worker_command_not_pinned")
+    ledger = consume_authorization_once(
+        ledger_root, authorization_sha256=authorization_sha256, launch_id=auth["launch_id"],
+        admission_sha256=package["metadata_sha256"], implementation_sha256=_canonical_sha(pre), t0=t0,
+    )
+
     supplied_attempt.mkdir(mode=0o700, exist_ok=False)
     attempt = _real_directory(supplied_attempt)
     launch_id = auth.get("launch_id")
@@ -445,9 +728,22 @@ def run_synthetic_attempt(*, authorization_path: Path, authorization_sha256: str
              "t0": t0, "work_deadline": work_deadline, "hard_deadline": hard_deadline,
              "attempt": 1, "parameter_updates": 0}
     claim_record = _write_exclusive_json(attempt, "claim.json", claim)
+    launch_spec = {"schema": admission.SCHEMA + "/synthetic_worker_launch_v1",
+                   "launch_id": launch_id, "authorization_sha256": authorization_sha256,
+                   "admission_metadata_sha256": package["metadata_sha256"],
+                   "implementation_closure_sha256": _canonical_sha(pre),
+                   "ledger_sha256": ledger["sha256"], "parameter_updates": 0}
+    launch_spec_record = _write_exclusive_json(attempt, "worker_launch.json", launch_spec)
+    launch_event = _record_authorization_event(
+        ledger_root, ledger, "launch_started.json",
+        {"schema": admission.SCHEMA + "/authorization_event_v1", "event": "launch_started",
+         "launch_id": launch_id, "attempt_root": str(attempt),
+         "launch_spec_sha256": launch_spec_record["sha256"], "parameter_updates": 0},
+    )
 
     wait = supervise_process(command, output_root=attempt, t0=t0, work_deadline=work_deadline,
-                             hard_deadline=hard_deadline, clock=clock, popen=popen, cwd=attempt)
+                             hard_deadline=hard_deadline, clock=clock, popen=popen, cwd=attempt,
+                             env=worker_env)
     if wait.return_code != 0 or wait.timed_out or not wait.group_reaped or wait.log_overflow:
         raise ValueError("synthetic_worker_failed_or_unclean")
     candidate_raw = _read_regular(attempt / "worker_candidate.json", 64 << 10)
@@ -460,10 +756,17 @@ def run_synthetic_attempt(*, authorization_path: Path, authorization_sha256: str
                           "authorization_sha256": authorization_sha256,
                           "admission_metadata_sha256": package["metadata_sha256"],
                           "implementation_closure_sha256": _canonical_sha(pre),
+                          "ledger_sha256": ledger["sha256"],
                           "parameter_updates": 0}
     if candidate != expected_candidate:
         raise ValueError("synthetic_worker_candidate_binding")
     candidate_record = {"bytes": len(candidate_raw), "sha256": hashlib.sha256(candidate_raw).hexdigest()}
+    candidate_event = _record_authorization_event(
+        ledger_root, ledger, "candidate_validated.json",
+        {"schema": admission.SCHEMA + "/authorization_event_v1", "event": "candidate_validated",
+         "launch_id": launch_id, "candidate_sha256": candidate_record["sha256"],
+         "parameter_updates": 0},
+    )
 
     post = _implementation_closure(project_root, package["implementation"]["files"])
     if post != pre:
@@ -471,7 +774,15 @@ def run_synthetic_attempt(*, authorization_path: Path, authorization_sha256: str
     wait_record = return_witness(wait, t0=t0, registered_s=hard_cap_s,
                                  work_deadline=work_deadline, hard_deadline=hard_deadline,
                                  final_sample=wait.cleaned_at)
-    binding_facts = {"claim": claim_record, "candidate": candidate_record,
+    return_candidate_event = _record_authorization_event(
+        ledger_root, ledger, "return_candidate.json",
+        {"schema": admission.SCHEMA + "/authorization_event_v1", "event": "return_candidate",
+         "launch_id": launch_id, "implementation_closure_sha256": _canonical_sha(post),
+         "candidate_sha256": candidate_record["sha256"], "parameter_updates": 0},
+    )
+    binding_facts = {"claim": claim_record, "ledger": {"path": ledger["path"], "sha256": ledger["sha256"]},
+                     "ledger_events": [launch_event, candidate_event, return_candidate_event],
+                     "launch_spec": launch_spec_record, "candidate": candidate_record,
                      "implementation_pre_sha256": _canonical_sha(pre),
                      "implementation_post_sha256": _canonical_sha(post),
                      "wait_witness_sha256": _canonical_sha(wait_record),
@@ -487,6 +798,8 @@ def run_synthetic_attempt(*, authorization_path: Path, authorization_sha256: str
         raise ValueError("synthetic_return_binding_failed")
     return {"status": "candidate_complete", "attempt_root": str(attempt),
             "claim": claim, "claim_sha256": claim_record["sha256"],
+            "authorization_ledger": ledger, "launch_spec": launch_spec,
+            "authorization_ledger_events": [launch_event, candidate_event, return_candidate_event],
             "candidate": candidate, "candidate_sha256": candidate_record["sha256"],
             "implementation_pre_sha256": _canonical_sha(pre),
             "implementation_post_sha256": _canonical_sha(post),

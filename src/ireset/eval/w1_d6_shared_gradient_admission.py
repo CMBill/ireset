@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import sys
 
 
 SCHEMA = "w1_d6_shared_gradient_real_admission_v1"
@@ -24,6 +25,7 @@ OUTCOME = Path("derived/audit/w1_d6_joint_fit_lr_half_v1/execution_review/verifi
 INDEX = SOURCE_ROOT / "d6/artifacts_index.json"
 IC_ACCEPTANCE = ROOT_REL / "synthetic/attempt_006/cuda_acceptance.json"
 REVIEW_DIR = ROOT_REL / "real_admission"
+AUTHORIZATION_LEDGER_REL = ROOT_REL / "authorization_consumption_v1"
 METADATA_PINS = {
     "r6": (205291, "9e54107c7a6bf812b0f87098f1925e1d2f09293f4c1affd825179c28988eb527"),
     "outcome": (21510, "1de06dae2eca5d554b948db24e33399647f868ef60283ace4775e887e57e56b0"),
@@ -189,8 +191,29 @@ def build_materials(project_root: Path) -> tuple[dict, dict]:
                        "process_group_created": 1, "actual_wait_calls": 1,
                        "group_cleanup_checks_max": SUPERVISOR_GROUP_CLEANUP_CHECKS_MAX,
                        "log_streams_drained": 2, "return_observation_write_readback": 1,
-                       "synthetic_claim_writes": 1, "synthetic_candidate_readbacks": 1,
+                       "authorization_consumption_markers": 1, "authorization_ledger_events_max": 4,
+                       "launch_spec_writes": 1, "worker_result_reads": 1,
+                       "implementation_closure_hash_passes": 2,
                        "authorization_file_reads": 1, "attempts": 1},
+    }
+    worker_launch = {
+        "script_rel": "scripts/run_w1_d6_shared_gradient_worker.py",
+        "argv_template": [sys.executable, "-I",
+                          str(root / "scripts/run_w1_d6_shared_gradient_worker.py"),
+                          "--launch-spec", "{launch_spec}",
+                          "--admission-snapshot", "{admission_snapshot}",
+                          "--authorization-snapshot", "{authorization_snapshot}",
+                          "--authorization-sha256", "{authorization_sha256}"],
+        "executable": sys.executable,
+        "cwd": "project_root",
+        "env": {"PYTHONNOUSERSITE": "1", "PYTHONHASHSEED": "0",
+                "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1",
+                "OPENBLAS_NUM_THREADS": "1"},
+        "shell": False,
+        "inherit_stdin": False,
+        "new_process_group": True,
+        "execution_mode": "real_worker_v1",
+        "status": "proposed_not_executable",
     }
     source_bindings = pkg["bindings"]
     production_assets = source_bindings["production_assets"]["files"]
@@ -221,9 +244,10 @@ def build_materials(project_root: Path) -> tuple[dict, dict]:
     # The current I/C matrix describes synthetic core work only. Real source,
     # asset, setup and outer-return counts remain proposed until worker review.
     package = {
-        "schema": SCHEMA, "state": "metadata_only_real_execution_pending_synthetic_outer_chain_reviewed",
+        "schema": SCHEMA, "state": "metadata_only_real_execution_pending_authorized_worker_cli_review",
         "executable": False, "authorized": False,
         "proposed_real_root": str(PROPOSED_REAL_ROOT),
+        "authorization_consumption_ledger": str(AUTHORIZATION_LEDGER_REL),
         "historical": {"r6": meta_records["r6"], "verified_outcome": meta_records["outcome"],
                        "d6_artifacts_index": meta_records["d6_index"],
                        "synthetic_ic_acceptance": meta_records["ic_acceptance"]},
@@ -239,6 +263,7 @@ def build_materials(project_root: Path) -> tuple[dict, dict]:
                                                                    separators=(",", ":")).encode()),
                    "selected_payloads_opened": False},
         "implementation": {"files": implementation},
+        "worker_launch": worker_launch,
         "call_matrix_proposal": call_matrix,
         "io_matrix_proposal": io_matrix,
         "budgets": {"wall_cap_s": 300, "work_cap_s": 240, "seal_return_reserve_s": 60,
@@ -246,7 +271,7 @@ def build_materials(project_root: Path) -> tuple[dict, dict]:
         "forbidden_calls": dict(ZERO_COUNTS),
         "status": {"fresh_source_hash_verification": "not_run",
                    "checkpoint_and_batch_read": "not_run",
-                   "real_worker": "worker_and_synthetic_supervisor_chain_reviewed_production_refusal",
+                   "real_worker": "numerical_worker_in_process_only_supervised_cli_pending",
                    "external_authorization": "not_granted"},
     }
     package["metadata_sha256"] = _sha(json.dumps(package, sort_keys=True, separators=(",", ":")).encode())
@@ -256,8 +281,9 @@ def build_materials(project_root: Path) -> tuple[dict, dict]:
         "attempts": 1, "checklist": dict.fromkeys(CHECKLIST), "approval_reference": None,
         "bindings": {"admission_metadata_sha256": package["metadata_sha256"],
                      "ic_acceptance": meta_records["ic_acceptance"],
-                     "historical_d6_outcome": meta_records["outcome"],
-                     "implementation_files": implementation},
+                      "historical_d6_outcome": meta_records["outcome"],
+                      "implementation_files": implementation,
+                      "worker_launch": worker_launch},
     }
     return package, draft
 
@@ -281,6 +307,7 @@ def authorization_problems(auth: dict, package: dict) -> list[str]:
             "implementation_files": package.get("implementation", {}).get("files"),
             "ic_acceptance": package.get("historical", {}).get("synthetic_ic_acceptance"),
             "historical_d6_outcome": package.get("historical", {}).get("verified_outcome"),
+            "worker_launch": package.get("worker_launch"),
         }
         for name, expected in expected_bindings.items():
             if bindings.get(name) != expected:
