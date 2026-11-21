@@ -239,12 +239,14 @@ class Trainer:
             persistent_workers=cfg.num_workers > 0,
             worker_init_fn=_worker_thread_limits,
         )
+        self._constructed("train_loader")
         g_val = torch.Generator().manual_seed(cfg.seed)
         enter('val_loader')
         self.val_loader = DataLoader(
             val_ds, batch_size=cfg.micro_batch, shuffle=False,
             num_workers=0, drop_last=False, generator=g_val,
         )
+        self._constructed("val_loader")
 
     def _constructed(self, unit: str) -> None:
         observer = getattr(self, "_construction_observer", None)
