@@ -1,10 +1,12 @@
 # 文档索引
 
-最后更新：2026-11-20。**[固定六窗联合拟合](verification/omniretarget_w1_d6_joint_fit_result.md)已完成唯一一次真实 D6 → F 并通过证据验收：`fit_insufficient`（0/6 窗四门全过），F 两端逐位重放通过，一次性授权已消费。** [固定单窗学习率日程对照](verification/omniretarget_w1_d1_lr_schedule_diagnostic.md#8-真实-b-执行与最终比较2026-11-18)的 B 仍为四项平均门全过，仅限固定单窗。冻结原文和历史工件保持原路径、原字节。
+最后更新：2026-11-21。**[固定六窗联合拟合](verification/omniretarget_w1_d6_joint_fit_result.md)已完成唯一一次真实 D6 → F 并通过证据验收：`fit_insufficient`（0/6 窗四门全过），F 两端逐位重放通过，一次性授权已消费。** 本轮[共享梯度诊断 I/C](verification/omniretarget_w1_d6_shared_gradient_i_c.md)纯合成验收通过（权威 `attempt_006`：18/18 CUDA cases、18/18 独立读盘复核）；真实 checkpoint/数据未读、真实诊断未授权未运行。 [固定单窗学习率日程对照](verification/omniretarget_w1_d1_lr_schedule_diagnostic.md#8-真实-b-执行与最终比较2026-11-18)的 B 仍为四项平均门全过，仅限固定单窗。冻结原文和历史工件保持原路径、原字节。
 
 ## 当前状态
 
 - **2026-11-20 六窗误差复盘完成。** 40 项 CPU 合成验收通过，唯一归档复盘独立核对 606 窗行、24 条曲线和 101 对共同窗。四指标最早持续差距均始于 step10，六窗的固定 FK 三点组均无持续集中，裁决 `attribution_insufficient`。[逐窗误差复盘报告](verification/omniretarget_w1_d6_window_error_review.md)
+- **2026-11-21 共享梯度诊断 I/C 完成。** D6 生产架构、生产损失与合成 FK 下，9 组输入 × 2 个模型 seed 的 18 个 CUDA cases 全通过固定 `h`/参数加性门，18/18 独立读盘复核；16 文件实现身份前后稳定。结果仅支持合成机制验收，真实阶段仍需另行冻结与明确授权。[I/C 验证记录](verification/omniretarget_w1_d6_shared_gradient_i_c.md)
+- **2026-11-21 共享梯度独立 worker 与真实路径矩阵实现完成，限临时 fake-worker/metadata-only 验收。** package-pinned CLI 在数值核心导入前验证快照、授权和实现闭包；worker 与 supervisor 按冻结 call/I/O 矩阵、runtime 和返回见证核验。相关回归 147 passed；当前 `attempt_018` 仍 `executable=false/authorized=false`，未读取真实 payload、未运行真实 worker，生产 supervisor 仍 refusal-only。[准入/监督记录](verification/omniretarget_w1_d6_shared_gradient_admission.md)
 - **2026-11-20 六窗真实诊断收口**：D6 1000 更新、101 批 probe/606 窗行；F 端点逐位重放、阶段和外层实际返回覆盖均通过。整链至最后见证同步回读 1638.648367 s ≤ 登记 1642.608866 s ≤ 4200 s。详见[逐窗裁决及返回证据](verification/omniretarget_w1_d6_joint_fit_result.md)。
 - **2026-11-19 六窗授权前复核**：补齐 §6.3 的逐构造/转移/加载和终点证据硬门；双身份绑定与未签草案已独立回读。定向回归共 235 项通过，见[授权前记录](verification/omniretarget_w1_d6_joint_fit_preauthorization.md)。
 - **2026-11-19 六窗外层计时修复**：父进程覆盖启动前起点、实际退出和清理、定额日志、最后同步与回读；缺见证或迟返仅判 `incomplete`。新增 48 项、R6/适配回归 34 项、I6 回归 90 项通过，见[修复验收记录](verification/omniretarget_w1_d6_joint_fit_outer.md)。
@@ -32,6 +34,8 @@
 | [固定六窗真实诊断结果](verification/omniretarget_w1_d6_joint_fit_result.md) | **已收口**：`fit_insufficient`，证据完整、端点重放通过；不自动续行。 |
 | [固定六窗逐窗误差复盘方案](plans/omniretarget_w1_d6_window_error_review_plan.md) | **冻结的 v0.3**，含两侧历史准入与组级候选判据。 |
 | [固定六窗逐窗误差复盘报告](verification/omniretarget_w1_d6_window_error_review.md) | **已验收**，共同窗 `comparable`，组级调权候选 `null`。 |
+| [固定六窗共享梯度诊断预注册草案](plans/omniretarget_w1_d6_shared_gradient_prereg_draft.md) | **v0.3 复阅修订**。绑定首个训练批、成对梯度返回、完整调用矩阵和实现身份，训练更新额度为 0。 |
+| [固定六窗共享梯度诊断 I/C 验证记录](verification/omniretarget_w1_d6_shared_gradient_i_c.md) | **纯合成验收通过**：18/18 CUDA cases、18/18 独立读盘复核；不读取真实数据/检查点，不授权真实阶段。 |
 | [固定六窗 I6 验证记录](verification/omniretarget_w1_d6_joint_fit_i6.md) | **纯 CPU 合成复阅通过**：载荷、日程、逐窗门、端点重放与实际退出覆盖。 |
 | [固定六窗 R6 与旧身份](verification/omniretarget_w1_d6_joint_fit_r6.md) | **唯一正式 R6 已消费**：历史封存和未签草案不变，不绑定修订后的代码。 |
 | [固定六窗外层计时修复](verification/omniretarget_w1_d6_joint_fit_outer.md) | **纯合成验收通过**：启动、返回、最后回读及独立见证；不放行真实运行。 |
@@ -50,6 +54,8 @@
 **2026-11-20 六窗范围已结束：**唯一 `["D6","F"]` 授权已消费。保留负结果与保存曲线，不重跑 R6 或真实链，不追加 D1、六窗恒定学习率对照或其他实验。
 
 六窗归档复盘已按 v0.3 完成，组级调权判据未满足。任何新真实数值诊断须另立范围、预算并取得明确授权。[逐窗误差复盘报告](verification/omniretarget_w1_d6_window_error_review.md)
+
+共享梯度 I/C 已在 D6 架构上完成纯合成验收，拟量化 step0 时其余五窗对共同窗下降方向的合计投影。独立 worker/真实路径矩阵虽已实现，但 `attempt_018` 不可执行、无真实授权；真实求导和 CUDA/runtime/I/O 链仍未运行。[固定六窗共享梯度诊断预注册草案](plans/omniretarget_w1_d6_shared_gradient_prereg_draft.md) · [I/C 验证记录](verification/omniretarget_w1_d6_shared_gradient_i_c.md) · [准入/监督记录](verification/omniretarget_w1_d6_shared_gradient_admission.md)
 
 学习率对照已按[冻结方案](plans/omniretarget_w1_d1_lr_schedule_diagnostic_plan.md)完成，前 500 步与 A 的共同前缀核验通过，B 在 step1000 四门达标。结论只覆盖固定窗和固定 seed，不代表泛化或生产资格；不自动追加 D6、续训或下一实验。
 

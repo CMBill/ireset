@@ -1,7 +1,13 @@
 import io
+import builtins
+import hashlib
+import importlib.util
 import json
+import os
 from collections import Counter
 from pathlib import Path
+import sys
+import time
 
 import numpy as np
 import pytest
@@ -11,6 +17,138 @@ from torch import nn
 from ireset.eval import w1_d6_joint_fit_evidence as evidence
 from ireset.eval import w1_d6_shared_gradient as shared
 from ireset.eval import w1_d6_shared_gradient_real as real
+
+
+def test_worker_cli_rejects_bad_launch_before_importing_numeric_core(tmp_path, monkeypatch):
+    script = Path(__file__).resolve().parents[1] / "scripts/run_w1_d6_shared_gradient_worker.py"
+    spec = importlib.util.spec_from_file_location("d6_worker_cli_preflight_test", script)
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+    attempted_numeric_imports = []
+    original_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name in {"ireset.eval.w1_d6_shared_gradient_real", "ireset.eval.w1_d6_shared_gradient"}:
+            attempted_numeric_imports.append(name)
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    with pytest.raises(OSError):
+        cli.execute_worker(
+            launch_spec_path=tmp_path / "missing-launch.json",
+            admission_snapshot_path=tmp_path / "admission.json",
+            authorization_snapshot_path=tmp_path / "authorization.json",
+            authorization_sha256="0" * 64,
+            project_root=tmp_path,
+        )
+    assert attempted_numeric_imports == []
+
+
+def test_worker_preimport_closure_rejects_symlinked_parent(tmp_path):
+    script = Path(__file__).resolve().parents[1] / "scripts/run_w1_d6_shared_gradient_worker.py"
+    spec = importlib.util.spec_from_file_location("d6_worker_cli_symlink_test", script)
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+    project = tmp_path / "project"
+    external = tmp_path / "external"
+    project.mkdir()
+    external.mkdir()
+    (external / "module.py").write_text("payload\n")
+    (project / "src").symlink_to(external, target_is_directory=True)
+    record = (external / "module.py").read_bytes()
+    roster = {"src/module.py": {"bytes": len(record), "sha256": cli._sha(record)}}
+    with pytest.raises(OSError):
+        cli._implementation_closure(project, roster)
+
+
+def test_worker_cli_rejects_unsigned_snapshot_before_numeric_core_import(tmp_path, monkeypatch):
+    source_root = Path(__file__).resolve().parents[1]
+    script = source_root / "scripts/run_w1_d6_shared_gradient_worker.py"
+    spec = importlib.util.spec_from_file_location("d6_worker_cli_unsigned_test", script)
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+
+    project = tmp_path / "project"
+    attempt = project / "derived/run/attempt_001"
+    package_path = project / "src/ireset/eval/w1_d6_shared_gradient_admission.py"
+    worker_path = project / "scripts/run_w1_d6_shared_gradient_worker.py"
+    package_path.parent.mkdir(parents=True)
+    worker_path.parent.mkdir(parents=True)
+    attempt.mkdir(parents=True)
+    (project / "src/ireset").mkdir(exist_ok=True)
+    (project / "src/ireset/__init__.py").write_text("")
+    (project / "src/ireset/eval/__init__.py").write_text("")
+    package_path.write_bytes((source_root / "src/ireset/eval/w1_d6_shared_gradient_admission.py").read_bytes())
+    worker_path.write_bytes(script.read_bytes())
+    cli.__file__ = str(worker_path)
+    code_path = project / "contract.txt"
+    code_path.write_text("pinned metadata only\n")
+    files = {}
+    for rel, path in (("contract.txt", code_path),
+                      ("scripts/run_w1_d6_shared_gradient_worker.py", worker_path)):
+        raw = path.read_bytes()
+        files[rel] = {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+
+    worker_launch = {"script_rel": "scripts/run_w1_d6_shared_gradient_worker.py",
+                     "executable": sys.executable, "env": dict(os.environ),
+                     "status": "reviewed_executable", "execution_mode": "real_worker_v1"}
+    package = {"schema": "w1_d6_shared_gradient_real_admission_v1",
+               "executable": True, "proposed_real_root": "derived/run/attempt_001",
+               "authorization_consumption_ledger": "derived/ledger",
+               "implementation": {"files": files}, "worker_launch": worker_launch,
+               "historical": {"synthetic_ic_acceptance": {}, "verified_outcome": {}},
+               "status": {"real_worker": "implemented_and_reviewed_and_supervised"}}
+    package["metadata_sha256"] = cli._canonical_sha(package)
+    admission_raw = (json.dumps(package, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    auth = {"schema": "w1_d6_shared_gradient_real_admission_v1/authorization_v1",
+            "cohort": "w1_d6_shared_gradient_step0_v1", "authorized": False,
+            "template_only": True, "includes": ["single_step0_diagnostic"], "attempts": 1,
+            "checklist": dict.fromkeys(real.admission.CHECKLIST),
+            "approval_reference": None,
+            "bindings": {"admission_metadata_sha256": package["metadata_sha256"],
+                         "implementation_files": files,
+                         "ic_acceptance": {}, "historical_d6_outcome": {},
+                         "worker_launch": worker_launch}}
+    authorization_raw = (json.dumps(auth, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    t0 = time.perf_counter() - .01
+    launch_spec = {"schema": "w1_d6_shared_gradient_real_admission_v1/worker_launch_spec_v1",
+                   "execution_mode": "real_worker_v1", "launch_id": "a" * 64,
+                   "authorization_sha256": hashlib.sha256(authorization_raw).hexdigest(),
+                   "authorization_record": {"bytes": len(authorization_raw),
+                                            "sha256": hashlib.sha256(authorization_raw).hexdigest()},
+                   "admission_metadata_sha256": package["metadata_sha256"],
+                   "admission_record": {"bytes": len(admission_raw),
+                                        "sha256": hashlib.sha256(admission_raw).hexdigest()},
+                   "implementation_pre": files,
+                   "implementation_pre_sha256": cli._canonical_sha(files),
+                   "authorization_ledger": {"path": "a" * 64 + "/consumed.json", "sha256": "b" * 64},
+                   "attempt_root": str(attempt), "project_root": str(project),
+                   "t0": t0, "work_deadline": t0 + 240,
+                   "hard_deadline": t0 + 300, "parameter_updates": 0}
+    (attempt / "worker_launch.json").write_text(json.dumps(launch_spec))
+    (attempt / "admission_snapshot.json").write_bytes(admission_raw)
+    (attempt / "authorization_snapshot.json").write_bytes(authorization_raw)
+
+    attempted_numeric_imports = []
+    original_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "ireset.eval.w1_d6_shared_gradient_real":
+            attempted_numeric_imports.append(name)
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    monkeypatch.chdir(attempt)
+    with pytest.raises(ValueError, match="worker_authorization_rejected"):
+        cli.execute_worker(
+            launch_spec_path=attempt / "worker_launch.json",
+            admission_snapshot_path=attempt / "admission_snapshot.json",
+            authorization_snapshot_path=attempt / "authorization_snapshot.json",
+            authorization_sha256=launch_spec["authorization_sha256"],
+            project_root=project,
+        )
+    assert attempted_numeric_imports == []
+    assert not (attempt / "d6").exists()
 
 
 def _json(value):

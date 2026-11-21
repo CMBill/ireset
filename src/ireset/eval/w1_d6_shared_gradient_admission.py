@@ -49,6 +49,115 @@ CHECKLIST = (
     "one_shot_300s_budget_and_zero_updates_reviewed", "independent_review_complete",
 )
 SUPERVISOR_GROUP_CLEANUP_CHECKS_MAX = 20
+REAL_CALL_MATRIX = {
+    "schema": SCHEMA + "/real_call_matrix_v1",
+    "sources": {"d6_file_reads": 6, "root_stats_file_reads": 1, "asset_file_reads": 41,
+                "source_file_hashes": 48, "d6_npz_member_reads": 60,
+                "root_stats_npz_member_reads": 2, "npz_archive_opens": 4,
+                "initial_checkpoint_cpu_loads": 1},
+    "setup_units": {
+        "runtime_identity_checks": 1, "runtime_dependency_hashes": 5,
+        "runtime_binary_hashes": 1, "fk_runtime_sources": 1, "runtime_setups": 1,
+        "site_record_decodes": 1, "urdf_decodes": 1, "joint_specs": 1,
+        "joint_xml_bindings": 1, "joint_plain_compiles": 1,
+        "tokenizer_constructions": 1, "metric_decoder_constructions": 1,
+        "fk_constructions": 1, "fk_chain_builds": 1, "fk_chain_transfers": 1,
+        "scene_specs": 1, "scene_xml_bindings": 1, "scene_compiles": 1,
+        "scene_data_constructions": 1, "scene_resets": 1, "scene_mj_forwards": 1,
+        "loss_constructions": 1, "runtime_syncs": 134,
+    },
+    "trainer_construction": {"dataset_constructions": 1, "trainer_constructions": 1,
+                             "model_constructions": 1, "model_transfers": 1,
+                             "conditioner_constructions": 1, "conditioner_transfers": 1,
+                             "loader_constructions": 2, "loader_iterators": 0,
+                             "dataset_reads": 0, "optimizer_constructions": 0},
+    "numeric": {"input_tensor_transfers": 10, "trainer_predict": 1,
+                "conditioner_forward": 1, "backbone_forward": 1, "loss_assembly": 1,
+                "loss_decode": 2, "fk_call": 2, "paired_vjp": 7,
+                "vjp_pre_sync_points": 7},
+    "forbidden": {"contact_branch": 0, "optimizer_steps": 0,
+                   "accumulate_micro": 0, "clip_gradients": 0,
+                   "step_optimizer": 0, "parameter_updates": 0,
+                   "checkpoint_writes": 0, "dataset_iterations": 0},
+    "supervisor": {"authorization_file_reads": 1, "implementation_closure_hash_passes": 2,
+                   "worker_launches": 1, "worker_retries": 0, "actual_wait_calls": 1,
+                   "stdout_log_creates": 1, "stderr_log_creates": 1, "worker_result_reads": 1,
+                   "return_observation_writes": 1, "return_observation_readbacks": 2,
+                   "authorization_consumption_markers": 1, "authorization_ledger_events": 3,
+                   "attempts": 1, "process_group_created": 1,
+                   "group_cleanup_checks_max": SUPERVISOR_GROUP_CLEANUP_CHECKS_MAX,
+                   "log_streams_drained": 2, "launch_spec_writes": 1, "return_witnesses": 1},
+}
+
+
+def real_call_matrix_problems(value: dict) -> list[str]:
+    return [] if type(value) is dict and value == REAL_CALL_MATRIX else ["real_call_matrix_not_frozen"]
+
+
+def real_io_matrix_problems(package: dict) -> list[str]:
+    source = package.get("source") if type(package) is dict else None
+    io = package.get("io_matrix") if type(package) is dict else None
+    if type(source) is not dict or type(io) is not dict:
+        return ["real_io_matrix_missing"]
+    files = source.get("selected_d6_files")
+    root_stats = source.get("root_stats")
+    stats = root_stats.get("file") if type(root_stats) is dict else None
+    assets = source.get("production_assets")
+    if type(files) is not list or len(files) != 6 or type(stats) is not dict or type(assets) is not dict:
+        return ["real_io_source_roster_invalid"]
+    if any(type(row) is not dict or type(row.get("path")) is not str
+           or type(row.get("bytes")) is not int or row["bytes"] <= 0
+           or type(row.get("sha256")) is not str or len(row["sha256"]) != 64
+           or any(c not in "0123456789abcdef" for c in row["sha256"])
+           for row in files):
+        return ["real_io_d6_roster_invalid"]
+    if (type(stats.get("path")) is not str or type(stats.get("bytes")) is not int
+            or stats["bytes"] <= 0 or type(stats.get("sha256")) is not str
+            or len(stats["sha256"]) != 64
+            or any(c not in "0123456789abcdef" for c in stats["sha256"])):
+        return ["real_io_root_stats_invalid"]
+    if any(type(rel) is not str or type(rec) is not dict
+           or type(rec.get("bytes")) is not int or rec["bytes"] <= 0
+           or type(rec.get("sha256")) is not str or len(rec["sha256"]) != 64
+           or any(c not in "0123456789abcdef" for c in rec["sha256"])
+           for rel, rec in assets.items()):
+        return ["real_io_asset_roster_invalid"]
+    expected = {
+        "d6_files": [{"path": r["path"], "bytes": r["bytes"], "sha256": r["sha256"], "read": 1, "hash": 1}
+                      for r in files],
+        "root_stats": {"path": stats["path"], "bytes": stats["bytes"], "sha256": stats["sha256"],
+                       "read": 1, "hash": 1, "npz_members": ["mean", "std"]},
+        "production_assets": [{"path": rel, "bytes": rec["bytes"], "sha256": rec["sha256"],
+                               "read": 1, "hash": 1} for rel, rec in sorted(assets.items())],
+    }
+    future = io.get("authorized_future_reads")
+    if future != expected or len(assets) != 41:
+        return ["real_io_source_roster_not_frozen"]
+    if io.get("worker_actual") != {
+        "launch_metadata_reads": 3, "ledger_reads": 2, "implementation_closure_hash_passes": 2,
+        "source_file_reads": 48, "source_file_hashes": 48, "d6_npz_member_reads": 60,
+        "root_stats_npz_member_reads": 2, "npz_archive_opens": 4, "independent_artifact_reads": 24,
+        "independent_artifact_hashes": 20, "artifact_npy_writes": 20, "artifact_json_writes": 5,
+        "d6_directory_created": 1, "checkpoint_cpu_loads": 1, "strict_model_loads": 2,
+        "worker_result_writes": 1, "worker_result_readbacks": 1,
+    }:
+        return ["real_io_worker_counts_not_frozen"]
+    outer = io.get("supervisor_actual")
+    expected_outer = {key: REAL_CALL_MATRIX["supervisor"][key]
+                      for key in ("authorization_file_reads", "implementation_closure_hash_passes",
+                                  "worker_launches", "worker_retries", "actual_wait_calls",
+                                  "stdout_log_creates", "stderr_log_creates", "worker_result_reads",
+                                  "return_observation_writes", "return_observation_readbacks",
+                                  "authorization_consumption_markers", "authorization_ledger_events",
+                                  "attempts", "process_group_created", "log_streams_drained",
+                                  "launch_spec_writes", "return_witnesses")}
+    expected_outer["retries"] = expected_outer.pop("worker_retries")
+    if (type(outer) is not dict
+            or {key: outer.get(key) for key in expected_outer} != expected_outer
+            or type(outer.get("group_cleanup_checks")) is not int
+            or not 0 <= outer["group_cleanup_checks"] <= REAL_CALL_MATRIX["supervisor"]["group_cleanup_checks_max"]):
+        return ["real_io_supervisor_counts_not_frozen"]
+    return []
 
 
 class AdmissionError(RuntimeError):
@@ -158,6 +267,7 @@ def build_materials(project_root: Path) -> tuple[dict, dict]:
         "scripts/verify_w1_d6_shared_gradient.py",
         "scripts/prepare_w1_d6_shared_gradient_admission.py",
         "scripts/supervise_w1_d6_shared_gradient.py",
+        "scripts/run_w1_d6_shared_gradient_worker.py",
         "tests/test_w1_d6_shared_gradient_supervisor.py",
         "tests/test_w1_d6_shared_gradient.py",
         "tests/test_w1_d6_shared_gradient_admission.py",
@@ -179,23 +289,7 @@ def build_materials(project_root: Path) -> tuple[dict, dict]:
         raw, rec = _read_metadata(root / rel, 16 << 20)
         implementation[rel] = {"bytes": rec["bytes"], "sha256": rec["sha256"]}
 
-    call_matrix = {
-        "real_sources": {"selected_d6_artifacts": 6, "root_stats_npz": 1, "production_assets": 41},
-        "numerics": {"checkpoint_cpu_load": 1, "strict_model_loads": 2, "trainer_predict": 1,
-                     "loss_assembly": 1, "decode": 2, "production_fk": 2, "paired_vjp": 7,
-                     "cuda_sync_points": 32},
-        "control": {"optimizer_construct": 0, "loader_iterations": 0, "contact_branch": 0,
-                    "parameter_updates": 0},
-        "supervisor": {"worker_launches": 1, "worker_retries": 0, "return_witnesses": 1,
-                       "pre_and_post_implementation_hash_passes": 2,
-                       "process_group_created": 1, "actual_wait_calls": 1,
-                       "group_cleanup_checks_max": SUPERVISOR_GROUP_CLEANUP_CHECKS_MAX,
-                       "log_streams_drained": 2, "return_observation_write_readback": 1,
-                       "authorization_consumption_markers": 1, "authorization_ledger_events_max": 4,
-                       "launch_spec_writes": 1, "worker_result_reads": 1,
-                       "implementation_closure_hash_passes": 2,
-                       "authorization_file_reads": 1, "attempts": 1},
-    }
+    call_matrix = json.loads(json.dumps(REAL_CALL_MATRIX))
     worker_launch = {
         "script_rel": "scripts/run_w1_d6_shared_gradient_worker.py",
         "argv_template": [sys.executable, "-I",
@@ -203,11 +297,11 @@ def build_materials(project_root: Path) -> tuple[dict, dict]:
                           "--launch-spec", "{launch_spec}",
                           "--admission-snapshot", "{admission_snapshot}",
                           "--authorization-snapshot", "{authorization_snapshot}",
-                          "--authorization-sha256", "{authorization_sha256}"],
+                          "--authorization-sha256", "{authorization_sha256}",
+                          "--project-root", "{project_root}"],
         "executable": sys.executable,
-        "cwd": "project_root",
-        "env": {"PYTHONNOUSERSITE": "1", "PYTHONHASHSEED": "0",
-                "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1",
+        "cwd": "attempt_root",
+        "env": {"OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1",
                 "OPENBLAS_NUM_THREADS": "1"},
         "shell": False,
         "inherit_stdin": False,
@@ -224,7 +318,7 @@ def build_materials(project_root: Path) -> tuple[dict, dict]:
                                      "implementation_files_hashed_once": len(implementation_paths),
                                      "checkpoint_payload_reads": 0, "npz_payload_or_member_reads": 0,
                                      "dataset_or_asset_payload_reads": 0},
-        "authorized_future_reads_proposed": {
+        "authorized_future_reads": {
             "d6_files": [{"path": x["path"], "bytes": x["bytes"], "sha256": x["sha256"],
                           "read": 1, "hash": 1} for x in _source_read_set(index)],
             "root_stats": {"path": source_bindings["root_stats"]["file"]["path"],
@@ -235,14 +329,46 @@ def build_materials(project_root: Path) -> tuple[dict, dict]:
                                    "read": 1, "hash": 1}
                                   for rel, rec in sorted(production_assets.items())],
         },
-        "future_outputs_proposed": {"worker_npy": 20, "worker_json": 5, "outer_json_max": 4,
-                                    "stdout_log_bytes_max": 256 << 10,
-                                    "stderr_log_bytes_max": 256 << 10, "supervisor_receipt": 1,
-                                    "retry": 0, "overwrite": 0},
-        "closure_status": "proposed_only_not_runtime_verified",
+        "future_outputs_proposed": {"worker_npy": 20, "worker_json": 6, "outer_json_max": 5,
+                                     "stdout_log_bytes_max": 256 << 10,
+                                     "stderr_log_bytes_max": 256 << 10, "supervisor_receipt": 1,
+                                     "retry": 0, "overwrite": 0},
+        "worker_reads": {"launch_spec": 1, "admission_snapshot": 1, "authorization_snapshot": 1,
+                          "consumption_receipt": 1, "launch_event": 1,
+                          "artifact_readbacks_for_independent_review": 24,
+                          "artifact_sha256_for_independent_review": 20},
+        "worker_writes": {"d6_directory_create": 1, "artifact_npy": 20,
+                          "artifact_json": 5, "worker_result": 1},
+        "supervisor_reads": {"authorization": 1, "worker_result": 1,
+                             "worker_logs": 2, "return_observation": 2,
+                             "ledger_consumption_verifications": 3},
+        "supervisor_writes": {"admission_snapshot": 1, "authorization_snapshot": 1,
+                              "launch_spec": 1, "ledger_consumption": 1,
+                              "ledger_events": 3, "stdout_log": 1, "stderr_log": 1,
+                              "return_observation": 1},
+        "worker_actual": {"launch_metadata_reads": 3, "ledger_reads": 2,
+                          "implementation_closure_hash_passes": 2,
+                          "source_file_reads": 48, "source_file_hashes": 48,
+                          "d6_npz_member_reads": 60, "root_stats_npz_member_reads": 2,
+                          "npz_archive_opens": 4, "independent_artifact_reads": 24,
+                          "independent_artifact_hashes": 20, "artifact_npy_writes": 20,
+                          "artifact_json_writes": 5, "d6_directory_created": 1,
+                          "checkpoint_cpu_loads": 1, "strict_model_loads": 2,
+                          "worker_result_writes": 1, "worker_result_readbacks": 1},
+        "supervisor_actual": {"authorization_file_reads": 1,
+                              "implementation_closure_hash_passes": 2,
+                              "worker_launches": 1, "actual_wait_calls": 1,
+                              "stdout_log_creates": 1, "stderr_log_creates": 1,
+                              "worker_result_reads": 1, "return_observation_writes": 1,
+                              "return_observation_readbacks": 2,
+                              "authorization_consumption_markers": 1,
+                              "authorization_ledger_events": 3,
+                              "attempts": 1, "retries": 0,
+                              "process_group_created": 1, "group_cleanup_checks": 0,
+                              "log_streams_drained": 2, "launch_spec_writes": 1,
+                              "return_witnesses": 1},
+        "closure_status": "frozen_and_enforced_by_supervisor_and_worker",
     }
-    # The current I/C matrix describes synthetic core work only. Real source,
-    # asset, setup and outer-return counts remain proposed until worker review.
     package = {
         "schema": SCHEMA, "state": "metadata_only_real_execution_pending_authorized_worker_cli_review",
         "executable": False, "authorized": False,
@@ -264,16 +390,18 @@ def build_materials(project_root: Path) -> tuple[dict, dict]:
                    "selected_payloads_opened": False},
         "implementation": {"files": implementation},
         "worker_launch": worker_launch,
-        "call_matrix_proposal": call_matrix,
-        "io_matrix_proposal": io_matrix,
+        "call_matrix": call_matrix,
+        "io_matrix": io_matrix,
         "budgets": {"wall_cap_s": 300, "work_cap_s": 240, "seal_return_reserve_s": 60,
                     "attempts": 1, "parameter_updates": 0},
         "forbidden_calls": dict(ZERO_COUNTS),
         "status": {"fresh_source_hash_verification": "not_run",
                    "checkpoint_and_batch_read": "not_run",
-                   "real_worker": "numerical_worker_in_process_only_supervised_cli_pending",
+                   "real_worker": "independent_worker_cli_implemented_matrix_enforced_pending_final_review",
                    "external_authorization": "not_granted"},
     }
+    _require(not real_call_matrix_problems(package["call_matrix"]), "real_call_matrix_builder_drift")
+    _require(not real_io_matrix_problems(package), "real_io_matrix_builder_drift")
     package["metadata_sha256"] = _sha(json.dumps(package, sort_keys=True, separators=(",", ":")).encode())
     draft = {
         "schema": AUTH_SCHEMA, "cohort": "w1_d6_shared_gradient_step0_v1",

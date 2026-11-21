@@ -80,7 +80,7 @@ class ReadonlyTrainerReceipt:
 
 
 def authorize_worker(auth: dict, package: dict, *, authorization_raw: bytes,
-                     authorization_sha256: str, project_root: Path) -> RealWorkerPermit:
+                     authorization_sha256: str, project_root: Path, budget=None) -> RealWorkerPermit:
     """Turn a separately verified, executable package into an in-process permit."""
     require(type(authorization_raw) is bytes and admission._sha(authorization_raw) == authorization_sha256
             and _json_object(authorization_raw, "authorization_json_invalid") == auth,
@@ -92,13 +92,16 @@ def authorize_worker(auth: dict, package: dict, *, authorization_raw: bytes,
     problems = admission.authorization_problems(auth, package)
     require(not problems, "real_worker_authorization_rejected:" + ",".join(problems))
     root = Path(project_root).resolve(strict=True)
+    budget = budget or NullBudget()
     file_roster = package.get("implementation", {}).get("files")
     require(type(file_roster) is dict and len(file_roster) >= 1, "worker_implementation_roster")
     for rel, expected in file_roster.items():
+        budget.check("worker_implementation_hash:" + rel + ":pre")
         rel_path = Path(rel)
         require(not rel_path.is_absolute() and ".." not in rel_path.parts,
                 "worker_implementation_path_invalid")
         raw = open_regular_source(root, rel_path, 32 << 20)
+        budget.check("worker_implementation_hash:" + rel + ":post")
         observed = {"path": rel, "bytes": len(raw), "sha256": _sha(raw)}
         require(observed == {"path": rel, "bytes": expected.get("bytes"), "sha256": expected.get("sha256")},
                 "worker_implementation_drift:" + rel)
@@ -209,7 +212,7 @@ def read_authorized_source_bundle(package: dict, project_root: Path, budget) -> 
     return snapshots, records
 
 
-def prepare_snapshot_inputs(package: dict, snapshots: dict, records: dict) -> PreparedInputs:
+def prepare_snapshot_inputs(package: dict, snapshots: dict, records: dict, *, io_meter=None) -> PreparedInputs:
     """Bind source records, reconstruct the first micro, and preflight step 0."""
     source = package.get("source")
     require(type(source) is dict and type(source.get("d6_identity")) is dict
@@ -237,7 +240,8 @@ def prepare_snapshot_inputs(package: dict, snapshots: dict, records: dict) -> Pr
         blobs[rel] = snapshots[spec["path"]]
         refs[rel] = {"path": rel, "bytes": spec["bytes"], "sha256": spec["sha256"]}
     require(set(blobs) == set(INPUT_RECORDS), "admission_d6_snapshot_coverage")
-    items, batch, roster, payload = reconstruct_batch(blobs, refs, expected_identity=source["d6_identity"])
+    items, batch, roster, payload = reconstruct_batch(blobs, refs, expected_identity=source["d6_identity"],
+                                                       io_meter=io_meter)
     stats_spec = source["root_stats"]["file"]
     require(stats_spec["path"] in snapshots and stats_spec["path"] in records,
             "admission_root_stats_snapshot_missing")
@@ -246,7 +250,10 @@ def prepare_snapshot_inputs(package: dict, snapshots: dict, records: dict) -> Pr
             and len(snapshots[stats_spec["path"]]) == stats_spec["bytes"]
             and _sha(snapshots[stats_spec["path"]]) == stats_spec["sha256"],
             "admission_root_stats_binding")
-    stats = decode_root_stats(snapshots[stats_spec["path"]], source["root_stats"]["headers"])
+    stats = decode_root_stats(snapshots[stats_spec["path"]], source["root_stats"]["headers"],
+                              io_meter=io_meter)
+    if io_meter is not None:
+        io_meter["checkpoint_cpu_loads"] += 1
     checkpoint = checkpoint_snapshot(blobs["d6/initial.pt"])
     require(checkpoint.get("identity") == source["d6_identity"], "checkpoint_d6_identity")
     require(checkpoint.get("config") == expected_config, "checkpoint_config_mismatch")
@@ -294,22 +301,28 @@ def _jsonl_first(raw: bytes, code: str) -> dict:
     return _json_object(first, code + "_first_record_invalid")
 
 
-def _archive_members(raw: bytes, expected: set[str]) -> dict[str, np.ndarray]:
+def _archive_members(raw: bytes, expected: set[str], *, io_meter=None) -> dict[str, np.ndarray]:
     require(type(raw) is bytes and len(raw) <= NPZ_MEMBER_BYTES_CAP * NPZ_MEMBER_COUNT,
             "probe_archive_byte_cap")
     try:
         with zipfile.ZipFile(io.BytesIO(raw), "r") as archive:
+            if io_meter is not None:
+                io_meter["npz_archive_opens"] += 1
             infos = archive.infolist()
             require(len(infos) == NPZ_MEMBER_COUNT, "probe_archive_member_count")
             names = [info.filename[:-4] if info.filename.endswith(".npy") else "" for info in infos]
             require(len(set(names)) == len(names) and set(names) == expected, "probe_archive_member_roster")
             require(all(0 < info.file_size <= NPZ_MEMBER_BYTES_CAP for info in infos), "probe_member_size_cap")
         with np.load(io.BytesIO(raw), allow_pickle=False) as archive:
+            if io_meter is not None:
+                io_meter["npz_archive_opens"] += 1
             require(set(archive.files) == expected and len(archive.files) == NPZ_MEMBER_COUNT,
                     "probe_archive_loaded_roster")
             arrays = {}
             for name in sorted(expected):
                 arr = archive[name]
+                if io_meter is not None:
+                    io_meter["d6_npz_member_reads"] += 1
                 require(arr.dtype == np.dtype("<f4") or arr.dtype == np.dtype("<i8"),
                         "probe_member_dtype:" + name)
                 require(arr.flags.c_contiguous and np.isfinite(arr).all(), "probe_member_domain:" + name)
@@ -325,20 +338,26 @@ def _expected_npz_roster() -> set[str]:
     return {f"w{slot}__{key}" for slot in range(protocol.N) for key in evidence.INPUT_TABLE}
 
 
-def decode_root_stats(raw: bytes, headers: dict) -> dict[str, np.ndarray]:
+def decode_root_stats(raw: bytes, headers: dict, *, io_meter=None) -> dict[str, np.ndarray]:
     """Decode the two pinned FP32 constants from one already-hashed NPZ blob."""
     require(type(raw) is bytes and 0 < len(raw) <= ROOT_STATS_CAP, "root_stats_archive_size")
     require(type(headers) is dict and set(headers) == {"mean", "std"}, "root_stats_header_roster")
     try:
         with zipfile.ZipFile(io.BytesIO(raw), "r") as archive:
+            if io_meter is not None:
+                io_meter["npz_archive_opens"] += 1
             infos = archive.infolist()
             require(len(infos) == 2 and {i.filename for i in infos} == {"mean.npy", "std.npy"},
                     "root_stats_archive_members")
             require(all(0 < i.file_size <= 4096 for i in infos), "root_stats_member_size")
         with np.load(io.BytesIO(raw), allow_pickle=False) as archive:
+            if io_meter is not None:
+                io_meter["npz_archive_opens"] += 1
             values = {}
             for key in ("mean", "std"):
                 value = archive[key]
+                if io_meter is not None:
+                    io_meter["root_stats_npz_member_reads"] += 1
                 header = headers[key]
                 require(type(header) is dict and list(value.shape) == header.get("shape")
                         and value.dtype.str == header.get("dtype") and value.dtype == np.dtype("<f4")
@@ -381,7 +400,7 @@ def _first_micro_positions(row: dict, payload: dict) -> list[int]:
 
 
 def reconstruct_batch(blobs: dict[str, bytes], records: dict[str, dict], *,
-                      expected_identity: dict) -> tuple[list[dict], dict, list, dict]:
+                      expected_identity: dict, io_meter=None) -> tuple[list[dict], dict, list, dict]:
     """Decode only the six approved records and rebuild the first micro batch."""
     require(set(blobs) == set(INPUT_RECORDS), "approved_input_snapshot_roster")
     require(set(records) == set(INPUT_RECORDS), "approved_input_record_roster")
@@ -412,7 +431,7 @@ def reconstruct_batch(blobs: dict[str, bytes], records: dict[str, dict], *,
     expected_consumption = evidence.consumption(payload, positions, kind="train", step=1,
                                                 micro=1, event=2)
     protocol.equal(history_first["micros"][0], expected_consumption)
-    arrays = _archive_members(blobs["d6/probe_inputs.npz"], _expected_npz_roster())
+    arrays = _archive_members(blobs["d6/probe_inputs.npz"], _expected_npz_roster(), io_meter=io_meter)
     items = []
     field_names = tuple(evidence.BATCH_KEYS)
     for slot, window in enumerate(windows):
@@ -508,6 +527,7 @@ def strict_load_initial_checkpoint(checkpoint: dict, *, model, conditioner,
                                    runtime_guard) -> dict:
     """Strictly copy the already-preflighted step-0 state into fresh modules."""
     loaded = {}
+    strict_loads = 0
     for side, module in (("model", model), ("conditioner", conditioner)):
         runtime_guard.check_unit("initial_strict_load_" + side + ":pre")
         budget.check("initial_strict_load_" + side + ":pre")
@@ -519,6 +539,7 @@ def strict_load_initial_checkpoint(checkpoint: dict, *, model, conditioner,
             require(value.shape == target.shape and value.dtype == target.dtype
                     and value.device.type == "cpu", "checkpoint_tensor_contract:" + side + ":" + name)
         result = module.load_state_dict(source, strict=True)
+        strict_loads += 1
         require(not result.missing_keys and not result.unexpected_keys,
                 "checkpoint_strict_load_result:" + side)
         budget.check("initial_strict_load_" + side + ":post")
@@ -526,7 +547,7 @@ def strict_load_initial_checkpoint(checkpoint: dict, *, model, conditioner,
         loaded[side] = module.state_dict()
     digest = state_digest(loaded["model"], loaded["conditioner"], budget)
     require(digest == expected_endpoint_sha256, "loaded_initial_probe_endpoint_mismatch")
-    return {"step": 0, "endpoint_state_sha256": digest, "strict_model_loads": 2,
+    return {"step": 0, "endpoint_state_sha256": digest, "strict_model_loads": strict_loads,
             "missing_keys": [], "unexpected_keys": []}
 
 
@@ -549,6 +570,7 @@ def build_readonly_trainer(prepared: PreparedInputs, *, permit: RealWorkerPermit
             and all(cfg_doc[key] == value for key, value in prepared.expected_config.items()),
             "real_trainer_config_mismatch")
     dataset = shared.NoReadRegisteredWindowDataset(prepared.items, window_keys=None)
+    dataset_constructions = 1
     allowed = ("model", "model_transfer", "conditioner", "conditioner_transfer",
                "train_loader", "val_loader")
     entered, returned = [], []
@@ -566,6 +588,7 @@ def build_readonly_trainer(prepared: PreparedInputs, *, permit: RealWorkerPermit
         construction_check(name, module)
         returned.append(name)
 
+    trainer_constructions = 1
     trainer = shared.Trainer(cfg, tokenizer, dataset, dataset, run_dir,
                              budget_deadline=budget.work_deadline, loss_fn=loss,
                              build_optimizer=False, construction_entry=enter,
@@ -583,6 +606,8 @@ def build_readonly_trainer(prepared: PreparedInputs, *, permit: RealWorkerPermit
     trainer.model.train()
     trainer.conditioner.train()
     construction = {"construction_entered": entered, "construction_returned": returned,
+                    "dataset_constructions": dataset_constructions,
+                    "trainer_constructions": trainer_constructions,
                     "optimizer_construction": 0, "loader_constructions": 2,
                     "loader_iterator_creations": 0, "dataset_iterations": 0}
     receipt = ReadonlyTrainerReceipt(id(trainer), id(trainer.model), id(trainer.conditioner),
@@ -591,23 +616,32 @@ def build_readonly_trainer(prepared: PreparedInputs, *, permit: RealWorkerPermit
 
 
 class _WorkerMeter:
-    def __init__(self, budget):
+    def __init__(self, budget, expected):
         self.budget = budget
+        self.expected = dict(expected)
         self.entered = {}
         self.completed = {}
 
     def enter(self, name):
         self.budget.check(name + ":pre")
-        self.entered[name] = self.entered.get(name, 0) + 1
+        require(name in self.expected, "worker_setup_call_not_registered:" + name)
+        count = self.entered.get(name, 0) + 1
+        require(count <= self.expected[name], "worker_setup_call_extra:" + name)
+        self.entered[name] = count
 
     def unit(self, name, fn, /, *args, point=None, **kwargs):
         label = point or name
-        self.budget.check(label + ":pre")
-        self.entered[name] = self.entered.get(name, 0) + 1
+        self.enter(name)
         result = fn(*args, **kwargs)
         self.budget.check(label + ":post")
         self.completed[name] = self.completed.get(name, 0) + 1
         return result
+
+    def verify(self):
+        require(self.entered == self.expected and self.completed == self.expected,
+                "worker_setup_call_matrix_mismatch")
+        return {"expected": self.expected, "entered": dict(self.entered),
+                "completed": dict(self.completed)}
 
 
 class _GuardedArtifactStore(shared.ArtifactStore):
@@ -642,14 +676,14 @@ class WorkerComponents:
     batch: dict
     loss: object
     runtime: object
-    setup_meter: object
     trainer_receipt: ReadonlyTrainerReceipt
     setup_report: dict
+    setup_meter: object
 
 
 def setup_production_worker(package: dict, snapshots: dict, records: dict, *,
                             prepared: PreparedInputs, permit: RealWorkerPermit, run_dir: Path,
-                            budget, construction_entry, construction_check) -> WorkerComponents:
+                            budget, construction_entry, construction_check, setup_meter) -> WorkerComponents:
     """Create production apparatus/modules, strict-load step 0, and transfer one batch."""
     require(isinstance(permit, RealWorkerPermit) and permit._token is _PERMIT_TOKEN,
             "real_worker_permit_required")
@@ -659,8 +693,9 @@ def setup_production_worker(package: dict, snapshots: dict, records: dict, *,
     require(asdict(cfg) == prepared.expected_config, "real_plan_config_not_bound")
     require([window.window_id for window in registration.windows] == list(shared.WINDOWS),
             "real_registration_window_order")
-    app, _spec, runtime, meter = build_production_apparatus(package, snapshots, records,
-                                                             prepared=prepared, budget=budget)
+    app, _spec, runtime, _meter = build_production_apparatus(package, snapshots, records,
+                                                              prepared=prepared, budget=budget,
+                                                              meter=setup_meter)
     trainer, receipt = build_readonly_trainer(prepared, permit=permit, tokenizer=app.tokenizer,
                                                loss=app.loss_fn, run_dir=run_dir, plan=plan,
                                                budget=budget, runtime_guard=runtime,
@@ -700,14 +735,16 @@ def setup_production_worker(package: dict, snapshots: dict, records: dict, *,
                     "real_transferred_batch_payload:" + key)
     setup_report = {"app_runtime": runtime.facts(), "strict_load": loaded,
                     "trainer_construction": receipt.construction,
-                    "setup_entered": dict(meter.entered), "setup_completed": dict(meter.completed),
+                    "setup_calls": {"expected": setup_meter.expected,
+                                    "entered": dict(setup_meter.entered),
+                                    "completed": dict(setup_meter.completed)},
                     "input_tensor_transfers": len(batch), "optimizer_construction": 0,
                     "parameter_updates": 0, "loader_iterations": 0}
-    return WorkerComponents(trainer, batch, app.loss_fn, runtime, meter, receipt, setup_report)
+    return WorkerComponents(trainer, batch, app.loss_fn, runtime, receipt, setup_report, setup_meter)
 
 
 def build_production_apparatus(package: dict, snapshots: dict, records: dict, *,
-                               prepared: PreparedInputs, budget):
+                               prepared: PreparedInputs, budget, meter=None):
     """Build the existing D6 production FK/loss stack from the verified bytes."""
     source = package.get("source")
     require(type(source) is dict and type(source.get("d6_bindings")) is dict
@@ -722,7 +759,7 @@ def build_production_apparatus(package: dict, snapshots: dict, records: dict, *,
     root_spec = bindings["root_stats"]["file"]
     require(root_spec["path"] in records, "root_stats_record_missing")
     root_record = records[root_spec["path"]]
-    meter = _WorkerMeter(budget)
+    meter = meter or _WorkerMeter(budget, package["call_matrix"]["setup_units"])
     runtime = d6real.Runtime(meter, meter, bindings["runtime"], source["d6_contract"]["runtime_evidence"])
     app, spec = d6real.apparatus(bindings, meter, runtime, preloaded_assets=raw_assets,
                                  preloaded_root_stats=(prepared.root_stats, root_record))
@@ -932,7 +969,7 @@ def run_numeric_kernel(trainer, batch, loss, *, permit: RealWorkerPermit, artifa
         store.write_json("independent_review.json", review)
         return {"outcome": outcome, "independent_review": review,
                 "counts": calls, "vjp": vjp_counts, "artifact_peak_bytes": store.peak_bytes,
-                "artifact_io": dict(store.io_counts)}
+        "artifact_io": dict(store.io_counts), "artifact_readback_io": review["io"]}
     finally:
         for handle in handles:
             handle.remove()
@@ -950,18 +987,25 @@ def run_authorized_worker(*, authorization_raw: bytes, authorization_sha256: str
     permit = authorize_worker(package=package, auth=_json_object(authorization_raw, "authorization_invalid"),
                               authorization_raw=authorization_raw,
                               authorization_sha256=authorization_sha256,
-                              project_root=project_root)
+                              project_root=project_root, budget=work_budget)
     require(permit._token is _PERMIT_TOKEN and permit.root == Path(project_root).resolve() /
             admission.PROPOSED_REAL_ROOT, "worker_permit_path_binding")
     work_budget.check("worker_source_snapshot_entry")
     snapshots, records = read_authorized_source_bundle(package, project_root, work_budget)
-    prepared = prepare_snapshot_inputs(package, snapshots, records)
+    source_io = {"d6_npz_member_reads": 0, "root_stats_npz_member_reads": 0,
+                 "npz_archive_opens": 0, "checkpoint_cpu_loads": 0}
+    prepared = prepare_snapshot_inputs(package, snapshots, records, io_meter=source_io)
     work_budget.check("worker_production_setup_entry")
+    matrix = package.get("call_matrix")
+    require(type(matrix) is dict and matrix.get("schema") == admission.SCHEMA + "/real_call_matrix_v1",
+            "real_call_matrix_missing")
+    setup_meter = _WorkerMeter(work_budget, matrix.get("setup_units", {}))
     components = setup_production_worker(package, snapshots, records, prepared=prepared,
                                          permit=permit, run_dir=permit.root / "d6",
                                          budget=work_budget,
                                          construction_entry=runtime_construction_entry,
-                                         construction_check=runtime_construction_check)
+                                         construction_check=runtime_construction_check,
+                                         setup_meter=setup_meter)
     work_budget.check("worker_numerics_entry")
     result = run_numeric_kernel(components.trainer, components.batch, components.loss,
                                 permit=permit, artifact_dir=permit.root / "artifacts",
@@ -969,17 +1013,111 @@ def run_authorized_worker(*, authorization_raw: bytes, authorization_sha256: str
                                 trainer_receipt=components.trainer_receipt,
                                 budget=work_budget, runtime_guard=components.runtime,
                                 setup_report=components.setup_report)
+    result["source_io"] = source_io
     require(result["outcome"]["status"] == "candidate_pending_external_return",
             "worker_candidate_state")
+    construction = components.setup_report["trainer_construction"]
+    setup_calls = components.setup_meter.verify()
+    require(setup_calls["entered"].get("runtime_syncs") == result["outcome"].get("runtime_sync_count"),
+            "runtime_guard_sync_count_disagreement")
+    construction_entered = construction["construction_entered"]
+    construction_returned = construction["construction_returned"]
+    trainer_calls = {
+        "dataset_constructions": construction["dataset_constructions"],
+        "trainer_constructions": construction["trainer_constructions"],
+        "model_constructions": construction_entered.count("model"),
+        "model_transfers": construction_entered.count("model_transfer"),
+        "conditioner_constructions": construction_entered.count("conditioner"),
+        "conditioner_transfers": construction_entered.count("conditioner_transfer"),
+        "loader_constructions": construction_entered.count("train_loader") + construction_entered.count("val_loader"),
+        "loader_iterators": construction["loader_iterator_creations"],
+        "dataset_reads": construction["dataset_iterations"],
+        "optimizer_constructions": construction["optimizer_construction"],
+    }
+    source_rows = package["io_matrix"]["authorized_future_reads"]
+    observed_paths = set(records)
+    d6_paths = {row["path"] for row in source_rows["d6_files"]}
+    root_stats_path = source_rows["root_stats"]["path"]
+    asset_paths = {row["path"] for row in source_rows["production_assets"]}
+    source_counts = {"d6_file_reads": len(observed_paths & d6_paths),
+                     "root_stats_file_reads": int(root_stats_path in observed_paths),
+                     "asset_file_reads": len(observed_paths & asset_paths),
+                     "source_file_hashes": len(records),
+                     "d6_npz_member_reads": source_io["d6_npz_member_reads"],
+                     "root_stats_npz_member_reads": source_io["root_stats_npz_member_reads"],
+                     "npz_archive_opens": source_io["npz_archive_opens"],
+                     "initial_checkpoint_cpu_loads": source_io["checkpoint_cpu_loads"]}
+    actual_calls = {
+        "schema": matrix["schema"],
+        "sources": source_counts,
+        "setup_units": setup_calls["entered"],
+        "trainer_construction": trainer_calls,
+        "numeric": {"input_tensor_transfers": components.setup_report["input_tensor_transfers"],
+                    "trainer_predict": result["counts"]["trainer_predict"],
+                    "conditioner_forward": result["counts"]["conditioner_forward"],
+                    "backbone_forward": result["counts"]["backbone_forward"],
+                    "loss_assembly": result["counts"]["loss_assembly"],
+                    "loss_decode": result["counts"]["loss_decode"],
+                    "fk_call": result["counts"]["fk_call"],
+                    "paired_vjp": result["vjp"]["vjp_entered"],
+                    "vjp_pre_sync_points": result["vjp"]["vjp_pre_sync_points"]},
+        "forbidden": {"contact_branch": result["outcome"]["contact_branch"],
+                      "optimizer_steps": sum(result["outcome"]["forbidden_update_calls"].values()),
+                      "accumulate_micro": result["outcome"]["forbidden_update_calls"]["accumulate_micro"],
+                      "clip_gradients": result["outcome"]["forbidden_update_calls"]["clip_gradients"],
+                      "step_optimizer": result["outcome"]["forbidden_update_calls"]["step_optimizer"],
+                      "parameter_updates": result["outcome"]["parameter_updates"],
+                      "checkpoint_writes": 0,
+                      "dataset_iterations": construction["dataset_iterations"]},
+    }
+    require(actual_calls == {key: matrix[key] for key in actual_calls},
+            "real_worker_call_matrix_mismatch")
     return {"schema": SCHEMA + "/worker_result", "status": "candidate_pending_external_return",
             "launch_id": permit.launch_id, "authorization_sha256": permit.authorization_sha256,
             "admission_metadata_sha256": permit.admission_metadata_sha256,
             "outcome": result["outcome"], "independent_review": result["independent_review"],
             "counts": result["counts"], "vjp": result["vjp"],
-            "artifact_peak_bytes": result["artifact_peak_bytes"],
-            "artifact_io": result["artifact_io"], "source_records": records,
-            "budget": work_budget.facts(), "parameter_updates": 0,
-            "worker_pid": os.getpid()}
+             "artifact_peak_bytes": result["artifact_peak_bytes"],
+             "artifact_io": result["artifact_io"], "source_records": records,
+             "call_matrix": actual_calls,
+             "io_matrix": real_worker_io_matrix(package, records, result),
+             "budget": work_budget.facts(), "parameter_updates": 0,
+             "worker_pid": os.getpid()}
+
+
+def real_worker_io_matrix(package: dict, source_records: dict, result: dict) -> dict:
+    """Summarize only worker-owned reads/writes for supervisor equality checks."""
+    io = package.get("io_matrix")
+    require(type(io) is dict, "real_io_matrix_missing")
+    expected_paths = {row["path"]: {"bytes": row["bytes"], "sha256": row["sha256"]}
+                      for row in io["authorized_future_reads"]["d6_files"]}
+    root = io["authorized_future_reads"]["root_stats"]
+    expected_paths[root["path"]] = {"bytes": root["bytes"], "sha256": root["sha256"]}
+    for row in io["authorized_future_reads"]["production_assets"]:
+        expected_paths[row["path"]] = {"bytes": row["bytes"], "sha256": row["sha256"]}
+    require(set(source_records) == set(expected_paths), "real_worker_source_record_roster")
+    normalized = {path: {"bytes": rec["bytes"], "sha256": rec["sha256"]}
+                  for path, rec in source_records.items()}
+    require(normalized == expected_paths, "real_worker_source_records_drift")
+    artifact_io = result["artifact_io"]
+    require(artifact_io == {"npy_writes": 20, "json_writes": 5}, "real_worker_artifact_io_matrix")
+    files = result["outcome"].get("files")
+    require(type(files) is dict and len(files) == 20
+            and all(name.endswith(".npy") for name in files),
+            "real_worker_artifact_file_matrix")
+    readback = result["artifact_readback_io"]
+    require(readback == {"artifact_reads": 24, "file_sha256_verified": 20},
+            "real_worker_artifact_read_matrix")
+    source_io = result["source_io"]
+    require(source_io == {"d6_npz_member_reads": 60, "root_stats_npz_member_reads": 2,
+                          "npz_archive_opens": 4, "checkpoint_cpu_loads": 1},
+            "real_worker_source_member_matrix")
+    return {"source_file_reads": len(source_records), "source_file_hashes": len(source_records),
+            "source_records": normalized, **source_io,
+            "independent_artifact_reads": readback["artifact_reads"],
+            "independent_artifact_hashes": readback["file_sha256_verified"],
+            "artifact_files": files, "artifact_io": artifact_io,
+            "strict_model_loads": result["outcome"]["setup_report"]["strict_load"]["strict_model_loads"]}
 
 
 def review_real_artifacts(root: Path, expected_analysis: dict | None = None, *,
@@ -989,10 +1127,13 @@ def review_real_artifacts(root: Path, expected_analysis: dict | None = None, *,
     budget = budget or NullBudget()
     runtime_guard = runtime_guard or _NullRuntime()
 
+    io_counts = {"artifact_reads": 0, "file_sha256_verified": 0}
+
     def read(rel, cap):
         budget.check("independent_read:" + rel + ":pre")
         runtime_guard.check_unit("independent_read:" + rel + ":pre")
         raw = open_regular_source(root, Path(rel), cap)
+        io_counts["artifact_reads"] += 1
         budget.check("independent_read:" + rel + ":post")
         runtime_guard.check_unit("independent_read:" + rel + ":post")
         return raw
@@ -1011,6 +1152,7 @@ def review_real_artifacts(root: Path, expected_analysis: dict | None = None, *,
         size_cap = shared.PARAMETER_COUNT * 4 + (16 << 10) if name.startswith("g_") else 2 << 20
         raw = read(name, size_cap)
         require(len(raw) == rec.get("bytes") and _sha(raw) == rec.get("sha256"), "real_array_file_binding")
+        io_counts["file_sha256_verified"] += 1
         arr = np.load(io.BytesIO(raw), allow_pickle=False)
         require(type(rec.get("shape")) is list and list(arr.shape) == rec["shape"]
                 and rec.get("dtype") == "<f4" and arr.dtype == np.dtype("<f4")
@@ -1110,4 +1252,4 @@ def review_real_artifacts(root: Path, expected_analysis: dict | None = None, *,
     return {"schema": SCHEMA + "/independent_review", "passed": True,
             "decision": analysis["decision"], "groups": analysis["groups"],
             "h_checks": analysis["h_checks"], "vjp_pair_count": len(pairs),
-            "array_files": len(arrays), "parameter_updates": 0}
+            "array_files": len(arrays), "parameter_updates": 0, "io": io_counts}

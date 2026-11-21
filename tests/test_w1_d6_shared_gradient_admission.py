@@ -59,3 +59,18 @@ def test_supervisor_refuses_before_opening_authorization_or_spawning_worker(caps
     assert result["authorization_path_opened"] is False
     assert result["checkpoint_or_batch_reads"] == 0
     assert result["parameter_updates"] == 0
+
+
+def test_frozen_real_call_and_io_matrices_reject_single_count_drift():
+    package, _ = admission.build_materials(Path(__file__).resolve().parents[1])
+    assert admission.real_call_matrix_problems(package["call_matrix"]) == []
+    assert admission.real_io_matrix_problems(package) == []
+    changed_calls = json.loads(json.dumps(package["call_matrix"]))
+    changed_calls["numeric"]["fk_call"] += 1
+    assert admission.real_call_matrix_problems(changed_calls) == ["real_call_matrix_not_frozen"]
+    changed_io = json.loads(json.dumps(package))
+    changed_io["io_matrix"]["worker_actual"]["d6_npz_member_reads"] -= 1
+    assert admission.real_io_matrix_problems(changed_io) == ["real_io_worker_counts_not_frozen"]
+    changed_asset = json.loads(json.dumps(package))
+    changed_asset["io_matrix"]["authorized_future_reads"]["production_assets"].pop()
+    assert admission.real_io_matrix_problems(changed_asset) == ["real_io_source_roster_not_frozen"]

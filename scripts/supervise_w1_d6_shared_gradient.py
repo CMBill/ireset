@@ -40,6 +40,8 @@ class ExternalWaitWitness:
     waited_at: float
     cleaned_at: float
     group_reaped: bool
+    group_cleanup_checks: int
+    actual_wait_calls: int
     timed_out: bool
     log_overflow: bool
     logs: dict
@@ -50,9 +52,9 @@ class ExternalWaitWitness:
 class ExternalReturnWitness:
     observation: dict
     observation_sha256: str
-    final_sample: float
     t0: float
     registered_s: float
+    work_deadline: float
     hard_deadline: float
     _token: object
 
@@ -171,6 +173,8 @@ def supervise_process(command: list[str], *, output_root: Path, t0: float,
     process = None
     threads = []
     timed_out = False
+    cleanup_checks = 0
+    wait_calls = 0
     launch_started_at = None
     try:
         launch_started_at = clock()
@@ -184,20 +188,24 @@ def supervise_process(command: list[str], *, output_root: Path, t0: float,
             thread.start()
         remaining = max(0., work_deadline - clock())
         try:
+            wait_calls += 1
             return_code = process.wait(timeout=remaining)
         except subprocess.TimeoutExpired:
             timed_out = True
             _signal_group(pgid, signal.SIGTERM)
             try:
+                wait_calls += 1
                 process.wait(timeout=term_grace_s)
             except subprocess.TimeoutExpired:
                 pass
             _signal_group(pgid, signal.SIGKILL)
+            wait_calls += 1
             return_code = process.wait()
         waited_at = clock()
 
         _signal_group(pgid, signal.SIGTERM)
         for _ in range(GROUP_REAP_ROUNDS):
+            cleanup_checks += 1
             if not _group_exists(pgid):
                 break
             if clock() >= hard_deadline:
@@ -215,7 +223,7 @@ def supervise_process(command: list[str], *, output_root: Path, t0: float,
         cleaned_at = clock()
         records = {key: _hash_file(path, identities[key]) for key, path in log_paths.items()}
         return ExternalWaitWitness(os.getpid(), process.pid, pgid, return_code, launch_started_at,
-                                   waited_at, cleaned_at, group_reaped, timed_out,
+                                   waited_at, cleaned_at, group_reaped, cleanup_checks, wait_calls, timed_out,
                                    any(overflow.values()), records, _WAIT_TOKEN)
     except BaseException:
         if process is not None:
@@ -247,7 +255,7 @@ def return_witness(witness: ExternalWaitWitness, *, t0: float, registered_s: flo
             and registered_s >= 0 and witness.cleaned_at < work_deadline):
         raise ValueError("return_witness_time_coverage")
     if witness.pid != witness.process_group or witness.pid == witness.supervisor_pid \
-            or witness.return_code != 0 or witness.timed_out:
+            or witness.return_code != 0 or witness.timed_out or witness.actual_wait_calls != 1:
         raise ValueError("return_witness_worker_not_successful")
     if not witness.group_reaped or witness.log_overflow:
         raise ValueError("return_witness_cleanup_or_log_failure")
@@ -260,9 +268,11 @@ def return_witness(witness: ExternalWaitWitness, *, t0: float, registered_s: flo
         raise ValueError("return_witness_log_contract")
     return {"schema": admission.SCHEMA + "/external_return_witness_v1",
             "supervisor_pid": witness.supervisor_pid, "pid": witness.pid,
-            "process_group": witness.process_group,
-            "return_code": witness.return_code, "started_at": witness.started_at,
-            "waited_at": witness.waited_at, "cleaned_at": witness.cleaned_at,
+             "process_group": witness.process_group,
+             "return_code": witness.return_code, "started_at": witness.started_at,
+             "waited_at": witness.waited_at, "cleaned_at": witness.cleaned_at,
+             "group_cleanup_checks": witness.group_cleanup_checks,
+             "actual_wait_calls": witness.actual_wait_calls,
             "final_sample": final_sample, "registered_s": registered_s,
             "wall_cap_s": hard_deadline - t0, "group_reaped": True,
             "timed_out": False, "log_overflow": False, "logs": witness.logs,
@@ -312,18 +322,12 @@ def seal_external_return(root: Path, wait: ExternalWaitWitness, *, t0: float,
     if check != raw:
         raise ValueError("return_observation_readback_mismatch")
     rec = {"bytes": len(check), "sha256": hashlib.sha256(check).hexdigest()}
-    final_sample = clock()
-    finite_final = type(final_sample) in (int, float) and final_sample == final_sample \
-        and abs(final_sample) != float("inf")
-    if (not finite_final or final_sample - t0 > registered_s or final_sample > hard_deadline
-            or wait.cleaned_at >= work_deadline):
-        raise ValueError("return_observation_actual_coverage_failed")
-    return ExternalReturnWitness(observation, rec["sha256"], final_sample, t0,
-                                registered_s, hard_deadline, _RETURN_TOKEN)
+    return ExternalReturnWitness(observation, rec["sha256"], t0,
+                                registered_s, work_deadline, hard_deadline, _RETURN_TOKEN)
 
 
-def verify_external_return(root: Path, witness: ExternalReturnWitness) -> dict:
-    """Consume only an unchanged disk receipt paired with this live witness."""
+def verify_external_return(root: Path, witness: ExternalReturnWitness, *, clock=time.perf_counter) -> dict:
+    """Read back the pending receipt, then take the final no-I/O clock sample."""
     if not isinstance(witness, ExternalReturnWitness) or witness._token is not _RETURN_TOKEN:
         raise ValueError("external_return_witness_missing")
     path = _real_directory(root) / "return_observation.json"
@@ -338,12 +342,20 @@ def verify_external_return(root: Path, witness: ExternalReturnWitness) -> dict:
             or observation.get("registered_s") != witness.registered_s
             or observation.get("hard_deadline") != witness.hard_deadline
             or type(receipt_pre_sample) not in (int, float)
-            or not witness.t0 <= receipt_pre_sample <= witness.final_sample
-            or witness.final_sample - witness.t0 > witness.registered_s
-            or witness.final_sample > witness.hard_deadline):
+            or receipt_pre_sample < witness.t0):
         raise ValueError("external_return_observation_uncovered")
+    final_sample = clock()
+    wait_cleaned_at = observation.get("cleaned_at")
+    finite_final = type(final_sample) in (int, float) and final_sample == final_sample \
+        and abs(final_sample) != float("inf")
+    if (not finite_final or final_sample < receipt_pre_sample
+            or final_sample - witness.t0 > witness.registered_s
+            or final_sample > witness.hard_deadline
+            or type(wait_cleaned_at) not in (int, float)
+            or wait_cleaned_at >= witness.work_deadline):
+        raise ValueError("return_observation_actual_coverage_failed")
     return {"coverage": "covered", "observation_sha256": digest,
-            "final_sample": witness.final_sample, "registered_s": witness.registered_s}
+            "final_sample": final_sample, "registered_s": witness.registered_s}
 
 
 def _read_bounded_regular(path: Path, cap: int) -> bytes:
@@ -492,8 +504,10 @@ def _approved_worker_argv(package: dict, launch_spec_path: Path,
     substitutions = {"{launch_spec}": str(launch_spec_path),
                      "{admission_snapshot}": str(admission_path),
                      "{authorization_snapshot}": str(authorization_path),
-                     "{authorization_sha256}": authorization_sha256}
+                     "{authorization_sha256}": authorization_sha256,
+                     "{project_root}": str(project_root)}
     if (worker.get("status") != "reviewed_executable" or worker.get("execution_mode") != "real_worker_v1"
+            or worker.get("cwd") != "attempt_root"
             or type(template) is not list or not template
             or not all(type(part) is str and part for part in template)
             or script.is_absolute() or ".." in script.parts or script_rel not in implementation_files
@@ -532,7 +546,16 @@ def run_authorized_attempt(*, authorization_path: Path, authorization_sha256: st
                            ledger_root: Path, clock=time.perf_counter,
                            popen=subprocess.Popen) -> dict:
     """Run only a separately approved, package-pinned worker exactly once."""
+    t0 = clock()
+    def outer_check(point):
+        if type(t0) not in (int, float) or t0 != t0 or abs(t0) == float("inf"):
+            raise ValueError("real_execution_clock_invalid")
+        if clock() - t0 >= 240.:
+            raise TimeoutError("real_supervisor_work_deadline:" + point)
+
+    outer_check("project_root_resolve:pre")
     project_root = _real_directory(project_root)
+    outer_check("project_root_resolve:post")
     if type(package) is not dict or package.get("schema") != admission.SCHEMA:
         raise ValueError("real_admission_package_invalid")
     package_body = {key: value for key, value in package.items() if key != "metadata_sha256"}
@@ -540,10 +563,16 @@ def run_authorized_attempt(*, authorization_path: Path, authorization_sha256: st
             or package.get("metadata_sha256") != _canonical_sha(package_body)
             or package.get("status", {}).get("real_worker") != "implemented_and_reviewed_and_supervised"):
         raise ValueError("real_admission_not_executable")
+    if (admission.real_call_matrix_problems(package.get("call_matrix"))
+            or admission.real_io_matrix_problems(package)):
+        raise ValueError("real_admission_io_or_call_matrix_not_frozen")
+    outer_check("authorization_read:pre")
     auth_raw, auth = _read_authorization(authorization_path, authorization_sha256)
+    outer_check("authorization_read:post")
     problems = admission.authorization_problems(auth, package)
     if problems:
         raise ValueError("real_authorization_rejected:" + ",".join(problems))
+    outer_check("authorization_validation:post")
     launch_id = auth.get("launch_id")
     if (not isinstance(launch_id, str) or len(launch_id) != 64
             or any(ch not in "0123456789abcdef" for ch in launch_id)):
@@ -562,9 +591,9 @@ def run_authorized_attempt(*, authorization_path: Path, authorization_sha256: st
     if (ledger_rel.is_absolute() or ".." in ledger_rel.parts or not ledger_rel.parts
             or ledger_root != project_root / ledger_rel):
         raise ValueError("real_authorization_ledger_root_not_frozen")
+    outer_check("implementation_closure_pre:pre")
     pre = _implementation_closure(project_root, package.get("implementation", {}).get("files"))
-
-    t0 = clock()
+    outer_check("implementation_closure_pre:post")
     budgets = package.get("budgets")
     if (type(t0) not in (int, float) or t0 != t0 or abs(t0) == float("inf")
             or type(budgets) is not dict
@@ -578,12 +607,15 @@ def run_authorized_attempt(*, authorization_path: Path, authorization_sha256: st
         ledger_root, authorization_sha256=authorization_sha256, launch_id=launch_id,
         admission_sha256=package["metadata_sha256"], implementation_sha256=_canonical_sha(pre), t0=t0,
     )
+    outer_check("authorization_consumption_write:post")
     attempt_root.mkdir(mode=0o700, exist_ok=False)
     attempt = _real_directory(attempt_root)
     package_path = attempt / "admission_snapshot.json"
     auth_path = attempt / "authorization_snapshot.json"
     package_record = _write_exclusive_json(attempt, package_path.name, package)
+    outer_check("admission_snapshot_write:post")
     auth_record = _write_exclusive_bytes(attempt, auth_path.name, auth_raw)
+    outer_check("authorization_snapshot_write:post")
     launch_spec = {"schema": admission.SCHEMA + "/worker_launch_spec_v1",
                    "execution_mode": "real_worker_v1", "launch_id": launch_id,
                    "authorization_sha256": authorization_sha256,
@@ -593,10 +625,11 @@ def run_authorized_attempt(*, authorization_path: Path, authorization_sha256: st
                    "implementation_pre": pre,
                    "implementation_pre_sha256": _canonical_sha(pre),
                    "authorization_ledger": {"path": ledger["path"], "sha256": ledger["sha256"]},
-                   "attempt_root": str(attempt), "t0": t0,
+                   "attempt_root": str(attempt), "project_root": str(project_root), "t0": t0,
                    "work_deadline": work_deadline, "hard_deadline": hard_deadline,
                    "parameter_updates": 0}
     launch_spec_record = _write_exclusive_json(attempt, "worker_launch.json", launch_spec)
+    outer_check("launch_spec_write:post")
     command = _approved_worker_argv(package, attempt / "worker_launch.json", package_path,
                                     auth_path, authorization_sha256, project_root)
     worker_env = _approved_worker_environment(package)
@@ -606,12 +639,15 @@ def run_authorized_attempt(*, authorization_path: Path, authorization_sha256: st
          "launch_id": launch_id, "attempt_root": str(attempt),
          "launch_spec_sha256": launch_spec_record["sha256"], "parameter_updates": 0},
     )
+    outer_check("launch_event_write:post")
     wait = supervise_process(command, output_root=attempt, t0=t0, work_deadline=work_deadline,
                              hard_deadline=hard_deadline, clock=clock, popen=popen,
-                             cwd=project_root, env=worker_env)
+                             cwd=attempt, env=worker_env)
+    outer_check("worker_wait_and_cleanup:post")
     if wait.return_code != 0 or wait.timed_out or not wait.group_reaped or wait.log_overflow:
         raise ValueError("real_worker_failed_or_unclean")
     result_raw = _read_regular(attempt / "worker_result.json", 2 << 20)
+    outer_check("worker_result_read:post")
     try:
         worker_result = json.loads(result_raw)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -627,6 +663,92 @@ def run_authorized_attempt(*, authorization_path: Path, authorization_sha256: st
             or type(worker_result.get("independent_review")) is not dict
             or worker_result["independent_review"].get("passed") is not True):
         raise ValueError("real_worker_result_binding_or_review")
+    worker_matrix = package["call_matrix"]
+    expected_worker_matrix = {key: worker_matrix[key] for key in
+                              ("schema", "sources", "setup_units", "trainer_construction", "numeric", "forbidden")}
+    if worker_result.get("call_matrix") != expected_worker_matrix:
+        raise ValueError("real_worker_call_matrix_mismatch")
+    if worker_result.get("worker_matrix_sha256") != package["metadata_sha256"]:
+        raise ValueError("real_worker_matrix_binding_mismatch")
+    if worker_result.get("worker_io") != package["io_matrix"].get("worker_actual"):
+        raise ValueError("real_worker_io_call_counts_mismatch")
+    runtime_report = worker_result.get("outcome", {}).get("runtime_report")
+    expected_runtime = package.get("source", {}).get("d6_bindings", {}).get("runtime")
+    if (type(runtime_report) is not dict or type(expected_runtime) is not dict
+            or runtime_report.get("stage") != "D6" or runtime_report.get("kind") != "production"
+            or runtime_report.get("device") != "cuda:0"
+            or runtime_report.get("identity") != expected_runtime.get("identity")
+            or runtime_report.get("gpu") != expected_runtime.get("gpu")
+            or runtime_report.get("before") != expected_runtime.get("observed_before_setup")
+            or runtime_report.get("setup", {}).get("applied") is not True
+            or runtime_report.get("setup", {}).get("problems") != []
+            or runtime_report.get("endpoint") is None
+            or worker_result.get("outcome", {}).get("runtime_sync_count") !=
+               worker_matrix["setup_units"].get("runtime_syncs")):
+        raise ValueError("real_worker_runtime_matrix_mismatch")
+    io_actual = worker_result.get("io_matrix")
+    expected_source_records = {
+        row["path"]: {"bytes": row["bytes"], "sha256": row["sha256"]}
+        for row in package["io_matrix"]["authorized_future_reads"]["d6_files"]
+    }
+    stats = package["io_matrix"]["authorized_future_reads"]["root_stats"]
+    expected_source_records[stats["path"]] = {"bytes": stats["bytes"], "sha256": stats["sha256"]}
+    for row in package["io_matrix"]["authorized_future_reads"]["production_assets"]:
+        expected_source_records[row["path"]] = {"bytes": row["bytes"], "sha256": row["sha256"]}
+    if (type(io_actual) is not dict or io_actual.get("source_records") != expected_source_records
+            or worker_result.get("source_records") != io_actual.get("source_records")
+            or io_actual.get("source_file_reads") != 48 or io_actual.get("source_file_hashes") != 48
+            or io_actual.get("d6_npz_member_reads") != 60
+            or io_actual.get("root_stats_npz_member_reads") != 2
+            or io_actual.get("npz_archive_opens") != 4
+            or io_actual.get("independent_artifact_reads") != 24
+            or io_actual.get("independent_artifact_hashes") != 20
+            or io_actual.get("checkpoint_cpu_loads") != 1
+            or io_actual.get("strict_model_loads") != 2
+            or io_actual.get("artifact_io") != {"npy_writes": 20, "json_writes": 5}
+            or worker_result.get("artifact_io") != io_actual.get("artifact_io")
+            or worker_result.get("outcome", {}).get("files") != io_actual.get("artifact_files")
+            or type(io_actual.get("artifact_files")) is not dict
+            or set(io_actual["artifact_files"]) != ({f"{role}_{i}.npy" for role in ("h", "g") for i in range(7)}
+               | {f"loss_{name}.npy" for name in ("pos", "rot6d", "joint", "geodesic_rad2", "vel", "fk_m2")})):
+        raise ValueError("real_worker_io_matrix_mismatch")
+    supervisor_expected = worker_matrix.get("supervisor")
+    supervisor_io_expected = package["io_matrix"].get("supervisor_actual")
+    supervisor_actual = {
+        "authorization_file_reads": 1,
+        "implementation_closure_hash_passes": 2,
+        "worker_launches": 1,
+        "worker_retries": 0,
+        "actual_wait_calls": wait.actual_wait_calls,
+        "stdout_log_creates": int("stdout" in wait.logs),
+        "stderr_log_creates": int("stderr" in wait.logs),
+        "worker_result_reads": 1,
+        "return_observation_writes": 1,
+        "return_observation_readbacks": 2,
+        "authorization_consumption_markers": 1,
+        "authorization_ledger_events": 3,
+        "attempts": 1,
+        "process_group_created": int(wait.process_group == wait.pid),
+        "group_cleanup_checks": wait.group_cleanup_checks,
+        "log_streams_drained": len(wait.logs),
+        "launch_spec_writes": 1,
+        "return_witnesses": 1,
+    }
+    supervisor_io_actual = {key: value for key, value in supervisor_actual.items()
+                            if key != "worker_retries"}
+    supervisor_io_actual["retries"] = supervisor_actual["worker_retries"]
+    call_actual_fixed = {key: value for key, value in supervisor_actual.items()
+                         if key != "group_cleanup_checks"}
+    call_expected_fixed = {key: value for key, value in supervisor_expected.items()
+                           if key != "group_cleanup_checks_max"}
+    io_actual_fixed = {key: value for key, value in supervisor_io_actual.items()
+                       if key != "group_cleanup_checks"}
+    io_expected_fixed = {key: value for key, value in supervisor_io_expected.items()
+                         if key != "group_cleanup_checks"}
+    if (call_actual_fixed != call_expected_fixed or io_actual_fixed != io_expected_fixed
+            or supervisor_io_actual.get("group_cleanup_checks") != supervisor_actual["group_cleanup_checks"]
+            or supervisor_actual["group_cleanup_checks"] > supervisor_expected["group_cleanup_checks_max"]):
+        raise ValueError("real_supervisor_call_or_io_matrix_mismatch")
     post = _implementation_closure(project_root, package["implementation"]["files"])
     if post != pre:
         raise ValueError("implementation_closure_changed_during_worker")
@@ -650,10 +772,14 @@ def run_authorized_attempt(*, authorization_path: Path, authorization_sha256: st
                      "launch_spec": launch_spec_record, "worker_result": result_record,
                      "implementation_pre_sha256": _canonical_sha(pre),
                      "implementation_post_sha256": _canonical_sha(post),
+                     "call_matrix": expected_worker_matrix,
+                     "supervisor_call_matrix": supervisor_actual,
+                     "io_matrix": {key: value for key, value in io_actual.items() if key != "artifact_files"},
                      "wait_witness_sha256": _canonical_sha(wait_record), "parameter_updates": 0}
     receipt = seal_external_return(attempt, wait, t0=t0, registered_s=300.,
                                    work_deadline=work_deadline, hard_deadline=hard_deadline,
                                    clock=clock, binding_facts=binding_facts)
+    outer_check("return_receipt_seal:post")
     consumed = verify_external_return(attempt, receipt)
     if consumed.get("coverage") != "covered" or receipt.observation.get("binding_facts") != binding_facts:
         raise ValueError("real_external_return_binding_failed")
