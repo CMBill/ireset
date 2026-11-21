@@ -188,7 +188,9 @@ def build_materials(project_root: Path) -> tuple[dict, dict]:
                        "pre_and_post_implementation_hash_passes": 2,
                        "process_group_created": 1, "actual_wait_calls": 1,
                        "group_cleanup_checks_max": SUPERVISOR_GROUP_CLEANUP_CHECKS_MAX,
-                       "log_streams_drained": 2, "return_observation_write_readback": 1},
+                       "log_streams_drained": 2, "return_observation_write_readback": 1,
+                       "synthetic_claim_writes": 1, "synthetic_candidate_readbacks": 1,
+                       "authorization_file_reads": 1, "attempts": 1},
     }
     source_bindings = pkg["bindings"]
     production_assets = source_bindings["production_assets"]["files"]
@@ -219,7 +221,7 @@ def build_materials(project_root: Path) -> tuple[dict, dict]:
     # The current I/C matrix describes synthetic core work only. Real source,
     # asset, setup and outer-return counts remain proposed until worker review.
     package = {
-        "schema": SCHEMA, "state": "metadata_only_materials_real_kernel_partial_supervision_pending",
+        "schema": SCHEMA, "state": "metadata_only_real_execution_pending_synthetic_outer_chain_reviewed",
         "executable": False, "authorized": False,
         "proposed_real_root": str(PROPOSED_REAL_ROOT),
         "historical": {"r6": meta_records["r6"], "verified_outcome": meta_records["outcome"],
@@ -244,7 +246,7 @@ def build_materials(project_root: Path) -> tuple[dict, dict]:
         "forbidden_calls": dict(ZERO_COUNTS),
         "status": {"fresh_source_hash_verification": "not_run",
                    "checkpoint_and_batch_read": "not_run",
-                   "real_worker": "kernel_and_supervisor_primitive_synthetic_reviewed_cli_refusal",
+                   "real_worker": "worker_and_synthetic_supervisor_chain_reviewed_production_refusal",
                    "external_authorization": "not_granted"},
     }
     package["metadata_sha256"] = _sha(json.dumps(package, sort_keys=True, separators=(",", ":")).encode())

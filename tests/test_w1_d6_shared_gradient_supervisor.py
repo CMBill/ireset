@@ -1,6 +1,8 @@
 import sys
 import time
 from dataclasses import replace
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -142,3 +144,131 @@ def test_nonfinite_deadline_is_rejected_before_spawn(tmp_path):
             work_deadline=float("nan"), hard_deadline=t0 + 10, popen=forbidden_spawn,
         )
     assert called == []
+
+
+def _synthetic_authorized_packet(tmp_path):
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    source = source_root / "worker_contract.txt"
+    source.write_text("synthetic implementation closure v1\n")
+    source_raw = source.read_bytes()
+    files = {"worker_contract.txt": {"bytes": len(source_raw),
+                                      "sha256": hashlib.sha256(source_raw).hexdigest()}}
+    package = {
+        "schema": supervisor.admission.SCHEMA,
+        "execution_mode": "synthetic_test_only",
+        "executable": True,
+        "metadata_sha256": "",
+        "implementation": {"files": files},
+        "historical": {"synthetic_ic_acceptance": {"bytes": 1, "sha256": "1" * 64},
+                       "verified_outcome": {"bytes": 1, "sha256": "2" * 64}},
+        "status": {"real_worker": "implemented_and_reviewed_and_supervised"},
+    }
+    body = {key: value for key, value in package.items() if key != "metadata_sha256"}
+    package["metadata_sha256"] = supervisor._canonical_sha(body)
+    auth = {
+        "schema": supervisor.admission.AUTH_SCHEMA,
+        "cohort": "w1_d6_shared_gradient_step0_v1",
+        "authorized": True, "template_only": False,
+        "includes": ["single_step0_diagnostic"], "attempts": 1,
+        "checklist": dict.fromkeys(supervisor.admission.CHECKLIST, True),
+        "approval_reference": "synthetic-test-only",
+        "launch_id": "a" * 64,
+        "bindings": {"admission_metadata_sha256": package["metadata_sha256"],
+                     "implementation_files": files,
+                     "ic_acceptance": package["historical"]["synthetic_ic_acceptance"],
+                     "historical_d6_outcome": package["historical"]["verified_outcome"]},
+    }
+    auth_raw = (json.dumps(auth, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    auth_path = tmp_path / "authorization.json"
+    auth_path.write_bytes(auth_raw)
+    return source_root, package, auth_path, hashlib.sha256(auth_raw).hexdigest(), auth
+
+
+def _candidate_command(package, authorization_sha256, launch_id, closure_sha256):
+    candidate = {"schema": supervisor.admission.SCHEMA + "/synthetic_worker_candidate_v1",
+                 "status": "candidate_complete", "launch_id": launch_id,
+                 "authorization_sha256": authorization_sha256,
+                 "admission_metadata_sha256": package["metadata_sha256"],
+                 "implementation_closure_sha256": closure_sha256,
+                 "parameter_updates": 0}
+    literal = repr(json.dumps(candidate, sort_keys=True, separators=(",", ":")))
+    code = ("import json, os; from pathlib import Path; "
+            f"p=Path('worker_candidate.json'); raw={literal}.encode(); "
+            "fd=os.open(p, os.O_WRONLY|os.O_CREAT|os.O_EXCL, 0o600); "
+            "f=os.fdopen(fd,'wb'); f.write(raw); f.flush(); os.fsync(f.fileno()); f.close()")
+    return [sys.executable, "-I", "-c", code]
+
+
+def test_synthetic_outer_chain_claim_wait_closure_candidate_and_return(tmp_path):
+    source_root, package, auth_path, auth_sha, auth = _synthetic_authorized_packet(tmp_path)
+    (tmp_path / "runs").mkdir()
+    closure_sha = supervisor._canonical_sha(package["implementation"]["files"])
+    command = _candidate_command(package, auth_sha, auth["launch_id"], closure_sha)
+    result = supervisor.run_synthetic_attempt(
+        authorization_path=auth_path, authorization_sha256=auth_sha,
+        package=package, project_root=source_root,
+        attempt_root=tmp_path / "runs" / "attempt_001", command=command,
+    )
+    assert result["status"] == "candidate_complete"
+    assert result["claim"]["attempt"] == 1
+    assert result["claim"]["parameter_updates"] == 0
+    assert result["implementation_pre_sha256"] == result["implementation_post_sha256"]
+    assert result["wait"]["return_code"] == 0 and result["wait"]["group_reaped"] is True
+    assert result["return"]["coverage"] == "covered"
+    attempt = Path(result["attempt_root"])
+    assert {p.name for p in attempt.iterdir()} == {
+        "claim.json", "worker.stdout.log", "worker.stderr.log",
+        "worker_candidate.json", "return_observation.json",
+    }
+    observation = json.loads((attempt / "return_observation.json").read_text())
+    assert observation["publication"] == "pending_actual_readback"
+    assert observation["binding_facts"]["parameter_updates"] == 0
+
+
+def test_unsigned_authorization_is_rejected_before_attempt_claim_or_spawn(tmp_path):
+    source_root, package, auth_path, auth_sha, auth = _synthetic_authorized_packet(tmp_path)
+    auth["authorized"] = False
+    auth_raw = (json.dumps(auth, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    auth_path.write_bytes(auth_raw)
+    (tmp_path / "runs").mkdir()
+    attempt = tmp_path / "runs" / "attempt_001"
+    called = []
+
+    def forbidden_spawn(*_args, **_kwargs):
+        called.append(True)
+        raise AssertionError("unsigned auth must not spawn")
+
+    with pytest.raises(ValueError, match="synthetic_authorization_rejected"):
+        supervisor.run_synthetic_attempt(
+            authorization_path=auth_path, authorization_sha256=hashlib.sha256(auth_raw).hexdigest(),
+            package=package, project_root=source_root, attempt_root=attempt,
+            command=[sys.executable, "-I", "-c", "pass"], popen=forbidden_spawn,
+        )
+    assert not attempt.exists() and called == []
+
+
+def test_source_closure_change_during_child_blocks_return_coverage(tmp_path):
+    source_root, package, auth_path, auth_sha, auth = _synthetic_authorized_packet(tmp_path)
+    (tmp_path / "runs").mkdir()
+    closure_sha = supervisor._canonical_sha(package["implementation"]["files"])
+    command = _candidate_command(package, auth_sha, auth["launch_id"], closure_sha)
+    source = source_root / "worker_contract.txt"
+    original = source.read_bytes()
+
+    def mutate_after_spawn(cmd, **kwargs):
+        process = __import__("subprocess").Popen(cmd, **kwargs)
+        source.write_text("synthetic implementation drift\n")
+        return process
+
+    with pytest.raises(ValueError, match="implementation_closure_drift"):
+        supervisor.run_synthetic_attempt(
+            authorization_path=auth_path, authorization_sha256=auth_sha,
+            package=package, project_root=source_root,
+            attempt_root=tmp_path / "runs" / "attempt_001", command=command,
+            popen=mutate_after_spawn,
+        )
+    assert original != source.read_bytes()
+    attempt = tmp_path / "runs" / "attempt_001"
+    assert (attempt / "claim.json").is_file()
+    assert not (attempt / "return_observation.json").exists()

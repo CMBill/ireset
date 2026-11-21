@@ -120,7 +120,8 @@ def _signal_group(pgid: int, sig: int) -> None:
 def supervise_process(command: list[str], *, output_root: Path, t0: float,
                       work_deadline: float, hard_deadline: float,
                       clock=time.perf_counter, popen=subprocess.Popen,
-                      log_cap: int = LOG_CAP, term_grace_s: float = TERM_GRACE_S) -> ExternalWaitWitness:
+                      log_cap: int = LOG_CAP, term_grace_s: float = TERM_GRACE_S,
+                      cwd: Path | None = None) -> ExternalWaitWitness:
     """Wait for one process and prove process-group cleanup with bounded logs."""
     root = _real_directory(output_root)
     if (not isinstance(command, list) or not command or
@@ -133,6 +134,7 @@ def supervise_process(command: list[str], *, output_root: Path, t0: float,
         raise ValueError("worker_deadline_invalid")
     if type(log_cap) is not int or log_cap <= 0 or term_grace_s < 0:
         raise ValueError("worker_supervisor_limits_invalid")
+    working_directory = _real_directory(cwd) if cwd is not None else None
 
     log_paths = {"stdout": root / "worker.stdout.log", "stderr": root / "worker.stderr.log"}
     streams, identities = {}, {}
@@ -169,7 +171,8 @@ def supervise_process(command: list[str], *, output_root: Path, t0: float,
     try:
         launch_started_at = clock()
         process = popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE, start_new_session=True, close_fds=True)
+                        stderr=subprocess.PIPE, start_new_session=True, close_fds=True,
+                        cwd=working_directory)
         pgid = process.pid
         threads = [threading.Thread(target=drain, args=("stdout", process.stdout), daemon=True),
                    threading.Thread(target=drain, args=("stderr", process.stderr), daemon=True)]
@@ -264,7 +267,8 @@ def return_witness(witness: ExternalWaitWitness, *, t0: float, registered_s: flo
 
 def seal_external_return(root: Path, wait: ExternalWaitWitness, *, t0: float,
                          registered_s: float, work_deadline: float,
-                         hard_deadline: float, clock=time.perf_counter) -> ExternalReturnWitness:
+                         hard_deadline: float, clock=time.perf_counter,
+                         binding_facts: dict | None = None) -> ExternalReturnWitness:
     """Publish/readback the pending proof, then take the final no-I/O sample."""
     root = _real_directory(root)
     candidate = return_witness(wait, t0=t0, registered_s=registered_s,
@@ -274,6 +278,10 @@ def seal_external_return(root: Path, wait: ExternalWaitWitness, *, t0: float,
     observation.update({"publication": "pending_actual_readback", "nonce": secrets.token_hex(16),
                         "t0": t0, "work_deadline": work_deadline,
                         "hard_deadline": hard_deadline, "receipt_pre_sample": clock()})
+    if binding_facts is not None:
+        if type(binding_facts) is not dict:
+            raise ValueError("return_binding_facts_invalid")
+        observation["binding_facts"] = binding_facts
     raw = (json.dumps(observation, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode()
     path = Path(root) / "return_observation.json"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
@@ -332,6 +340,157 @@ def verify_external_return(root: Path, witness: ExternalReturnWitness) -> dict:
         raise ValueError("external_return_observation_uncovered")
     return {"coverage": "covered", "observation_sha256": digest,
             "final_sample": witness.final_sample, "registered_s": witness.registered_s}
+
+
+def _read_bounded_regular(path: Path, cap: int) -> bytes:
+    return _read_regular(path, cap)
+
+
+def _canonical_sha(doc: dict) -> str:
+    return hashlib.sha256(json.dumps(doc, sort_keys=True, separators=(",", ":"),
+                                    allow_nan=False).encode()).hexdigest()
+
+
+def _implementation_closure(project_root: Path, files: dict) -> dict:
+    if type(files) is not dict or not files:
+        raise ValueError("implementation_closure_empty")
+    closure = {}
+    for rel, expected in sorted(files.items()):
+        relative = Path(rel)
+        if (relative.is_absolute() or ".." in relative.parts or not relative.parts
+                or type(expected) is not dict or type(expected.get("bytes")) is not int
+                or type(expected.get("sha256")) is not str or len(expected["sha256"]) != 64):
+            raise ValueError("implementation_closure_record_invalid")
+        raw = _read_bounded_regular(Path(project_root) / relative, expected["bytes"] + 1)
+        record = {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+        if record != {"bytes": expected["bytes"], "sha256": expected["sha256"]}:
+            raise ValueError("implementation_closure_drift:" + rel)
+        closure[rel] = record
+    return closure
+
+
+def _write_exclusive_json(root: Path, name: str, doc: dict) -> dict:
+    raw = (json.dumps(doc, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode()
+    path = root / name
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            raise ValueError("supervisor_json_not_regular")
+        with os.fdopen(fd, "wb", closefd=False) as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        os.close(fd)
+    dirfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(dirfd)
+    finally:
+        os.close(dirfd)
+    observed = _read_regular(path, 1 << 20)
+    if observed != raw:
+        raise ValueError("supervisor_json_readback_mismatch")
+    return {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+
+
+def run_synthetic_attempt(*, authorization_path: Path, authorization_sha256: str,
+                          package: dict, project_root: Path, attempt_root: Path,
+                          command: list[str], work_cap_s: float = 5.0,
+                          hard_cap_s: float = 10.0, clock=time.perf_counter,
+                          popen=subprocess.Popen) -> dict:
+    """Exercise the complete outer contract with an explicitly synthetic packet."""
+    project_root = _real_directory(project_root)
+    supplied_attempt = Path(attempt_root).absolute()
+    parent = _real_directory(supplied_attempt.parent)
+    if supplied_attempt.parent != parent or supplied_attempt.exists():
+        raise ValueError("synthetic_attempt_root_not_exclusive")
+    if type(package) is not dict or package.get("execution_mode") != "synthetic_test_only":
+        raise ValueError("synthetic_packet_required")
+    body = {key: value for key, value in package.items() if key != "metadata_sha256"}
+    if package.get("metadata_sha256") != _canonical_sha(body):
+        raise ValueError("synthetic_packet_metadata_hash")
+    if package.get("executable") is not True:
+        raise ValueError("synthetic_packet_not_executable")
+    if not isinstance(authorization_path, Path):
+        raise ValueError("authorization_path_invalid")
+    auth_raw = _read_bounded_regular(authorization_path, 1 << 20)
+    if hashlib.sha256(auth_raw).hexdigest() != authorization_sha256:
+        raise ValueError("authorization_sha256_mismatch")
+    try:
+        auth = json.loads(auth_raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("authorization_json_invalid") from exc
+    if type(auth) is not dict or admission.authorization_problems(auth, package):
+        raise ValueError("synthetic_authorization_rejected")
+
+    t0 = clock()
+    if (type(t0) not in (float, int) or t0 != t0 or abs(t0) == float("inf")
+            or type(work_cap_s) not in (float, int) or work_cap_s <= 0
+            or type(hard_cap_s) not in (float, int) or hard_cap_s <= work_cap_s):
+        raise ValueError("synthetic_budget_invalid")
+    hard_deadline = t0 + hard_cap_s
+    work_deadline = t0 + work_cap_s
+    pre = _implementation_closure(project_root, package.get("implementation", {}).get("files"))
+
+    supplied_attempt.mkdir(mode=0o700, exist_ok=False)
+    attempt = _real_directory(supplied_attempt)
+    launch_id = auth.get("launch_id")
+    if not isinstance(launch_id, str) or len(launch_id) != 64:
+        raise ValueError("synthetic_launch_id_invalid")
+    claim = {"schema": admission.SCHEMA + "/synthetic_claim_v1", "launch_id": launch_id,
+             "authorization_sha256": authorization_sha256,
+             "admission_metadata_sha256": package["metadata_sha256"],
+             "implementation_closure_sha256": _canonical_sha(pre),
+             "t0": t0, "work_deadline": work_deadline, "hard_deadline": hard_deadline,
+             "attempt": 1, "parameter_updates": 0}
+    claim_record = _write_exclusive_json(attempt, "claim.json", claim)
+
+    wait = supervise_process(command, output_root=attempt, t0=t0, work_deadline=work_deadline,
+                             hard_deadline=hard_deadline, clock=clock, popen=popen, cwd=attempt)
+    if wait.return_code != 0 or wait.timed_out or not wait.group_reaped or wait.log_overflow:
+        raise ValueError("synthetic_worker_failed_or_unclean")
+    candidate_raw = _read_regular(attempt / "worker_candidate.json", 64 << 10)
+    try:
+        candidate = json.loads(candidate_raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("synthetic_worker_candidate_invalid") from exc
+    expected_candidate = {"schema": admission.SCHEMA + "/synthetic_worker_candidate_v1",
+                          "status": "candidate_complete", "launch_id": launch_id,
+                          "authorization_sha256": authorization_sha256,
+                          "admission_metadata_sha256": package["metadata_sha256"],
+                          "implementation_closure_sha256": _canonical_sha(pre),
+                          "parameter_updates": 0}
+    if candidate != expected_candidate:
+        raise ValueError("synthetic_worker_candidate_binding")
+    candidate_record = {"bytes": len(candidate_raw), "sha256": hashlib.sha256(candidate_raw).hexdigest()}
+
+    post = _implementation_closure(project_root, package["implementation"]["files"])
+    if post != pre:
+        raise ValueError("implementation_closure_changed_during_worker")
+    wait_record = return_witness(wait, t0=t0, registered_s=hard_cap_s,
+                                 work_deadline=work_deadline, hard_deadline=hard_deadline,
+                                 final_sample=wait.cleaned_at)
+    binding_facts = {"claim": claim_record, "candidate": candidate_record,
+                     "implementation_pre_sha256": _canonical_sha(pre),
+                     "implementation_post_sha256": _canonical_sha(post),
+                     "wait_witness_sha256": _canonical_sha(wait_record),
+                     "parameter_updates": 0}
+    return_receipt = seal_external_return(
+        attempt, wait, t0=t0, registered_s=hard_cap_s,
+        work_deadline=work_deadline, hard_deadline=hard_deadline,
+        clock=clock, binding_facts=binding_facts,
+    )
+    consumed = verify_external_return(attempt, return_receipt)
+    if (consumed["coverage"] != "covered"
+            or return_receipt.observation.get("binding_facts") != binding_facts):
+        raise ValueError("synthetic_return_binding_failed")
+    return {"status": "candidate_complete", "attempt_root": str(attempt),
+            "claim": claim, "claim_sha256": claim_record["sha256"],
+            "candidate": candidate, "candidate_sha256": candidate_record["sha256"],
+            "implementation_pre_sha256": _canonical_sha(pre),
+            "implementation_post_sha256": _canonical_sha(post),
+            "wait": wait_record, "return": consumed, "parameter_updates": 0}
 
 
 def main(argv=None):
