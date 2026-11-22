@@ -349,7 +349,7 @@ def test_authorized_source_bundle_snapshots_each_approved_file_once(tmp_path):
                            "root_stats": {"file": {"path": stats_rel, "bytes": len(stats_raw),
                                                      "sha256": real._sha(stats_raw)},
                                           "headers": {}},
-                           "production_assets": {"files": assets}}}
+                            "d6_bindings": {"production_assets": {"files": assets}}}}
 
     class Budget:
         def __init__(self):

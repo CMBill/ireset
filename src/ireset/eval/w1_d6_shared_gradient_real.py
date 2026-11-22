@@ -180,12 +180,13 @@ def read_authorized_source_bundle(package: dict, project_root: Path, budget, *, 
     require(type(source) is dict, "admission_source_block")
     d6 = source.get("selected_d6_files")
     stats = source.get("root_stats")
-    assets = source.get("production_assets")
+    bindings = source.get("d6_bindings")
     require(type(d6) is list and [row.get("path") for row in d6] ==
             [str(admission.SOURCE_ROOT / rel) for rel in INPUT_RECORDS], "admission_d6_source_roster")
     require(type(stats) is dict and type(stats.get("file")) is dict and type(stats.get("headers")) is dict,
             "admission_root_stats_binding")
-    asset_files = assets.get("files") if type(assets) is dict else None
+    production_assets = bindings.get("production_assets") if type(bindings) is dict else None
+    asset_files = production_assets.get("files") if type(production_assets) is dict else None
     require(type(asset_files) is dict and len(asset_files) == 41, "admission_asset_source_roster")
     d6_caps = {"initial.pt": 32 << 20, "probe_inputs.npz": 16 << 20,
                "payload.json": 2 << 20, "optimizer_roster.json": 2 << 20,
