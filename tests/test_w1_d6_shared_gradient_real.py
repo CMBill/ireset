@@ -460,6 +460,15 @@ def test_worker_budget_binds_d6_runtime_stage():
     assert budget.work_deadline == budget.deadline == 2.0
 
 
+def test_conditioner_receives_only_registered_condition_fields():
+    full_batch = {key: object() for key in shared.INPUT_KEYS}
+    condition = real.conditioner_only_input(full_batch)
+    assert set(condition) == set(shared.COND_KEYS)
+    assert all(condition[key] is full_batch[key] for key in shared.COND_KEYS)
+    with pytest.raises(real.RealWorkerError, match="real_conditioner_input_roster"):
+        real.conditioner_only_input({key: value for key, value in full_batch.items() if key != "contact"})
+
+
 def test_rejects_duplicate_or_extra_npz_members():
     blobs, records = _fixture_blobs()
     arrays = {f"w{s}__{key}": np.zeros(shape, dtype=np.dtype(dtype))

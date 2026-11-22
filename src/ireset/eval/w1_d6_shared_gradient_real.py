@@ -118,6 +118,14 @@ def require(condition: bool, code: str) -> None:
         raise RealWorkerError(code)
 
 
+def conditioner_only_input(batch_like: dict) -> dict:
+    require(type(batch_like) is dict and set(shared.COND_KEYS) <= set(batch_like),
+            "real_conditioner_input_roster")
+    condition = {key: batch_like[key] for key in shared.COND_KEYS}
+    require(set(condition) == set(shared.COND_KEYS), "real_conditioner_input_roster")
+    return condition
+
+
 def _sha(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
@@ -895,9 +903,7 @@ def run_numeric_kernel(trainer, batch, loss, *, permit: RealWorkerPermit, artifa
                 else calls[key] <= 2, "real_numeric_call_extra:" + key)
 
     def condition_only(batch_like):
-        require(type(batch_like) is dict and set(batch_like) == set(shared.COND_KEYS),
-                "real_conditioner_input_roster")
-        return original_conditioner(batch_like)
+        return original_conditioner(conditioner_only_input(batch_like))
 
     trainer.conditioner.forward = condition_only
     def pre(key):
