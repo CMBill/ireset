@@ -21,7 +21,25 @@ import stat
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-from ireset.eval import w1_d6_shared_gradient_admission as admission
+
+_ADMISSION_SCHEMA = "w1_d6_shared_gradient_real_admission_v1"
+_admission_module = None
+
+
+class _AdmissionProxy:
+    def __getattr__(self, name):
+        return getattr(_load_admission(), name)
+
+
+admission = _AdmissionProxy()
+
+
+def _load_admission():
+    global _admission_module
+    if _admission_module is None:
+        from ireset.eval import w1_d6_shared_gradient_admission
+        _admission_module = w1_d6_shared_gradient_admission
+    return _admission_module
 
 
 LOG_CAP = 256 << 10
@@ -266,7 +284,7 @@ def return_witness(witness: ExternalWaitWitness, *, t0: float, registered_s: flo
             or any(ch not in "0123456789abcdef" for ch in rec["sha256"])
             for rec in witness.logs.values()):
         raise ValueError("return_witness_log_contract")
-    return {"schema": admission.SCHEMA + "/external_return_witness_v1",
+    return {"schema": _load_admission().SCHEMA + "/external_return_witness_v1",
             "supervisor_pid": witness.supervisor_pid, "pid": witness.pid,
              "process_group": witness.process_group,
              "return_code": witness.return_code, "started_at": witness.started_at,
@@ -449,7 +467,7 @@ def consume_authorization_once(ledger_root: Path, *, authorization_sha256: str,
     if type(t0) not in (int, float) or t0 != t0 or abs(t0) == float("inf"):
         raise ValueError("authorization_ledger_time_invalid")
     name = authorization_sha256
-    receipt = {"schema": admission.SCHEMA + "/authorization_consumption_v1",
+    receipt = {"schema": _load_admission().SCHEMA + "/authorization_consumption_v1",
                "state": "consumed_before_worker_launch", "authorization_sha256": authorization_sha256,
                "launch_id": launch_id, "admission_metadata_sha256": admission_sha256,
                "implementation_closure_sha256": implementation_sha256, "t0": t0,
@@ -556,19 +574,23 @@ def run_authorized_attempt(*, authorization_path: Path, authorization_sha256: st
     outer_check("project_root_resolve:pre")
     project_root = _real_directory(project_root)
     outer_check("project_root_resolve:post")
-    if type(package) is not dict or package.get("schema") != admission.SCHEMA:
+    if type(package) is not dict or package.get("schema") != _ADMISSION_SCHEMA:
         raise ValueError("real_admission_package_invalid")
     package_body = {key: value for key, value in package.items() if key != "metadata_sha256"}
     if (package.get("executable") is not True
             or package.get("metadata_sha256") != _canonical_sha(package_body)
             or package.get("status", {}).get("real_worker") != "implemented_and_reviewed_and_supervised"):
         raise ValueError("real_admission_not_executable")
-    if (admission.real_call_matrix_problems(package.get("call_matrix"))
-            or admission.real_io_matrix_problems(package)):
-        raise ValueError("real_admission_io_or_call_matrix_not_frozen")
     outer_check("authorization_read:pre")
     auth_raw, auth = _read_authorization(authorization_path, authorization_sha256)
     outer_check("authorization_read:post")
+    outer_check("implementation_closure_pre:pre")
+    pre = _implementation_closure(project_root, package.get("implementation", {}).get("files"))
+    outer_check("implementation_closure_pre:post")
+    admission = _load_admission()
+    if (admission.real_call_matrix_problems(package.get("call_matrix"))
+            or admission.real_io_matrix_problems(package)):
+        raise ValueError("real_admission_io_or_call_matrix_not_frozen")
     problems = admission.authorization_problems(auth, package)
     if problems:
         raise ValueError("real_authorization_rejected:" + ",".join(problems))
@@ -591,9 +613,6 @@ def run_authorized_attempt(*, authorization_path: Path, authorization_sha256: st
     if (ledger_rel.is_absolute() or ".." in ledger_rel.parts or not ledger_rel.parts
             or ledger_root != project_root / ledger_rel):
         raise ValueError("real_authorization_ledger_root_not_frozen")
-    outer_check("implementation_closure_pre:pre")
-    pre = _implementation_closure(project_root, package.get("implementation", {}).get("files"))
-    outer_check("implementation_closure_pre:post")
     budgets = package.get("budgets")
     if (type(t0) not in (int, float) or t0 != t0 or abs(t0) == float("inf")
             or type(budgets) is not dict
@@ -780,7 +799,7 @@ def run_authorized_attempt(*, authorization_path: Path, authorization_sha256: st
                                    work_deadline=work_deadline, hard_deadline=hard_deadline,
                                    clock=clock, binding_facts=binding_facts)
     outer_check("return_receipt_seal:post")
-    consumed = verify_external_return(attempt, receipt)
+    consumed = verify_external_return(attempt, receipt, clock=clock)
     if consumed.get("coverage") != "covered" or receipt.observation.get("binding_facts") != binding_facts:
         raise ValueError("real_external_return_binding_failed")
     return {"status": "candidate_complete", "attempt_root": str(attempt),
@@ -817,8 +836,10 @@ def run_synthetic_attempt(*, authorization_path: Path, authorization_sha256: str
         auth = json.loads(auth_raw)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("authorization_json_invalid") from exc
-    if type(auth) is not dict or admission.authorization_problems(auth, package):
+    admission_module = _load_admission()
+    if type(auth) is not dict or admission_module.authorization_problems(auth, package):
         raise ValueError("synthetic_authorization_rejected")
+    admission = admission_module
 
     t0 = clock()
     if (type(t0) not in (float, int) or t0 != t0 or abs(t0) == float("inf")
@@ -918,7 +939,7 @@ def run_synthetic_attempt(*, authorization_path: Path, authorization_sha256: str
         work_deadline=work_deadline, hard_deadline=hard_deadline,
         clock=clock, binding_facts=binding_facts,
     )
-    consumed = verify_external_return(attempt, return_receipt)
+    consumed = verify_external_return(attempt, return_receipt, clock=clock)
     if (consumed["coverage"] != "covered"
             or return_receipt.observation.get("binding_facts") != binding_facts):
         raise ValueError("synthetic_return_binding_failed")
@@ -940,7 +961,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     # Intentionally do not read the authorization path, worker inputs, or
     # output root in this implementation-only delivery.
-    result = {"schema": admission.SCHEMA + "/supervisor_refusal",
+    result = {"schema": _ADMISSION_SCHEMA + "/supervisor_refusal",
               "status": "refused", "reason": "real_worker_supervisor_integration_not_reviewed",
               "authorization_path_opened": False, "worker_spawned": False,
               "checkpoint_or_batch_reads": 0, "parameter_updates": 0}

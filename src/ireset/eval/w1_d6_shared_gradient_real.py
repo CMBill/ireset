@@ -174,7 +174,7 @@ def open_regular_source(project_root: Path, relative: Path, size_cap: int) -> by
         os.close(root_fd)
 
 
-def read_authorized_source_bundle(package: dict, project_root: Path, budget) -> tuple[dict, dict]:
+def read_authorized_source_bundle(package: dict, project_root: Path, budget, *, io_meter=None) -> tuple[dict, dict]:
     """Take the exact authorized snapshots once; never re-open through helpers."""
     source = package.get("source")
     require(type(source) is dict, "admission_source_block")
@@ -206,6 +206,15 @@ def read_authorized_source_bundle(package: dict, project_root: Path, budget) -> 
             spec, lambda rel, _requested_size: open_regular_source(root, rel, cap),
         )
         budget.check(label + ":post")
+        if io_meter is not None:
+            if label.startswith("selected_d6_snapshot:"):
+                io_meter["d6_file_reads"] += 1
+            elif label.startswith("root_stats_snapshot:"):
+                io_meter["root_stats_file_reads"] += 1
+            elif label.startswith("asset_snapshot:"):
+                io_meter["asset_file_reads"] += 1
+            io_meter["source_file_reads"] += 1
+            io_meter["source_file_hashes"] += 1
         snapshots[spec["path"]] = raw
         records[spec["path"]] = record
     require(len(snapshots) == 48, "authorized_source_snapshot_count")
@@ -991,9 +1000,14 @@ def run_authorized_worker(*, authorization_raw: bytes, authorization_sha256: str
     require(permit._token is _PERMIT_TOKEN and permit.root == Path(project_root).resolve() /
             admission.PROPOSED_REAL_ROOT, "worker_permit_path_binding")
     work_budget.check("worker_source_snapshot_entry")
-    snapshots, records = read_authorized_source_bundle(package, project_root, work_budget)
-    source_io = {"d6_npz_member_reads": 0, "root_stats_npz_member_reads": 0,
-                 "npz_archive_opens": 0, "checkpoint_cpu_loads": 0}
+    source_io = {"d6_file_reads": 0, "root_stats_file_reads": 0,
+                 "asset_file_reads": 0, "source_file_reads": 0,
+                 "source_file_hashes": 0, "d6_npz_member_reads": 0,
+                 "root_stats_npz_member_reads": 0, "npz_archive_opens": 0,
+                 "checkpoint_cpu_loads": 0,
+                 }
+    snapshots, records = read_authorized_source_bundle(package, project_root, work_budget,
+                                                       io_meter=source_io)
     prepared = prepare_snapshot_inputs(package, snapshots, records, io_meter=source_io)
     work_budget.check("worker_production_setup_entry")
     matrix = package.get("call_matrix")
@@ -1034,15 +1048,10 @@ def run_authorized_worker(*, authorization_raw: bytes, authorization_sha256: str
         "dataset_reads": construction["dataset_iterations"],
         "optimizer_constructions": construction["optimizer_construction"],
     }
-    source_rows = package["io_matrix"]["authorized_future_reads"]
-    observed_paths = set(records)
-    d6_paths = {row["path"] for row in source_rows["d6_files"]}
-    root_stats_path = source_rows["root_stats"]["path"]
-    asset_paths = {row["path"] for row in source_rows["production_assets"]}
-    source_counts = {"d6_file_reads": len(observed_paths & d6_paths),
-                     "root_stats_file_reads": int(root_stats_path in observed_paths),
-                     "asset_file_reads": len(observed_paths & asset_paths),
-                     "source_file_hashes": len(records),
+    source_counts = {"d6_file_reads": source_io["d6_file_reads"],
+                     "root_stats_file_reads": source_io["root_stats_file_reads"],
+                     "asset_file_reads": source_io["asset_file_reads"],
+                     "source_file_hashes": source_io["source_file_hashes"],
                      "d6_npz_member_reads": source_io["d6_npz_member_reads"],
                      "root_stats_npz_member_reads": source_io["root_stats_npz_member_reads"],
                      "npz_archive_opens": source_io["npz_archive_opens"],
@@ -1109,11 +1118,14 @@ def real_worker_io_matrix(package: dict, source_records: dict, result: dict) -> 
     require(readback == {"artifact_reads": 24, "file_sha256_verified": 20},
             "real_worker_artifact_read_matrix")
     source_io = result["source_io"]
-    require(source_io == {"d6_npz_member_reads": 60, "root_stats_npz_member_reads": 2,
-                          "npz_archive_opens": 4, "checkpoint_cpu_loads": 1},
+    require(source_io == {"d6_file_reads": 6, "root_stats_file_reads": 1,
+                          "asset_file_reads": 41, "source_file_reads": 48,
+                          "source_file_hashes": 48, "d6_npz_member_reads": 60,
+                          "root_stats_npz_member_reads": 2, "npz_archive_opens": 4,
+                          "checkpoint_cpu_loads": 1,
+                          },
             "real_worker_source_member_matrix")
-    return {"source_file_reads": len(source_records), "source_file_hashes": len(source_records),
-            "source_records": normalized, **source_io,
+    return {"source_records": normalized, **source_io,
             "independent_artifact_reads": readback["artifact_reads"],
             "independent_artifact_hashes": readback["file_sha256_verified"],
             "artifact_files": files, "artifact_io": artifact_io,

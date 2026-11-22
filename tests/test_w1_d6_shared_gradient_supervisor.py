@@ -258,6 +258,20 @@ def test_synthetic_outer_chain_claim_wait_closure_candidate_and_return(tmp_path)
     }
 
 
+def test_synthetic_outer_chain_uses_injected_clock_for_final_return(tmp_path):
+    source_root, package, auth_path, auth_sha, _ = _synthetic_authorized_packet(tmp_path)
+    (tmp_path / "runs").mkdir()
+    (tmp_path / "ledger").mkdir()
+    result = supervisor.run_synthetic_attempt(
+        authorization_path=auth_path, authorization_sha256=auth_sha,
+        package=package, project_root=source_root,
+        attempt_root=tmp_path / "runs" / "attempt_001", ledger_root=tmp_path / "ledger",
+        clock=lambda: 100.0,
+    )
+    assert result["status"] == "candidate_complete"
+    assert result["return"]["coverage"] == "covered"
+
+
 def test_unsigned_authorization_is_rejected_before_attempt_claim_or_spawn(tmp_path):
     source_root, package, auth_path, auth_sha, auth = _synthetic_authorized_packet(tmp_path)
     auth["authorized"] = False

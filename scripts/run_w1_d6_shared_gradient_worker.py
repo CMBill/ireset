@@ -247,8 +247,14 @@ def execute_worker(*, launch_spec_path: Path, admission_snapshot_path: Path,
             or package.get("status", {}).get("real_worker") != "implemented_and_reviewed_and_supervised"):
         raise ValueError("worker_package_not_executable")
 
-    # Importing the metadata-only admission validator is safe. Numerical modules
-    # stay unloaded until the complete byte closure and authorization pass.
+    closure_passes = 1
+    closure = _implementation_closure(project, package.get("implementation", {}).get("files"), budget)
+    if closure != launch.get("implementation_pre"):
+        raise ValueError("worker_preimport_closure_mismatch")
+
+    # Only import project code after the complete byte closure has passed.
+    # Numerical modules remain unloaded until the authorization and recipe gates
+    # below have also passed.
     sys.path.insert(0, str(project / "src"))
     from ireset.eval import w1_d6_shared_gradient_admission as admission
 
@@ -266,10 +272,6 @@ def execute_worker(*, launch_spec_path: Path, admission_snapshot_path: Path,
         raise ValueError("worker_interpreter_not_package_pinned")
     if dict(os.environ) != package["worker_launch"].get("env"):
         raise ValueError("worker_environment_not_package_pinned")
-    closure_passes = 1
-    closure = _implementation_closure(project, package.get("implementation", {}).get("files"), budget)
-    if closure != launch.get("implementation_pre"):
-        raise ValueError("worker_preimport_closure_mismatch")
     _verify_worker_recipe(package, project)
     matrix_problems = admission.real_call_matrix_problems(package.get("call_matrix"))
     matrix_problems.extend(admission.real_io_matrix_problems(package))
@@ -321,8 +323,8 @@ def execute_worker(*, launch_spec_path: Path, admission_snapshot_path: Path,
         raise ValueError("worker_parameter_update_forbidden")
     result["worker_io"] = {"launch_metadata_reads": metadata_reads, "ledger_reads": ledger_facts["reads"],
                             "implementation_closure_hash_passes": closure_passes,
-                            "source_file_reads": len(result["source_records"]),
-                            "source_file_hashes": len(result["source_records"]),
+                            "source_file_reads": result["source_io"]["source_file_reads"],
+                            "source_file_hashes": result["source_io"]["source_file_hashes"],
                             "d6_npz_member_reads": result["io_matrix"]["d6_npz_member_reads"],
                             "root_stats_npz_member_reads": result["io_matrix"]["root_stats_npz_member_reads"],
                             "npz_archive_opens": result["io_matrix"]["npz_archive_opens"],

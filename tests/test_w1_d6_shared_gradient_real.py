@@ -299,9 +299,16 @@ def test_authorized_source_bundle_snapshots_each_approved_file_once(tmp_path):
             self.points.append(point)
 
     budget = Budget()
-    snapshots, records = real.read_authorized_source_bundle(package, tmp_path, budget)
+    io_meter = {"d6_file_reads": 0, "root_stats_file_reads": 0,
+                "asset_file_reads": 0, "source_file_reads": 0,
+                "source_file_hashes": 0}
+    snapshots, records = real.read_authorized_source_bundle(
+        package, tmp_path, budget, io_meter=io_meter)
     assert snapshots == expected
     assert len(records) == 48
+    assert io_meter == {"d6_file_reads": 6, "root_stats_file_reads": 1,
+                        "asset_file_reads": 41, "source_file_reads": 48,
+                        "source_file_hashes": 48}
     assert len(budget.points) == 96
     assert all(count == 2 for count in Counter(point.rsplit(":", 1)[0]
                                                for point in budget.points).values())
