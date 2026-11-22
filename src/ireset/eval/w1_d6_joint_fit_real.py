@@ -95,9 +95,10 @@ class Runtime:
         row = budget.unit('tensor_contract:' + point, fn, obj, device)
         self.checked.append({'point': point, **row})
 
-    def finish(self):
+    def finish(self, verifier=None):
         self.endpoint = self.check_unit('real_stage_endpoint')
-        self.guards.budget.unit('runtime_endpoint_proof', r6.verify_runtime_report, self.stage, self.facts(), self.actual, self.policy)
+        verify = r6.verify_runtime_report if verifier is None else verifier
+        self.guards.budget.unit('runtime_endpoint_proof', verify, self.stage, self.facts(), self.actual, self.policy)
 
     def facts(self):
         return {'schema': r6.RUNTIME_REPORT, 'stage': self.stage, 'kind': 'production', 'device': DEVICE,

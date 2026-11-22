@@ -469,6 +469,31 @@ def test_conditioner_receives_only_registered_condition_fields():
         real.conditioner_only_input({key: value for key, value in full_batch.items() if key != "contact"})
 
 
+def test_step0_runtime_report_binds_each_field_with_specific_failure():
+    flags = {key: value for key, value in real.d6real.r6.REQ.items() if key != "device"}
+    expected = {"identity": {"cpu_threads": 20}, "gpu": {"uuid": "gpu-0"},
+                "observed_before_setup": dict(flags)}
+    policy = {"schema": real.d6real.r6.RUNTIME_REPORT, "helper": "runtime_helper.py",
+              "tensor_check_points": {"D6": [["fk_ready", "cuda:0"]]}}
+    ready = {"flags": flags, "current_device": real.d6real.DEVICE, "cpu_threads": 20}
+    report = {"schema": policy["schema"], "stage": "D6", "kind": "production",
+              "device": real.d6real.DEVICE, "source": policy["helper"],
+              "identity": expected["identity"], "gpu": expected["gpu"],
+              "before": dict(flags),
+              "setup": {"schema": "w1_real_fk_runtime_v1",
+                        "requirements": {k: flags[k] for k in real.d6real.r6.AUDITED_FLAGS},
+                        "before": {k: flags[k] for k in real.d6real.r6.AUDITED_FLAGS},
+                        "after": {k: flags[k] for k in real.d6real.r6.AUDITED_FLAGS},
+                        "applied": True, "problems": []},
+              "ready": ready, "endpoint": ready,
+              "tensor_checks": [{"point": "fk_ready", "device": "cuda:0",
+                                 "float_dtype": flags["default_dtype"], "float_tensors": 1, "tensors": 1}]}
+    real.verify_step0_runtime_report("D6", report, expected, policy)
+    broken = dict(report, source="other.py")
+    with pytest.raises(real.RealWorkerError, match="step0_runtime_report_binding:source"):
+        real.verify_step0_runtime_report("D6", broken, expected, policy)
+
+
 def test_rejects_duplicate_or_extra_npz_members():
     blobs, records = _fixture_blobs()
     arrays = {f"w{s}__{key}": np.zeros(shape, dtype=np.dtype(dtype))

@@ -126,6 +126,44 @@ def conditioner_only_input(batch_like: dict) -> dict:
     return condition
 
 
+def verify_step0_runtime_report(stage, doc, expected, policy) -> None:
+    require(type(doc) is dict and doc.get("schema") == policy.get("schema")
+            and doc.get("stage") == stage == "D6"
+            and doc.get("kind") == "production" and doc.get("device") == d6real.DEVICE,
+            "step0_runtime_report_header")
+    flags = {key: value for key, value in d6real.r6.REQ.items() if key != "device"}
+    checks = (
+        ("source", doc.get("source"), policy.get("helper")),
+        ("identity", doc.get("identity"), expected.get("identity")),
+        ("gpu", doc.get("gpu"), expected.get("gpu")),
+        ("before", doc.get("before"), expected.get("observed_before_setup")),
+        ("setup", doc.get("setup"), {
+            "schema": "w1_real_fk_runtime_v1",
+            "requirements": {key: flags[key] for key in d6real.r6.AUDITED_FLAGS},
+            "before": {key: doc["before"][key] for key in d6real.r6.AUDITED_FLAGS},
+            "after": {key: flags[key] for key in d6real.r6.AUDITED_FLAGS},
+            "applied": True, "problems": [],
+        } if type(doc.get("before")) is dict and set(d6real.r6.AUDITED_FLAGS) <= set(doc["before"]) else None),
+        ("ready", doc.get("ready"), {"flags": flags, "current_device": d6real.DEVICE,
+                                      "cpu_threads": expected.get("identity", {}).get("cpu_threads")}),
+        ("endpoint", doc.get("endpoint"), {"flags": flags, "current_device": d6real.DEVICE,
+                                            "cpu_threads": expected.get("identity", {}).get("cpu_threads")}),
+        ("tensor_check_points",
+         [[row.get("point"), row.get("device")] for row in doc.get("tensor_checks", [])]
+         if type(doc.get("tensor_checks")) is list else None,
+         policy.get("tensor_check_points", {}).get("D6")),
+    )
+    for field, got, want in checks:
+        try:
+            d6real.p.equal(got, want)
+        except Exception as exc:
+            raise RealWorkerError("step0_runtime_report_binding:" + field) from exc
+    require(all(type(row) is dict and row.get("float_dtype") == flags["default_dtype"]
+                and type(row.get("float_tensors")) is int and type(row.get("tensors")) is int
+                and 0 < row["float_tensors"] <= row["tensors"] for row in doc["tensor_checks"]),
+            "step0_runtime_tensor_check_facts")
+
+
 def _sha(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
@@ -997,7 +1035,7 @@ def run_numeric_kernel(trainer, batch, loss, *, permit: RealWorkerPermit, artifa
         shared.require(all(parameter.grad is None for parameter in
                            (*trainer.model.parameters(), *trainer.conditioner.parameters())),
                        "real_parameter_grad_field_written")
-        runtime_guard.finish()
+        runtime_guard.finish(verifier=verify_step0_runtime_report)
         runtime_sync_counts = runtime_guard.guards.entered.get("runtime_syncs", 0)
         loss_receipts = shared._write_losses(store, values)
         counts_artifact = {"schema": SCHEMA + "/counts_artifact", "counts": calls,
@@ -1043,6 +1081,12 @@ def run_numeric_kernel(trainer, batch, loss, *, permit: RealWorkerPermit, artifa
                 "artifact_files": dict(store.records),
                 "budget": budget.facts(),
             }
+            runtime_guard = locals().get("runtime_guard")
+            if runtime_guard is not None:
+                try:
+                    failure_context["numeric"]["runtime_report"] = runtime_guard.facts()
+                except Exception as report_exc:
+                    failure_context["numeric"]["runtime_report_error"] = type(report_exc).__name__
             meter = locals().get("vjp_meter")
             if meter is not None:
                 failure_context["numeric"]["vjp"] = {
