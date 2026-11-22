@@ -494,6 +494,16 @@ def test_step0_runtime_report_binds_each_field_with_specific_failure():
         real.verify_step0_runtime_report("D6", broken, expected, policy)
 
 
+def test_vjp_pair_receipts_bind_request_and_response_entries():
+    requests = [{"call_id": i, "request_sha256": f"request-{i}"} for i in range(7)]
+    responses = [{"call_id": i, "response_sha256": f"response-{i}"} for i in range(7)]
+    pairs = real.vjp_pair_receipts(requests, responses)
+    assert pairs == [{"call_id": i, "request_sha256": f"request-{i}",
+                      "response_sha256": f"response-{i}"} for i in range(7)]
+    with pytest.raises(real.RealWorkerError, match="real_vjp_receipt_count"):
+        real.vjp_pair_receipts(requests, responses[:-1])
+
+
 def test_rejects_duplicate_or_extra_npz_members():
     blobs, records = _fixture_blobs()
     arrays = {f"w{s}__{key}": np.zeros(shape, dtype=np.dtype(dtype))

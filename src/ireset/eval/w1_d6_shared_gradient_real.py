@@ -164,6 +164,23 @@ def verify_step0_runtime_report(stage, doc, expected, policy) -> None:
             "step0_runtime_tensor_check_facts")
 
 
+def vjp_pair_receipts(requests: list, responses: list) -> list[dict]:
+    require(type(requests) is list and type(responses) is list and len(requests) == len(responses) == 7,
+            "real_vjp_receipt_count")
+    receipts = []
+    for request, response in zip(requests, responses, strict=True):
+        require(type(request) is dict and type(response) is dict
+                and type(request.get("call_id")) is int
+                and request.get("call_id") == response.get("call_id")
+                and type(request.get("request_sha256")) is str
+                and type(response.get("response_sha256")) is str,
+                "real_vjp_receipt_binding")
+        receipts.append({"call_id": request["call_id"],
+                         "request_sha256": request["request_sha256"],
+                         "response_sha256": response["response_sha256"]})
+    return receipts
+
+
 def _sha(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
@@ -1046,9 +1063,7 @@ def run_numeric_kernel(trainer, batch, loss, *, permit: RealWorkerPermit, artifa
                    "analysis": analysis, "loss_scalars": production_scalars,
                    "independent_loss_scalars": replay, "loss_arrays": loss_receipts,
                    "vjp_roster_sha256": vjp["roster_sha256"],
-                   "vjp_pairs": [{"call_id": r["call_id"], "request_sha256": r["request_sha256"],
-                                  "response_sha256": r["response_sha256"]}
-                                 for r in zip(vjp["requests"], vjp["responses"], strict=True)],
+                    "vjp_pairs": vjp_pair_receipts(vjp["requests"], vjp["responses"]),
                    "vjp_counts": vjp_counts, "parameter_state_sha256": before_state,
                    "parameter_state_unchanged": True, "rng_unchanged": vjp["rng_unchanged"],
                     "parameter_updates": 0, "optimizer_construction": 0,
