@@ -72,8 +72,8 @@ def test_pinned_worker_environment_includes_python_locale_normalization():
 
 def test_real_attempt_root_advances_past_consumed_failed_claim():
     package, _ = admission.build_materials(Path(__file__).resolve().parents[1])
-    assert package["proposed_real_root"].endswith("/attempt_015")
-    assert admission.PROPOSED_REAL_ROOT.name == "attempt_015"
+    assert package["proposed_real_root"].endswith("/attempt_016")
+    assert admission.PROPOSED_REAL_ROOT.name == "attempt_016"
     root = Path(__file__).resolve().parents[1] / admission.PROPOSED_REAL_ROOT
     if root.exists():
         assert (root / "worker_failure.json").is_file()
