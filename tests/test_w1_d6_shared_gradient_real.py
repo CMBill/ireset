@@ -380,10 +380,12 @@ def test_prepare_snapshot_inputs_binds_probe_endpoint_and_root_stats():
     config = __import__("dataclasses").asdict(real.d6real.joint.config(real.evidence.plan_for(False)))
     model, conditioner = nn.Linear(2, 1), nn.Linear(2, 1)
     endpoint = real.state_digest(model.state_dict(), conditioner.state_dict())
-    stats = {"mean": np.zeros(3, dtype="<f4"), "std": np.ones(3, dtype="<f4")}
+    source_stats = {"mean": np.array([0.1, 0.2, 0.9], dtype="<f8"),
+                    "std": np.array([0.5, 0.5, 0.3], dtype="<f8")}
+    checkpoint_stats = {key: value.astype("<f4") for key, value in source_stats.items()}
     checkpoint_doc = {"step": 0, "val": {"step": 0}, "identity": identity, "config": config,
                       "checkpoint_usable": True, "parameters_finite": True, "diagnostic_only": False,
-                      "failure": None, "formal": None, "root_stats": stats,
+                      "failure": None, "formal": None, "root_stats": checkpoint_stats,
                       "model": model.state_dict(), "conditioner": conditioner.state_dict()}
     checkpoint = io.BytesIO()
     torch.save(checkpoint_doc, checkpoint)
@@ -392,7 +394,7 @@ def test_prepare_snapshot_inputs_binds_probe_endpoint_and_root_stats():
     probe_rows[0]["endpoint_state_sha256"] = endpoint
     blobs["d6/probe_index.jsonl"] = b"".join(_json(row) for row in probe_rows)
     stat_npz = io.BytesIO()
-    np.savez(stat_npz, **stats)
+    np.savez(stat_npz, **source_stats)
     d6_prefix = "fixture/d6/"
     snapshots, records, selected = {}, {}, []
     for rel, raw in blobs.items():
@@ -404,14 +406,14 @@ def test_prepare_snapshot_inputs_binds_probe_endpoint_and_root_stats():
     snapshots[stats_path] = stat_npz.getvalue()
     records[stats_path] = {"path": stats_path, "bytes": len(stat_npz.getvalue()),
                            "sha256": real._sha(stat_npz.getvalue())}
-    headers = {key: {"shape": list(value.shape), "dtype": value.dtype.str} for key, value in stats.items()}
+    headers = {key: {"shape": list(value.shape), "dtype": value.dtype.str} for key, value in source_stats.items()}
     package = {"source": {"selected_d6_files": selected, "d6_identity": identity,
                            "d6_config": {key: config[key] for key in ("model_type", "seed", "d_model")},
                            "root_stats": {"file": records[stats_path], "headers": headers}}}
     prepared = real.prepare_snapshot_inputs(package, snapshots, records)
     assert prepared.batch["clip_idx"].tolist() == list(real.PERMUTATION)
     assert prepared.expected_endpoint_sha256 == endpoint
-    assert prepared.root_stats["std"].tolist() == [1.0, 1.0, 1.0]
+    assert prepared.root_stats["std"].tolist() == [0.5, 0.5, 0.3]
     victim = selected[2]["path"]
     snapshots[victim] = b"changed payload bytes"
     records[victim] = {"path": victim, "bytes": len(snapshots[victim]), "sha256": real._sha(snapshots[victim])}

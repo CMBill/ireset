@@ -243,8 +243,9 @@ def apparatus(bindings, meter, runtime, *, preloaded_assets=None, preloaded_root
     else:
         stats, stat_rec = preloaded_root_stats
         p.require(type(stats) is dict and set(stats) == {'mean', 'std'} and type(stat_rec) is dict
-                  and all(isinstance(stats[k], np.ndarray) and stats[k].dtype == np.float32
-                          and np.isfinite(stats[k]).all() for k in ('mean', 'std'))
+                   and all(isinstance(stats[k], np.ndarray)
+                           and stats[k].dtype in (np.dtype("<f4"), np.dtype("<f8"))
+                           and np.isfinite(stats[k]).all() for k in ('mean', 'std'))
                   and (stats['std'] > 0).all(), 'real_preloaded_root_stats')
     p.require((stats['std'] > 0).all(), 'real_root_stats_std_domain')
     spec = assets.spec('joint')

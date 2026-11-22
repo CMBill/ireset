@@ -273,8 +273,20 @@ def prepare_snapshot_inputs(package: dict, snapshots: dict, records: dict, *, io
             and checkpoint.get("formal") is None, "checkpoint_not_usable")
     for key in ("mean", "std"):
         actual = checkpoint.get("root_stats", {}).get(key)
-        require(type(actual) is np.ndarray and actual.dtype == np.float32 and actual.shape == stats[key].shape
-                and np.array_equal(actual.view(np.uint32), stats[key].view(np.uint32)),
+        try:
+            actual_raw = np.asarray(actual)
+            expected_raw = np.asarray(stats[key])
+            require(np.issubdtype(actual_raw.dtype, np.number)
+                    and actual_raw.dtype != np.dtype(bool)
+                    and np.issubdtype(expected_raw.dtype, np.number),
+                    "checkpoint_root_stats_type:" + key)
+            actual_f32 = np.ascontiguousarray(actual_raw, dtype=np.float32)
+            expected_f32 = np.ascontiguousarray(expected_raw, dtype=np.float32)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RealWorkerError("checkpoint_root_stats_unreadable:" + key) from exc
+        require(np.isfinite(actual_f32).all()
+                and actual_f32.shape == expected_f32.shape
+                and np.array_equal(actual_f32.view(np.uint32), expected_f32.view(np.uint32)),
                 "checkpoint_root_stats_mismatch:" + key)
     probe_first = _jsonl_first(blobs["d6/probe_index.jsonl"], "probe_index_invalid")
     endpoint = probe_first.get("endpoint_state_sha256")
