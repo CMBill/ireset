@@ -496,7 +496,9 @@ def build_reviewed_materials(project_root: Path, review_path: Path) -> tuple[dic
     package["status"]["fresh_source_hash_verification"] = "not_run_until_authorized"
     package["status"]["checkpoint_and_batch_read"] = "not_run_until_authorized"
     package["status"]["external_authorization"] = "not_granted"
-    package["metadata_sha256"] = _sha(json.dumps(package, sort_keys=True,
+    package_body = {key: value for key, value in package.items()
+                    if key != "metadata_sha256"}
+    package["metadata_sha256"] = _sha(json.dumps(package_body, sort_keys=True,
                                                    separators=(",", ":")).encode())
     draft["bindings"]["independent_review"] = review_record
     draft["bindings"]["admission_metadata_sha256"] = package["metadata_sha256"]
