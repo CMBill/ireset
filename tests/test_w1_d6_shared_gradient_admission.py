@@ -44,8 +44,6 @@ def test_metadata_package_binds_only_existing_records_and_source_roster(monkeypa
     assert runtime_evidence["tensor_check_points"]["D6"] == [
         ["fk_chain_built", "cpu"], ["fk_chain_transferred", "cuda:0"],
         ["fk_ready", "cuda:0"], ["loss_ready", "cuda:0"],
-        ["trainer_model", "cpu"], ["trainer_model_transfer", "cuda:0"],
-        ["trainer_conditioner", "cpu"], ["trainer_conditioner_transfer", "cuda:0"],
         ["initial_checkpoint", "cpu"], ["loaded_model", "cuda:0"],
         ["loaded_conditioner", "cuda:0"],
     ]
