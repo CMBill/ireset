@@ -151,6 +151,32 @@ def test_worker_cli_rejects_unsigned_snapshot_before_numeric_core_import(tmp_pat
     assert not (attempt / "d6").exists()
 
 
+def test_worker_cli_persists_early_failure_beside_supervisor_claim(tmp_path, monkeypatch, capsys):
+    script = Path(__file__).resolve().parents[1] / "scripts/run_w1_d6_shared_gradient_worker.py"
+    spec = importlib.util.spec_from_file_location("d6_worker_cli_failure_receipt_test", script)
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+    for name in ("worker_launch.json", "admission_snapshot.json", "authorization_snapshot.json"):
+        (tmp_path / name).write_text("{}\n")
+    monkeypatch.chdir(tmp_path)
+
+    def fail_preflight(**_kwargs):
+        raise ValueError("worker_environment_not_package_pinned")
+
+    monkeypatch.setattr(cli, "execute_worker", fail_preflight)
+    rc = cli.main(["--launch-spec", str(tmp_path / "worker_launch.json"),
+                   "--admission-snapshot", str(tmp_path / "admission_snapshot.json"),
+                   "--authorization-snapshot", str(tmp_path / "authorization_snapshot.json"),
+                   "--authorization-sha256", "a" * 64, "--project-root", str(tmp_path)])
+    assert rc == 2
+    failure = json.loads((tmp_path / "worker_failure.json").read_text())
+    assert failure["failure_stage"] == "worker_cli_preflight_or_dispatch"
+    assert failure["error"] == "worker_environment_not_package_pinned"
+    assert failure["parameter_updates"] == 0
+    assert json.loads(capsys.readouterr().err)["failure_artifact"]["sha256"] == real._sha(
+        (tmp_path / "worker_failure.json").read_bytes())
+
+
 def _json(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n"
 

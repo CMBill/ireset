@@ -400,6 +400,28 @@ def _write_failure(path: Path, failure: dict) -> None:
         raise ValueError("worker_failure_readback_mismatch")
 
 
+def _persist_cli_failure(args, exc: BaseException) -> dict | None:
+    """Keep even pre-import failures beside the supervisor-owned launch claim."""
+    attempt = Path.cwd()
+    launch_path = Path(args.launch_spec).absolute()
+    if (launch_path.parent != attempt or launch_path.name != "worker_launch.json"
+            or launch_path.is_symlink() or not launch_path.is_file()):
+        return None
+    for name in ("admission_snapshot.json", "authorization_snapshot.json"):
+        path = attempt / name
+        if path.is_symlink() or not path.is_file():
+            return None
+    failure_path = attempt / "worker_failure.json"
+    failure = {"schema": "w1_d6_shared_gradient_real_worker_v1/worker_failure",
+               "status": "incomplete", "failure_stage": "worker_cli_preflight_or_dispatch",
+               "error_type": type(exc).__name__, "error": str(exc)[:500],
+               "worker_budget": None, "failure_context": None,
+               "parameter_updates": 0}
+    _write_failure(failure_path, failure)
+    raw = _read_regular(failure_path, 2 << 20)
+    return {"bytes": len(raw), "sha256": _sha(raw)}
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--launch-spec", type=Path, required=True)
@@ -421,9 +443,16 @@ def main(argv=None) -> int:
         if time.perf_counter() >= work_deadline:
             raise TimeoutError("worker_result_write:post")
     except BaseException as exc:
+        failure_artifact = None
+        try:
+            failure_artifact = _persist_cli_failure(args, exc)
+        except BaseException:
+            pass
         print(json.dumps({"schema": "w1_d6_shared_gradient_real_worker_v1/worker_failure",
                           "status": "incomplete", "error_type": type(exc).__name__,
-                          "error": str(exc)[:500]}, sort_keys=True), file=sys.stderr, flush=True)
+                          "error": str(exc)[:500],
+                          "failure_artifact": failure_artifact,
+                          "parameter_updates": 0}, sort_keys=True), file=sys.stderr, flush=True)
         return 2
     return 0
 
