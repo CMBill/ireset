@@ -41,6 +41,14 @@ def test_metadata_package_binds_only_existing_records_and_source_roster(monkeypa
     assert {key: value for key, value in runtime_evidence.items()
             if key != "fk_buffer_sources"} == admission.RUNTIME_EVIDENCE
     assert runtime_evidence["schema"] == "w1_d6_joint_fit_lr_half_v1/section_6_3_runtime_v1"
+    assert runtime_evidence["tensor_check_points"]["D6"] == [
+        ["fk_chain_built", "cpu"], ["fk_chain_transferred", "cuda:0"],
+        ["fk_ready", "cuda:0"], ["loss_ready", "cuda:0"],
+        ["trainer_model", "cpu"], ["trainer_model_transfer", "cuda:0"],
+        ["trainer_conditioner", "cpu"], ["trainer_conditioner_transfer", "cuda:0"],
+        ["initial_checkpoint", "cpu"], ["loaded_model", "cuda:0"],
+        ["loaded_conditioner", "cuda:0"],
+    ]
     assert set(runtime_evidence["fk_buffer_sources"]) == {
         "pytorch_kinematics/chain.py", "pytorch_kinematics/frame.py"}
     assert all(record["bytes"] > 0 and len(record["sha256"]) == 64

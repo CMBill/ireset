@@ -64,10 +64,9 @@ RUNTIME_EVIDENCE = {
             ["trainer_model_transfer", "cuda:0"],
             ["trainer_conditioner", "cpu"],
             ["trainer_conditioner_transfer", "cuda:0"],
-            ["checkpoint_initial", "cpu"],
-            ["checkpoint_last", "cpu"],
-            ["reference_model", "cpu"],
-            ["reference_conditioner", "cpu"],
+            ["initial_checkpoint", "cpu"],
+            ["loaded_model", "cuda:0"],
+            ["loaded_conditioner", "cuda:0"],
         ],
     },
 }
