@@ -326,6 +326,9 @@ def build_materials(project_root: Path) -> tuple[dict, dict]:
         implementation[rel] = {"bytes": rec["bytes"], "sha256": rec["sha256"]}
 
     call_matrix = json.loads(json.dumps(REAL_CALL_MATRIX))
+    runtime_cpu_threads = pkg["bindings"]["runtime"]["identity"].get("cpu_threads")
+    _require(type(runtime_cpu_threads) is int and runtime_cpu_threads > 0,
+             "r6_runtime_cpu_threads_invalid")
     worker_launch = {
         "script_rel": "scripts/run_w1_d6_shared_gradient_worker.py",
         "argv_template": [sys.executable, "-I",
@@ -337,7 +340,8 @@ def build_materials(project_root: Path) -> tuple[dict, dict]:
                           "--project-root", "{project_root}"],
         "executable": sys.executable,
         "cwd": "attempt_root",
-        "env": {"LC_CTYPE": "C.UTF-8", "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1",
+        "env": {"LC_CTYPE": "C.UTF-8", "OMP_NUM_THREADS": str(runtime_cpu_threads),
+                "MKL_NUM_THREADS": str(runtime_cpu_threads),
                 "OPENBLAS_NUM_THREADS": "1"},
         "shell": False,
         "inherit_stdin": False,

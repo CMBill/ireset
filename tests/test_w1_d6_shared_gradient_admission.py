@@ -50,10 +50,15 @@ def test_pinned_worker_environment_includes_python_locale_normalization():
     package, _ = admission.build_materials(Path(__file__).resolve().parents[1])
     env = package["worker_launch"]["env"]
     actual = subprocess.check_output(
-        [sys.executable, "-I", "-c", "import json,os; print(json.dumps(dict(os.environ),sort_keys=True))"],
+        [sys.executable, "-I", "-c",
+         "import json,os,torch; print(json.dumps({'env':dict(os.environ),'cpu_threads':torch.get_num_threads()},sort_keys=True))"],
         env=env, text=True)
-    assert json.loads(actual) == env
+    observed = json.loads(actual)
+    assert observed["env"] == env
     assert env["LC_CTYPE"] == "C.UTF-8"
+    assert env["OMP_NUM_THREADS"] == str(
+        package["source"]["d6_bindings"]["runtime"]["identity"]["cpu_threads"])
+    assert observed["cpu_threads"] == package["source"]["d6_bindings"]["runtime"]["identity"]["cpu_threads"]
 
 
 def test_real_attempt_root_advances_past_consumed_failed_claim():
