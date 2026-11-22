@@ -106,7 +106,7 @@ margin       = ||g_0||₂ × E_all / own
 
 实现验收通过后冻结方案、输入白名单、实现、合成证明、判据、调用矩阵与额度。新的明确授权须绑定该材料并限定一次 step0 checkpoint 加载、一次整批生产前向与损失、七次 VJP、表列 FK 和 **零参数更新**。交付包括一份机读裁决与一份人读报告，记录是否值得起草后续短前缀对照。 [六窗复盘的停止规则](omniretarget_w1_d6_window_error_review_plan.md#5-如何决定下一步)
 
-本 v0.3 仍是方案草案，不足以签发真实执行授权。合成 I/C 已完成；`attempt_006` 固定并验收的是合成路径调用、同步与工件 I/O 矩阵，不涵盖真实来源白名单读取、资产构造与真实 runtime。独立 worker CLI、真实路径 call/I/O 矩阵和 supervisor 对账已实现，并以临时源码/fake-worker 验收；当前 metadata-only packet 冻结了 38 文件闭包、六工件/41 资产白名单和矩阵，但 `executable=false`，真实来源 payload、CUDA/setup 数值及生产返回链仍未运行。真实执行前须复阅最终代码与 packet、完成实现审查并另获明确授权；当前监督器拒绝正式材料。后续任何短前缀训练是新的训练更新，必须另立方案和独立授权，不属于本诊断建议。
+本 v0.3 仍是方案草案，不足以签发真实执行授权。合成 I/C 已完成；`attempt_006` 固定并验收的是合成路径调用、同步与工件 I/O 矩阵，不涵盖真实来源白名单读取、资产构造与真实 runtime。独立 worker CLI、真实路径 call/I/O 矩阵、signed-path supervisor dispatch 和临时源码/fake-worker 协议复核已完成；当前 executable packet 绑定 39 文件闭包、六工件/41 资产白名单和矩阵，但真实来源 payload、CUDA/setup 数值及生产返回链仍未运行。packet 仍 `authorized=false`，真实执行须另获一次性明确授权；后续任何短前缀训练是新的训练更新，必须另立方案和独立授权，不属于本诊断建议。
 
 ## 10. I/C 合成实现记录（2026-11-21，非真实执行授权）
 
@@ -116,8 +116,8 @@ I/C 纯合成实现已完成，验收细节见[验证记录](../verification/omn
 
 ## 11. 真实执行准入材料（2026-11-22；未授权）
 
-已增加 metadata-only 材料生成器、fail-closed supervisor 入口及反例测试。最新材料按独占递增 attempt 保存在 `derived/audit/w1_d6_shared_gradient_step0_v1/real_admission/`；早期尝试均原样保留，具体权威文件、SHA 与验证状态见[准入/监督验证记录](../verification/omniretarget_w1_d6_shared_gradient_admission.md)。当前实现闭包为 38 个文件；本轮最新 packet 为 `attempt_020`，仍 `authorized=false`、`executable=false`。该交付绑定既有 D6 `fit_insufficient` 独立裁决、固定 SHA 的历史 R6 metadata admission、D6 artifact index、I/C `attempt_006` 和当前实现/方案闭包；只打开四份 JSON 元数据及实现/方案文本。D6 六个目标输入仅从既有 artifact index 消费登记的路径/字节数/SHA；不重新哈希或打开 checkpoint、NPZ、数据集或生产资产。R6 已登记的 41 项资产哈希作为历史元数据引用，不代表本轮重新验证资产。
+已增加 metadata-only 材料生成器、fail-closed supervisor 入口、独立复核收据及反例测试。最新材料按独占递增 attempt 保存在 `derived/audit/w1_d6_shared_gradient_step0_v1/real_admission/`；早期尝试均原样保留，具体权威文件、SHA 与验证状态见[准入/监督验证记录](../verification/omniretarget_w1_d6_shared_gradient_admission.md)。最终独立复核绑定 commit `5a6904e`、66 项定向测试和 39 文件闭包；新 executable packet 为 `attempt_023`，`authorized=false`、`executable=true`。该交付只打开四份历史 JSON 元数据、实现/方案文本及独立复核收据，不读取 checkpoint、NPZ、数据集或生产资产。D6 六个目标输入仅从既有 artifact index 消费登记的路径/字节数/SHA；不重新哈希或打开真实 payload。R6 已登记的 41 项资产哈希作为历史元数据引用，不代表本轮重新验证资产。
 
-材料固定候选六窗、未来六份 D6 工件、root-stats 与 41 个生产资产读集合、单次执行上限 300s（240s 工作/60s 收口）、一次 attempt、更新 0，以及未来输出文件数量上限。当前 I/C 的 32 同步点与合成工件矩阵不能证明真实输入、资产构造、外层 `wait()`、进程组回收、同步回读与返回见证；这些在 admission JSON 中明确标为 `proposed_only_not_runtime_verified`。因此 admission state 是 `metadata_only_materials_drafted_worker_missing`、`executable=false`；草案 `authorized=false/template_only=true`，六项 checklist 均 null。supervisor 当前只做拒绝，不读授权、不启动进程，也不生成真实尝试根。**这不是可签发授权的材料包**：必须先实现真实 worker 与外层监督/返回证据链，再冻结完整精确矩阵并独立复核，生成绑定新实现闭包的材料后才可提交新的授权审阅。没有沿用 R6 或 D6/F 的任何授权。
+材料固定候选六窗、未来六份 D6 工件、root-stats 与 41 个生产资产读集合、单次执行上限 300s（240s 工作/60s 收口）、一次 attempt、更新 0，以及未来输出文件数量上限。独立复核已验证 worker CLI、signed-path supervisor dispatch、临时 fake-worker、矩阵拒绝、失败证据、账本和返回见证；真实输入、资产、CUDA/setup 数值及生产返回链仍标为未运行。executable packet 的授权草案仍 `authorized=false/template_only=true`，六项 checklist 均 null；未签署前 supervisor 不读取授权、不启动 worker、不创建真实 attempt。没有沿用 R6 或 D6/F 的任何授权。
 
-**边界：**这只验证合成目标、梯度归约、槽位/名册绑定、计数和有限存储/截止守卫。真实 archive/checkpoint/资产读取、真实 FK、真实七次 VJP、真实裁决均未运行，参数更新严格为 0。`--real` 入口在任何路径检查前拒绝；本记录不构成真实执行授权。真实阶段仍须新的冻结材料、完整外层 supervisor 与 I/O/runtime 矩阵、明确一次性授权；不得复用已消费的 D6/R6 授权。
+**边界：**这只验证合成目标、梯度归约、槽位/名册绑定、worker/supervisor 协议、计数和有限存储/截止守卫。真实 archive/checkpoint/资产读取、真实 FK、真实七次 VJP、真实裁决均未运行，参数更新严格为 0。executable packet 不是授权；只有绑定该 packet 的新一次性明确授权才能启动真实 worker，不得复用已消费的 D6/R6 授权。
