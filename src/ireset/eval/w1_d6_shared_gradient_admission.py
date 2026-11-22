@@ -17,6 +17,7 @@ import sys
 
 SCHEMA = "w1_d6_shared_gradient_real_admission_v1"
 AUTH_SCHEMA = SCHEMA + "/authorization_v1"
+REVIEW_SCHEMA = SCHEMA + "/independent_review_v1"
 ROOT_REL = Path("derived/audit/w1_d6_shared_gradient_step0_v1")
 SOURCE_ROOT = Path("derived/experiments/omniretarget_first/w1_d6_joint_fit_lr_half_v1")
 PROPOSED_REAL_ROOT = Path("derived/experiments/omniretarget_first/w1_d6_shared_gradient_step0_v1/attempt_001")
@@ -268,6 +269,7 @@ def build_materials(project_root: Path) -> tuple[dict, dict]:
         "scripts/prepare_w1_d6_shared_gradient_admission.py",
         "scripts/supervise_w1_d6_shared_gradient.py",
         "scripts/run_w1_d6_shared_gradient_worker.py",
+        "scripts/review_w1_d6_shared_gradient.py",
         "tests/test_w1_d6_shared_gradient_supervisor.py",
         "tests/test_w1_d6_shared_gradient.py",
         "tests/test_w1_d6_shared_gradient_admission.py",
@@ -437,6 +439,8 @@ def authorization_problems(auth: dict, package: dict) -> list[str]:
             "historical_d6_outcome": package.get("historical", {}).get("verified_outcome"),
             "worker_launch": package.get("worker_launch"),
         }
+        if "independent_review" in package:
+            expected_bindings["independent_review"] = package["independent_review"]
         for name, expected in expected_bindings.items():
             if bindings.get(name) != expected:
                 problems.append("authorization_binding_mismatch:" + name)
@@ -446,3 +450,54 @@ def authorization_problems(auth: dict, package: dict) -> list[str]:
     if not isinstance(auth.get("approval_reference"), str) or not auth["approval_reference"].strip():
         problems.append("approval_reference_missing")
     return problems
+
+
+def build_reviewed_materials(project_root: Path, review_path: Path) -> tuple[dict, dict]:
+    """Promote metadata-only materials only after an independent review receipt.
+
+    This still never opens checkpoint, NPZ, dataset, or robot-asset payloads.
+    The receipt proves only the worker/supervisor protocol and synthetic review;
+    the eventual real run remains separately authorized and one-shot.
+    """
+    root = project_root.resolve(strict=True)
+    package, draft = build_materials(root)
+    review_path = Path(review_path).absolute()
+    if review_path.resolve(strict=True) != review_path or not review_path.is_relative_to(root):
+        raise AdmissionError("independent_review_path_not_in_project")
+    raw, record = _read_metadata(review_path, 2 << 20)
+    review = _json(raw, "independent_review_invalid")
+    _require(review.get("schema") == REVIEW_SCHEMA, "independent_review_schema")
+    implementation_sha = _sha(json.dumps(package["implementation"]["files"],
+                                         sort_keys=True, separators=(",", ":")).encode())
+    _require(review.get("implementation_closure_sha256") == implementation_sha,
+             "independent_review_implementation_binding")
+    _require(type(review.get("reviewed_commit")) is str and len(review["reviewed_commit"]) == 40,
+             "independent_review_commit")
+    _require(review.get("ready_for_executable_packet") is True,
+             "independent_review_not_ready")
+    _require(review.get("synthetic_protocol_passed") is True
+             and review.get("supervisor_dispatch_reviewed") is True,
+             "independent_review_protocol_incomplete")
+    _require(review.get("real_payload_reads") == 0
+             and review.get("real_worker_spawns") == 0
+             and review.get("parameter_updates") == 0,
+             "independent_review_scope_violation")
+    tests = review.get("tests")
+    _require(type(tests) is dict and type(tests.get("passed")) is int
+             and tests["passed"] >= 65 and tests.get("exit_code") == 0,
+             "independent_review_tests_incomplete")
+    review_record = {"path": str(review_path.relative_to(root)), **record}
+    package["independent_review"] = review_record
+    package["state"] = "executable_ready_independent_reviewed"
+    package["executable"] = True
+    package["authorized"] = False
+    package["worker_launch"]["status"] = "reviewed_executable"
+    package["status"]["real_worker"] = "implemented_and_reviewed_and_supervised"
+    package["status"]["fresh_source_hash_verification"] = "not_run_until_authorized"
+    package["status"]["checkpoint_and_batch_read"] = "not_run_until_authorized"
+    package["status"]["external_authorization"] = "not_granted"
+    package["metadata_sha256"] = _sha(json.dumps(package, sort_keys=True,
+                                                   separators=(",", ":")).encode())
+    draft["bindings"]["independent_review"] = review_record
+    draft["bindings"]["admission_metadata_sha256"] = package["metadata_sha256"]
+    return package, draft

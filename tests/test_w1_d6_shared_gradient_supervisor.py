@@ -547,6 +547,20 @@ def test_real_authorization_ledger_and_pinned_worker_launch_end_to_end_on_temp_t
     assert result["parameter_updates"] == 0
     assert result["wait"]["return_code"] == 0 and result["wait"]["group_reaped"] is True
     assert result["return"]["coverage"] == "covered"
+
+
+def test_formal_main_dispatches_only_bound_executable_packet_on_temp_tree(tmp_path, capsys):
+    project, package, auth_path, auth_sha, ledger_root = _real_protocol_fixture(tmp_path)
+    packet_path = project / "admission.json"
+    packet_path.write_text(json.dumps(package, sort_keys=True, separators=(",", ":")))
+    rc = supervisor.main([
+        "--authorization", str(auth_path), "--authorization-sha256", auth_sha,
+        "--admission", str(packet_path), "--project-root", str(project), "--run",
+    ])
+    result = json.loads(capsys.readouterr().out)
+    assert rc == 0 and result["status"] == "candidate_complete"
+    assert result["parameter_updates"] == 0
+    assert result["return"]["coverage"] == "covered"
     ledger = ledger_root / auth_sha
     assert {path.name for path in ledger.iterdir()} == {
         "consumed.json", "launch_started.json", "candidate_validated.json", "return_candidate.json",

@@ -978,16 +978,60 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--authorization", type=Path, required=True)
     parser.add_argument("--authorization-sha256", required=True)
+    parser.add_argument("--admission", type=Path)
+    parser.add_argument("--project-root", type=Path, default=ROOT)
     parser.add_argument("--run", action="store_true")
     args = parser.parse_args(argv)
-    # Intentionally do not read the authorization path, worker inputs, or
-    # output root in this implementation-only delivery.
-    result = {"schema": _ADMISSION_SCHEMA + "/supervisor_refusal",
-              "status": "refused", "reason": "real_worker_supervisor_integration_not_reviewed",
-              "authorization_path_opened": False, "worker_spawned": False,
-              "checkpoint_or_batch_reads": 0, "parameter_updates": 0}
-    print(json.dumps(result, sort_keys=True))
-    return 3
+    refusal = {"schema": _ADMISSION_SCHEMA + "/supervisor_refusal",
+               "status": "refused", "authorization_path_opened": False,
+               "worker_spawned": False, "checkpoint_or_batch_reads": 0,
+               "parameter_updates": 0}
+    if not args.run:
+        print(json.dumps({**refusal, "reason": "run_flag_required"}, sort_keys=True))
+        return 3
+    if args.admission is None:
+        print(json.dumps({**refusal, "reason": "executable_admission_packet_required"}, sort_keys=True))
+        return 3
+    try:
+        project_root = _real_directory(args.project_root)
+        admission_path = Path(args.admission).absolute()
+        if admission_path.resolve(strict=True) != admission_path or \
+                not admission_path.is_relative_to(project_root):
+            raise ValueError("admission_path_not_in_project")
+        package_raw = _read_regular(admission_path, 16 << 20)
+        package = json.loads(package_raw)
+        if type(package) is not dict:
+            raise ValueError("real_admission_package_not_object")
+        package_body = {key: value for key, value in package.items()
+                        if key != "metadata_sha256"}
+        if (package.get("schema") != _ADMISSION_SCHEMA
+                or package.get("metadata_sha256") != _canonical_sha(package_body)):
+            raise ValueError("real_admission_package_hash_invalid")
+        if (package.get("executable") is not True
+                or package.get("status", {}).get("real_worker") !=
+                "implemented_and_reviewed_and_supervised"):
+            print(json.dumps({**refusal, "reason": "real_admission_not_executable",
+                              "admission_path_opened": True}, sort_keys=True))
+            return 3
+        ledger_rel = Path(package.get("authorization_consumption_ledger", ""))
+        if ledger_rel.is_absolute() or ".." in ledger_rel.parts or not ledger_rel.parts:
+            raise ValueError("real_authorization_ledger_path_invalid")
+        result = run_authorized_attempt(
+            authorization_path=args.authorization,
+            authorization_sha256=args.authorization_sha256,
+            package=package,
+            project_root=project_root,
+            ledger_root=project_root / ledger_rel,
+        )
+        print(json.dumps(result, sort_keys=True, allow_nan=False))
+        return 0
+    except BaseException as exc:
+        print(json.dumps({"schema": _ADMISSION_SCHEMA + "/supervisor_failure",
+                          "status": "incomplete", "error_type": type(exc).__name__,
+                          "error": str(exc)[:500], "authorization_path_opened": False,
+                          "worker_spawned": False, "parameter_updates": 0},
+                         sort_keys=True))
+        return 2
 
 
 if __name__ == "__main__":
