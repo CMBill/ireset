@@ -436,6 +436,18 @@ def test_json_and_root_stats_reject_ambiguous_or_malformed_bytes():
         real.decode_root_stats(bad_std.getvalue(), headers)
 
 
+def test_root_stats_accepts_training_float64_source_for_float32_checkpoint():
+    archive = io.BytesIO()
+    np.savez(archive, mean=np.array([0.1, 0.2, 0.9], dtype="<f8"),
+             std=np.array([0.5, 0.5, 0.3], dtype="<f8"))
+    headers = {"mean": {"shape": [3], "dtype": "<f8"},
+               "std": {"shape": [3], "dtype": "<f8"}}
+    values = real.decode_root_stats(archive.getvalue(), headers)
+    assert values["mean"].dtype == np.dtype("<f8")
+    assert values["std"].dtype == np.dtype("<f8")
+    assert np.array_equal(values["mean"].astype("<f4"), np.array([0.1, 0.2, 0.9], dtype="<f4"))
+
+
 def test_rejects_duplicate_or_extra_npz_members():
     blobs, records = _fixture_blobs()
     arrays = {f"w{s}__{key}": np.zeros(shape, dtype=np.dtype(dtype))

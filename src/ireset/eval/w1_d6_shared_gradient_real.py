@@ -349,7 +349,7 @@ def _expected_npz_roster() -> set[str]:
 
 
 def decode_root_stats(raw: bytes, headers: dict, *, io_meter=None) -> dict[str, np.ndarray]:
-    """Decode the two pinned FP32 constants from one already-hashed NPZ blob."""
+    """Decode pinned FP32/FP64 statistics from one already-hashed NPZ blob."""
     require(type(raw) is bytes and 0 < len(raw) <= ROOT_STATS_CAP, "root_stats_archive_size")
     require(type(headers) is dict and set(headers) == {"mean", "std"}, "root_stats_header_roster")
     try:
@@ -370,7 +370,9 @@ def decode_root_stats(raw: bytes, headers: dict, *, io_meter=None) -> dict[str, 
                     io_meter["root_stats_npz_member_reads"] += 1
                 header = headers[key]
                 require(type(header) is dict and list(value.shape) == header.get("shape")
-                        and value.dtype.str == header.get("dtype") and value.dtype == np.dtype("<f4")
+                        and header.get("dtype") in {"<f4", "<f8"}
+                        and value.dtype.str == header.get("dtype")
+                        and value.dtype in (np.dtype("<f4"), np.dtype("<f8"))
                         and value.flags.c_contiguous and np.isfinite(value).all(),
                         "root_stats_value_contract:" + key)
                 values[key] = np.array(value, copy=True)
