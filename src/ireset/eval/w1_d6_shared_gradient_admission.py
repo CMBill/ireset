@@ -88,6 +88,7 @@ REAL_CALL_MATRIX = {
         "scene_data_constructions": 1, "scene_resets": 1, "scene_mj_forwards": 1,
         "loss_constructions": 1, "input_domain_validations": 6, "runtime_syncs": 134,
         "scene_accesses": 1, "scene_cache_misses": 1,
+        "scene_plain_xml_bindings": 1, "scene_plain_compiles": 1,
     },
     "trainer_construction": {"dataset_constructions": 1, "trainer_constructions": 1,
                              "model_constructions": 1, "model_transfers": 1,
