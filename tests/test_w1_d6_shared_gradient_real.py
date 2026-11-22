@@ -19,6 +19,26 @@ from ireset.eval import w1_d6_shared_gradient as shared
 from ireset.eval import w1_d6_shared_gradient_real as real
 
 
+def test_worker_io_receipt_projects_the_validated_io_matrix_without_source_io():
+    script = Path(__file__).resolve().parents[1] / "scripts/run_w1_d6_shared_gradient_worker.py"
+    spec = importlib.util.spec_from_file_location("d6_worker_io_projection_test", script)
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+    result = {"io_matrix": {
+        "source_file_reads": 48, "source_file_hashes": 48,
+        "d6_npz_member_reads": 60, "root_stats_npz_member_reads": 2,
+        "npz_archive_opens": 4, "independent_artifact_reads": 27,
+        "independent_artifact_hashes": 20, "artifact_io": {"npy_writes": 20, "json_writes": 8},
+        "checkpoint_cpu_loads": 1, "strict_model_loads": 2,
+    }}
+    receipt = cli._worker_io_receipt(result, metadata_reads=3, ledger_reads=2, closure_passes=2)
+    assert receipt["source_file_reads"] == receipt["source_file_hashes"] == 48
+    assert receipt["independent_artifact_reads"] == 27
+    assert receipt["independent_artifact_hashes"] == 20
+    assert receipt["artifact_npy_writes"] == 20 and receipt["artifact_json_writes"] == 8
+    assert receipt["launch_metadata_reads"] == 3 and receipt["ledger_reads"] == 2
+
+
 def test_worker_cli_rejects_bad_launch_before_importing_numeric_core(tmp_path, monkeypatch):
     script = Path(__file__).resolve().parents[1] / "scripts/run_w1_d6_shared_gradient_worker.py"
     spec = importlib.util.spec_from_file_location("d6_worker_cli_preflight_test", script)

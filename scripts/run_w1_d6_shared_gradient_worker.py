@@ -172,6 +172,26 @@ def _verify_worker_recipe(package: dict, project: Path) -> None:
         raise ValueError("worker_launch_recipe_mismatch")
 
 
+def _worker_io_receipt(result: dict, *, metadata_reads: int, ledger_reads: int,
+                       closure_passes: int) -> dict:
+    io = result["io_matrix"]
+    return {"launch_metadata_reads": metadata_reads, "ledger_reads": ledger_reads,
+            "implementation_closure_hash_passes": closure_passes,
+            "source_file_reads": io["source_file_reads"],
+            "source_file_hashes": io["source_file_hashes"],
+            "d6_npz_member_reads": io["d6_npz_member_reads"],
+            "root_stats_npz_member_reads": io["root_stats_npz_member_reads"],
+            "npz_archive_opens": io["npz_archive_opens"],
+            "independent_artifact_reads": io["independent_artifact_reads"],
+            "independent_artifact_hashes": io["independent_artifact_hashes"],
+            "artifact_npy_writes": io["artifact_io"]["npy_writes"],
+            "artifact_json_writes": io["artifact_io"]["json_writes"],
+            "checkpoint_cpu_loads": io["checkpoint_cpu_loads"],
+            "strict_model_loads": io["strict_model_loads"],
+            "d6_directory_created": 1, "worker_result_writes": 1,
+            "worker_result_readbacks": 1}
+
+
 class WorkerBudget:
     def __init__(self, t0: float, deadline: float, clock=time.perf_counter):
         self.t0, self.deadline, self.clock = t0, deadline, clock
@@ -338,21 +358,9 @@ def execute_worker(*, launch_spec_path: Path, admission_snapshot_path: Path,
         raise ValueError("worker_trainer_construction_matrix")
     if result.get("parameter_updates") != 0:
         raise ValueError("worker_parameter_update_forbidden")
-    result["worker_io"] = {"launch_metadata_reads": metadata_reads, "ledger_reads": ledger_facts["reads"],
-                            "implementation_closure_hash_passes": closure_passes,
-                            "source_file_reads": result["source_io"]["source_file_reads"],
-                            "source_file_hashes": result["source_io"]["source_file_hashes"],
-                            "d6_npz_member_reads": result["io_matrix"]["d6_npz_member_reads"],
-                            "root_stats_npz_member_reads": result["io_matrix"]["root_stats_npz_member_reads"],
-                            "npz_archive_opens": result["io_matrix"]["npz_archive_opens"],
-                            "independent_artifact_reads": result["io_matrix"]["independent_artifact_reads"],
-                            "independent_artifact_hashes": result["io_matrix"]["independent_artifact_hashes"],
-                            "artifact_npy_writes": result["artifact_io"]["npy_writes"],
-                            "artifact_json_writes": result["artifact_io"]["json_writes"],
-                            "checkpoint_cpu_loads": result["io_matrix"]["checkpoint_cpu_loads"],
-                            "strict_model_loads": result["io_matrix"]["strict_model_loads"],
-                            "d6_directory_created": 1, "worker_result_writes": 1,
-                            "worker_result_readbacks": 1}
+    result["worker_io"] = _worker_io_receipt(
+        result, metadata_reads=metadata_reads, ledger_reads=ledger_facts["reads"],
+        closure_passes=closure_passes)
     result["worker_budget"] = budget.facts()
     result["worker_matrix_sha256"] = package["metadata_sha256"]
     return result
