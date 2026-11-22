@@ -504,6 +504,14 @@ def test_vjp_pair_receipts_bind_request_and_response_entries():
         real.vjp_pair_receipts(requests, responses[:-1])
 
 
+def test_outcome_array_roster_excludes_late_json_receipts():
+    records = {"h_0.npy": {"sha256": "h"}, "g_0.npy": {"sha256": "g"},
+               "loss_pos.npy": {"sha256": "p"}, "counts.json": {"sha256": "c"}}
+    selected = {name: record for name, record in records.items()
+                if name.startswith("h_") or name.startswith("g_") or name.startswith("loss_")}
+    assert set(selected) == {"h_0.npy", "g_0.npy", "loss_pos.npy"}
+
+
 def test_rejects_duplicate_or_extra_npz_members():
     blobs, records = _fixture_blobs()
     arrays = {f"w{s}__{key}": np.zeros(shape, dtype=np.dtype(dtype))

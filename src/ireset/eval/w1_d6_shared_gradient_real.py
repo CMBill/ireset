@@ -1059,6 +1059,9 @@ def run_numeric_kernel(trainer, batch, loss, *, permit: RealWorkerPermit, artifa
                            "vjp": vjp_counts, "runtime_sync_count": runtime_sync_counts,
                            "parameter_updates": 0, "contact_branch": 0}
         store.write_json("counts.json", counts_artifact)
+        outcome_files = {name: record for name, record in store.records.items()
+                         if name.startswith("h_") or name.startswith("g_")
+                         or name.startswith("loss_")}
         outcome = {"schema": SCHEMA, "status": "candidate_pending_external_return",
                    "analysis": analysis, "loss_scalars": production_scalars,
                    "independent_loss_scalars": replay, "loss_arrays": loss_receipts,
@@ -1071,7 +1074,7 @@ def run_numeric_kernel(trainer, batch, loss, *, permit: RealWorkerPermit, artifa
                     "trainer_construction": trainer_receipt.construction,
                     "setup_report": setup_report, "runtime_report": runtime_guard.facts(),
                     "runtime_sync_count": runtime_sync_counts,
-                    "counts": calls, "files": store.records}
+                     "counts": calls, "files": outcome_files}
         store.write_json("vjp_records.json", {"requests": vjp["requests"], "responses": vjp["responses"],
                                                 "roster": vjp["roster"], "roster_sha256": vjp["roster_sha256"],
                                                 "file_records": vjp["file_records"]})
