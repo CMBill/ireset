@@ -711,6 +711,22 @@ def test_real_artifact_readback_is_independent_and_binds_all_outputs(tmp_path, m
         real.review_real_artifacts(root)
 
 
+@pytest.mark.parametrize(
+    ("total", "outcome", "reads", "valid"),
+    [(140, 86, 27, True), (139, 86, 27, False), (140, 87, 27, False),
+     (140, 86, 26, False), (True, 86, 27, False), (140, False, 27, False),
+     (140, 86, True, False)],
+)
+def test_runtime_sync_reconciliation_uses_candidate_and_readback_scopes(total, outcome, reads, valid):
+    setup_calls = {"entered": {"runtime_syncs": total}}
+    review_io = {"artifact_reads": reads}
+    if valid:
+        real._verify_runtime_sync_reconciliation(setup_calls, outcome, review_io)
+    else:
+        with pytest.raises(real.RealWorkerError, match="runtime_guard_sync_count_disagreement"):
+            real._verify_runtime_sync_reconciliation(setup_calls, outcome, review_io)
+
+
 class _NullRuntime:
     def check_unit(self, _point):
         return None

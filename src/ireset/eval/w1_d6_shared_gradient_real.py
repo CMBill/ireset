@@ -1134,6 +1134,16 @@ def run_numeric_kernel(trainer, batch, loss, *, permit: RealWorkerPermit, artifa
             setattr(trainer, name, original)
 
 
+def _verify_runtime_sync_reconciliation(setup_calls: dict, outcome_count: int,
+                                       review_io: dict) -> None:
+    entered = setup_calls.get("entered") if type(setup_calls) is dict else None
+    reads = review_io.get("artifact_reads") if type(review_io) is dict else None
+    require(type(entered) is dict and type(entered.get("runtime_syncs")) is int
+            and type(outcome_count) is int and type(reads) is int and reads >= 0
+            and entered["runtime_syncs"] == outcome_count + 2 * reads,
+            "runtime_guard_sync_count_disagreement")
+
+
 def run_authorized_worker(*, authorization_raw: bytes, authorization_sha256: str,
                           package: dict, project_root: Path, work_budget,
                           runtime_construction_entry, runtime_construction_check,
@@ -1195,8 +1205,8 @@ def run_authorized_worker(*, authorization_raw: bytes, authorization_sha256: str
             "worker_candidate_state")
     construction = components.setup_report["trainer_construction"]
     setup_calls = components.setup_meter.verify()
-    require(setup_calls["entered"].get("runtime_syncs") == result["outcome"].get("runtime_sync_count"),
-            "runtime_guard_sync_count_disagreement")
+    _verify_runtime_sync_reconciliation(setup_calls, result["outcome"].get("runtime_sync_count"),
+                                        result["artifact_readback_io"])
     construction_entered = construction["construction_entered"]
     construction_returned = construction["construction_returned"]
     trainer_calls = {
