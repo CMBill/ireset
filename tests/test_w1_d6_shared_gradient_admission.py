@@ -49,6 +49,12 @@ def test_pinned_worker_environment_includes_python_locale_normalization():
     assert env["LC_CTYPE"] == "C.UTF-8"
 
 
+def test_real_attempt_root_advances_past_consumed_failed_claim():
+    package, _ = admission.build_materials(Path(__file__).resolve().parents[1])
+    assert package["proposed_real_root"].endswith("/attempt_002")
+    assert admission.PROPOSED_REAL_ROOT.name == "attempt_002"
+
+
 def test_authorization_is_rejected_until_real_worker_is_frozen():
     package, draft = admission.build_materials(Path(__file__).resolve().parents[1])
     assert "authorization_not_signed" in admission.authorization_problems(draft, package)
