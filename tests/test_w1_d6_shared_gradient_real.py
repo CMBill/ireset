@@ -514,12 +514,15 @@ def test_outcome_array_roster_excludes_late_json_receipts():
 
 def test_setup_meter_separates_entry_only_scene_observations_from_completed_units():
     class Budget:
+        unit_calls = {"fk_runtime_sources": 1}
+
         def check(self, _point):
             pass
 
     meter = real._WorkerMeter(Budget(), {
         "scene_accesses": 1,
         "scene_cache_misses": 1,
+        "fk_runtime_sources": 1,
         "scene_compiles": 1,
     })
     meter.enter("scene_accesses")
@@ -528,8 +531,20 @@ def test_setup_meter_separates_entry_only_scene_observations_from_completed_unit
 
     receipt = meter.verify()
     assert receipt["entered"] == {"scene_accesses": 1, "scene_cache_misses": 1,
-                                  "scene_compiles": 1}
+                                  "fk_runtime_sources": 1, "scene_compiles": 1}
     assert receipt["completed"] == {"scene_compiles": 1}
+
+
+def test_setup_meter_rejects_unobserved_budget_metered_call():
+    class Budget:
+        unit_calls = {}
+
+        def check(self, _point):
+            pass
+
+    meter = real._WorkerMeter(Budget(), {"fk_runtime_sources": 1})
+    with pytest.raises(real.RealWorkerError, match="worker_setup_call_matrix_mismatch"):
+        meter.verify()
 
 
 def test_rejects_duplicate_or_extra_npz_members():

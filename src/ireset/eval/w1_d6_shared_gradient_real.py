@@ -722,6 +722,7 @@ def build_readonly_trainer(prepared: PreparedInputs, *, permit: RealWorkerPermit
 
 class _WorkerMeter:
     ENTRY_ONLY = frozenset({"scene_accesses", "scene_cache_misses", "scene_cache_hits"})
+    BUDGET_METERED = frozenset({"fk_runtime_sources"})
 
     def __init__(self, budget, expected):
         self.budget = budget
@@ -745,11 +746,17 @@ class _WorkerMeter:
         return result
 
     def verify(self):
-        expected_completed = {name: count for name, count in self.expected.items()
+        metered_expected = {name: count for name, count in self.expected.items()
+                            if name not in self.BUDGET_METERED}
+        expected_completed = {name: count for name, count in metered_expected.items()
                               if name not in self.ENTRY_ONLY}
-        require(self.entered == self.expected and self.completed == expected_completed,
+        external = {name: count for name, count in self.expected.items()
+                    if name in self.BUDGET_METERED}
+        budget_calls = getattr(self.budget, "unit_calls", {})
+        require(self.entered == metered_expected and self.completed == expected_completed
+                and all(budget_calls.get(name, 0) == count for name, count in external.items()),
                 "worker_setup_call_matrix_mismatch")
-        return {"expected": self.expected, "entered": dict(self.entered),
+        return {"expected": self.expected, "entered": {**self.entered, **external},
                 "completed": dict(self.completed)}
 
 
