@@ -408,6 +408,22 @@ def _first_micro_positions(row: dict, payload: dict) -> list[int]:
     return positions
 
 
+def _validate_reconstructed_domain(arrays: dict[str, np.ndarray], slot: int) -> None:
+    """Reject source-domain violations before any production module work."""
+    require(set(arrays) == set(evidence.BATCH_KEYS), "payload_key_set")
+    for key, value in arrays.items():
+        require(isinstance(value, np.ndarray) and value.dtype == np.float32
+                and np.isfinite(value).all(), f"payload_shape_dtype_domain:{slot}:{key}")
+    require(np.isin(arrays["contact"], (0., 1.)).all(),
+            f"payload_contact_domain:{slot}")
+    require(np.array_equal(arrays["valid"], np.ones_like(arrays["valid"])),
+            f"payload_valid_domain:{slot}")
+    require(np.allclose(np.linalg.norm(arrays["box_quat"], axis=-1), 1., rtol=0, atol=1e-5),
+            f"payload_box_quaternion_domain:{slot}")
+    require(np.array_equal(arrays["wfc"][3], np.asarray([0., 0., 0., 1.], dtype=np.float32)),
+            f"payload_world_from_clip_domain:{slot}")
+
+
 def reconstruct_batch(blobs: dict[str, bytes], records: dict[str, dict], *,
                       expected_identity: dict, io_meter=None) -> tuple[list[dict], dict, list, dict]:
     """Decode only the six approved records and rebuild the first micro batch."""
@@ -455,6 +471,8 @@ def reconstruct_batch(blobs: dict[str, bytes], records: dict[str, dict], *,
             if key in field_names:
                 require(evidence.array_record(arr) == fields[key], f"payload_field_binding:{slot}:{key}")
             item[key] = torch.from_numpy(np.array(arr, copy=True))
+        _validate_reconstructed_domain(
+            {key: item[key].numpy() for key in evidence.BATCH_KEYS}, slot)
         require(int(item["clip_idx"]) == slot and int(item["start"]) == 0,
                 "probe_input_slot_identity")
         items.append(item)
@@ -705,6 +723,10 @@ def setup_production_worker(package: dict, snapshots: dict, records: dict, *,
     app, _spec, runtime, _meter = build_production_apparatus(package, snapshots, records,
                                                               prepared=prepared, budget=budget,
                                                               meter=setup_meter)
+    for slot, item in enumerate(prepared.items):
+        arrays = {key: item[key].detach().cpu().numpy() for key in evidence.BATCH_KEYS}
+        setup_meter.unit("input_domain_validations", evidence.valid_window, arrays, app.decoder,
+                         point="input_domain_validation:" + str(slot))
     trainer, receipt = build_readonly_trainer(prepared, permit=permit, tokenizer=app.tokenizer,
                                                loss=app.loss_fn, run_dir=run_dir, plan=plan,
                                                budget=budget, runtime_guard=runtime,
@@ -813,7 +835,9 @@ class _VJPMeter:
 def run_numeric_kernel(trainer, batch, loss, *, permit: RealWorkerPermit, artifact_dir: Path,
                        expected_roster: list, trainer_receipt: ReadonlyTrainerReceipt,
                        budget, runtime_guard, setup_report: dict,
-                       synchronize=None) -> dict:
+                       synchronize=None, failure_context: dict | None = None,
+                       launch_artifact: dict | None = None,
+                       inputs_artifact: dict | None = None) -> dict:
     """Run the one predict/loss/seven-VJP core after caller's source/setup gates."""
     require(isinstance(permit, RealWorkerPermit) and permit._token is _PERMIT_TOKEN
             and Path(artifact_dir) == permit.root / "artifacts", "real_worker_permit_required")
@@ -898,6 +922,12 @@ def run_numeric_kernel(trainer, batch, loss, *, permit: RealWorkerPermit, artifa
     fk.site_world_positions = counted_fk
 
     try:
+        store.write_json("launch.json", launch_artifact or {
+            "schema": SCHEMA + "/launch_artifact", "launch_id": permit.launch_id,
+            "authorization_sha256": permit.authorization_sha256,
+            "admission_metadata_sha256": permit.admission_metadata_sha256,
+        })
+        store.write_json("inputs.json", inputs_artifact or {"schema": SCHEMA + "/inputs_artifact"})
         runtime_guard.check_unit("shared_gradient_before_predict")
         before_state = shared.parameter_state_digest(trainer)
         before_rng = shared._rng_snapshot()
@@ -949,6 +979,10 @@ def run_numeric_kernel(trainer, batch, loss, *, permit: RealWorkerPermit, artifa
         runtime_guard.finish()
         runtime_sync_counts = runtime_guard.guards.entered.get("runtime_syncs", 0)
         loss_receipts = shared._write_losses(store, values)
+        counts_artifact = {"schema": SCHEMA + "/counts_artifact", "counts": calls,
+                           "vjp": vjp_counts, "runtime_sync_count": runtime_sync_counts,
+                           "parameter_updates": 0, "contact_branch": 0}
+        store.write_json("counts.json", counts_artifact)
         outcome = {"schema": SCHEMA, "status": "candidate_pending_external_return",
                    "analysis": analysis, "loss_scalars": production_scalars,
                    "independent_loss_scalars": replay, "loss_arrays": loss_receipts,
@@ -978,7 +1012,24 @@ def run_numeric_kernel(trainer, batch, loss, *, permit: RealWorkerPermit, artifa
         store.write_json("independent_review.json", review)
         return {"outcome": outcome, "independent_review": review,
                 "counts": calls, "vjp": vjp_counts, "artifact_peak_bytes": store.peak_bytes,
-        "artifact_io": dict(store.io_counts), "artifact_readback_io": review["io"]}
+                "artifact_io": dict(store.io_counts), "artifact_readback_io": review["io"]}
+    except BaseException:
+        if failure_context is not None:
+            failure_context["numeric"] = {
+                "counts": dict(calls),
+                "forbidden_update_calls": dict(update_calls),
+                "artifact_io": dict(store.io_counts),
+                "artifact_files": dict(store.records),
+                "budget": budget.facts(),
+            }
+            meter = locals().get("vjp_meter")
+            if meter is not None:
+                failure_context["numeric"]["vjp"] = {
+                    "entered": meter.entered,
+                    "completed": meter.completed,
+                    "sync_points": meter.sync_points,
+                }
+        raise
     finally:
         for handle in handles:
             handle.remove()
@@ -991,7 +1042,8 @@ def run_numeric_kernel(trainer, batch, loss, *, permit: RealWorkerPermit, artifa
 
 def run_authorized_worker(*, authorization_raw: bytes, authorization_sha256: str,
                           package: dict, project_root: Path, work_budget,
-                          runtime_construction_entry, runtime_construction_check) -> dict:
+                          runtime_construction_entry, runtime_construction_check,
+                          failure_context: dict | None = None) -> dict:
     """In-process real worker. Only a supervisor-issued external permit may enter."""
     permit = authorize_worker(package=package, auth=_json_object(authorization_raw, "authorization_invalid"),
                               authorization_raw=authorization_raw,
@@ -1006,6 +1058,8 @@ def run_authorized_worker(*, authorization_raw: bytes, authorization_sha256: str
                  "root_stats_npz_member_reads": 0, "npz_archive_opens": 0,
                  "checkpoint_cpu_loads": 0,
                  }
+    if failure_context is not None:
+        failure_context["source_io"] = source_io
     snapshots, records = read_authorized_source_bundle(package, project_root, work_budget,
                                                        io_meter=source_io)
     prepared = prepare_snapshot_inputs(package, snapshots, records, io_meter=source_io)
@@ -1014,6 +1068,8 @@ def run_authorized_worker(*, authorization_raw: bytes, authorization_sha256: str
     require(type(matrix) is dict and matrix.get("schema") == admission.SCHEMA + "/real_call_matrix_v1",
             "real_call_matrix_missing")
     setup_meter = _WorkerMeter(work_budget, matrix.get("setup_units", {}))
+    if failure_context is not None:
+        failure_context["setup_calls"] = setup_meter.entered
     components = setup_production_worker(package, snapshots, records, prepared=prepared,
                                          permit=permit, run_dir=permit.root / "d6",
                                          budget=work_budget,
@@ -1026,7 +1082,20 @@ def run_authorized_worker(*, authorization_raw: bytes, authorization_sha256: str
                                 expected_roster=prepared.expected_roster,
                                 trainer_receipt=components.trainer_receipt,
                                 budget=work_budget, runtime_guard=components.runtime,
-                                setup_report=components.setup_report)
+                                setup_report=components.setup_report,
+                                failure_context=failure_context,
+                                launch_artifact={
+                                    "schema": SCHEMA + "/launch_artifact",
+                                    "launch_id": permit.launch_id,
+                                    "authorization_sha256": permit.authorization_sha256,
+                                    "admission_metadata_sha256": permit.admission_metadata_sha256,
+                                },
+                                inputs_artifact={
+                                    "schema": SCHEMA + "/inputs_artifact",
+                                    "identity": prepared.expected_identity,
+                                    "windows": prepared.payload_manifest.get("windows"),
+                                    "source_records": records,
+                                })
     result["source_io"] = source_io
     require(result["outcome"]["status"] == "candidate_pending_external_return",
             "worker_candidate_state")
@@ -1109,13 +1178,13 @@ def real_worker_io_matrix(package: dict, source_records: dict, result: dict) -> 
                   for path, rec in source_records.items()}
     require(normalized == expected_paths, "real_worker_source_records_drift")
     artifact_io = result["artifact_io"]
-    require(artifact_io == {"npy_writes": 20, "json_writes": 5}, "real_worker_artifact_io_matrix")
+    require(artifact_io == {"npy_writes": 20, "json_writes": 8}, "real_worker_artifact_io_matrix")
     files = result["outcome"].get("files")
     require(type(files) is dict and len(files) == 20
             and all(name.endswith(".npy") for name in files),
             "real_worker_artifact_file_matrix")
     readback = result["artifact_readback_io"]
-    require(readback == {"artifact_reads": 24, "file_sha256_verified": 20},
+    require(readback == {"artifact_reads": 27, "file_sha256_verified": 20},
             "real_worker_artifact_read_matrix")
     source_io = result["source_io"]
     require(source_io == {"d6_file_reads": 6, "root_stats_file_reads": 1,
@@ -1242,6 +1311,18 @@ def review_real_artifacts(root: Path, expected_analysis: dict | None = None, *,
     require(type(got_total) in (int, float) and np.isfinite(got_total)
             and abs(got_total - want_total) <= shared.LOSS_TOL * max(abs(got_total), abs(want_total)),
             "real_production_batch_loss_mismatch")
+    launch = _json_object(read("launch.json", 256 << 10), "real_launch_artifact_invalid")
+    inputs = _json_object(read("inputs.json", 8 << 20), "real_inputs_artifact_invalid")
+    counts = _json_object(read("counts.json", 256 << 10), "real_counts_artifact_invalid")
+    require(launch.get("schema") == SCHEMA + "/launch_artifact"
+            and type(launch.get("launch_id")) is str
+            and type(launch.get("authorization_sha256")) is str
+            and type(launch.get("admission_metadata_sha256")) is str,
+            "real_launch_artifact_contract")
+    require(inputs.get("schema") == SCHEMA + "/inputs_artifact"
+            and type(inputs.get("windows")) is list and len(inputs["windows"]) == protocol.N
+            and type(inputs.get("source_records")) is dict,
+            "real_inputs_artifact_contract")
     call_matrix = _json_object(read("call_matrix.json", 256 << 10), "real_call_matrix_invalid")
     forbidden_updates = {name: 0 for name in ("accumulate_micro", "clip_gradients", "step_optimizer")}
     require(outcome.get("vjp_counts") == {"vjp_entered": 7, "vjp_completed": 7, "vjp_pre_sync_points": 7}
@@ -1259,6 +1340,9 @@ def review_real_artifacts(root: Path, expected_analysis: dict | None = None, *,
             and call_matrix.get("counts") == outcome.get("counts")
             and call_matrix.get("vjp") == outcome.get("vjp_counts")
             and call_matrix.get("runtime_sync_count") == outcome.get("runtime_sync_count")
+            and counts.get("counts") == outcome.get("counts")
+            and counts.get("vjp") == outcome.get("vjp_counts")
+            and counts.get("runtime_sync_count") == outcome.get("runtime_sync_count")
             and call_matrix.get("parameter_updates") == 0 and call_matrix.get("contact_branch") == 0,
             "real_candidate_forbidden_or_call_counts")
     return {"schema": SCHEMA + "/independent_review", "passed": True,

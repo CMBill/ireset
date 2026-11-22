@@ -664,6 +664,25 @@ def run_authorized_attempt(*, authorization_path: Path, authorization_sha256: st
                              cwd=attempt, env=worker_env)
     outer_check("worker_wait_and_cleanup:post")
     if wait.return_code != 0 or wait.timed_out or not wait.group_reaped or wait.log_overflow:
+        failure_record = None
+        failure_path = attempt / "worker_failure.json"
+        try:
+            if failure_path.exists():
+                failure_raw = _read_regular(failure_path, 2 << 20)
+                failure_record = {"bytes": len(failure_raw),
+                                  "sha256": hashlib.sha256(failure_raw).hexdigest()}
+        except BaseException:
+            failure_record = None
+        try:
+            _record_authorization_event(
+                ledger_root, ledger, "failed.json",
+                {"schema": admission.SCHEMA + "/authorization_event_v1",
+                 "event": "failed", "launch_id": launch_id,
+                 "return_code": wait.return_code, "timed_out": wait.timed_out,
+                 "group_reaped": wait.group_reaped, "log_overflow": wait.log_overflow,
+                 "worker_failure": failure_record, "parameter_updates": 0})
+        except BaseException:
+            pass
         raise ValueError("real_worker_failed_or_unclean")
     result_raw = _read_regular(attempt / "worker_result.json", 2 << 20)
     outer_check("worker_result_read:post")
@@ -719,17 +738,19 @@ def run_authorized_attempt(*, authorization_path: Path, authorization_sha256: st
             or io_actual.get("source_file_reads") != 48 or io_actual.get("source_file_hashes") != 48
             or io_actual.get("d6_npz_member_reads") != 60
             or io_actual.get("root_stats_npz_member_reads") != 2
-            or io_actual.get("npz_archive_opens") != 4
-            or io_actual.get("independent_artifact_reads") != 24
+                or io_actual.get("npz_archive_opens") != 4
+                or io_actual.get("independent_artifact_reads") != 27
             or io_actual.get("independent_artifact_hashes") != 20
             or io_actual.get("checkpoint_cpu_loads") != 1
-            or io_actual.get("strict_model_loads") != 2
-            or io_actual.get("artifact_io") != {"npy_writes": 20, "json_writes": 5}
+                or io_actual.get("strict_model_loads") != 2
+                or io_actual.get("artifact_io") != {"npy_writes": 20, "json_writes": 8}
             or worker_result.get("artifact_io") != io_actual.get("artifact_io")
             or worker_result.get("outcome", {}).get("files") != io_actual.get("artifact_files")
-            or type(io_actual.get("artifact_files")) is not dict
-            or set(io_actual["artifact_files"]) != ({f"{role}_{i}.npy" for role in ("h", "g") for i in range(7)}
-               | {f"loss_{name}.npy" for name in ("pos", "rot6d", "joint", "geodesic_rad2", "vel", "fk_m2")})):
+                or type(io_actual.get("artifact_files")) is not dict
+                or set(io_actual["artifact_files"]) != (
+                    {f"{role}_{i}.npy" for role in ("h", "g") for i in range(7)}
+                    | {f"loss_{name}.npy" for name in ("pos", "rot6d", "joint", "geodesic_rad2", "vel", "fk_m2")}
+                )):
         raise ValueError("real_worker_io_matrix_mismatch")
     supervisor_expected = worker_matrix.get("supervisor")
     supervisor_io_expected = package["io_matrix"].get("supervisor_actual")

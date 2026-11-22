@@ -295,6 +295,7 @@ def execute_worker(*, launch_spec_path: Path, admission_snapshot_path: Path,
     d6_dir = attempt / "d6"
     d6_dir.mkdir(mode=0o700, exist_ok=False)
     construction = {"entered": [], "returned": []}
+    failure_context = {}
 
     def construction_entry(name):
         budget.check("trainer_construct_" + name + ":pre")
@@ -308,11 +309,25 @@ def execute_worker(*, launch_spec_path: Path, admission_snapshot_path: Path,
             raise ValueError("worker_trainer_construction_missing_module")
         construction["returned"].append(name)
 
-    result = worker.run_authorized_worker(
-        authorization_raw=authorization_raw, authorization_sha256=authorization_sha256,
-        package=package, project_root=project, work_budget=budget,
-        runtime_construction_entry=construction_entry,
-        runtime_construction_check=construction_check)
+    try:
+        result = worker.run_authorized_worker(
+            authorization_raw=authorization_raw, authorization_sha256=authorization_sha256,
+            package=package, project_root=project, work_budget=budget,
+            runtime_construction_entry=construction_entry,
+            runtime_construction_check=construction_check,
+            failure_context=failure_context)
+    except BaseException as exc:
+        failure = {"schema": "w1_d6_shared_gradient_real_worker_v1/worker_failure",
+                   "status": "incomplete", "error_type": type(exc).__name__,
+                   "error": str(exc)[:500], "worker_budget": budget.facts(),
+                   "construction": construction,
+                   "failure_context": failure_context,
+                   "parameter_updates": 0}
+        try:
+            _write_failure(attempt / "worker_failure.json", failure)
+        except BaseException:
+            pass
+        raise
     closure_passes += 1
     expected_entered = ["model", "model_transfer", "conditioner", "conditioner_transfer",
                         "train_loader", "val_loader"]
@@ -361,6 +376,28 @@ def _write_result(path: Path, result: dict) -> None:
         os.close(dirfd)
     if _read_regular(path, 2 << 20) != raw:
         raise ValueError("worker_result_readback_mismatch")
+
+
+def _write_failure(path: Path, failure: dict) -> None:
+    """Persist bounded partial facts without publishing a candidate result."""
+    raw = (json.dumps(failure, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode()
+    if len(raw) > 2 << 20:
+        raise ValueError("worker_failure_too_large")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "wb", closefd=False) as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        os.close(fd)
+    directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    if _read_regular(path, 2 << 20) != raw:
+        raise ValueError("worker_failure_readback_mismatch")
 
 
 def main(argv=None) -> int:

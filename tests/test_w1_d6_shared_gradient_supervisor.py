@@ -422,14 +422,14 @@ def _real_protocol_fixture(tmp_path):
         "worker_io=io['worker_actual']; runtime=pkg['source']['d6_bindings']['runtime']\n"
         "runtime_report={'stage':'D6','kind':'production','device':'cuda:0','identity':runtime['identity'],'gpu':runtime['gpu'],'before':runtime['observed_before_setup'],'setup':{'applied':True,'problems':[]},'endpoint':{'ok':True}}\n"
         "worker_cm={k:cm[k] for k in ('schema','sources','setup_units','trainer_construction','numeric','forbidden')}\n"
-        "worker_matrix={'source_file_reads':48,'source_file_hashes':48,'d6_npz_member_reads':60,'root_stats_npz_member_reads':2,'npz_archive_opens':4,'independent_artifact_reads':24,'independent_artifact_hashes':20,'artifact_files':artifacts,'artifact_io':{'npy_writes':20,'json_writes':5},'checkpoint_cpu_loads':1,'strict_model_loads':2,'source_records':records}\n"
+        "worker_matrix={'source_file_reads':48,'source_file_hashes':48,'d6_npz_member_reads':60,'root_stats_npz_member_reads':2,'npz_archive_opens':4,'independent_artifact_reads':27,'independent_artifact_hashes':20,'artifact_files':artifacts,'artifact_io':{'npy_writes':20,'json_writes':8},'checkpoint_cpu_loads':1,'strict_model_loads':2,'source_records':records}\n"
         "result={'schema':'w1_d6_shared_gradient_real_worker_v1/worker_result',"
         "'status':'candidate_pending_external_return','launch_id':spec['launch_id'],"
         "'authorization_sha256':spec['authorization_sha256'],"
         "'admission_metadata_sha256':spec['admission_metadata_sha256'],"
         "'independent_review':{'passed':True},'parameter_updates':0,'worker_matrix_sha256':pkg['metadata_sha256'],"
         "'call_matrix':worker_cm,'worker_io':worker_io,'io_matrix':worker_matrix,"
-        "'source_records':records,'artifact_io':{'npy_writes':20,'json_writes':5},"
+        "'source_records':records,'artifact_io':{'npy_writes':20,'json_writes':8},"
         "'outcome':{'runtime_report':runtime_report,'runtime_sync_count':cm['setup_units']['runtime_syncs'],'files':artifacts}}\n"
         "raw=(json.dumps(result,sort_keys=True,separators=(',',':'))+'\\n').encode()\n"
         "fd=os.open(Path(spec['attempt_root'])/'worker_result.json',os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)\n"
@@ -469,8 +469,8 @@ def _real_protocol_fixture(tmp_path):
                      "implementation_closure_hash_passes": 2, "source_file_reads": 48,
                      "source_file_hashes": 48, "d6_npz_member_reads": 60,
                      "root_stats_npz_member_reads": 2, "npz_archive_opens": 4,
-                     "independent_artifact_reads": 24, "independent_artifact_hashes": 20,
-                     "artifact_npy_writes": 20, "artifact_json_writes": 5,
+                     "independent_artifact_reads": 27, "independent_artifact_hashes": 20,
+                     "artifact_npy_writes": 20, "artifact_json_writes": 8,
                      "checkpoint_cpu_loads": 1, "strict_model_loads": 2,
                      "d6_directory_created": 1, "worker_result_writes": 1,
                      "worker_result_readbacks": 1}

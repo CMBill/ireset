@@ -219,6 +219,40 @@ def test_reconstructs_registered_first_micro_from_one_bound_snapshot():
         real.reconstruct_batch(blobs, records, expected_identity={"launch": "other-d6"})
 
 
+@pytest.mark.parametrize("key,mutate,reason", [
+    ("valid", lambda value: value.__setitem__(0, 0), "payload_valid_domain"),
+    ("contact", lambda value: value.__setitem__(0, 2), "payload_contact_domain"),
+    ("box_quat", lambda value: value.__setitem__((0, 0), 0.), "payload_box_quaternion_domain"),
+    ("wfc", lambda value: value.__setitem__((3, 3), 0.), "payload_world_from_clip_domain"),
+])
+def test_reconstruct_rejects_input_domain_values(key, mutate, reason):
+    blobs, records = _fixture_blobs()
+    archive = np.load(io.BytesIO(blobs["d6/probe_inputs.npz"]), allow_pickle=False)
+    values = {name: np.array(archive[name], copy=True) for name in archive.files}
+    mutate(values[f"w0__{key}"])
+    updated = io.BytesIO()
+    np.savez(updated, **values)
+    blobs["d6/probe_inputs.npz"] = updated.getvalue()
+    records["d6/probe_inputs.npz"] = {"path": "d6/probe_inputs.npz",
+                                       "bytes": len(blobs["d6/probe_inputs.npz"]),
+                                       "sha256": real._sha(blobs["d6/probe_inputs.npz"])}
+    payload = json.loads(blobs["d6/payload.json"])
+    payload["windows"][0]["fields"][key] = evidence.array_record(values[f"w0__{key}"])
+    blobs["d6/payload.json"] = _json(payload)
+    records["d6/payload.json"] = {"path": "d6/payload.json",
+                                   "bytes": len(blobs["d6/payload.json"]),
+                                   "sha256": real._sha(blobs["d6/payload.json"])}
+    history = json.loads(blobs["d6/history.jsonl"])
+    history["micros"][0] = evidence.consumption(
+        payload, list(real.PERMUTATION), kind="train", step=1, micro=1, event=2)
+    blobs["d6/history.jsonl"] = _json(history)
+    records["d6/history.jsonl"] = {"path": "d6/history.jsonl",
+                                    "bytes": len(blobs["d6/history.jsonl"]),
+                                    "sha256": real._sha(blobs["d6/history.jsonl"])}
+    with pytest.raises(real.RealWorkerError, match=reason):
+        real.reconstruct_batch(blobs, records, expected_identity={"launch": "bound-d6"})
+
+
 def test_rejects_source_byte_drift_before_npz_decode():
     blobs, records = _fixture_blobs()
     blobs["d6/probe_inputs.npz"] = blobs["d6/probe_inputs.npz"][:-1]
@@ -511,8 +545,16 @@ def _make_review_fixture(tmp_path, monkeypatch):
                "runtime_report": {"stage": "D6", "kind": "production"},
                "runtime_sync_count": 1,
                "rng_unchanged": True, "parameter_state_unchanged": True,
-               "independent_loss_scalars": independent, "loss_scalars": production,
-               "loss_arrays": receipts, "counts": {"vjp": 7}}
+                "independent_loss_scalars": independent, "loss_scalars": production,
+                "loss_arrays": receipts, "counts": {"vjp": 7}}
+    store.write_json("launch.json", {"schema": real.SCHEMA + "/launch_artifact",
+                                      "launch_id": "fixture", "authorization_sha256": "a" * 64,
+                                      "admission_metadata_sha256": "b" * 64})
+    store.write_json("inputs.json", {"schema": real.SCHEMA + "/inputs_artifact",
+                                     "windows": list(shared.WINDOWS), "source_records": {}})
+    store.write_json("counts.json", {"schema": real.SCHEMA + "/counts_artifact",
+                                     "counts": outcome["counts"], "vjp": vjp_counts,
+                                     "runtime_sync_count": 1})
     store.write_json("vjp_records.json", vjp_records)
     store.write_json("loss_scalars.json", loss_records)
     store.write_json("call_matrix.json", {"counts": outcome["counts"], "vjp": vjp_counts,
