@@ -1,19 +1,19 @@
 # W1 固定六窗共享梯度真实准入与监督材料
 
-**2026-11-22 · 输入域、失败计数与固定输出工件契约完成修复；独立 worker/supervisor 复核完成；executable packet `attempt_026` 已生成；未读取 checkpoint/批次/资产 payload；无真实执行授权。**
+**2026-11-22 · 独立复核生成 executable packet `attempt_028`；用户授权的一次运行已消费，但 worker 在数值/来源读取前因 Python locale 环境契约不匹配退出；未读取 checkpoint/批次/资产 payload、未更新参数；禁止重试，需新的授权。**
 
 ## 结果
 
 生成器读取四份已封口元数据：R6 admission、D6 独立裁决、D6 artifacts index、I/C `attempt_006` CUDA acceptance；另读取并 SHA-256 绑定 39 个当前实现/方案文件。它不打开被索引指向的 `initial.pt`、`probe_inputs.npz`、root-stats NPZ、数据集或生产资产，也不重新哈希历史绑定的 41 个资产。R6 的历史绑定仅作为已封口元数据引用；本轮未重新验证其 payload 当前仍与登记相符。
 
-当前材料目录：`derived/audit/w1_d6_shared_gradient_step0_v1/real_admission/attempt_026/`
+当前材料目录：`derived/audit/w1_d6_shared_gradient_step0_v1/real_admission/attempt_028/`
 
 | 文件 | SHA-256 | 状态 |
 | --- | --- | --- |
-| `admission.json` | `3ea3346fdc15f3bb91903757136235500ac5503299bac1820690e6a333417d7c` | `executable=true`、`authorized=false`、独立复核绑定 |
-| `authorization_draft.json` | `889ccd0b0f6a7e9ca89301489a88dcee9cbf409eb0aa55b896000cef4b18dc9d` | `authorized=false`、`template_only=true`、六项 checklist 为 null |
+| `admission.json` | `fdc092cecc8cde37545e79bfb323fbfd70ea0ad01e5dbadaad60eb7efbde7aec` | `executable=true`、`authorized=false`、独立复核绑定 |
+| `authorization_draft.json` | `5b2c1ba9cdf772e513cf6fd5cdfa47fd3f0129f43e5cb7d52695ade0c2a7d6ba` | `authorized=false`、`template_only=true`、六项 checklist 为 null |
 
-Admission canonical metadata SHA 为 `030412e5c08b12c2c1720c0a05ba0389247ad980afe97f5c0c4a7894cf2678c7`。它绑定 D6 裁决 SHA `1de06dae…`、R6 admission SHA `9e54107c…`、D6 artifact index SHA `c5cca9bc…`、I/C acceptance SHA `f05fc505…`、六窗登记路径、六份 D6 工件记录、41 项资产记录、39 文件实现闭包、独立复核收据、固定账本根 `derived/audit/w1_d6_shared_gradient_step0_v1/authorization_consumption_v1` 和 package-pinned worker argv/environment。独立复核 receipt SHA `54167b5e…` 绑定 commit `764dfb3`，定向测试 67 项通过。真实 CUDA/I/O 运行仍未授权、未执行。候选真实运行根未创建。
+Admission canonical metadata SHA 为 `986f757e1ec53a992ef5b4ab1986d9dd9b822118f41c1c49b4475169645d5294`。它绑定 D6 裁决 SHA `1de06dae…`、R6 admission SHA `9e54107c…`、D6 artifact index SHA `c5cca9bc…`、I/C acceptance SHA `f05fc505…`、六窗登记路径、六份 D6 工件记录、41 项资产记录、39 文件实现闭包、独立复核收据、固定账本根 `derived/audit/w1_d6_shared_gradient_step0_v1/authorization_consumption_v1` 和 package-pinned worker argv/environment。独立复核 receipt `independent_review/attempt_007/review.json` SHA `d4dc7a3c…` 绑定 commit `7ad5b2c`，定向测试 68 项通过。授权草案仍 unsigned；此前 `attempt_027` 的一次性授权绑定旧 packet，已在下述 dispatch 失败后消费，不得用于当前 packet。
 
 材料重申单次运行 300s 硬上限（240s 工作+60s 收口）、一次 attempt、参数更新 0。冻结 call matrix 分列来源读取、NPZ 成员、生产 scene/setup、只读 Trainer 构造、数值调用及禁止更新；worker I/O matrix 分列 48 个来源文件、60+2 个 NPZ 成员访问、20 个 NPY 与 8 个 JSON 工件写入、独立复核读回 27 次/哈希 20 次；supervisor matrix 登记消费事件、启动、实际 wait、日志、cleanup 检查上限与返回回读。运行时 worker meter 在生产 setup 调用点逐项计数，数值核心的 hook/VJP meter 复核前向与梯度调用，NPZ decoder、artifact store、独立读盘复核记录实际 I/O；supervisor 对 worker result 中的矩阵、运行时身份和来源 SHA 逐项比对 admission 包。真实值仍未运行；当前证明只来自临时 worker。
 
@@ -21,7 +21,15 @@ Admission canonical metadata SHA 为 `030412e5c08b12c2c1720c0a05ba0389247ad980af
 
 `scripts/supervise_w1_d6_shared_gradient.py` 对未 executable 的 packet 仍在授权文件读取与 spawn 前拒绝，退出码 3；对 executable packet 才进入签名授权校验与一次性 worker dispatch。其合成进程监督和 signed-path fake-worker 已通过实际 `wait()`、超时回收、日志定额、ledger 与 pending return receipt 测试。失败发生在 dispatch 后时，CLI 记录 `dispatch_started_outcome_unknown`，不谎报 worker 未启动或授权未读取。
 
-验证：独立复核脚本执行 compileall、worker/supervisor signed-path 门和相关 I/C 定向回归 **67 passed**；review receipt `independent_review/attempt_005/review.json` SHA `54167b5e…` 绑定 commit `764dfb3`、39 文件闭包，真实 payload reads/worker spawns/updates 均为 0。复核包含 supervisor dispatch 后失败时不谎报“未 spawn”，并确认 consumed ledger/failure event 保留。worker CLI 坏 launch 与 unsigned 快照在导入数值核心前拒绝；临时 fake-worker 正常启动/回收/收口，矩阵漂移拒绝候选；输入重建域反例、worker_failure 留痕、固定工件、账本和返回见证均通过。`attempt_026` 为 `executable=true`、`authorized=false`，不会因生成而启动真实 worker。真实 payload、资产、CUDA 数值、autograd、参数更新和真实运行根均为 0。
+验证：独立复核脚本执行 compileall、worker/supervisor signed-path 门和相关 I/C 定向回归 **68 passed**；review receipt `independent_review/attempt_007/review.json` 绑定 commit `7ad5b2c` 和 39 文件闭包，复核本身的真实 payload reads/worker spawns/updates 均为 0。复核新增 CPython isolated-mode 下 `LC_CTYPE` 环境逐位一致正控。当前 `attempt_028` 为 `executable=true`、`authorized=false`；授权并非 packet 的副作用。
+
+## 一次性授权执行（失败，2026-11-22）
+
+用户明确要求授权运行后，生成 `authorization/attempt_001/authorization.json`，SHA-256 `56aa3ad5…`，绑定旧 executable packet `attempt_027` metadata SHA `487f621b…`、一次 attempt、300s hard cap/240s work cap、参数更新 0，六项 checklist 全 true。首次 supervisor 预检在 `attempt_root.parent` 尚不存在时退出，账本为空、未 spawn；补建指定父目录后使用同一授权进入一次真实 dispatch。该次账本已消费并封存：`authorization_consumption_v1/56aa…/consumed.json`、`launch_started.json`、`failed.json`；唯一运行目录为 `derived/experiments/omniretarget_first/w1_d6_shared_gradient_step0_v1/attempt_001/`。
+
+Worker 实际 spawn 并在标准库预检中以 `worker_environment_not_package_pinned` 退出。原因是 CPython isolated 启动在原冻结环境未包含 locale 时自动注入 `LC_CTYPE=C.UTF-8`，与 package 的精确环境 dict 不一致。该检查位于数值模块 import 和 `read_authorized_source_bundle()` 之前；attempt 目录没有 `d6/` 或 `artifacts/`，没有 checkpoint/NPZ/source/asset payload reads、模型/FK/VJP、参数更新。Supervisor wait 返回 exit 2、timed_out=false、group_reaped=true、log_overflow=false；授权事件记录 `parameter_updates=0`，失败收口为 `incomplete`。按一次性协议，该授权与 packet 均不可重用，未重试。
+
+随后在 commit `7ad5b2c` 将 `LC_CTYPE=C.UTF-8` 纳入 package-pinned worker environment，并新增隔离解释器环境正控；复核 68 passed。基于新复核 receipt 生成 `attempt_028`，其 SHA 与 review receipt 如上。当前没有绑定 `attempt_028` 的授权。任何再次 worker dispatch 都需要用户对当前 packet SHA 新签发的一次性明确授权；本记录不将旧用户授权延伸到新 packet。
 
 ## Supervisor 合成复核（2026-11-21）
 
@@ -31,8 +39,8 @@ Admission canonical metadata SHA 为 `030412e5c08b12c2c1720c0a05ba0389247ad980af
 
 `run_synthetic_attempt()` 仍仅接收显式 `execution_mode=synthetic_test_only` 的包。真实协议入口 `run_authorized_attempt()` 要求 signed authorization、`executable=true`、冻结的一次性额度、精确 real worker 身份和授权绑定的 `argv_template`；在工作起点后先以授权文件 SHA 创建不可重放 ledger directory，再创建 attempt claim。Ledger 采用 O_EXCL 事件文件：`consumed.json`、`launch_started.json`、`candidate_validated.json`、`return_candidate.json`。worker 启动命令只能由已绑定模板及固定 launch-spec 路径生成，不接受调用方临时命令；启动前后实现闭包摘要相等才允许候选进入返回见证。失败后消费 marker 保留，不重置额度或自动重试。
 
-真实协议入口已有 temp-tree fake worker 贯通。独立 CLI `scripts/run_w1_d6_shared_gradient_worker.py` 在数值模块导入前验证 bounded/no-follow launch、授权绑定、一次性消费 receipt 和 launch event，再进入生产数值核心。它只消费 supervisor 固定 argv/environment，cwd 固定为 attempt root；`attempt_026` 因 `authorized=false` 不会启动它。supervisor 核对矩阵、runtime、来源记录、wait、回收与返回见证；dispatch 后异常以 outcome unknown 收口，失败不释放额度、不重试。**边界：**真实 worker 尚未获授权执行；真实 production runtime、CUDA 数值和资产 payload 未测。旧 D6/R6 授权不适用于此流程。
+真实协议入口已有 temp-tree fake worker 贯通。独立 CLI `scripts/run_w1_d6_shared_gradient_worker.py` 在数值模块导入前验证 bounded/no-follow launch、授权绑定、一次性消费 receipt 和 launch event，再进入生产数值核心。它只消费 supervisor 固定 argv/environment，cwd 固定为 attempt root；`attempt_028` 因 `authorized=false` 不会启动它。supervisor 核对矩阵、runtime、来源记录、wait、回收与返回见证；dispatch 后异常以 outcome unknown 收口，失败不释放额度、不重试。**边界：**真实 worker 已启动一次但在数值模块导入和 payload 读取前失败；真实 production runtime、CUDA 数值和资产 payload 未测。旧 D6/R6 授权不适用于此流程。
 
 ## 保留尝试
 
-`real_admission/` 根目录下早期非 attempt 文件及 `attempt_001/` 至 `attempt_026/` 的前序 packet 均保留。`attempt_021/` 保留输入域、失败计数、固定工件和矩阵修复；`attempt_026/` 为当前 executable packet，仍 `authorized=false`，未签署前不能执行。
+`real_admission/` 根目录下早期非 attempt 文件及 `attempt_001/` 至 `attempt_028/` 的前序 packet 均保留。`attempt_026/` 为授权前 executable packet；`attempt_027/` 及其授权记录保留为 dispatch 失败证据；`attempt_028/` 是基于 locale 修复与当前 review receipt 生成的 executable packet，仍 `authorized=false`，未获新授权不能执行。一次失败授权不重用、不自动续签。
