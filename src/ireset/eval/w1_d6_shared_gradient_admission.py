@@ -8,6 +8,7 @@ to run the numerical worker.
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
 import os
 from pathlib import Path
@@ -209,6 +210,19 @@ def _read_metadata(path: Path, limit: int = 64 << 20) -> tuple[bytes, dict]:
     return raw, {"path": str(path), "bytes": len(raw), "sha256": _sha(raw)}
 
 
+def _fk_buffer_source_records() -> dict:
+    distribution = importlib.metadata.distribution("pytorch-kinematics")
+    roster = set(map(str, distribution.files or ()))
+    records = {}
+    for relative in ("pytorch_kinematics/chain.py", "pytorch_kinematics/frame.py"):
+        _require(relative in roster, "runtime_fk_buffer_source_missing:" + relative)
+        path = Path(distribution.locate_file(relative)).resolve(strict=True)
+        raw, record = _read_metadata(path, 4 << 20)
+        records[relative] = {"path": str(path), "bytes": record["bytes"],
+                             "sha256": record["sha256"]}
+    return records
+
+
 def _json(raw: bytes, code: str):
     try:
         value = json.loads(raw)
@@ -392,7 +406,9 @@ def build_materials(project_root: Path) -> tuple[dict, dict]:
         "closure_status": "frozen_and_enforced_by_supervisor_and_worker",
     }
     d6_contract = json.loads(json.dumps(pkg["contract"]))
-    d6_contract["runtime_evidence"] = json.loads(json.dumps(RUNTIME_EVIDENCE))
+    runtime_evidence = json.loads(json.dumps(RUNTIME_EVIDENCE))
+    runtime_evidence["fk_buffer_sources"] = _fk_buffer_source_records()
+    d6_contract["runtime_evidence"] = runtime_evidence
     package = {
         "schema": SCHEMA, "state": "metadata_only_real_execution_pending_authorized_worker_cli_review",
         "executable": False, "authorized": False,

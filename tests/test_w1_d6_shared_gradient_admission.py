@@ -36,8 +36,14 @@ def test_metadata_package_binds_only_existing_records_and_source_roster(monkeypa
     assert package["source"]["selected_payloads_opened"] is False
     assert draft["authorized"] is False and draft["template_only"] is True
     assert draft["checklist"] == dict.fromkeys(admission.CHECKLIST)
-    assert len(seen) == 4 + len(package["implementation"]["files"])
-    assert package["source"]["d6_contract"]["runtime_evidence"] == admission.RUNTIME_EVIDENCE
+    assert len(seen) == 6 + len(package["implementation"]["files"])
+    runtime_evidence = package["source"]["d6_contract"]["runtime_evidence"]
+    assert {key: value for key, value in runtime_evidence.items()
+            if key != "fk_buffer_sources"} == admission.RUNTIME_EVIDENCE
+    assert set(runtime_evidence["fk_buffer_sources"]) == {
+        "pytorch_kinematics/chain.py", "pytorch_kinematics/frame.py"}
+    assert all(record["bytes"] > 0 and len(record["sha256"]) == 64
+               for record in runtime_evidence["fk_buffer_sources"].values())
 
 
 def test_pinned_worker_environment_includes_python_locale_normalization():
