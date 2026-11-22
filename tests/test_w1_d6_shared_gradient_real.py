@@ -514,7 +514,7 @@ def test_outcome_array_roster_excludes_late_json_receipts():
 
 def test_setup_meter_separates_entry_only_scene_observations_from_completed_units():
     class Budget:
-        unit_calls = {"fk_runtime_sources": 1}
+        units = {"fk_runtime_sources": 1}
 
         def check(self, _point):
             pass
@@ -537,7 +537,7 @@ def test_setup_meter_separates_entry_only_scene_observations_from_completed_unit
 
 def test_setup_meter_rejects_unobserved_budget_metered_call():
     class Budget:
-        unit_calls = {}
+        units = {}
 
         def check(self, _point):
             pass

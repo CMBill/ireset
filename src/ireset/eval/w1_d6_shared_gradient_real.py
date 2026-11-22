@@ -752,7 +752,7 @@ class _WorkerMeter:
                               if name not in self.ENTRY_ONLY}
         external = {name: count for name, count in self.expected.items()
                     if name in self.BUDGET_METERED}
-        budget_calls = getattr(self.budget, "unit_calls", {})
+        budget_calls = getattr(self.budget, "units", {})
         require(self.entered == metered_expected and self.completed == expected_completed
                 and all(budget_calls.get(name, 0) == count for name, count in external.items()),
                 "worker_setup_call_matrix_mismatch")
