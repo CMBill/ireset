@@ -450,6 +450,15 @@ def test_root_stats_accepts_training_float64_source_for_float32_checkpoint():
     assert np.array_equal(values["mean"].astype("<f4"), np.array([0.1, 0.2, 0.9], dtype="<f4"))
 
 
+def test_worker_budget_binds_d6_runtime_stage():
+    worker_path = Path(__file__).resolve().parents[1] / "scripts/run_w1_d6_shared_gradient_worker.py"
+    spec = importlib.util.spec_from_file_location("w1_d6_worker_budget", worker_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    budget = module.WorkerBudget(1.0, 2.0, clock=lambda: 1.0)
+    assert budget.stage == "D6"
+
+
 def test_rejects_duplicate_or_extra_npz_members():
     blobs, records = _fixture_blobs()
     arrays = {f"w{s}__{key}": np.zeros(shape, dtype=np.dtype(dtype))
