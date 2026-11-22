@@ -982,6 +982,7 @@ def main(argv=None):
     parser.add_argument("--project-root", type=Path, default=ROOT)
     parser.add_argument("--run", action="store_true")
     args = parser.parse_args(argv)
+    dispatch_started = False
     refusal = {"schema": _ADMISSION_SCHEMA + "/supervisor_refusal",
                "status": "refused", "authorization_path_opened": False,
                "worker_spawned": False, "checkpoint_or_batch_reads": 0,
@@ -1016,6 +1017,7 @@ def main(argv=None):
         ledger_rel = Path(package.get("authorization_consumption_ledger", ""))
         if ledger_rel.is_absolute() or ".." in ledger_rel.parts or not ledger_rel.parts:
             raise ValueError("real_authorization_ledger_path_invalid")
+        dispatch_started = True
         result = run_authorized_attempt(
             authorization_path=args.authorization,
             authorization_sha256=args.authorization_sha256,
@@ -1028,8 +1030,10 @@ def main(argv=None):
     except BaseException as exc:
         print(json.dumps({"schema": _ADMISSION_SCHEMA + "/supervisor_failure",
                           "status": "incomplete", "error_type": type(exc).__name__,
-                          "error": str(exc)[:500], "authorization_path_opened": False,
-                          "worker_spawned": False, "parameter_updates": 0},
+                          "error": str(exc)[:500],
+                          "execution_state": ("dispatch_started_outcome_unknown"
+                                              if dispatch_started else "pre_dispatch_rejected"),
+                          "parameter_updates": 0},
                          sort_keys=True))
         return 2
 

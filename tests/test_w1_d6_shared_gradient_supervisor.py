@@ -573,6 +573,37 @@ def test_formal_main_dispatches_only_bound_executable_packet_on_temp_tree(tmp_pa
     assert json.loads((attempt / "authorization_snapshot.json").read_text())["authorized"] is True
 
 
+def test_formal_main_does_not_claim_no_spawn_after_dispatch_failure(tmp_path, capsys):
+    project, package, auth_path, auth_sha, ledger_root = _real_protocol_fixture(tmp_path)
+    worker_path = project / package["worker_launch"]["script_rel"]
+    worker_path.write_text("raise SystemExit(9)\n")
+    worker_raw = worker_path.read_bytes()
+    worker_rel = package["worker_launch"]["script_rel"]
+    package["implementation"]["files"][worker_rel] = {
+        "bytes": len(worker_raw), "sha256": hashlib.sha256(worker_raw).hexdigest()}
+    package["metadata_sha256"] = supervisor._canonical_sha(
+        {key: value for key, value in package.items() if key != "metadata_sha256"})
+    auth = json.loads(auth_path.read_text())
+    auth["bindings"]["implementation_files"] = package["implementation"]["files"]
+    auth["bindings"]["admission_metadata_sha256"] = package["metadata_sha256"]
+    auth["bindings"]["worker_launch"] = package["worker_launch"]
+    auth_raw = (json.dumps(auth, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    auth_path.write_bytes(auth_raw)
+    auth_sha = hashlib.sha256(auth_raw).hexdigest()
+    packet_path = project / "admission.json"
+    packet_path.write_text(json.dumps(package, sort_keys=True, separators=(",", ":")))
+
+    rc = supervisor.main([
+        "--authorization", str(auth_path), "--authorization-sha256", auth_sha,
+        "--admission", str(packet_path), "--project-root", str(project), "--run",
+    ])
+    result = json.loads(capsys.readouterr().out)
+    assert rc == 2 and result["status"] == "incomplete"
+    assert result["execution_state"] == "dispatch_started_outcome_unknown"
+    assert "worker_spawned" not in result and "authorization_path_opened" not in result
+    assert (ledger_root / auth_sha / "consumed.json").is_file()
+
+
 def test_real_authorization_consumption_persists_after_worker_failure(tmp_path):
     project, package, auth_path, auth_sha, ledger_root = _real_protocol_fixture(tmp_path)
     worker_path = project / package["worker_launch"]["script_rel"]
