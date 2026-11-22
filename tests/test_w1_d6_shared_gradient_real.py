@@ -512,6 +512,26 @@ def test_outcome_array_roster_excludes_late_json_receipts():
     assert set(selected) == {"h_0.npy", "g_0.npy", "loss_pos.npy"}
 
 
+def test_setup_meter_separates_entry_only_scene_observations_from_completed_units():
+    class Budget:
+        def check(self, _point):
+            pass
+
+    meter = real._WorkerMeter(Budget(), {
+        "scene_accesses": 1,
+        "scene_cache_misses": 1,
+        "scene_compiles": 1,
+    })
+    meter.enter("scene_accesses")
+    meter.enter("scene_cache_misses")
+    meter.unit("scene_compiles", lambda: "compiled")
+
+    receipt = meter.verify()
+    assert receipt["entered"] == {"scene_accesses": 1, "scene_cache_misses": 1,
+                                  "scene_compiles": 1}
+    assert receipt["completed"] == {"scene_compiles": 1}
+
+
 def test_rejects_duplicate_or_extra_npz_members():
     blobs, records = _fixture_blobs()
     arrays = {f"w{s}__{key}": np.zeros(shape, dtype=np.dtype(dtype))

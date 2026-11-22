@@ -721,6 +721,8 @@ def build_readonly_trainer(prepared: PreparedInputs, *, permit: RealWorkerPermit
 
 
 class _WorkerMeter:
+    ENTRY_ONLY = frozenset({"scene_accesses", "scene_cache_misses", "scene_cache_hits"})
+
     def __init__(self, budget, expected):
         self.budget = budget
         self.expected = dict(expected)
@@ -743,7 +745,9 @@ class _WorkerMeter:
         return result
 
     def verify(self):
-        require(self.entered == self.expected and self.completed == self.expected,
+        expected_completed = {name: count for name, count in self.expected.items()
+                              if name not in self.ENTRY_ONLY}
+        require(self.entered == self.expected and self.completed == expected_completed,
                 "worker_setup_call_matrix_mismatch")
         return {"expected": self.expected, "entered": dict(self.entered),
                 "completed": dict(self.completed)}
