@@ -20,7 +20,7 @@ AUTH_SCHEMA = SCHEMA + "/authorization_v1"
 REVIEW_SCHEMA = SCHEMA + "/independent_review_v1"
 ROOT_REL = Path("derived/audit/w1_d6_shared_gradient_step0_v1")
 SOURCE_ROOT = Path("derived/experiments/omniretarget_first/w1_d6_joint_fit_lr_half_v1")
-PROPOSED_REAL_ROOT = Path("derived/experiments/omniretarget_first/w1_d6_shared_gradient_step0_v1/attempt_005")
+PROPOSED_REAL_ROOT = Path("derived/experiments/omniretarget_first/w1_d6_shared_gradient_step0_v1/attempt_006")
 R6_REPORT = Path("derived/audit/w1_d6_joint_fit_lr_half_v1/r6/attempt_001/r6_admission.json")
 OUTCOME = Path("derived/audit/w1_d6_joint_fit_lr_half_v1/execution_review/verified_outcome.json")
 INDEX = SOURCE_ROOT / "d6/artifacts_index.json"
@@ -50,6 +50,26 @@ CHECKLIST = (
     "one_shot_300s_budget_and_zero_updates_reviewed", "independent_review_complete",
 )
 SUPERVISOR_GROUP_CLEANUP_CHECKS_MAX = 20
+RUNTIME_EVIDENCE = {
+    "schema": "w1_d6_shared_gradient_step0_v1/section_6_3_runtime_v1",
+    "helper": "src/ireset/eval/w1_real_fk_audit.py",
+    "tensor_check_points": {
+        "D6": [
+            ["fk_chain_built", "cpu"],
+            ["fk_chain_transferred", "cuda:0"],
+            ["fk_ready", "cuda:0"],
+            ["loss_ready", "cuda:0"],
+            ["trainer_model", "cpu"],
+            ["trainer_model_transfer", "cuda:0"],
+            ["trainer_conditioner", "cpu"],
+            ["trainer_conditioner_transfer", "cuda:0"],
+            ["checkpoint_initial", "cpu"],
+            ["checkpoint_last", "cpu"],
+            ["reference_model", "cpu"],
+            ["reference_conditioner", "cpu"],
+        ],
+    },
+}
 REAL_CALL_MATRIX = {
     "schema": SCHEMA + "/real_call_matrix_v1",
     "sources": {"d6_file_reads": 6, "root_stats_file_reads": 1, "asset_file_reads": 41,
@@ -371,6 +391,8 @@ def build_materials(project_root: Path) -> tuple[dict, dict]:
                               "return_witnesses": 1},
         "closure_status": "frozen_and_enforced_by_supervisor_and_worker",
     }
+    d6_contract = json.loads(json.dumps(pkg["contract"]))
+    d6_contract["runtime_evidence"] = json.loads(json.dumps(RUNTIME_EVIDENCE))
     package = {
         "schema": SCHEMA, "state": "metadata_only_real_execution_pending_authorized_worker_cli_review",
         "executable": False, "authorized": False,
@@ -382,7 +404,7 @@ def build_materials(project_root: Path) -> tuple[dict, dict]:
         "source": {"windows": WINDOWS, "selected_d6_files": _source_read_set(index),
                    "d6_identity": index["identity"],
                    "d6_config": pkg["contract"]["config"],
-                   "d6_contract": pkg["contract"],
+                   "d6_contract": d6_contract,
                    "d6_bindings": pkg["bindings"],
                    "root_stats": {"file": pkg["bindings"]["root_stats"]["file"],
                                   "headers": pkg["bindings"]["root_stats"]["headers"]},

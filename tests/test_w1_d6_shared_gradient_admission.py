@@ -37,6 +37,7 @@ def test_metadata_package_binds_only_existing_records_and_source_roster(monkeypa
     assert draft["authorized"] is False and draft["template_only"] is True
     assert draft["checklist"] == dict.fromkeys(admission.CHECKLIST)
     assert len(seen) == 4 + len(package["implementation"]["files"])
+    assert package["source"]["d6_contract"]["runtime_evidence"] == admission.RUNTIME_EVIDENCE
 
 
 def test_pinned_worker_environment_includes_python_locale_normalization():
@@ -51,8 +52,8 @@ def test_pinned_worker_environment_includes_python_locale_normalization():
 
 def test_real_attempt_root_advances_past_consumed_failed_claim():
     package, _ = admission.build_materials(Path(__file__).resolve().parents[1])
-    assert package["proposed_real_root"].endswith("/attempt_005")
-    assert admission.PROPOSED_REAL_ROOT.name == "attempt_005"
+    assert package["proposed_real_root"].endswith("/attempt_006")
+    assert admission.PROPOSED_REAL_ROOT.name == "attempt_006"
     root = Path(__file__).resolve().parents[1] / admission.PROPOSED_REAL_ROOT
     if root.exists():
         assert (root / "worker_failure.json").is_file()
