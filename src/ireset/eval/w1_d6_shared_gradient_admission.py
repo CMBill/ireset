@@ -21,7 +21,7 @@ AUTH_SCHEMA = SCHEMA + "/authorization_v1"
 REVIEW_SCHEMA = SCHEMA + "/independent_review_v1"
 ROOT_REL = Path("derived/audit/w1_d6_shared_gradient_step0_v1")
 SOURCE_ROOT = Path("derived/experiments/omniretarget_first/w1_d6_joint_fit_lr_half_v1")
-PROPOSED_REAL_ROOT = Path("derived/experiments/omniretarget_first/w1_d6_shared_gradient_step0_v1/attempt_019")
+PROPOSED_REAL_ROOT = Path("derived/experiments/omniretarget_first/w1_d6_shared_gradient_step0_v1/attempt_020")
 R6_REPORT = Path("derived/audit/w1_d6_joint_fit_lr_half_v1/r6/attempt_001/r6_admission.json")
 OUTCOME = Path("derived/audit/w1_d6_joint_fit_lr_half_v1/execution_review/verified_outcome.json")
 INDEX = SOURCE_ROOT / "d6/artifacts_index.json"
@@ -81,7 +81,8 @@ REAL_CALL_MATRIX = {
         "fk_constructions": 1, "fk_chain_builds": 1, "fk_chain_transfers": 1,
         "scene_specs": 1, "scene_xml_bindings": 1, "scene_compiles": 1,
         "scene_data_constructions": 1, "scene_resets": 1, "scene_mj_forwards": 1,
-        "loss_constructions": 1, "input_domain_validations": 6, "runtime_syncs": 134,
+        # 86 setup/numeric checks plus pre/post guards for all 27 review reads.
+        "loss_constructions": 1, "input_domain_validations": 6, "runtime_syncs": 140,
         "scene_accesses": 1, "scene_cache_misses": 1,
         "scene_plain_xml_bindings": 1, "scene_plain_compiles": 1,
     },

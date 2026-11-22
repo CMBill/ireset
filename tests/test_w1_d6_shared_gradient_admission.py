@@ -70,8 +70,8 @@ def test_pinned_worker_environment_includes_python_locale_normalization():
 
 def test_real_attempt_root_advances_past_consumed_failed_claim():
     package, _ = admission.build_materials(Path(__file__).resolve().parents[1])
-    assert package["proposed_real_root"].endswith("/attempt_019")
-    assert admission.PROPOSED_REAL_ROOT.name == "attempt_019"
+    assert package["proposed_real_root"].endswith("/attempt_020")
+    assert admission.PROPOSED_REAL_ROOT.name == "attempt_020"
     root = Path(__file__).resolve().parents[1] / admission.PROPOSED_REAL_ROOT
     if root.exists():
         assert (root / "worker_failure.json").is_file()
@@ -108,6 +108,7 @@ def test_frozen_real_call_and_io_matrices_reject_single_count_drift():
     assert package["call_matrix"]["setup_units"]["scene_cache_misses"] == 1
     assert package["call_matrix"]["setup_units"]["scene_plain_xml_bindings"] == 1
     assert package["call_matrix"]["setup_units"]["scene_plain_compiles"] == 1
+    assert package["call_matrix"]["setup_units"]["runtime_syncs"] == 86 + 2 * 27
     assert admission.real_io_matrix_problems(package) == []
     changed_calls = json.loads(json.dumps(package["call_matrix"]))
     changed_calls["numeric"]["fk_call"] += 1
