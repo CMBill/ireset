@@ -52,7 +52,7 @@ CHECKLIST = (
 )
 SUPERVISOR_GROUP_CLEANUP_CHECKS_MAX = 20
 RUNTIME_EVIDENCE = {
-    "schema": "w1_d6_shared_gradient_step0_v1/section_6_3_runtime_v1",
+    "schema": "w1_d6_joint_fit_lr_half_v1/section_6_3_runtime_v1",
     "helper": "src/ireset/eval/w1_real_fk_audit.py",
     "tensor_check_points": {
         "D6": [
