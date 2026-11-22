@@ -1,6 +1,8 @@
 import json
 import importlib.util
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -35,6 +37,16 @@ def test_metadata_package_binds_only_existing_records_and_source_roster(monkeypa
     assert draft["authorized"] is False and draft["template_only"] is True
     assert draft["checklist"] == dict.fromkeys(admission.CHECKLIST)
     assert len(seen) == 4 + len(package["implementation"]["files"])
+
+
+def test_pinned_worker_environment_includes_python_locale_normalization():
+    package, _ = admission.build_materials(Path(__file__).resolve().parents[1])
+    env = package["worker_launch"]["env"]
+    actual = subprocess.check_output(
+        [sys.executable, "-I", "-c", "import json,os; print(json.dumps(dict(os.environ),sort_keys=True))"],
+        env=env, text=True)
+    assert json.loads(actual) == env
+    assert env["LC_CTYPE"] == "C.UTF-8"
 
 
 def test_authorization_is_rejected_until_real_worker_is_frozen():

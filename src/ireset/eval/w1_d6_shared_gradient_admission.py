@@ -303,7 +303,7 @@ def build_materials(project_root: Path) -> tuple[dict, dict]:
                           "--project-root", "{project_root}"],
         "executable": sys.executable,
         "cwd": "attempt_root",
-        "env": {"OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1",
+        "env": {"LC_CTYPE": "C.UTF-8", "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1",
                 "OPENBLAS_NUM_THREADS": "1"},
         "shell": False,
         "inherit_stdin": False,
