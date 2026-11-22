@@ -97,6 +97,8 @@ def test_supervisor_refuses_before_opening_authorization_or_spawning_worker(caps
 def test_frozen_real_call_and_io_matrices_reject_single_count_drift():
     package, _ = admission.build_materials(Path(__file__).resolve().parents[1])
     assert admission.real_call_matrix_problems(package["call_matrix"]) == []
+    assert package["call_matrix"]["setup_units"]["scene_accesses"] == 1
+    assert package["call_matrix"]["setup_units"]["scene_cache_misses"] == 1
     assert admission.real_io_matrix_problems(package) == []
     changed_calls = json.loads(json.dumps(package["call_matrix"]))
     changed_calls["numeric"]["fk_call"] += 1
