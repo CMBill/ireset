@@ -1,19 +1,19 @@
 # W1 固定六窗共享梯度真实准入与监督材料
 
-**2026-11-22 · 十五次单次授权 dispatch 均已消费并 fail-closed，参数更新 0。第十五次完成前向、损失和七次 VJP，随后 D6 runtime report 仍以通用 `binding_mismatch` 拒绝，失败工件未保留 runtime facts，无法判明具体字段。已加字段级诊断和失败 report 留存；packet `attempt_046` 绑定空运行根 `attempt_016`，独立复核通过，仍未授权。**
+**2026-11-22 · 十六次单次授权 dispatch 均已消费并 fail-closed，参数更新 0。第十六次完成前向、损失和七次 VJP，字段级事实确认 packet 多要求了未执行的 trainer tensor checks。已按实际 step0 调用收窄 policy；packet `attempt_047` 绑定空运行根 `attempt_017`，独立复核通过，仍未授权。**
 
 ## 结果
 
 生成器读取四份已封口元数据：R6 admission、D6 独立裁决、D6 artifacts index、I/C `attempt_006` CUDA acceptance；另读取并 SHA-256 绑定 39 个当前实现/方案文件。它不打开被索引指向的 `initial.pt`、`probe_inputs.npz`、root-stats NPZ、数据集或生产资产，也不重新哈希历史绑定的 41 个资产。R6 的历史绑定仅作为已封口元数据引用；本轮未重新验证其 payload 当前仍与登记相符。
 
-当前材料目录：`derived/audit/w1_d6_shared_gradient_step0_v1/real_admission/attempt_046/`
+当前材料目录：`derived/audit/w1_d6_shared_gradient_step0_v1/real_admission/attempt_047/`
 
 | 文件 | SHA-256 | 状态 |
 | --- | --- | --- |
-| `admission.json` | `46c50d6e95bdbd1a4db66001a54fd87f79e725c9c112e52a3b964df5e80ca862` | `executable=true`、`authorized=false`、独立复核绑定 |
-| `authorization_draft.json` | `323aecdef56a663f60af5fe99d45b208e7f0f4b9e217f83b2d44546a4e37bf9c` | `authorized=false`、`template_only=true`、六项 checklist 为 null |
+| `admission.json` | `bea64ec2104251ca41c71051e84da03e47771bba3554a19c45eddcbc9b45e9a2` | `executable=true`、`authorized=false`、独立复核绑定 |
+| `authorization_draft.json` | `912ef64d0a4e296483a7a82ac02874fa6b85c74b78435c459d8dcb64dc381f15` | `authorized=false`、`template_only=true`、六项 checklist 为 null |
 
-Admission canonical metadata SHA 为 `b29f43ce70fa8f0e6cb96711c8f8d615628e42e3c47e721df369ee19b6e7b04b`。它绑定 D6/R6/I/C 固定元数据、六窗与 41 项资产记录、39 文件实现闭包、review receipt `independent_review/attempt_025/review.json` SHA `e766057c…`（commit `002c992`、74 项测试）、package-pinned worker argv/environment、runtime evidence/FK source hashes、D6 原生 runtime-report schema 与 step0 专属 tensor-check 列表、字段级 fail-closed report 绑定规则、`cpu_threads=20` 环境及完整 scene setup call matrix。当前 packet 绑定全新 `attempt_016`，生成时该根不存在。
+Admission canonical metadata SHA 为 `bc56a118c8f05c828768f3de4e5bf92dac4bac13b7e38380cd5c7fc31d62d857`。它绑定 D6/R6/I/C 固定元数据、六窗与 41 项资产记录、39 文件实现闭包、review receipt `independent_review/attempt_026/review.json` SHA `35eae946…`（commit `4c5e415`、74 项测试）、package-pinned worker argv/environment、runtime evidence/FK source hashes、D6 原生 runtime-report schema 与实际 step0 tensor-check 列表、字段级 fail-closed report 绑定规则、`cpu_threads=20` 环境及完整 scene setup call matrix。当前 packet 绑定全新 `attempt_017`，生成时该根不存在。
 
 材料重申单次运行 300s 硬上限（240s 工作+60s 收口）、一次 attempt、参数更新 0。冻结 call matrix 分列来源读取、NPZ 成员、生产 scene/setup、只读 Trainer 构造、数值调用及禁止更新；worker I/O matrix 分列 48 个来源文件、60+2 个 NPZ 成员访问、20 个 NPY 与 8 个 JSON 工件写入、独立复核读回 27 次/哈希 20 次；supervisor matrix 登记消费事件、启动、实际 wait、日志、cleanup 检查上限与返回回读。运行时 worker meter 在生产 setup 调用点逐项计数，数值核心的 hook/VJP meter 复核前向与梯度调用，NPZ decoder、artifact store、独立读盘复核记录实际 I/O；supervisor 对 worker result 中的矩阵、运行时身份和来源 SHA 逐项比对 admission 包。真实值仍未运行；当前证明只来自临时 worker。
 
@@ -21,7 +21,7 @@ Admission canonical metadata SHA 为 `b29f43ce70fa8f0e6cb96711c8f8d615628e42e3c4
 
 `scripts/supervise_w1_d6_shared_gradient.py` 对未 executable 的 packet 仍在授权文件读取与 spawn 前拒绝，退出码 3；对 executable packet 才进入签名授权校验与一次性 worker dispatch。其合成进程监督和 signed-path fake-worker 已通过实际 `wait()`、超时回收、日志定额、ledger 与 pending return receipt 测试。失败发生在 dispatch 后时，CLI 记录 `dispatch_started_outcome_unknown`，不谎报 worker 未启动或授权未读取。
 
-验证：最新独立复核执行 compileall、worker/supervisor signed-path 门和相关 I/C 定向回归 **74 passed**；review receipt `independent_review/attempt_025/review.json` SHA `e766057c…` 绑定 commit `002c992`、39 文件闭包，复核本身真实 payload reads/worker spawns/updates 均为 0。测试包含 runtime report 正控及字段损坏的具名拒绝；当前 packet 仍未授权。
+验证：最新独立复核执行 compileall、worker/supervisor signed-path 门和相关 I/C 定向回归 **74 passed**；review receipt `independent_review/attempt_026/review.json` SHA `35eae946…` 绑定 commit `4c5e415`、39 文件闭包，复核本身真实 payload reads/worker spawns/updates 均为 0。测试包含 runtime report 正控、字段损坏具名拒绝和实际 step0 检查点列表；当前 packet 仍未授权。
 
 ## 一次性授权执行（两次失败，2026-11-22）
 
@@ -35,6 +35,8 @@ locale 错误由 `7ad5b2c` 修复，早期失败留痕由 `94d8fab` 修复；资
 locale 错误由 `7ad5b2c` 修复，早期失败留痕由 `94d8fab` 修复；资产 roster 层级由 `4a280a2` 修复，运行根推进由 `87d5b86` 修复。第三至第七次授权的 root-stats、packet runtime evidence、WorkerBudget stage 和 FK source 修复历史保持在前序记录。第八至第十一及第十二次授权、conditioner 输入修复和 packet `attempt_042` 根冲突见前序段落。第十三次授权绑定 packet `attempt_043`、运行根 `attempt_013`；来源/setup/模型构造/strict load通过，conditioner 输入窄化后完成一次预测、损失、两次 decode/FK 与七次 VJP，保存 `h_0..h_6` 和 `g_0..g_6` 数组，参数更新 0。最终 `runtime_guard.finish()` 调用 `r6.verify_runtime_report`，因 admission schema 错用 `w1_d6_shared_gradient_step0_v1/...`、而 D6 verifier 要求 `w1_d6_joint_fit_lr_half_v1/section_6_3_runtime_v1`，以 `real_runtime_report_missing:D6` fail-closed；候选未封口，不将数组裁决为通过。修复 `9e8be76` 对齐原生 schema 并加断言，`89cde79` 将根推进到 `attempt_014`。
 **最近授权执行补记（2026-11-22）：**第十三次绑定 `attempt_043`/根 `attempt_013`，前向、损失和七次 VJP完成；runtime schema 与 D6 verifier 不匹配，proof 拒绝封口。第十四次绑定 `attempt_044`/根 `attempt_014`；schema 修正后 tensor-check 清单不匹配。第十五次绑定 `attempt_045`/根 `attempt_015`；相同计算已完成，但 verifier 仍抛通用 `binding_mismatch`，worker 失败工件当时仅记 runtime check 计数、没有 report facts，无法定位具体字段。三次均保留所有梯度数组与失败收据，不作通过裁决，参数更新 0。修复 `0999471` 让 step0 runtime verifier 对每个字段使用明确拒绝代码，并在失败收口保存已生成的 runtime report；正控与字段变异反例覆盖该路径。`002c992` 推进至空根 `attempt_016`；attempt_025 独立复核通过 74 项测试，当前 packet `attempt_046` 未授权。
 
+第十六次明确授权绑定 packet `attempt_046`、根 `attempt_016`；39 文件闭包和全新根预检通过。数值核心仍完成一次预测、损失、两次 decode/FK、七次 VJP，参数更新 0。失败收据首次保留 runtime facts，字段级拒绝为 `step0_runtime_report_binding:tensor_check_points`。report 的 7 个实测检查点是 `fk_chain_built`、`fk_chain_transferred`、`fk_ready`、`loss_ready`、`initial_checkpoint`、`loaded_model`、`loaded_conditioner`；packet 多登记了 4 个 full-D6 trainer construction checks，而该窄诊断的 `construction_check` 回调本来只登记构造次数、不执行 runtime tensor inspection。修复 `a9c1198` 将 policy 精确收窄到上述实际点位；`4c5e415` 绑定未使用根 `attempt_017`，独立复核 attempt_026 的 74 项测试通过。新 packet `attempt_047` 为 `executable=true`、`authorized=false`，仍待针对该包的新一次性授权。
+
 locale 错误由 `7ad5b2c` 修复，早期失败留痕由 `94d8fab` 修复；资产 roster 层级由 `4a280a2` 修复，运行根推进由 `87d5b86` 修复。第三次授权绑定 packet `attempt_032`、运行根 `attempt_003`，在来源 root-stats dtype 门失败；该授权已消费。`daf6bf6` 接受训练侧 float64 root-stats，并推进 packet `attempt_033`/运行根 `attempt_004`。第四次授权绑定 packet `attempt_033`；source/checkpoint stats 只读投影相等，但旧检查仍失败，修复 `d4fefe0` 后推进 packet `attempt_034`/运行根 `attempt_005`。第五次授权绑定 packet `attempt_034`；worker 完成 source/checkpoint/root-stats 绑定，在 production setup 因缺少 `runtime_evidence` 退出，修复 `ec4ed0b` 后推进 packet `attempt_035`/运行根 `attempt_006`。第六次授权绑定 packet `attempt_035`；runtime 构造时因 WorkerBudget 缺少 `stage=D6` 退出，修复 `ac85c59` 后推进 packet `attempt_036`/运行根 `attempt_007`。第七次授权绑定 packet `attempt_036`；FK source metadata 对账通过，随后 packet runtime evidence 缺失该 source roster，修复 `fdb9e27` 后推进 packet `attempt_037`/运行根 `attempt_008`。第八次授权绑定 packet `attempt_037`；worker 完成 source/checkpoint/FK runtime source hash 检查，runtime identity 因 pinned OMP/MKL=1 与 `cpu_threads=20` 不一致而拒绝，模型构造/FK/VJP/参数更新均为 0。修复 `c99bd90` 令 OMP/MKL 从冻结 runtime identity 派生，推进 packet `attempt_038`/运行根 `attempt_009`。第九次授权绑定 packet `attempt_038`、运行根 `attempt_009`；runtime identity 和 FK source binding 通过，但 worker setup 在 `scene_accesses` 前因冻结矩阵未登记该调用而拒绝，scene 初始化、模型/FK/VJP/参数更新均为 0。修复 `91d7f9c` 将一次 `scene_accesses` 与一次 `scene_cache_misses` 纳入 setup call matrix，并推进 packet `attempt_039`/运行根 `attempt_010`。第十次授权绑定 packet `attempt_039`、运行根 `attempt_010`；setup 通过 runtime/FK binding 及 scene access/cache miss，随后在 `scene_plain_xml_bindings` 处因漏登记 plain XML binding/compile 拒绝，场景编译、模型构造/FK/VJP/参数更新均为 0。修复 `875db5d` 登记两项各一次，推进 packet `attempt_040`/运行根 `attempt_011`。
 
 ## Supervisor 合成复核（2026-11-21）
@@ -45,8 +47,8 @@ locale 错误由 `7ad5b2c` 修复，早期失败留痕由 `94d8fab` 修复；资
 
 `run_synthetic_attempt()` 仍仅接收显式 `execution_mode=synthetic_test_only` 的包。真实协议入口 `run_authorized_attempt()` 要求 signed authorization、`executable=true`、冻结的一次性额度、精确 real worker 身份和授权绑定的 `argv_template`；在工作起点后先以授权文件 SHA 创建不可重放 ledger directory，再创建 attempt claim。Ledger 采用 O_EXCL 事件文件：`consumed.json`、`launch_started.json`、`candidate_validated.json`、`return_candidate.json`。worker 启动命令只能由已绑定模板及固定 launch-spec 路径生成，不接受调用方临时命令；启动前后实现闭包摘要相等才允许候选进入返回见证。失败后消费 marker 保留，不重置额度或自动重试。
 
-真实协议入口已有 temp-tree fake worker 贯通。独立 CLI 在数值模块导入前验证 bounded/no-follow launch、授权绑定、一次性消费 receipt 和 launch event。十五次真实 worker spawn 均 fail-closed；最近一次完成前向、损失和七次 VJP，但 runtime report verifier 以通用绑定错误拒绝且未把 report facts 写入失败上下文，参数更新 0。字段级拒绝和失败 report 留存经独立复核；当前 packet 未授权。旧 D6/R6 授权不适用于此流程。
+真实协议入口已有 temp-tree fake worker 贯通。独立 CLI 在数值模块导入前验证 bounded/no-follow launch、授权绑定、一次性消费 receipt 和 launch event。十六次真实 worker spawn 均 fail-closed；最近一次完成前向、损失和七次 VJP，字段级事实确认多余 trainer 检查点后拒绝。实际 step0 检查点 policy 修复经独立复核；当前 packet 未授权。旧 D6/R6 授权不适用于此流程。
 
 ## 保留尝试
 
-`real_admission/` 根目录下 `attempt_001/` 至 `attempt_046` 全部保留；`attempt_042` 因候选运行根已存在而明确不可用，未获授权、未 dispatch。授权/运行 attempt `001` 至 `015` 均为已消费失败记录。`attempt_046` 是 runtime report 字段诊断与失败证据留存修复后的独立复核 packet，绑定空根 `attempt_016`，仍 `authorized=false`；真实运行需针对该 packet 新签一次性授权。已消费授权不重用、不自动续签。
+`real_admission/` 根目录下 `attempt_001` 至 `attempt_047` 全部保留；`attempt_042` 因候选运行根已存在而明确不可用，未获授权、未 dispatch。授权/运行 attempt `001` 至 `016` 均为已消费失败记录。`attempt_047` 是实际 step0 runtime tensor-check policy 修复后的独立复核 packet，绑定空根 `attempt_017`，仍 `authorized=false`；真实运行需针对该 packet 新签一次性授权。已消费授权不重用、不自动续签。
