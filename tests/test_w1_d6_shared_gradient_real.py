@@ -457,6 +457,7 @@ def test_worker_budget_binds_d6_runtime_stage():
     spec.loader.exec_module(module)
     budget = module.WorkerBudget(1.0, 2.0, clock=lambda: 1.0)
     assert budget.stage == "D6"
+    assert budget.work_deadline == budget.deadline == 2.0
 
 
 def test_rejects_duplicate_or_extra_npz_members():

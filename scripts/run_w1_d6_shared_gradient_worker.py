@@ -176,6 +176,7 @@ class WorkerBudget:
     def __init__(self, t0: float, deadline: float, clock=time.perf_counter):
         self.t0, self.deadline, self.clock = t0, deadline, clock
         self.stage = "D6"
+        self.work_deadline = deadline
         self.points = []
         self.units = {}
 
