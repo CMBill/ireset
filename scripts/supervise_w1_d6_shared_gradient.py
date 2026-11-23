@@ -559,6 +559,11 @@ def _approved_worker_environment(package: dict) -> dict[str, str]:
     return dict(env)
 
 
+def _runtime_sync_scopes_match(total: int, candidate: int, artifact_reads: int) -> bool:
+    return (type(total) is int and type(candidate) is int and type(artifact_reads) is int
+            and artifact_reads >= 0 and total == candidate + 2 * artifact_reads)
+
+
 def run_authorized_attempt(*, authorization_path: Path, authorization_sha256: str,
                            package: dict, project_root: Path,
                            ledger_root: Path, clock=time.perf_counter,
@@ -721,8 +726,10 @@ def run_authorized_attempt(*, authorization_path: Path, authorization_sha256: st
             or runtime_report.get("setup", {}).get("applied") is not True
             or runtime_report.get("setup", {}).get("problems") != []
             or runtime_report.get("endpoint") is None
-            or worker_result.get("outcome", {}).get("runtime_sync_count") !=
-               worker_matrix["setup_units"].get("runtime_syncs")):
+            or not _runtime_sync_scopes_match(
+                worker_matrix["setup_units"].get("runtime_syncs"),
+                worker_result.get("outcome", {}).get("runtime_sync_count"),
+                worker_result.get("io_matrix", {}).get("independent_artifact_reads"))):
         raise ValueError("real_worker_runtime_matrix_mismatch")
     io_actual = worker_result.get("io_matrix")
     expected_source_records = {

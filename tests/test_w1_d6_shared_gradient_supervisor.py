@@ -12,6 +12,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import supervise_w1_d6_shared_gradient as supervisor
 
 
+@pytest.mark.parametrize(
+    ("total", "candidate", "reads", "expected"),
+    [(140, 86, 27, True), (139, 86, 27, False), (140, 87, 27, False),
+     (140, 86, 26, False), (True, 86, 27, False), (140, False, 27, False),
+     (140, 86, True, False)],
+)
+def test_runtime_sync_scope_matrix(total, candidate, reads, expected):
+    assert supervisor._runtime_sync_scopes_match(total, candidate, reads) is expected
+
+
 def _supervise(tmp_path, code, *, timeout_s=5., log_cap=1024):
     root = tmp_path / "attempt_001"
     root.mkdir()
@@ -430,7 +440,7 @@ def _real_protocol_fixture(tmp_path):
         "'independent_review':{'passed':True},'parameter_updates':0,'worker_matrix_sha256':pkg['metadata_sha256'],"
         "'call_matrix':worker_cm,'worker_io':worker_io,'io_matrix':worker_matrix,"
         "'source_records':records,'artifact_io':{'npy_writes':20,'json_writes':8},"
-        "'outcome':{'runtime_report':runtime_report,'runtime_sync_count':cm['setup_units']['runtime_syncs'],'files':artifacts}}\n"
+        "'outcome':{'runtime_report':runtime_report,'runtime_sync_count':86,'files':artifacts}}\n"
         "raw=(json.dumps(result,sort_keys=True,separators=(',',':'))+'\\n').encode()\n"
         "fd=os.open(Path(spec['attempt_root'])/'worker_result.json',os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)\n"
         "f=os.fdopen(fd,'wb'); f.write(raw); f.flush(); os.fsync(f.fileno()); f.close()\n"
