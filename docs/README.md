@@ -1,12 +1,12 @@
 # 文档索引
 
-最后更新：2026-11-21。**[固定六窗联合拟合](verification/omniretarget_w1_d6_joint_fit_result.md)已完成唯一一次真实 D6 → F 并通过证据验收：`fit_insufficient`（0/6 窗四门全过），F 两端逐位重放通过，一次性授权已消费。** 本轮[共享梯度诊断 I/C](verification/omniretarget_w1_d6_shared_gradient_i_c.md)纯合成验收通过（权威 `attempt_006`：18/18 CUDA cases、18/18 独立读盘复核）；真实 checkpoint/数据未读、真实诊断未授权未运行。 [固定单窗学习率日程对照](verification/omniretarget_w1_d1_lr_schedule_diagnostic.md#8-真实-b-执行与最终比较2026-11-18)的 B 仍为四项平均门全过，仅限固定单窗。冻结原文和历史工件保持原路径、原字节。
+最后更新：2026-11-23。**[固定六窗联合拟合](verification/omniretarget_w1_d6_joint_fit_result.md)已完成唯一一次真实 D6 → F 并通过证据验收：`fit_insufficient`（0/6 窗四门全过），F 两端逐位重放通过，一次性授权已消费。** [共享梯度 step0 诊断](verification/omniretarget_w1_d6_shared_gradient_admission.md)的一次性授权 dispatch 已封口：外层返回 `covered`、独立复核通过，结论 `attribution_insufficient`，参数更新为 0；授权已消费，不重试。该运行读取并加载了登记的真实 checkpoint、构造生产 scene，完成一次预测/损失及七次 VJP，但没有训练更新或数据集迭代；历史 R6 payload 未重新验证。[共享梯度 I/C](verification/omniretarget_w1_d6_shared_gradient_i_c.md)仍是独立的纯合成验收。 [固定单窗学习率日程对照](verification/omniretarget_w1_d1_lr_schedule_diagnostic.md#8-真实-b-执行与最终比较2026-11-18)的 B 四项平均门全过，但仅适用于固定单窗。冻结原文和历史工件保持原路径、原字节。
 
 ## 当前状态
 
 - **2026-11-20 六窗误差复盘完成。** 40 项 CPU 合成验收通过，唯一归档复盘独立核对 606 窗行、24 条曲线和 101 对共同窗。四指标最早持续差距均始于 step10，六窗的固定 FK 三点组均无持续集中，裁决 `attribution_insufficient`。[逐窗误差复盘报告](verification/omniretarget_w1_d6_window_error_review.md)
-- **2026-11-21 共享梯度诊断 I/C 完成。** D6 生产架构、生产损失与合成 FK 下，9 组输入 × 2 个模型 seed 的 18 个 CUDA cases 全通过固定 `h`/参数加性门，18/18 独立读盘复核；16 文件实现身份前后稳定。结果仅支持合成机制验收，真实阶段仍需另行冻结与明确授权。[I/C 验证记录](verification/omniretarget_w1_d6_shared_gradient_i_c.md)
-- **2026-11-21 共享梯度独立 worker 与真实路径矩阵实现完成，限临时 fake-worker/metadata-only 验收。** package-pinned CLI 在数值核心导入前验证快照、授权和实现闭包；worker 与 supervisor 按冻结 call/I/O 矩阵、runtime 和返回见证核验。相关回归 147 passed；当前 `attempt_018` 仍 `executable=false/authorized=false`，未读取真实 payload、未运行真实 worker，生产 supervisor 仍 refusal-only。[准入/监督记录](verification/omniretarget_w1_d6_shared_gradient_admission.md)
+- **2026-11-21 共享梯度诊断 I/C 完成。** D6 生产架构、生产损失与合成 FK 下，9 组输入 × 2 个模型 seed 的 18 个 CUDA cases 全通过固定 `h`/参数加性门，18/18 独立读盘复核；16 文件实现身份前后稳定。该记录只证明合成机制验收；其后真实 step0 执行及边界见下一条。[I/C 验证记录](verification/omniretarget_w1_d6_shared_gradient_i_c.md)
+- **2026-11-23 共享梯度 step0 真实诊断完成。** packet `attempt_057` / 根 `attempt_027` 的真实 worker 与独立复核通过，七组 VJP 配对、27/27 工件读取和 20/20 SHA 校验通过；外层返回 `covered`，13.972053s，参数更新/optimizer steps/contact branch/dataset iteration 均为 0。结论 `attribution_insufficient`，授权已消费，不重试；历史 R6 payload 未重新验证。[准入与监督记录](verification/omniretarget_w1_d6_shared_gradient_admission.md)
 - **2026-11-20 六窗真实诊断收口**：D6 1000 更新、101 批 probe/606 窗行；F 端点逐位重放、阶段和外层实际返回覆盖均通过。整链至最后见证同步回读 1638.648367 s ≤ 登记 1642.608866 s ≤ 4200 s。详见[逐窗裁决及返回证据](verification/omniretarget_w1_d6_joint_fit_result.md)。
 - **2026-11-19 六窗授权前复核**：补齐 §6.3 的逐构造/转移/加载和终点证据硬门；双身份绑定与未签草案已独立回读。定向回归共 235 项通过，见[授权前记录](verification/omniretarget_w1_d6_joint_fit_preauthorization.md)。
 - **2026-11-19 六窗外层计时修复**：父进程覆盖启动前起点、实际退出和清理、定额日志、最后同步与回读；缺见证或迟返仅判 `incomplete`。新增 48 项、R6/适配回归 34 项、I6 回归 90 项通过，见[修复验收记录](verification/omniretarget_w1_d6_joint_fit_outer.md)。
@@ -36,6 +36,7 @@
 | [固定六窗逐窗误差复盘报告](verification/omniretarget_w1_d6_window_error_review.md) | **已验收**，共同窗 `comparable`，组级调权候选 `null`。 |
 | [固定六窗共享梯度诊断预注册草案](plans/omniretarget_w1_d6_shared_gradient_prereg_draft.md) | **v0.3 复阅修订**。绑定首个训练批、成对梯度返回、完整调用矩阵和实现身份，训练更新额度为 0。 |
 | [固定六窗共享梯度诊断 I/C 验证记录](verification/omniretarget_w1_d6_shared_gradient_i_c.md) | **纯合成验收通过**：18/18 CUDA cases、18/18 独立读盘复核；不读取真实数据/检查点，不授权真实阶段。 |
+| [固定六窗共享梯度准入与监督记录](verification/omniretarget_w1_d6_shared_gradient_admission.md) | **一次真实 step0 dispatch 已封口**：`attribution_insufficient`、更新 0、外层 `covered`；授权已消费，不重试。 |
 | [固定六窗 I6 验证记录](verification/omniretarget_w1_d6_joint_fit_i6.md) | **纯 CPU 合成复阅通过**：载荷、日程、逐窗门、端点重放与实际退出覆盖。 |
 | [固定六窗 R6 与旧身份](verification/omniretarget_w1_d6_joint_fit_r6.md) | **唯一正式 R6 已消费**：历史封存和未签草案不变，不绑定修订后的代码。 |
 | [固定六窗外层计时修复](verification/omniretarget_w1_d6_joint_fit_outer.md) | **纯合成验收通过**：启动、返回、最后回读及独立见证；不放行真实运行。 |
@@ -51,17 +52,17 @@
 
 ## 下一步的范围
 
-**2026-11-20 六窗范围已结束：**唯一 `["D6","F"]` 授权已消费。保留负结果与保存曲线，不重跑 R6 或真实链，不追加 D1、六窗恒定学习率对照或其他实验。
+**已执行范围均已结束：**六窗 D6→F 的唯一授权与共享梯度 step0 的唯一授权均已消费。保留 `fit_insufficient` 和 `attribution_insufficient` 结果；不重跑 R6/D6/F 或 step0 诊断，不自动追加训练或其他真实实验。
 
 六窗归档复盘已按 v0.3 完成，组级调权判据未满足。任何新真实数值诊断须另立范围、预算并取得明确授权。[逐窗误差复盘报告](verification/omniretarget_w1_d6_window_error_review.md)
 
-共享梯度 I/C 已在 D6 架构上完成纯合成验收，拟量化 step0 时其余五窗对共同窗下降方向的合计投影。独立 worker/真实路径矩阵虽已实现，但 `attempt_018` 不可执行、无真实授权；真实求导和 CUDA/runtime/I/O 链仍未运行。[固定六窗共享梯度诊断预注册草案](plans/omniretarget_w1_d6_shared_gradient_prereg_draft.md) · [I/C 验证记录](verification/omniretarget_w1_d6_shared_gradient_i_c.md) · [准入/监督记录](verification/omniretarget_w1_d6_shared_gradient_admission.md)
+共享梯度 step0 真实诊断已完成一次，独立复核为 `attribution_insufficient`；它不支持因素归因，不能外推为训练拟合、泛化或生产资格。授权已消费，后续真实数值诊断须另立范围与预算并取得明确授权。[固定六窗共享梯度诊断预注册草案](plans/omniretarget_w1_d6_shared_gradient_prereg_draft.md) · [I/C 验证记录](verification/omniretarget_w1_d6_shared_gradient_i_c.md) · [准入/监督记录](verification/omniretarget_w1_d6_shared_gradient_admission.md)
 
 学习率对照已按[冻结方案](plans/omniretarget_w1_d1_lr_schedule_diagnostic_plan.md)完成，前 500 步与 A 的共同前缀核验通过，B 在 step1000 四门达标。结论只覆盖固定窗和固定 seed，不代表泛化或生产资格；不自动追加 D6、续训或下一实验。
 
-先用已有保存量区分不可辨识、相消敏感和实现问题，不机械追求539项全部改判通过。拟合诊断先回答新实现能否拟合固定训练窗，不直接续训旧checkpoint、扩数据、改变损失或重启旧修复路线。
+已有保存量分析、固定六窗拟合和 step0 共享梯度诊断均已按各自冻结范围收口。当前没有待执行或仍有效的一次性真实授权；任何后续真实数值工作都须另立范围、预算、调用矩阵和方案，并取得新的明确授权。历史 D1/D6/F 及共享梯度方案中的调用、验收与状态字段是其对应实验的冻结契约，不构成当前启动指令。
 
-真实D1/D6只在新数据/代码/资源/预算/精确调用矩阵冻结并获明确授权后启动；每阶段固定1000步、101次probe，只用最终last判平均门。D阶段仅发布local_complete_evidence/local_mean_fit_passed；D1按本地落盘核验与handoff_ready交接，不等待或提前执行F。F再重算保存指标并逐位重放initial/last，独立发布最终验收字段。根/关节指标从原始x0规范CPU解码并核对关联，中间FK只核对保存点的度量自洽，状态关联为not_evaluated，不冒称完整中间物理链已验证。运行时沿用已审计CUDA/float32硬要求，probe固定整批D1=1/D6=6，每路径总forward≤8206；不能拆批或额外预测。峰值门保持 `spike_gate_status="not_evaluated"`；平均拟合通过不排除局部尖峰，也不代表泛化、严格碰撞、持续抓握或生产接入。长序列融合、质量干预、扩散对照和最终加速分别作为后续候选，不自动执行。
+总体边界不变：固定六窗拟合结果为 `fit_insufficient`，step0 因素归因为 `attribution_insufficient`；两者均不证明泛化、完整目标契约、严格碰撞、持续抓握或生产资格。`spike_gate_status="not_evaluated"`、`objective_coverage=partial`、`full_objective_contract_passed=null`、`factor_selected=false`、`auto_execute=false`、`production_integration=false` 与最终交互 `not_ready` 保持。历史失败、负结果和授权消费记录不得重写或据此自动续跑。
 
 ## 已完成阶段归档
 
