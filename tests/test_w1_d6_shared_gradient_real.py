@@ -39,6 +39,14 @@ def test_worker_io_receipt_projects_the_validated_io_matrix_without_source_io():
     assert receipt["launch_metadata_reads"] == 3 and receipt["ledger_reads"] == 2
 
 
+def test_worker_result_source_records_use_normalized_io_projection():
+    normalized = {"source/a": {"bytes": 3, "sha256": "a" * 64}}
+    io_matrix = {"source_records": normalized, "source_file_reads": 48}
+    assert real.worker_result_source_records(io_matrix) is normalized
+    with pytest.raises(real.RealWorkerError, match="real_worker_source_projection_invalid"):
+        real.worker_result_source_records({"source_records": []})
+
+
 def test_worker_cli_rejects_bad_launch_before_importing_numeric_core(tmp_path, monkeypatch):
     script = Path(__file__).resolve().parents[1] / "scripts/run_w1_d6_shared_gradient_worker.py"
     spec = importlib.util.spec_from_file_location("d6_worker_cli_preflight_test", script)

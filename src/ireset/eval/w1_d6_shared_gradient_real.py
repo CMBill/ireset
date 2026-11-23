@@ -1254,15 +1254,17 @@ def run_authorized_worker(*, authorization_raw: bytes, authorization_sha256: str
     }
     require(actual_calls == {key: matrix[key] for key in actual_calls},
             "real_worker_call_matrix_mismatch")
+    io_matrix = real_worker_io_matrix(package, records, result)
     return {"schema": SCHEMA + "/worker_result", "status": "candidate_pending_external_return",
             "launch_id": permit.launch_id, "authorization_sha256": permit.authorization_sha256,
             "admission_metadata_sha256": permit.admission_metadata_sha256,
             "outcome": result["outcome"], "independent_review": result["independent_review"],
             "counts": result["counts"], "vjp": result["vjp"],
              "artifact_peak_bytes": result["artifact_peak_bytes"],
-             "artifact_io": result["artifact_io"], "source_records": records,
+             "artifact_io": result["artifact_io"],
+             "source_records": worker_result_source_records(io_matrix),
              "call_matrix": actual_calls,
-             "io_matrix": real_worker_io_matrix(package, records, result),
+             "io_matrix": io_matrix,
              "budget": work_budget.facts(), "parameter_updates": 0,
              "worker_pid": os.getpid()}
 
@@ -1303,6 +1305,12 @@ def real_worker_io_matrix(package: dict, source_records: dict, result: dict) -> 
             "independent_artifact_hashes": readback["file_sha256_verified"],
             "artifact_files": files, "artifact_io": artifact_io,
             "strict_model_loads": result["outcome"]["setup_report"]["strict_load"]["strict_model_loads"]}
+
+
+def worker_result_source_records(io_matrix: dict) -> dict:
+    require(type(io_matrix) is dict and type(io_matrix.get("source_records")) is dict,
+            "real_worker_source_projection_invalid")
+    return io_matrix["source_records"]
 
 
 def review_real_artifacts(root: Path, expected_analysis: dict | None = None, *,
